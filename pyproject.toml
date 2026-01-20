@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remoroo"
-version = "0.1.7"
+version = "0.1.8"
 description = "Remoroo Offline Engine CLI"
 requires-python = ">=3.9"
 dependencies = [

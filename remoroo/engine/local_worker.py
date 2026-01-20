@@ -58,6 +58,46 @@ class WorkerService:
             return explicit_root
         return self.repo_root
 
+    def _get_worker_env(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """
+        Build the environment for local command execution.
+        Injects venv PATH to ensure isolated execution even without Docker.
+        """
+        env = os.environ.copy()
+        
+        # 1. Inject Venv PATH
+        # We check for 'venv' or '.venv' in repo_root
+        for venv_name in ["venv", ".venv"]:
+            venv_path = os.path.join(self.repo_root, venv_name)
+            if os.path.isdir(venv_path):
+                # Determine bin dir (bin on Linux/Mac, Scripts on Windows)
+                import sys
+                bin_name = "Scripts" if sys.platform == "win32" else "bin"
+                bin_path = os.path.join(venv_path, bin_name)
+                
+                if os.path.isdir(bin_path):
+                    # Prepend to PATH
+                    current_path = env.get("PATH", "")
+                    env["PATH"] = f"{bin_path}{os.pathsep}{current_path}"
+                    # Also set VIRTUAL_ENV
+                    env["VIRTUAL_ENV"] = venv_path
+                    # Remove PYTHONHOME if set (interference)
+                    if "PYTHONHOME" in env:
+                        del env["PYTHONHOME"]
+                    break
+        
+        # 2. Inject Remoroo defaults
+        env["REMOROO_ARTIFACTS_DIR"] = os.path.join(self.repo_root, "artifacts")
+        env["PYTHONUNBUFFERED"] = "1"
+        
+        # 3. Apply extra env from request
+        if extra_env:
+            for k, v in extra_env.items():
+                if k:
+                    env[str(k)] = str(v)
+                    
+        return env
+
     def _handle_request_internal(self, request: ExecutionRequest) -> ExecutionResult:
         """Dispatch request to appropriate Worker method."""
         # 1. Resolve Target Context
@@ -202,6 +242,7 @@ class WorkerService:
                     cwd=self.repo_root,
                     timeout_s=timeout,
                     show_progress=True,
+                    env=self._get_worker_env(),
                     runner_factory=runner
                 )
                 
@@ -218,9 +259,9 @@ class WorkerService:
                 
                 runner = None
                 if self.sandbox and self.sandbox.available:
-                    def sandbox_runner(cmd, env=None):
-                        return self.sandbox.exec_popen(cmd, env=env or {})
                     runner = sandbox_runner
+                
+                exec_env = self._get_worker_env()
                 
                 outcomes = []
                 success = True
@@ -230,6 +271,7 @@ class WorkerService:
                         cwd=self.repo_root,
                         timeout_s=timeout,
                         show_progress=True,
+                        env=exec_env,
                         runner_factory=runner
                     )
                     outcomes.append(cmd)
@@ -338,7 +380,7 @@ class WorkerService:
                     runner = sandbox_runner
                 else:
                     # Local execution: use host path
-                    env_vars["REMOROO_ARTIFACTS_DIR"] = os.path.join(self.repo_root, "artifacts")
+                    exec_env = self._get_worker_env(env_vars)
                 
                 outcomes = []
                 success = True
@@ -411,7 +453,7 @@ class WorkerService:
                     runner = sandbox_runner
                 else:
                     # Local execution: use host path
-                    exec_env["REMOROO_ARTIFACTS_DIR"] = os.path.join(self.repo_root, "artifacts")
+                    exec_env = self._get_worker_env()
                     
                 command_results = executor.run_command_plan(
                     repo_root=self.repo_root,
@@ -497,7 +539,7 @@ class WorkerService:
                     cwd=self.repo_root,
                     timeout_s=timeout,
                     show_progress=True,
-                    env=env_vars,
+                    env=self._get_worker_env(env_vars),
                     runner_factory=runner
                 )
                 return ExecutionResult(success=True, data={"outcome": outcome})
@@ -703,10 +745,21 @@ class WorkerService:
                 from ..execution import import_diagnostics
                 # Use explicit repo_root from payload if provided (stateless protocol)
                 target_root = request.payload.get("repo_root") or self.repo_root
+                # Use absolute venv python if available
+                venv_python = request.payload.get("venv_python")
+                if not venv_python or venv_python == "python":
+                    potential_venv = os.path.join(target_root, "venv", "bin", "python")
+                    if os.path.exists(potential_venv):
+                        venv_python = potential_venv
+                    else:
+                        potential_venv = os.path.join(target_root, ".venv", "bin", "python")
+                        if os.path.exists(potential_venv):
+                            venv_python = potential_venv
+
                 d = import_diagnostics.diagnose_import_error(
                     error_message=request.payload.get("error_message", ""),
                     repo_root=target_root,
-                    venv_python=request.payload.get("venv_python")
+                    venv_python=venv_python
                 )
                 return ExecutionResult(success=True, data=d)
                 
@@ -786,13 +839,7 @@ class WorkerService:
                 execution_id = f"exec-{uuid.uuid4().hex[:8]}"
                 
                 # Build execution environment
-                exec_env = os.environ.copy()
-                exec_env["REMOROO_ARTIFACTS_DIR"] = os.path.join(self.repo_root, "artifacts")
-                exec_env["PYTHONUNBUFFERED"] = "1" # Ensure Python logs flush immediately
-                if env_vars:
-                    for k, v in env_vars.items():
-                        if k:
-                            exec_env[str(k)] = str(v)
+                exec_env = self._get_worker_env(env_vars)
                 
                 try:
                     import subprocess
