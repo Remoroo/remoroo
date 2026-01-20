@@ -21,3 +21,8 @@ env/
 *.log
 *.tmp
 *.temp
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
