@@ -47,26 +47,29 @@ def worker(
     current_run_id = [None] # Use list for closure mutability
     stop_heartbeat = threading.Event()
 
+    import threading
+    
+    def send_heartbeat(run_id_to_send):
+        try:
+            requests.post(
+                f"{server_url}/workers/heartbeat",
+                json={
+                    "run_id": run_id_to_send,
+                    "client_id": "simulated-cloud-worker-1",
+                    "timestamp": time.time()
+                },
+                timeout=5
+            )
+        except Exception:
+            pass # Silent fail
+
     def heartbeat_loop():
         while not stop_heartbeat.is_set():
             run_id = current_run_id[0]
             if run_id:
-                try:
-                    # Use a fresh session or requests directly for heartbeat
-                    requests.post(
-                        f"{server_url}/workers/heartbeat",
-                        json={
-                            "run_id": run_id,
-                            "client_id": "simulated-cloud-worker-1",
-                            "timestamp": time.time()
-                        },
-                        timeout=5
-                    )
-                except Exception:
-                    pass # Silent fail for heartbeat
+                send_heartbeat(run_id)
             time.sleep(10)
 
-    import threading
     hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     hb_thread.start()
 
@@ -119,7 +122,10 @@ def worker(
                     continue
                 
                 # Update heartbeat run_id
-                current_run_id[0] = run_id
+                if run_id != current_run_id[0]:
+                    current_run_id[0] = run_id
+                    # Force immediate heartbeat to prevent "Worker Disappeared" race condition
+                    threading.Thread(target=send_heartbeat, args=(run_id,), daemon=True).start()
                 
                 # Got a step!
                 request = ExecutionRequest(**step_data)
