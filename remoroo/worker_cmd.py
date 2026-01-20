@@ -43,76 +43,89 @@ def worker(
     # Session for keep-alive
     session = requests.Session()
 
+    # Heartbeat State
+    current_run_id = [None] # Use list for closure mutability
+    stop_heartbeat = threading.Event()
+
+    def heartbeat_loop():
+        while not stop_heartbeat.is_set():
+            run_id = current_run_id[0]
+            if run_id:
+                try:
+                    # Use a fresh session or requests directly for heartbeat
+                    requests.post(
+                        f"{server_url}/workers/heartbeat",
+                        json={
+                            "run_id": run_id,
+                            "client_id": "simulated-cloud-worker-1",
+                            "timestamp": time.time()
+                        },
+                        timeout=5
+                    )
+                except Exception:
+                    pass # Silent fail for heartbeat
+            time.sleep(10)
+
+    import threading
+    hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    hb_thread.start()
+
+    def process_request(request, run_id):
+        try:
+            # 2. Execute Request
+            typer.secho(f"\n📨 Received Job: {request.type} (Run: {run_id})", fg=typer.colors.GREEN)
+            
+            # Execute using Worker Service
+            # handle_request is now internally thread-safe with a lock
+            result = worker_service.handle_request(request)
+            
+            # 3. Submit Result
+            # Use a fresh session or the shared one (session is thread-safe in requests)
+            submit_resp = session.post(f"{server_url}/jobs/result", json={
+                "client_id": "simulated-cloud-worker-1",
+                "result": {
+                    "request_id": request.request_id,
+                    "success": result.success,
+                    "data": result.data,
+                    "error": result.error
+                }
+            })
+            submit_resp.raise_for_status()
+            typer.echo(f"   ✅ Result for {request.type} submitted.")
+        except Exception as e:
+            typer.secho(f"⚠️  Error in job processing ({request.type}): {e}", fg=typer.colors.RED)
+
     try:
         while True:
             try:
                 # 1. Poll for work
-                resp = session.post(f"{server_url}/workers/poll", json={
+                payload = {
                     "capabilities": {"python": True, "bash": True},
                     "client_id": "simulated-cloud-worker-1"
-                }, timeout=5)
+                }
+                
+                resp = session.post(f"{server_url}/workers/poll", json=payload, timeout=5)
                 
                 if resp.status_code != 200:
-                    # connection error or server down
-                    pass 
+                    time.sleep(poll_interval)
+                    continue 
                 
                 data = resp.json()
-                
-                # Check if we got a job? 
-                # The current BrainServer implementation of /workers/poll:
-                # It returns the NEXT request from the orchestrator queue.
-                # If null/empty, it means no work.
-                
-                # Server returns {"step": {...} or None}
                 step_data = data.get("step")
+                run_id = data.get("run_id")
                 
                 if not step_data:
                     time.sleep(poll_interval)
                     continue
                 
-                # We got a request!
+                # Update heartbeat run_id
+                current_run_id[0] = run_id
+                
+                # Got a step!
                 request = ExecutionRequest(**step_data)
                 
-                # Special Case: workflow_complete / workflow_error handling?
-                # The BrainServer puts these on the queue too?
-                # Actually, BrainServer.get_next_step calls transport.get_next_request.
-                # If it returns None, /workers/poll returns None.
-                
-                # 2. Execute Request
-                typer.secho(f"\n📨 Received Job: {request.type}", fg=typer.colors.GREEN)
-                
-                # Execute using Worker Service
-                result = worker_service.handle_request(request)
-                
-                # 3. Submit Result
-                # We need to submit back to /jobs/result?
-                # Wait, strictly speaking, /workers/poll usually just GETs.
-                # But here we are using HTTP Transport concepts.
-                
-                # We can't use HttpTransport here because HttpTransport acts as a CLIENT to the Brain.
-                # The Worker IS the client here too.
-                # We need to POST the result back.
-                
-                # BrainServer expects result submission via... wait.
-                # BrainServer wraps QueueTransport.
-                # The /workers/poll endpoint pops from `transport.outbox`.
-                # The /jobs/result endpoint puts into `transport.inbox`.
-                
-                # So we verify /jobs/result endpoint exists? 
-                # Yes, in remoroo_offline/server.py.
-                
-                submit_resp = session.post(f"{server_url}/jobs/result", json={
-                    "client_id": "simulated-cloud-worker-1",
-                    "result": {
-                        "request_id": request.request_id,
-                        "success": result.success,
-                        "data": result.data,
-                        "error": result.error
-                    }
-                })
-                submit_resp.raise_for_status()
-                
-                typer.echo("   ✅ Result submitted.")
+                # Start job in a background thread to avoid starvation
+                threading.Thread(target=process_request, args=(request, run_id), daemon=True).start()
                 
             except requests.exceptions.ConnectionError:
                 typer.secho("⚠️  Connection failed. Retrying...", fg=typer.colors.YELLOW)
@@ -122,5 +135,6 @@ def worker(
                 time.sleep(poll_interval)
                 
     except KeyboardInterrupt:
+        stop_heartbeat.set()
         typer.secho("\n🛑 Worker stopped.", fg=typer.colors.YELLOW)
 

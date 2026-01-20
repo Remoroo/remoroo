@@ -6,6 +6,7 @@ from .core import context_packer, env_setup, executor, applier
 import shutil
 import uuid
 import os
+import threading
 
 class WorkerService:
     """
@@ -34,16 +35,19 @@ class WorkerService:
         # but for local worker memory is fine.
         self._running_processes: Dict[str, Any] = {}
         self._execution_buffers: Dict[str, Any] = {} # Store stdout/stderr buffers
+        self._lock = threading.Lock()
 
         
     def handle_request(self, request: ExecutionRequest) -> ExecutionResult:
         """Dispatch request to appropriate Worker method and ensure contract metadata."""
-        result = self._handle_request_internal(request)
-        if result is None:
-            result = ExecutionResult(success=False, error="Handler returned None")
-        if result.request_id is None:
-            result.request_id = request.request_id
-        return result
+        # Use lock to protect repo_root context switching and internal structures
+        with self._lock:
+            result = self._handle_request_internal(request)
+            if result is None:
+                result = ExecutionResult(success=False, error="Handler returned None")
+            if result.request_id is None:
+                result.request_id = request.request_id
+            return result
 
     def _resolve_repo_root(self, request: ExecutionRequest) -> str:
         """

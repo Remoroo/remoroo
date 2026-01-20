@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="remoroo",
-    version="0.1.8",
+    version="0.1.9",
     packages=find_packages(),
     install_requires=[
         "typer>=0.9.0",
