@@ -134,7 +134,16 @@ def worker(
                 typer.secho(f"⚠️  Error in worker loop: {e}", fg=typer.colors.RED)
                 time.sleep(poll_interval)
                 
-    except KeyboardInterrupt:
+    except BaseException as e:
+        import traceback
+        crash_log = repo_path / "worker_crash.log"
+        with open(crash_log, "w") as f:
+            f.write(f"Worker crashed at {time.ctime()}\n")
+            f.write(f"Exception: {e}\n")
+            f.write(traceback.format_exc())
+        
+        typer.secho(f"\n🔥 Worker Crashed! Log saved to {crash_log}", fg=typer.colors.RED)
         stop_heartbeat.set()
-        typer.secho("\n🛑 Worker stopped.", fg=typer.colors.YELLOW)
+        if not isinstance(e, KeyboardInterrupt):
+            raise e
 
