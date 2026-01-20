@@ -1,0 +1,209 @@
+import subprocess
+import os
+import sys
+import time
+import uuid
+from typing import List, Dict, Any, Optional, Tuple
+from pathlib import Path
+
+class DockerSandbox:
+    def __init__(self, repo_path: str, artifact_dir: str, image_name: str = "remoroo-worker"):
+        self.repo_path = os.path.abspath(repo_path)
+        self.artifact_dir = os.path.abspath(artifact_dir)
+        self.image_name = image_name
+        self.container_name = f"remoroo-sandbox-{uuid.uuid4().hex[:8]}"
+        self.is_running = False
+        self.available = self.check_docker()
+        if not self.available:
+            print("⚠️  Docker not available. Sandbox disabled.")
+
+    def check_docker(self) -> bool:
+        """Check if docker daemon is accessible."""
+        try:
+            subprocess.check_call(
+                ["docker", "info"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    def check_image(self) -> bool:
+        """Check if image exists."""
+        try:
+            subprocess.check_call(
+                ["docker", "image", "inspect", self.image_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    def build_image_if_missing(self, context_path: str):
+        """Build the worker image if it doesn't exist."""
+        if not self.check_image():
+            print(f"📦 Building sandbox image '{self.image_name}'...")
+            
+            # Locate Dockerfile.worker relative to this module
+            # remoroo_cli/remoroo/engine/sandbox.py -> root/Dockerfile.worker
+            current_file = Path(__file__).resolve()
+            
+            # Try to find engine root where Dockerfile.worker lives
+            # We look up finding the file
+            dockerfile_path = None
+            candidate_dir = current_file.parent
+            for _ in range(5): # Go up 5 levels
+                if (candidate_dir / "Dockerfile.worker").exists():
+                    dockerfile_path = candidate_dir / "Dockerfile.worker"
+                    break
+                candidate_dir = candidate_dir.parent
+                
+            if not dockerfile_path:
+                 # Fallback to CWD if running from root
+                 if Path("Dockerfile.worker").exists():
+                     dockerfile_path = Path("Dockerfile.worker").resolve()
+            
+            if not dockerfile_path:
+                 print("⚠️  Warning: Dockerfile.worker not found. Cannot build sandbox.")
+                 return
+
+            # Use the directory containing Dockerfile as build context
+            build_context = dockerfile_path.parent
+
+            subprocess.check_call(
+                ["docker", "build", "-t", self.image_name, "-f", str(dockerfile_path), "."],
+                cwd=str(build_context),
+                stdout=sys.stdout,
+                stderr=sys.stderr
+            )
+
+    def start(self):
+        """Start the persistent sandbox container."""
+        if self.is_running:
+            return
+
+        self.build_image_if_missing(os.path.dirname(self.repo_path) if os.path.isfile(self.repo_path) else self.repo_path)
+
+        print(f"📦 Starting sandbox container '{self.container_name}'...")
+        
+        # We mount the repo to /app/repo so we don't overwrite the /app code in the image
+        # But wait, the image has 'COPY . .' to /app. 
+        # Ideally we want to run against the USER's repo.
+        # Let's mount repo to /app/workdir and set WORKDIR there.
+        
+        cmd = [
+            "docker", "run", "-d", "--rm",
+            "--name", self.container_name,
+            "-v", f"{self.repo_path}:/app/workdir",
+            "-v", f"{self.artifact_dir}:/app/workdir/artifacts",
+            # We also might need credentials if pulling deps, but let's skip for now
+            "--entrypoint", "sleep",
+            self.image_name, 
+            "infinity"
+        ]
+        
+        subprocess.check_call(cmd)
+        self.is_running = True
+        
+        # Fix permissions? In Docker usually root.
+        # For now, we assume user mapping is not strict p0.
+
+    def stop(self):
+        """Stop and remove the container."""
+        if self.is_running:
+            try:
+                subprocess.run(["docker", "kill", self.container_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except:
+                pass
+            self.is_running = False
+
+    def exec_popen(self, cmd: List[str], env: Dict[str, str] = {}, workdir: str = "/app/workdir") -> subprocess.Popen:
+        """
+        Run a command via docker exec, returning a Popen object for streaming.
+        """
+        if not self.is_running:
+            self.start()
+
+        # Construct exec command
+        exec_cmd = ["docker", "exec", "-i"]
+        
+        # Workdir
+        exec_cmd.extend(["-w", workdir])
+        
+        # Env
+        for k, v in env.items():
+            exec_cmd.extend(["-e", f"{k}={v}"])
+            
+        exec_cmd.append(self.container_name)
+        # Check if cmd is string or list
+        if isinstance(cmd, str):
+            # If shell=True behavior is needed, we should wrap in sh -c
+            exec_cmd.extend(["/bin/sh", "-c", cmd])
+        else:
+            exec_cmd.extend(cmd)
+
+        return subprocess.Popen(
+            exec_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+
+    def exec_run(self, cmd: List[str], env: Dict[str, str] = {}, workdir: str = "/app/workdir", timeout: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Run a command via docker exec.
+        Matches the return signature of executor.run_command_with_timeout mostly.
+        """
+        if not self.is_running:
+            self.start()
+
+        # Construct exec command
+        exec_cmd = ["docker", "exec", "-i"]
+        
+        # Workdir
+        exec_cmd.extend(["-w", workdir])
+        
+        # Env
+        for k, v in env.items():
+            exec_cmd.extend(["-e", f"{k}={v}"])
+            
+        exec_cmd.append(self.container_name)
+        exec_cmd.extend(cmd)
+
+        start_time = time.time()
+        
+        try:
+            # We use subprocess.run for simplicity for now, passing text=True
+            # For streaming, we'd need Popen similar to executor.py
+            # But let's wrap strictly.
+            
+            proc = subprocess.run(
+                exec_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout
+            )
+            
+            duration = time.time() - start_time
+            return {
+                "cmd": " ".join(cmd),
+                "exit_code": proc.returncode,
+                "duration_s": duration,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "timed_out": False
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "cmd": " ".join(cmd),
+                "exit_code": -1,
+                "duration_s": time.time() - start_time,
+                "stdout": "",
+                "stderr": "Timeout",
+                "timed_out": True
+            }

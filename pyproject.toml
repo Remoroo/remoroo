@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools<70.0.0", "wheel", "packaging>=23.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remoroo"
+version = "0.1.0"
+description = "Remoroo Offline Engine CLI"
+requires-python = ">=3.9"
+dependencies = [
+    "typer>=0.9.0",
+    "jsonschema>=4.22.0",
+    "openai>=1.40.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+remoroo = "remoroo.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["remoroo*", "remoroo_offline*"]
