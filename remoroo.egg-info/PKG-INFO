@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: remoroo
-Version: 0.1.0
-Summary: Remoroo Offline Engine CLI
-Requires-Python: >=3.9
-Requires-Dist: typer>=0.9.0
-Requires-Dist: jsonschema>=4.22.0
-Requires-Dist: openai>=1.40.0
-Requires-Dist: requests>=2.31.0
