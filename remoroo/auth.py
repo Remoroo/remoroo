@@ -10,8 +10,8 @@ CRED_PATH = Path.home() / ".config" / "remoroo" / "credentials"
 
 class AuthClient:
     def __init__(self, base_url: Optional[str] = None):
-        self.base_url = base_url or os.environ.get("REMOROO_API_URL", "https://api.remoroo.com")
-        self.auth_url = os.environ.get("REMOROO_AUTH_URL", "http://localhost:3000/console") # Point to console for key generation
+        self.base_url = base_url or os.environ.get("REMOROO_API_URL", "https://brain.remoroo.com")
+        self.auth_url = os.environ.get("REMOROO_AUTH_URL", "https://brain.remoroo.com/console") # Point to console for key generation
         self._token: Optional[str] = None
         self._load_token()
 
