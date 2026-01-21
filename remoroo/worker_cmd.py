@@ -37,7 +37,16 @@ def worker(
     artifact_dir = repo_path / "artifacts"
     worker_service = WorkerService(str(repo_path), str(artifact_dir))
 
+    import socket
+    import uuid
+    
+    # Generate Unique Identity
+    hostname = socket.gethostname()
+    short_id = str(uuid.uuid4())[:8]
+    client_id = f"worker-{hostname}-{short_id}"
+
     # Polling Loop
+    typer.echo(f"   🆔 Client ID: {client_id}")
     typer.echo("   Polling for jobs...")
     
     # Session for keep-alive
@@ -49,7 +58,7 @@ def worker(
                 # 1. Poll for work
                 resp = session.post(f"{server_url}/workers/poll", json={
                     "capabilities": {"python": True, "bash": True},
-                    "client_id": "simulated-cloud-worker-1"
+                    "client_id": client_id
                 }, timeout=5)
                 
                 if resp.status_code != 200:
@@ -102,7 +111,7 @@ def worker(
                 # Yes, in remoroo_offline/server.py.
                 
                 submit_resp = session.post(f"{server_url}/jobs/result", json={
-                    "client_id": "simulated-cloud-worker-1",
+                    "client_id": client_id,
                     "result": {
                         "request_id": request.request_id,
                         "success": result.success,
