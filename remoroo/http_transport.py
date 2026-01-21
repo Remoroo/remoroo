@@ -114,7 +114,7 @@ class HttpTransport(Transport):
                 resp = self.session.post(
                     f"{self.base_url}/jobs/result",
                     json={"client_id": self.client_id, "result": payload},
-                    timeout=10.0 # Increase timeout
+                    timeout=60.0 # Increase timeout
                 )
                 if resp.status_code == 200:
                     return
