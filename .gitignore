@@ -1,28 +1,98 @@
-# =========================
-# Ignore generated junk
-# =========================
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*.pyo
+*$py.class
+
+# C extensions
 *.so
 
-# Virtual environments
-.venv/
-venv/
-env/
-
-
-# Editor / OS
-.vscode/
-.idea/
-.DS_Store
-
-# Logs / temp
-*.log
-*.tmp
-*.temp
-
-# Build artifacts
+# Distribution / packaging
+.Python
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Credentials (never commit these!)
+credentials
+*.pem
+*.key
+
+# Local config
+.env.local
+.env.*.local

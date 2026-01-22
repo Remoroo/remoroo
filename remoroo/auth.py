@@ -33,20 +33,27 @@ class AuthClient:
     def login(self) -> None:
         """Interactive login flow."""
         if self.is_authenticated():
-            typer.echo("Already logged in.")
+            typer.secho("✓ You are already logged in.", fg=typer.colors.GREEN)
+            typer.echo("  To switch accounts or update your API key, run: remoroo logout && remoroo login")
             return
 
         CRED_PATH.parent.mkdir(parents=True, exist_ok=True)
         
-        typer.secho("Opening browser to sign in...", fg=typer.colors.BLUE)
-        print(f"URL: {self.auth_url}")
+        typer.secho("\n🔐 Remoroo Authentication", fg=typer.colors.BLUE, bold=True)
+        typer.echo("─" * 40)
+        typer.echo("\n1. Opening the Remoroo Console in your browser...")
+        typer.echo("2. Click 'Generate' to create a new API key")
+        typer.secho("   ⚠️  Note: Generating a new key revokes any previous keys!", fg=typer.colors.YELLOW)
+        typer.echo("3. Copy the key and paste it below\n")
+        
+        print(f"Console URL: {self.auth_url}")
         
         try:
             webbrowser.open(self.auth_url)
         except Exception:
-            typer.echo("Could not open browser automatically.")
+            typer.echo("Could not open browser automatically. Please visit the URL above.")
             
-        token = typer.prompt("Paste your API key (will be saved locally)", hide_input=True)
+        token = typer.prompt("Paste your API key here (input is hidden)", hide_input=True)
         token = (token or "").strip()
         
         if not token:
@@ -55,19 +62,27 @@ class AuthClient:
             
         # Validate Token
         try:
-            import requests # Make sure requests is imported or available
+            import requests
             typer.echo("Verifying credentials...")
             res = requests.get(f"{self.base_url}/user/me", headers={"Authorization": token})
             if res.status_code == 200:
                 user = res.json()
-                typer.secho(f"Successfully logged in as {user.get('email') or user.get('username')}", fg=typer.colors.GREEN)
                 self._save_token(token)
+                typer.echo()
+                typer.secho("✅ Successfully authenticated!", fg=typer.colors.GREEN, bold=True)
+                typer.echo(f"   Logged in as: {user.get('email') or user.get('username')}")
+                typer.echo(f"   Credentials saved to: {CRED_PATH}")
+                typer.echo()
             else:
-                 typer.secho(f"Login failed: {res.status_code} - Invalid API Key", fg=typer.colors.RED)
+                 typer.secho(f"❌ Login failed: Invalid API Key (HTTP {res.status_code})", fg=typer.colors.RED)
+                 typer.echo("   Make sure you copied the complete key from the Console.")
                  raise typer.Exit(code=1)
+        except requests.exceptions.ConnectionError:
+             typer.secho("❌ Connection error: Could not reach the Remoroo API.", fg=typer.colors.RED)
+             typer.echo(f"   Tried: {self.base_url}")
+             raise typer.Exit(code=1)
         except Exception as e:
-             typer.secho(f"Verification error: {e}", fg=typer.colors.YELLOW)
-             # Proceed? No, fail secure.
+             typer.secho(f"❌ Verification error: {e}", fg=typer.colors.RED)
              raise typer.Exit(code=1)
 
     def logout(self) -> None:
