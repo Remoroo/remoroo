@@ -280,34 +280,26 @@ def run_local_worker(
             except Exception as e:
                 typer.echo(f"   ⚠️  Docker commit failed: {e}")
         
-        # 3. Clean up temporary working directories (only on failure)
-        import glob
-        temp_patterns = [
-            "/tmp/remoroo_worktree_*",
-            "/tmp/remoroo_working_*"
-        ]
+        # 3. Request cleanup of working copy via RPC (Handles both Mac and Linux)
+        from .engine.protocol import ExecutionRequest
+        cleanup_request = ExecutionRequest(
+            type="cleanup_working_copy",
+            payload={},
+            request_id=f"cleanup-{remote_run_id}"
+        )
+        cleanup_res = worker_service.handle_request(cleanup_request)
+        if cleanup_res.success:
+            typer.echo("   ✅ Temporary working copy cleaned up")
         
-        if not success:
-            # Only clean temp dirs on failure
-            for pattern in temp_patterns:
-                for temp_dir in glob.glob(pattern):
-                    try:
-                        import shutil
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                        typer.echo(f"   Removed failed run: {temp_dir}")
-                    except Exception as e:
-                        typer.echo(f"   ⚠️  Failed to remove {temp_dir}: {e}")
-        else:
-            # On success, preserve temp environments for reuse
-            typer.echo(f"   ✅ Preserving temporary environments for future reuse")
-        
-        # 4. Stop Docker sandbox (but don't remove if successful - already committed)
+        # 4. Stop Docker sandbox (stopped by cleanup RPC above, but defensive here)
         if hasattr(worker_service, 'sandbox') and worker_service.sandbox:
             try:
                 worker_service.sandbox.stop()
-                typer.echo("   Docker sandbox stopped")
-            except Exception as e:
-                typer.echo(f"   ⚠️  Failed to stop Docker sandbox: {e}")
+            except Exception:
+                pass
+    
+    except Exception as e:
+        typer.echo(f"   ⚠️ Cleanup warning: {e}")
     
     except Exception as e:
         typer.echo(f"   ⚠️  Cleanup warning: {e}")

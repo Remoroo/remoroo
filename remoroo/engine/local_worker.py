@@ -15,9 +15,11 @@ class WorkerService:
     
     def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None):
         print("🔧 WorkerService (Patched) Loaded")
+        import tempfile
         self.repo_root = repo_root
         self.original_repo_root = original_repo_root or repo_root # Keep reference to original
-        self.is_ephemeral = False # Track if we are in a temp copy
+        # Infer is_ephemeral if repo_root is different from original_repo_root
+        self.is_ephemeral = (self.repo_root != self.original_repo_root) 
         self.artifact_dir = artifact_dir
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
         
@@ -549,7 +551,8 @@ class WorkerService:
                 source_path = request.payload.get("source_path") or self.original_repo_root
                 
                 # Create ephemeral path
-                temp_dir = f"/tmp/remoroo_worktree_{run_id}"
+                import tempfile
+                temp_dir = os.path.join(tempfile.gettempdir(), f"remoroo_worktree_{run_id}")
                 
                 # Cleanup if exists (unlikely but safe)
                 if os.path.exists(temp_dir):
@@ -649,7 +652,11 @@ class WorkerService:
 
             
             elif request.type == "cleanup_working_copy":
-                if self.is_ephemeral and self.repo_root.startswith("/tmp/remoroo_worktree"):
+                # Robust check for EPC (Ephemeral Working Copy) cleanup
+                # On Mac, temp dirs are in /var/folders, not /tmp
+                import tempfile
+                is_in_temp = self.repo_root.startswith(tempfile.gettempdir())
+                if self.is_ephemeral and (is_in_temp or "remoroo_worktree" in self.repo_root):
                     print(f"🧹 Cleaning up Ephemeral Working Copy: {self.repo_root}")
                     try:
                         shutil.rmtree(self.repo_root)
