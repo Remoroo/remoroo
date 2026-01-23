@@ -76,13 +76,15 @@ def create_working_copy_from_url(url: str) -> str:
         raise RuntimeError(f"Failed to hydrate repo from URL: {e}")
 
 
-def generate_diff(original_repo: str, working_repo: str) -> str:
+def generate_diff(original_repo: str, working_repo: str, files: Optional[list[str]] = None) -> str:
     """
     Generate a unified diff between original and working repository.
     
     Args:
         original_repo: Path to the original repository
         working_repo: Path to the working copy
+        files: Optional list of relative file paths to include in the diff.
+               If None, diffs the entire directory.
         
     Returns:
         Unified diff string
@@ -90,6 +92,37 @@ def generate_diff(original_repo: str, working_repo: str) -> str:
     original_path = Path(original_repo).resolve()
     working_path = Path(working_repo).resolve()
     
+    # If a specific list of files is provided, generate diff for each and concatenate
+    if files:
+        diff_outputs = []
+        for rel_path in files:
+            orig_file = original_path / rel_path
+            work_file = working_path / rel_path
+            
+            # Use git diff --no-index for each file pair
+            try:
+                # Note: git diff --no-index return 1 if there are differences
+                result = subprocess.run(
+                    ["git", "diff", "--no-index", str(orig_file), str(work_file)],
+                    capture_output=True,
+                    text=True
+                )
+                if result.stdout:
+                    # Clean up the paths in the diff header to be relative to repo root
+                    # git diff --no-index output looks like:
+                    # --- a/old/path
+                    # +++ b/new/path
+                    header_lines = result.stdout.splitlines()
+                    if len(header_lines) >= 2:
+                        header_lines[0] = f"--- a/{rel_path}"
+                        header_lines[1] = f"+++ b/{rel_path}"
+                        diff_outputs.append("\n".join(header_lines))
+                    else:
+                        diff_outputs.append(result.stdout)
+            except (FileNotFoundError, subprocess.SubprocessError):
+                continue
+        return "\n".join(diff_outputs)
+
     # Use git diff if available, otherwise use diff command
     try:
         # Try git diff first (more reliable)

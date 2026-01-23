@@ -51,15 +51,37 @@ class WorkerService:
                 print(f"📍 Current Repo:  {self.repo_root}")
                 
                 if os.path.exists(self.repo_root):
-                    diff_content = generate_diff(self.original_repo_root, self.repo_root)
-                    if diff_content:
-                        dest_diff = os.path.join(self.original_repo_root, "final_patch.diff")
-                        with open(dest_diff, 'w', encoding='utf-8') as f:
-                            f.write(diff_content)
-                        finalized.append("final_patch.diff")
-                        print(f"✅ Saved final_patch.diff to {dest_diff}")
+                    from ..execution.repo_manager import get_modified_files
+                    all_modified = get_modified_files(self.original_repo_root, self.repo_root)
+                    
+                    # Filter for code files only (reduce noise)
+                    code_extensions = {
+                        '.py', '.js', '.ts', '.tsx', '.jsx', '.html', '.css', 
+                        '.json', '.yaml', '.yml', '.md', '.sql', '.sh', '.bash',
+                        '.toml', '.lock', '.txt', '.cfg', '.ini'
+                    }
+                    
+                    code_files = [
+                        f for f in all_modified 
+                        if any(f.endswith(ext) for ext in code_extensions)
+                        and "venv" not in f 
+                        and "__pycache__" not in f
+                    ]
+                    
+                    if code_files:
+                        print(f"📊 Generating filtered patch for {len(code_files)} code files...")
+                        diff_content = generate_diff(self.original_repo_root, self.repo_root, files=code_files)
+                        
+                        if diff_content:
+                            dest_diff = os.path.join(self.original_repo_root, "final_patch.diff")
+                            with open(dest_diff, 'w', encoding='utf-8') as f:
+                                f.write(diff_content)
+                            finalized.append("final_patch.diff")
+                            print(f"✅ Saved final_patch.diff to {dest_diff}")
+                        else:
+                            print("ℹ️  No significant changes detected in code files.")
                     else:
-                        print("ℹ️  No changes detected for final patch.")
+                        print("ℹ️  No modified code files found (skipping patch).")
                 else:
                     print(f"⚠️  Cannot generate diff: source directory {self.repo_root} no longer exists")
                     
