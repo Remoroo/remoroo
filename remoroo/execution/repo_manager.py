@@ -120,9 +120,15 @@ def generate_diff(original_repo: str, working_repo: str, files: Optional[list[st
                     clean_lines = []
                     for line in lines:
                         if line.startswith("--- "):
-                            clean_lines.append(f"--- a/{rel_path}")
+                            if diff_orig == os.devnull:
+                                clean_lines.append("--- /dev/null")
+                            else:
+                                clean_lines.append(f"--- a/{rel_path}")
                         elif line.startswith("+++ "):
-                            clean_lines.append(f"+++ b/{rel_path}")
+                            if diff_work == os.devnull:
+                                clean_lines.append("+++ /dev/null")
+                            else:
+                                clean_lines.append(f"+++ b/{rel_path}")
                         elif line.startswith("diff --git"):
                             clean_lines.append(f"diff --git a/{rel_path} b/{rel_path}")
                         else:
