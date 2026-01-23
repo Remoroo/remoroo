@@ -99,29 +99,38 @@ def generate_diff(original_repo: str, working_repo: str, files: Optional[list[st
             orig_file = original_path / rel_path
             work_file = working_path / rel_path
             
+            # For new files, diff against /dev/null
+            diff_orig = str(orig_file) if orig_file.exists() else os.devnull
+            diff_work = str(work_file) if work_file.exists() else os.devnull
+            
+            if not os.path.exists(diff_work) and not os.path.exists(diff_orig):
+                continue
+
             # Use git diff --no-index for each file pair
             try:
-                # Note: git diff --no-index return 1 if there are differences
+                # Note: git diff --no-index returns 1 if there are differences
                 result = subprocess.run(
-                    ["git", "diff", "--no-index", str(orig_file), str(work_file)],
+                    ["git", "diff", "--no-index", diff_orig, diff_work],
                     capture_output=True,
                     text=True
                 )
                 if result.stdout:
                     # Clean up the paths in the diff header to be relative to repo root
-                    # git diff --no-index output looks like:
-                    # --- a/old/path
-                    # +++ b/new/path
-                    header_lines = result.stdout.splitlines()
-                    if len(header_lines) >= 2:
-                        header_lines[0] = f"--- a/{rel_path}"
-                        header_lines[1] = f"+++ b/{rel_path}"
-                        diff_outputs.append("\n".join(header_lines))
-                    else:
-                        diff_outputs.append(result.stdout)
+                    lines = result.stdout.splitlines()
+                    clean_lines = []
+                    for line in lines:
+                        if line.startswith("--- "):
+                            clean_lines.append(f"--- a/{rel_path}")
+                        elif line.startswith("+++ "):
+                            clean_lines.append(f"+++ b/{rel_path}")
+                        elif line.startswith("diff --git"):
+                            clean_lines.append(f"diff --git a/{rel_path} b/{rel_path}")
+                        else:
+                            clean_lines.append(line)
+                    diff_outputs.append("\n".join(clean_lines))
             except (FileNotFoundError, subprocess.SubprocessError):
                 continue
-        return "\n".join(diff_outputs)
+        return "\n".join(diff_outputs) + "\n" if diff_outputs else ""
 
     # Use git diff if available, otherwise use diff command
     try:
