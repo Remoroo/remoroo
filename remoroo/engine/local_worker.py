@@ -13,10 +13,10 @@ class WorkerService:
     Handles ExecutionRequests and returns ExecutionResults.
     """
     
-    def __init__(self, repo_root: str, artifact_dir: str):
+    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None):
         print("🔧 WorkerService (Patched) Loaded")
         self.repo_root = repo_root
-        self.original_repo_root = repo_root # Keep reference to original
+        self.original_repo_root = original_repo_root or repo_root # Keep reference to original
         self.is_ephemeral = False # Track if we are in a temp copy
         self.artifact_dir = artifact_dir
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
@@ -608,50 +608,44 @@ class WorkerService:
             
             elif request.type == "finalize_artifacts":
                 """
-                Copy final_report.md and cumulative diff to original repository before cleanup.
-                This ensures artifacts are preserved in the user's repo.
+                Generate cumulative diff locally and save to original repository before cleanup.
+                Note: final_report.md is delivered directly by Brain via write_file RPC.
                 """
                 try:
                     from ..execution.repo_manager import generate_diff
                     
-                    artifacts_copied = []
+                    artifacts_finalized = []
                     
-                    # 1. Copy final_report.md if it exists
-                    final_report_path = os.path.join(self.artifact_dir, "final_report.md")
-                    if os.path.exists(final_report_path):
-                        with open(final_report_path, 'r', encoding='utf-8') as f:
-                            report_content = f.read()
-                        
-                        # Write report directly to original repo root
-                        dest_report = os.path.join(self.original_repo_root, "final_report.md")
-                        with open(dest_report, 'w', encoding='utf-8') as f:
-                            f.write(report_content)
-                        
-                        artifacts_copied.append("final_report.md")
-                        print(f"✅ Copied final_report.md to {dest_report}")
+                    # Log Absolute Path Stability for diagnosis
+                    print(f"💼 Worker Finalizing Artifacts...")
+                    print(f"📍 Original Repo: {self.original_repo_root}")
+                    print(f"📍 Current Repo:  {self.repo_root}")
                     
-                    # 2. Generate and copy cumulative diff
+                    # 1. Generate and save cumulative diff
                     if self.is_ephemeral and self.repo_root != self.original_repo_root:
-                        print(f"📊 Generating cumulative diff...")
+                        print(f"📊 Generating cumulative diff locally...")
                         diff_content = generate_diff(self.original_repo_root, self.repo_root)
                         
                         if diff_content:
                             # Write diff directly to original repo root
-                            dest_diff = os.path.join(self.original_repo_root, "cumulative_diff.patch")
+                            dest_diff = os.path.join(self.original_repo_root, "final_patch.diff")
                             with open(dest_diff, 'w', encoding='utf-8') as f:
                                 f.write(diff_content)
                             
-                            artifacts_copied.append("cumulative_diff.patch")
-                            print(f"✅ Copied cumulative diff to {dest_diff}")
+                            artifacts_finalized.append("final_patch.diff")
+                            print(f"✅ Saved final_patch.diff to {dest_diff}")
+                            print(f"📊 Patch Size: {len(diff_content)} bytes")
+                        else:
+                            print(f"ℹ️  No changes detected for cumulative diff.")
                     
                     return ExecutionResult(success=True, data={
-                        "artifacts_copied": artifacts_copied,
+                        "artifacts_finalized": artifacts_finalized,
                         "destination": self.original_repo_root
                     })
                     
                 except Exception as e:
                     print(f"⚠️ Artifact finalization failed: {e}")
-                    return ExecutionResult(success=False, error=f"Artifact finalization failed: {str(e)}")
+                    return ExecutionResult(success=False, error=str(e))
 
             
             elif request.type == "cleanup_working_copy":
@@ -695,9 +689,11 @@ class WorkerService:
                  )
                  
                  diff_content = outcome.get("stdout", "")
-                 if not diff_content and not outcome.get("exit_code") == 0:
-                     # Fallback if no git repo or other error
-                     pass
+                 return ExecutionResult(
+                     success=True, 
+                     data={"diff": diff_content},
+                     request_id=request.request_id
+                 )
                  
             elif request.type == "write_file":
                  # Simple write file handler for saving reports/artifacts
@@ -728,12 +724,20 @@ class WorkerService:
                      with open(target_path, 'w', encoding='utf-8') as f:
                          f.write(content)
                      
-                     if "report" in str(path):
-                         print("   📄 Report Content:")
-                         print(content)
+                     # Enhanced logging for debugging
+                     print(f"   ✅ File written successfully")
+                     print(f"   📍 Full path: {target_path}")
+                     print(f"   📊 Size: {len(content)} bytes")
+                     
+                     if "report" in str(path).lower():
+                         print("   📄 Report preview (first 200 chars):")
+                         print("   " + content[:200].replace("\n", "\n   "))
                          
                      return ExecutionResult(success=True, data={"path": target_path})
                  except Exception as e:
+                     print(f"   ❌ Write failed: {e}")
+                     import traceback
+                     traceback.print_exc()
                      return ExecutionResult(success=False, error=str(e))
 
             elif request.type == "env_infer_config":
