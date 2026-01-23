@@ -13,7 +13,7 @@ class WorkerService:
     Handles ExecutionRequests and returns ExecutionResults.
     """
     
-    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None):
+    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None):
         print("🔧 WorkerService (Patched) Loaded")
         import tempfile
         self.repo_root = repo_root
@@ -21,6 +21,7 @@ class WorkerService:
         # Infer is_ephemeral if repo_root is different from original_repo_root
         self.is_ephemeral = (self.repo_root != self.original_repo_root) 
         self.artifact_dir = artifact_dir
+        self.run_id = run_id
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
         
         # Initialize Sandbox (Lazy start)
@@ -51,7 +52,7 @@ class WorkerService:
                 print(f"📍 Current Repo:  {self.repo_root}")
                 
                 if os.path.exists(self.repo_root):
-                    from ..execution.repo_manager import get_modified_files
+                    from ..execution.repo_manager import get_modified_files, IGNORED_PATTERNS
                     all_modified = get_modified_files(self.original_repo_root, self.repo_root)
                     
                     # Filter for code files only (reduce noise)
@@ -64,8 +65,7 @@ class WorkerService:
                     code_files = [
                         f for f in all_modified 
                         if any(f.endswith(ext) for ext in code_extensions)
-                        and "venv" not in f 
-                        and "__pycache__" not in f
+                        and not any(ignored in f for ignored in IGNORED_PATTERNS)
                     ]
                     
                     if code_files:
@@ -73,7 +73,14 @@ class WorkerService:
                         diff_content = generate_diff(self.original_repo_root, self.repo_root, files=code_files)
                         
                         if diff_content:
-                            dest_diff = os.path.join(self.original_repo_root, "final_patch.diff")
+                            # 🎯 ROUTE TO RUN-SPECIFIC OUTPUT 
+                            if self.run_id:
+                                dest_dir = os.path.join(self.original_repo_root, ".remoroo", "runs", self.run_id)
+                                os.makedirs(dest_dir, exist_ok=True)
+                                dest_diff = os.path.join(dest_dir, "final_patch.diff")
+                            else:
+                                dest_diff = os.path.join(self.original_repo_root, "final_patch.diff")
+                                
                             with open(dest_diff, 'w', encoding='utf-8') as f:
                                 f.write(diff_content)
                             finalized.append("final_patch.diff")
@@ -734,7 +741,13 @@ class WorkerService:
                      root = self.repo_root
                      if target_scope == "original":
                          root = self.original_repo_root
-                         print(f"🚚 Delivering to ORIGINAL repo: {path}")
+                         # 🚀 AUTO-ROUTE REPORTS TO RUN-SPECIFIC FOLDER
+                         if self.run_id and ("final_report.md" in path or "report" in path.lower()):
+                              run_output = os.path.join(root, ".remoroo", "runs", self.run_id)
+                              os.makedirs(run_output, exist_ok=True)
+                              root = run_output
+                              
+                         print(f"🚚 Delivering to: {root}/{path}")
                      elif target_scope == "artifact":
                          root = self.artifact_dir
 

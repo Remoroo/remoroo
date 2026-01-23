@@ -13,6 +13,12 @@ from typing import Optional, Tuple
 import zipfile
 import requests
 
+IGNORED_PATTERNS = {
+    '.remoroo', '.git', 'venv', '.venv', 'env', '.env', 
+    '__pycache__', '.DS_Store', 'node_modules', '.remoroo_venvs',
+    'artifacts', 'runs'
+}
+
 def create_working_copy(original_repo: str) -> str:
     """
     Create a temporary working copy of the repository.
@@ -31,16 +37,15 @@ def create_working_copy(original_repo: str) -> str:
     temp_dir = tempfile.mkdtemp(prefix="remoroo_working_")
     working_repo = os.path.join(temp_dir, "repo")
     
-    # Copy the entire repository, but exclude .venv and other venv directories
-    def ignore_venvs(dirname, names):
-        # Exclude common venv directory names
+    # Copy the entire repository, but exclude ignored dirs
+    def ignore_patterns(dirname, names):
         ignored = []
         for name in names:
-            if name in ['.venv', 'venv', 'env', '.env', '__pycache__', '.remoroo_venvs']:
+            if name in IGNORED_PATTERNS:
                 ignored.append(name)
         return set(ignored)
     
-    shutil.copytree(str(original_path), working_repo, symlinks=False, ignore=ignore_venvs)
+    shutil.copytree(str(original_path), working_repo, symlinks=False, ignore=ignore_patterns)
     
     return working_repo
 
@@ -187,11 +192,12 @@ def get_modified_files(original_repo: str, working_repo: str) -> list[str]:
     
     # Walk through working repo and compare files
     for root, dirs, files in os.walk(working_path):
-        # Skip hidden directories
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        # Skip ignored directories
+        dirs[:] = [d for d in dirs if d not in IGNORED_PATTERNS]
         
         for file in files:
-            if file.startswith('.'):
+            # Skip ignored files
+            if file in IGNORED_PATTERNS:
                 continue
                 
             rel_path = os.path.relpath(os.path.join(root, file), working_path)
@@ -212,10 +218,10 @@ def get_modified_files(original_repo: str, working_repo: str) -> list[str]:
     
     # Check for deleted files
     for root, dirs, files in os.walk(original_path):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        dirs[:] = [d for d in dirs if d not in IGNORED_PATTERNS]
         
         for file in files:
-            if file.startswith('.'):
+            if file in IGNORED_PATTERNS:
                 continue
                 
             rel_path = os.path.relpath(os.path.join(root, file), original_path)

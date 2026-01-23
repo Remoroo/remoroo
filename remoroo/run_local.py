@@ -182,10 +182,30 @@ def run_local_worker(
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat_thread.start()
     
+    # Phase 2.5: Bulletproof Isolation & Persistence
+    # Create unique run output directory in the original repo
+    remoroo_dir = repo_path / ".remoroo"
+    run_output_base = remoroo_dir / "runs"
+    run_output_dir = run_output_base / remote_run_id
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Git Hygiene: Ensure .remoroo is ignored to prevent "patch soup"
+    gitignore_path = repo_path / ".gitignore"
+    try:
+        if gitignore_path.exists():
+            content = gitignore_path.read_text()
+            if ".remoroo/" not in content:
+                with open(gitignore_path, 'a') as f:
+                    f.write("\n# Remoroo Metadata\n.remoroo/\n")
+        else:
+            gitignore_path.write_text("# Remoroo Metadata\n.remoroo/\n")
+    except Exception:
+        pass # Ignore gitignore failures 
+
     # Initialize Execution Service (Does the work)
     # We define the true original repo root here to ensure it's preserved across context switches
     original_repo_path = str(repo_path.absolute())
-    worker_service = WorkerService(repo_root=original_repo_path, artifact_dir=str(artifact_dir), original_repo_root=original_repo_path)
+    worker_service = WorkerService(repo_root=original_repo_path, artifact_dir=str(artifact_dir), original_repo_root=original_repo_path, run_id=remote_run_id)
     
     final_result = None
     outcome = "UNKNOWN"
@@ -248,7 +268,7 @@ def run_local_worker(
                      pass
 
                  # Pass the original_repo_path to the new WorkerService
-                 worker_service = WorkerService(repo_root=new_root, artifact_dir=str(artifact_dir), original_repo_root=original_repo_path)
+                 worker_service = WorkerService(repo_root=new_root, artifact_dir=str(artifact_dir), original_repo_root=original_repo_path, run_id=remote_run_id)
                  typer.echo(f"🔄 Switched execution context to: {new_root}")
 
         # 6. Submit Result
