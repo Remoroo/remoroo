@@ -240,6 +240,13 @@ def run_local_worker(
         if step.type == "create_working_copy" and result.success:
              new_root = result.data.get("working_path")
              if new_root:
+                 # CLEANUP PREVIOUS EPHEMERAL WORKSPACE (if any)
+                 # This prevents leaking temp dirs when switching multiple times
+                 try:
+                     worker_service.handle_request(ExecutionRequest(type="cleanup_working_copy", payload={}))
+                 except Exception:
+                     pass
+
                  # Pass the original_repo_path to the new WorkerService
                  worker_service = WorkerService(repo_root=new_root, artifact_dir=str(artifact_dir), original_repo_root=original_repo_path)
                  typer.echo(f"🔄 Switched execution context to: {new_root}")

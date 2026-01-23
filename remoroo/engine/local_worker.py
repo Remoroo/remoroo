@@ -38,6 +38,36 @@ class WorkerService:
         self._execution_buffers: Dict[str, Any] = {} # Store stdout/stderr buffers
 
         
+    def _finalize_artifacts_internal(self) -> list[str]:
+        """Internal helper to generate diff and save artifacts. Returns list of finalized files."""
+        try:
+            from ..execution.repo_manager import generate_diff
+            finalized = []
+            
+            # Use original_repo_root and current repo_root for diff
+            if self.is_ephemeral and self.repo_root != self.original_repo_root:
+                print(f"💼 Finalizing Implementation Patch...")
+                print(f"📍 Original Repo: {self.original_repo_root}")
+                print(f"📍 Current Repo:  {self.repo_root}")
+                
+                if os.path.exists(self.repo_root):
+                    diff_content = generate_diff(self.original_repo_root, self.repo_root)
+                    if diff_content:
+                        dest_diff = os.path.join(self.original_repo_root, "final_patch.diff")
+                        with open(dest_diff, 'w', encoding='utf-8') as f:
+                            f.write(diff_content)
+                        finalized.append("final_patch.diff")
+                        print(f"✅ Saved final_patch.diff to {dest_diff}")
+                    else:
+                        print("ℹ️  No changes detected for final patch.")
+                else:
+                    print(f"⚠️  Cannot generate diff: source directory {self.repo_root} no longer exists")
+                    
+            return finalized
+        except Exception as e:
+            print(f"⚠️  Artifact finalization failed: {e}")
+            return []
+
     def handle_request(self, request: ExecutionRequest) -> ExecutionResult:
         """Dispatch request to appropriate Worker method and ensure contract metadata."""
         result = self._handle_request_internal(request)
@@ -608,55 +638,21 @@ class WorkerService:
                 except Exception as e:
                     print(f"❌ Failed to create working copy: {e}")
                     return ExecutionResult(success=False, error=f"Failed to create working copy: {str(e)}")
-            
-            elif request.type == "finalize_artifacts":
-                """
-                Generate cumulative diff locally and save to original repository before cleanup.
-                Note: final_report.md is delivered directly by Brain via write_file RPC.
-                """
-                try:
-                    from ..execution.repo_manager import generate_diff
-                    
-                    artifacts_finalized = []
-                    
-                    # Log Absolute Path Stability for diagnosis
-                    print(f"💼 Worker Finalizing Artifacts...")
-                    print(f"📍 Original Repo: {self.original_repo_root}")
-                    print(f"📍 Current Repo:  {self.repo_root}")
-                    
-                    # 1. Generate and save cumulative diff
-                    if self.is_ephemeral and self.repo_root != self.original_repo_root:
-                        print(f"📊 Generating cumulative diff locally...")
-                        diff_content = generate_diff(self.original_repo_root, self.repo_root)
-                        
-                        if diff_content:
-                            # Write diff directly to original repo root
-                            dest_diff = os.path.join(self.original_repo_root, "final_patch.diff")
-                            with open(dest_diff, 'w', encoding='utf-8') as f:
-                                f.write(diff_content)
-                            
-                            artifacts_finalized.append("final_patch.diff")
-                            print(f"✅ Saved final_patch.diff to {dest_diff}")
-                            print(f"📊 Patch Size: {len(diff_content)} bytes")
-                        else:
-                            print(f"ℹ️  No changes detected for cumulative diff.")
-                    
-                    return ExecutionResult(success=True, data={
-                        "artifacts_finalized": artifacts_finalized,
-                        "destination": self.original_repo_root
-                    })
-                    
-                except Exception as e:
-                    print(f"⚠️ Artifact finalization failed: {e}")
-                    return ExecutionResult(success=False, error=str(e))
 
+            elif request.type == "finalize_artifacts":
+                finalized = self._finalize_artifacts_internal()
+                return ExecutionResult(success=True, data={"artifacts_finalized": finalized})
             
             elif request.type == "cleanup_working_copy":
                 # Robust check for EPC (Ephemeral Working Copy) cleanup
-                # On Mac, temp dirs are in /var/folders, not /tmp
                 import tempfile
                 is_in_temp = self.repo_root.startswith(tempfile.gettempdir())
+                
                 if self.is_ephemeral and (is_in_temp or "remoroo_worktree" in self.repo_root):
+                    # SAFETY: Finalize artifacts BEFORE deleting the directory
+                    # This handles cases where Brain initiates cleanup before CLI finalization
+                    self._finalize_artifacts_internal()
+                    
                     print(f"🧹 Cleaning up Ephemeral Working Copy: {self.repo_root}")
                     try:
                         shutil.rmtree(self.repo_root)
@@ -676,7 +672,7 @@ class WorkerService:
                         return ExecutionResult(success=False, error=str(e))
                 else:
                     return ExecutionResult(success=True, data={"cleaned": False, "reason": "Not ephemeral"})
-            
+
             elif request.type == "git_diff":
                  # Git diff support
                  files = request.payload.get("files", [])
