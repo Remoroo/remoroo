@@ -606,6 +606,54 @@ class WorkerService:
                     print(f"❌ Failed to create working copy: {e}")
                     return ExecutionResult(success=False, error=f"Failed to create working copy: {str(e)}")
             
+            elif request.type == "finalize_artifacts":
+                """
+                Copy final_report.md and cumulative diff to original repository before cleanup.
+                This ensures artifacts are preserved in the user's repo.
+                """
+                try:
+                    from ..execution.repo_manager import generate_diff
+                    
+                    artifacts_copied = []
+                    
+                    # 1. Copy final_report.md if it exists
+                    final_report_path = os.path.join(self.artifact_dir, "final_report.md")
+                    if os.path.exists(final_report_path):
+                        with open(final_report_path, 'r', encoding='utf-8') as f:
+                            report_content = f.read()
+                        
+                        # Write report directly to original repo root
+                        dest_report = os.path.join(self.original_repo_root, "final_report.md")
+                        with open(dest_report, 'w', encoding='utf-8') as f:
+                            f.write(report_content)
+                        
+                        artifacts_copied.append("final_report.md")
+                        print(f"✅ Copied final_report.md to {dest_report}")
+                    
+                    # 2. Generate and copy cumulative diff
+                    if self.is_ephemeral and self.repo_root != self.original_repo_root:
+                        print(f"📊 Generating cumulative diff...")
+                        diff_content = generate_diff(self.original_repo_root, self.repo_root)
+                        
+                        if diff_content:
+                            # Write diff directly to original repo root
+                            dest_diff = os.path.join(self.original_repo_root, "cumulative_diff.patch")
+                            with open(dest_diff, 'w', encoding='utf-8') as f:
+                                f.write(diff_content)
+                            
+                            artifacts_copied.append("cumulative_diff.patch")
+                            print(f"✅ Copied cumulative diff to {dest_diff}")
+                    
+                    return ExecutionResult(success=True, data={
+                        "artifacts_copied": artifacts_copied,
+                        "destination": self.original_repo_root
+                    })
+                    
+                except Exception as e:
+                    print(f"⚠️ Artifact finalization failed: {e}")
+                    return ExecutionResult(success=False, error=f"Artifact finalization failed: {str(e)}")
+
+            
             elif request.type == "cleanup_working_copy":
                 if self.is_ephemeral and self.repo_root.startswith("/tmp/remoroo_worktree"):
                     print(f"🧹 Cleaning up Ephemeral Working Copy: {self.repo_root}")

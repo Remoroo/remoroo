@@ -64,11 +64,21 @@ def run_local_worker(
              typer.echo(f"   Error: {e}")
          raise typer.Exit(code=1)
     
+    
     # Auth Key
     import os
     session_key = os.getenv("REMOROO_API_KEY")
+    
+    # Fallback to saved credentials from remoroo login
     if not session_key:
-         typer.echo("⚠️  REMOROO_API_KEY not set. Assuming server accepts unauthenticated requests or allow-list.")
+        from .auth import _client
+        if _client.is_authenticated():
+            session_key = _client.get_token()
+            typer.echo("🔐 Using saved credentials from 'remoroo login'")
+    
+    if not session_key:
+         typer.echo("⚠️  No authentication found. Set REMOROO_API_KEY or run 'remoroo login'.")
+         typer.echo("   Assuming server accepts unauthenticated requests or allow-list.")
          # Generate a dummy key just in case protocol requires non-empty string
          session_key = "remote-worker-key"
 
@@ -80,7 +90,7 @@ def run_local_worker(
              timeout=2.0
          )
          if auth_resp.status_code != 200:
-            typer.secho(f"⚠️  Authentication failed (Status {auth_resp.status_code}). check REMOROO_API_KEY.", fg=typer.colors.YELLOW)
+            typer.secho(f"⚠️  Authentication failed (Status {auth_resp.status_code}). Check your credentials.", fg=typer.colors.YELLOW)
     except:
          pass
             
@@ -238,6 +248,51 @@ def run_local_worker(
         last_processed_id = step.request_id
         last_result = result
         
+    # Cleanup Phase: Ensure temporary resources are cleaned up
+    typer.echo("🧹 Cleaning up temporary resources...")
+    try:
+        # 1. Stop heartbeat
+        stop_heartbeat.set()
+        
+        # 2. Commit Docker environment if run was successful
+        if success and hasattr(worker_service, 'sandbox') and worker_service.sandbox:
+            try:
+                worker_service.sandbox.commit(success=True)
+            except Exception as e:
+                typer.echo(f"   ⚠️  Docker commit failed: {e}")
+        
+        # 3. Clean up temporary working directories (only on failure)
+        import glob
+        temp_patterns = [
+            "/tmp/remoroo_worktree_*",
+            "/tmp/remoroo_working_*"
+        ]
+        
+        if not success:
+            # Only clean temp dirs on failure
+            for pattern in temp_patterns:
+                for temp_dir in glob.glob(pattern):
+                    try:
+                        import shutil
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        typer.echo(f"   Removed failed run: {temp_dir}")
+                    except Exception as e:
+                        typer.echo(f"   ⚠️  Failed to remove {temp_dir}: {e}")
+        else:
+            # On success, preserve temp environments for reuse
+            typer.echo(f"   ✅ Preserving temporary environments for future reuse")
+        
+        # 4. Stop Docker sandbox (but don't remove if successful - already committed)
+        if hasattr(worker_service, 'sandbox') and worker_service.sandbox:
+            try:
+                worker_service.sandbox.stop()
+                typer.echo("   Docker sandbox stopped")
+            except Exception as e:
+                typer.echo(f"   ⚠️  Failed to stop Docker sandbox: {e}")
+    
+    except Exception as e:
+        typer.echo(f"   ⚠️  Cleanup warning: {e}")
+    
     return LocalRunResult(
         run_root=artifact_dir,
         run_id=run_id,

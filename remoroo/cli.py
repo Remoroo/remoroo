@@ -25,6 +25,13 @@ def logout():
     from .auth import _client
     _client.logout()
 
+@app.command()
+def whoami():
+    """Show current authentication status."""
+    from .auth import _client
+    _client.whoami()
+
+
 @app.callback()
 def main():
     """

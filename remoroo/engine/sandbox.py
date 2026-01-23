@@ -119,6 +119,40 @@ class DockerSandbox:
                 pass
             self.is_running = False
 
+    def commit(self, success: bool = True):
+        """
+        Commit container changes to image if run was successful.
+        This persists installed packages for future runs.
+        
+        Args:
+            success: Whether the run was successful. Only commits if True.
+        """
+        if not self.is_running:
+            print("ℹ️  Container not running, skipping commit")
+            return
+        
+        if not success:
+            print("⚠️  Run failed. Skipping Docker commit to avoid persisting bad state.")
+            return
+        
+        try:
+            # Commit container state to the same image name
+            commit_tag = f"{self.image_name}:latest"
+            print(f"💾 Committing Docker container changes to {commit_tag}...")
+            
+            subprocess.check_call(
+                ["docker", "commit", self.container_name, commit_tag],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            print(f"✅ Docker environment persisted for future runs")
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️  Docker commit failed: {e}")
+        except Exception as e:
+            print(f"⚠️  Unexpected error during Docker commit: {e}")
+
+
     def exec_popen(self, cmd: List[str], env: Dict[str, str] = {}, workdir: str = "/app/workdir") -> subprocess.Popen:
         """
         Run a command via docker exec, returning a Popen object for streaming.

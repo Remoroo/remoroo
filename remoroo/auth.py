@@ -64,7 +64,7 @@ class AuthClient:
         try:
             import requests
             typer.echo("Verifying credentials...")
-            res = requests.get(f"{self.base_url}/user/me", headers={"Authorization": token})
+            res = requests.get(f"{self.base_url}/user/me", headers={"Authorization": f"Bearer {token}"})
             if res.status_code == 200:
                 user = res.json()
                 self._save_token(token)
@@ -90,6 +90,46 @@ class AuthClient:
             CRED_PATH.unlink()
         self._token = None
         typer.echo("Logged out.")
+
+    def whoami(self) -> None:
+        """Display current authentication status and user information."""
+        if not self.is_authenticated():
+            typer.secho("❌ Not logged in", fg=typer.colors.RED)
+            typer.echo("   Run 'remoroo login' to authenticate")
+            raise typer.Exit(code=1)
+        
+        try:
+            import requests
+            typer.echo("🔍 Checking authentication status...")
+            res = requests.get(
+                f"{self.base_url}/user/me", 
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=5.0
+            )
+            
+            if res.status_code == 200:
+                user = res.json()
+                typer.echo()
+                typer.secho("✅ Authenticated", fg=typer.colors.GREEN, bold=True)
+                typer.echo(f"   Email: {user.get('email') or 'N/A'}")
+                typer.echo(f"   Username: {user.get('username') or 'N/A'}")
+                typer.echo(f"   API Endpoint: {self.base_url}")
+                typer.echo(f"   Credentials: {CRED_PATH}")
+                typer.echo()
+            else:
+                typer.secho(f"❌ Authentication failed (HTTP {res.status_code})", fg=typer.colors.RED)
+                typer.echo("   Your API key may have expired or been revoked")
+                typer.echo("   Run 'remoroo logout && remoroo login' to re-authenticate")
+                raise typer.Exit(code=1)
+                
+        except requests.exceptions.ConnectionError:
+            typer.secho("❌ Connection error: Could not reach the Remoroo API", fg=typer.colors.RED)
+            typer.echo(f"   Endpoint: {self.base_url}")
+            raise typer.Exit(code=1)
+        except Exception as e:
+            typer.secho(f"❌ Error: {e}", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+
 
     def _save_token(self, token: str) -> None:
         self._token = token
