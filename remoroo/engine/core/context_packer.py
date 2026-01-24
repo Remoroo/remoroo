@@ -121,8 +121,13 @@ def _should_include_file(
     if is_data_folder(abs_path, repo_root, allowed_data_folders):
         return False
     
-    # Include common code/config/test files
-    if ext in [".py", ".json", ".yaml", ".yml", ".toml", ".txt", ".md", ".sh", ".js", ".ts", ".go", ".rs", ".java", ".cpp", ".c", ".h", ".hpp"]:
+    # Include common code/config/test files (Neutralized/Expanded for Polyglot support)
+    if ext in [
+        ".py", ".json", ".yaml", ".yml", ".toml", ".txt", ".md", ".sh", ".bash", ".zsh",
+        ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", 
+        ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".hh", ".hxx",
+        ".make", ".cmake", ".sql", ".proto", ".ini", ".cfg", ".xml"
+    ]:
         return True
     
     return False
