@@ -1662,6 +1662,60 @@ def build_context_pack(
     data_chars = 0
     total_chars = 0
     included_paths: Set[str] = set()
+
+    # PRIORITY: Always include focus files (files actively being edited/viewed)
+    # This prevents them from being skipped by "max_files" limits if they appear late in directory traversal.
+    if focus_files:
+        print(f"  🔍 Prioritizing {len(focus_files)} focus file(s)...")
+        for relpath in focus_files:
+            if not relpath or relpath in included_paths:
+                continue
+            
+            abs_path = os.path.join(repo_root, relpath)
+            if not os.path.exists(abs_path):
+                continue
+                
+            # Process focus file (force inclusion even if limits strictly met, but count towards them)
+            # We treat them as if they are normal files, but proccessed first.
+            try:
+                with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+            except Exception:
+                continue # Skip if unreadable
+            
+            # Apply semantic chunking if requested (and relevant for file type)
+            if use_semantic_chunking and relpath.endswith('.py'):
+                chunked_data = _chunk_file_semantically(
+                    relpath, content, goal, focus_files, max_chars_per_file, min_relevance_threshold
+                )
+                file_entry = {
+                    "path": relpath,
+                    "contents": chunked_data["contents"],
+                    "chunked": chunked_data.get("chunked", False),
+                    "metadata": chunked_data.get("metadata", {})
+                }
+                char_count = len(file_entry["contents"])
+            else:
+                # Standard inclusion
+                if len(content) > max_chars_per_file:
+                     content = content[:max_chars_per_file] + "\n... (truncated)"
+                
+                file_entry = {
+                    "path": relpath,
+                    "contents": content
+                }
+                char_count = len(content)
+            
+            files.append(file_entry)
+            included_paths.add(relpath)
+            
+            # Update counters
+            total_chars += char_count
+            total_bytes += len(content.encode('utf-8'))
+            if is_data_folder(abs_path, repo_root, allowed_data_folders):
+                data_chars += char_count
+            else:
+                code_chars += char_count
     
     # First, explicitly summarize data folders (old style - for backward compatibility)
     # Also check for image folders and summarize them specially
