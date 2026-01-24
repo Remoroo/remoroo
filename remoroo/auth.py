@@ -33,9 +33,26 @@ class AuthClient:
     def login(self) -> None:
         """Interactive login flow."""
         if self.is_authenticated():
-            typer.secho("✓ You are already logged in.", fg=typer.colors.GREEN)
-            typer.echo("  To switch accounts or update your API key, run: remoroo logout && remoroo login")
-            return
+            # Check if current token works for the target base_url
+            try:
+                import requests
+                res = requests.get(
+                    f"{self.base_url}/user/me", 
+                    headers={"Authorization": f"Bearer {self._token}"},
+                    timeout=3.0
+                )
+                if res.status_code == 200:
+                    user = res.json()
+                    typer.secho(f"✓ You are already logged in as {user.get('email') or user.get('username')}.", fg=typer.colors.GREEN)
+                    typer.echo(f"  Target: {self.base_url}")
+                    typer.echo("  To switch accounts or update your API key, run: remoroo logout && remoroo login")
+                    return
+                else:
+                     typer.secho(f"⚠️  Stored token is invalid for {self.base_url} (HTTP {res.status_code})", fg=typer.colors.YELLOW)
+                     typer.echo("  Proceeding to re-authenticate...\n")
+            except Exception:
+                 # If we can't reach the server, better to proceed with login flow
+                 pass
 
         CRED_PATH.parent.mkdir(parents=True, exist_ok=True)
         
@@ -97,10 +114,9 @@ class AuthClient:
             typer.secho("❌ Not logged in", fg=typer.colors.RED)
             typer.echo("   Run 'remoroo login' to authenticate")
             raise typer.Exit(code=1)
-        
         try:
             import requests
-            typer.echo("🔍 Checking authentication status...")
+            typer.echo(f"🔍 Checking status at {self.base_url}...")
             res = requests.get(
                 f"{self.base_url}/user/me", 
                 headers={"Authorization": f"Bearer {self._token}"},
@@ -118,8 +134,9 @@ class AuthClient:
                 typer.echo()
             else:
                 typer.secho(f"❌ Authentication failed (HTTP {res.status_code})", fg=typer.colors.RED)
-                typer.echo("   Your API key may have expired or been revoked")
-                typer.echo("   Run 'remoroo logout && remoroo login' to re-authenticate")
+                typer.echo(f"   Target Endpoint: {self.base_url}")
+                typer.echo("   Your API key may have expired, been revoked, or belongs to a different environment.")
+                typer.echo("   Run 'remoroo logout && remoroo login' to re-authenticate.")
                 raise typer.Exit(code=1)
                 
         except requests.exceptions.ConnectionError:

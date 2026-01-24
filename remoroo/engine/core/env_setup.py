@@ -116,7 +116,7 @@ def detect_needs_editable_install(repo_root: str) -> Tuple[bool, str]:
     
     return False, package_name or "unknown_package"
 
-def rewrite_python_commands(commands: List[str], venv_path: str) -> List[str]:
+def rewrite_toolchain_commands(commands: List[str], venv_path: str) -> List[str]:
     """Rewrite commands to use venv python/pip."""
     rewritten = []
     
@@ -195,7 +195,7 @@ def execute_env_setup(
     actual_commands = []
     if install_commands:
         if use_venv:
-            actual_commands = rewrite_python_commands(install_commands, venv_path)
+            actual_commands = rewrite_toolchain_commands(install_commands, venv_path)
         else:
             actual_commands = install_commands
     elif not skip_auto_install:

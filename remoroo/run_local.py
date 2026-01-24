@@ -17,6 +17,7 @@ def run_local_worker(
     goal: str,
     metrics: list[str],
     brain_url: str = None,
+    engine: str = "docker",
     verbose: bool = False,
 ) -> LocalRunResult:
     from .configs import get_api_url
@@ -203,9 +204,15 @@ def run_local_worker(
         pass # Ignore gitignore failures 
 
     # Initialize Execution Service (Does the work)
-    # We define the true original repo root here to ensure it's preserved across context switches
+    # True original repo root preserved across context switches
     original_repo_path = str(repo_path.absolute())
-    worker_service = WorkerService(repo_root=original_repo_path, artifact_dir=str(artifact_dir), original_repo_root=original_repo_path, run_id=remote_run_id)
+    worker_service = WorkerService(
+        repo_root=original_repo_path, 
+        artifact_dir=str(artifact_dir), 
+        original_repo_root=original_repo_path, 
+        run_id=remote_run_id,
+        engine=engine
+    )
     
     final_result = None
     outcome = "UNKNOWN"
@@ -267,8 +274,14 @@ def run_local_worker(
                  except Exception:
                      pass
 
-                 # Pass the original_repo_path to the new WorkerService
-                 worker_service = WorkerService(repo_root=new_root, artifact_dir=str(artifact_dir), original_repo_root=original_repo_path, run_id=remote_run_id)
+                 # Pass the original_repo_path and engine to the new WorkerService
+                 worker_service = WorkerService(
+                     repo_root=new_root, 
+                     artifact_dir=str(artifact_dir), 
+                     original_repo_root=original_repo_path, 
+                     run_id=remote_run_id,
+                     engine=engine
+                 )
                  typer.echo(f"🔄 Switched execution context to: {new_root}")
 
         # 6. Submit Result

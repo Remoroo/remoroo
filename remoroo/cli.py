@@ -50,10 +50,19 @@ def run(
     goal: str = typer.Option(None, "--goal", help="Goal of the run."),
     metrics: str = typer.Option(None, "--metrics", help="Comma-separated metrics."),
     brain_url: str = typer.Option(None, "--brain-url", help="URL of the Brain Server."),
+    engine: str = typer.Option(None, "--engine", help="Execution engine (docker or venv). Defaults to 'docker'."),
 ):
-    from .configs import get_api_url
+    from .configs import get_api_url, get_default_engine
     if brain_url is None:
         brain_url = get_api_url()
+    
+    if engine is None:
+        engine = get_default_engine()
+    
+    # Validation
+    if engine not in ["docker", "venv"]:
+        typer.secho(f"❌ Invalid engine '{engine}'. Choose 'docker' or 'venv'.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
     # Logic: Default is Remote. 
     # If user explicitly says --local, then remote=False. 
     # Because 'remote' defaults to True, we check if local is True.
@@ -119,6 +128,7 @@ def run(
             goal=goal,
             metrics=metrics_list,
             brain_url=brain_url,
+            engine=engine,
             verbose=verbose,
         )
 

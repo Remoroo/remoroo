@@ -13,7 +13,7 @@ class WorkerService:
     Handles ExecutionRequests and returns ExecutionResults.
     """
     
-    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None):
+    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker"):
         print("🔧 WorkerService (Patched) Loaded")
         import tempfile
         self.repo_root = repo_root
@@ -22,14 +22,17 @@ class WorkerService:
         self.is_ephemeral = (self.repo_root != self.original_repo_root) 
         self.artifact_dir = artifact_dir
         self.run_id = run_id
+        self.engine = engine.lower()
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
         
         # Initialize Sandbox (Lazy start)
-        # We need check if we are in "Sandbox Mode". For now P0 = Always Sandbox.
-        # But since we need to build image, maybe we optionally init.
-        # Assuming image build happens externally or lazy.
-        from .sandbox import DockerSandbox
-        self.sandbox = DockerSandbox(repo_root, artifact_dir)
+        # Conditional initialization: Only if engine is 'docker'
+        self.sandbox = None
+        if self.engine == "docker":
+            from .sandbox import DockerSandbox
+            self.sandbox = DockerSandbox(repo_root, artifact_dir)
+        else:
+            print(f"ℹ️  Execution Engine: {self.engine.upper()} (Sandbox Disabled)")
         
         # Async Execution Tracking
         # Dictionary mapping execution_id (str) -> subprocess.Popen object
@@ -58,8 +61,10 @@ class WorkerService:
                     # Filter for code files only (reduce noise)
                     code_extensions = {
                         '.py', '.js', '.ts', '.tsx', '.jsx', '.html', '.css', 
-                        '.json', '.yaml', '.yml', '.md', '.sql', '.sh', '.bash',
-                        '.toml', '.lock', '.txt', '.cfg', '.ini'
+                        '.json', '.yaml', '.yml', '.md', '.sql', '.sh', '.bash', '.zsh',
+                        '.toml', '.lock', '.txt', '.cfg', '.ini',
+                        '.rs', '.go', '.java', '.cpp', '.c', '.h', '.hpp', '.cc', '.cxx', '.hh', '.hxx',
+                        '.make', '.cmake', '.proto', '.sql', '.xml'
                     }
                     
                     code_files = [
@@ -320,6 +325,8 @@ class WorkerService:
                 
                 runner = None
                 if self.sandbox and self.sandbox.available:
+                    def sandbox_runner(cmd, env=None):
+                        return self.sandbox.exec_popen(cmd, env=env or {})
                     runner = sandbox_runner
                 
                 exec_env = self._get_worker_env()
@@ -604,6 +611,34 @@ class WorkerService:
                     runner_factory=runner
                 )
                 return ExecutionResult(success=True, data={"outcome": outcome})
+
+            elif request.type == "command_discovery":
+                from .core import command_discovery
+                p = request.payload
+                
+                runner = None
+                if self.sandbox and self.sandbox.available:
+                    def sandbox_runner(cmd, env=None):
+                        return self.sandbox.exec_popen(cmd, env=env or {})
+                    runner = sandbox_runner
+                
+                res = command_discovery.discover_command_plan(
+                    repo_root=self.repo_root,
+                    artifact_dir=self.artifact_dir,
+                    metric_names=p.get("metric_names", []),
+                    initial_commands=p.get("initial_commands", []),
+                    venv_python=p.get("venv_python"),
+                    timeout_s=p.get("timeout_s", 8.0),
+                    runner_factory=runner
+                )
+                # Persist for debugging
+                command_discovery.persist_command_plan(
+                    repo_root=self.repo_root,
+                    artifact_dir=self.artifact_dir,
+                    result=res
+                )
+                import dataclasses
+                return ExecutionResult(success=True, data=dataclasses.asdict(res))
 
             elif request.type == "create_working_copy":
                 run_id = request.payload.get("run_id") or f"run-{uuid.uuid4().hex[:8]}"
