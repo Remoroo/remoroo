@@ -569,7 +569,11 @@ class WorkerService:
                     with open(abs_path, 'r', encoding='utf-8') as f:
                         content = f.read(max_chars) if max_chars else f.read()
                     
-                    return ExecutionResult(success=True, data={"content": content, "exists": True})
+                    return ExecutionResult(success=True, data={
+                        "content": content, 
+                        "exists": True,
+                        "mtime": os.path.getmtime(abs_path)
+                    })
                 except Exception as e:
                     return ExecutionResult(success=False, error=str(e))
             
