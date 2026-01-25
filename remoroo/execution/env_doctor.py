@@ -20,6 +20,9 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
+import sys
+import shutil
+import requests
 from ..engine.core.executor import run_command_with_timeout
 from ..engine.core.env_setup import (
     EnvSetupResult,
@@ -66,6 +69,33 @@ class EnvDoctor:
     MAX_ITERATIONS = 3
     SMOKE_TEST_TIMEOUT = 30.0
     FIX_COMMAND_TIMEOUT = 120.0
+    PYPI_TIMEOUT = 5.0
+    
+    # Static list of stdlib modules for Python < 3.10
+    _STDLIB_FALLBACK = {
+        "abc", "argparse", "ast", "asynchat", "asyncio", "asyncore", "base64", "bdb", "binascii", "binhex",
+        "bisect", "builtins", "bz2", "calendar", "cgi", "cgitb", "chunk", "cmath", "cmd", "code", "codecs",
+        "codeop", "collections", "colorsys", "compileall", "concurrent", "configparser", "contextlib",
+        "contextvars", "copy", "copyreg", "crypt", "csv", "ctypes", "curses", "dataclasses", "datetime",
+        "dbm", "decimal", "difflib", "dis", "distutils", "doctest", "dummy_threading", "email", "encodings",
+        "ensurepip", "enum", "errno", "faulthandler", "filecmp", "fileinput", "fnmatch", "formatter",
+        "fpectl", "fractions", "ftplib", "functools", "gc", "getopt", "getpass", "gettext", "glob", "grp",
+        "gzip", "hashlib", "heapq", "hmac", "html", "http", "imaplib", "imghdr", "imp", "importlib", "inspect",
+        "io", "ipaddress", "itertools", "json", "keyword", "lib2to3", "linecache", "locale", "logging",
+        "lzma", "mailbox", "mailcap", "marshal", "math", "mimetypes", "mmap", "modulefinder", "msilib",
+        "msvcrt", "multiprocessing", "netrc", "nis", "nntplib", "ntpath", "numbers", "operator", "optparse",
+        "os", "ossaudiodev", "parser", "pathlib", "pdb", "pickle", "pickletools", "pipes", "pkgutil",
+        "platform", "plistlib", "poplib", "posix", "posixpath", "pprint", "profile", "pstats", "pty", "pwd",
+        "py_compile", "pyclbr", "pydoc", "queue", "quopri", "random", "re", "readline", "reprlib", "resource",
+        "rlcompleter", "runpy", "sched", "secrets", "select", "selectors", "shelve", "shlex", "shutil",
+        "signal", "site", "smtpd", "smtplib", "sndhdr", "socket", "socketserver", "spwd", "sqlite3", "ssl",
+        "stat", "statistics", "string", "stringprep", "struct", "subprocess", "sunau", "symbol", "symtable",
+        "sys", "sysconfig", "syslog", "tabnanny", "tarfile", "telnetlib", "tempfile", "termios", "test",
+        "textwrap", "threading", "time", "timeit", "tkinter", "token", "tokenize", "trace", "traceback",
+        "tracemalloc", "tty", "types", "typing", "unicodedata", "unittest", "urllib", "uu", "uuid", "venv",
+        "warnings", "wave", "weakref", "webbrowser", "winreg", "winsound", "wsgiref", "xdrlib", "xml",
+        "xmlrpc", "zipapp", "zipfile", "zipimport", "zlib"
+    }
     
     
     def __init__(
@@ -103,6 +133,33 @@ class EnvDoctor:
         if not name:
             return ""
         return re.sub(r"[-_.]+", "-", name.strip().lower())
+
+    @classmethod
+    def is_stdlib(cls, module_name: str) -> bool:
+        """Check if a module is part of the Python Standard Library."""
+        if not module_name:
+            return False
+        # Use sys.stdlib_module_names if available (Python 3.10+)
+        if hasattr(sys, "stdlib_module_names"):
+            if module_name in sys.stdlib_module_names:
+                return True
+        # Fallback to static list
+        return module_name in cls._STDLIB_FALLBACK
+
+    def verify_pypi_package(self, pkg_name: str) -> bool:
+        """Verify if a package exists on PyPI."""
+        if not pkg_name:
+            return False
+        # Normalize to avoid common mishaps
+        norm_name = self._normalize_pkg_name(pkg_name)
+        try:
+            url = f"https://pypi.org/pypi/{norm_name}/json"
+            response = requests.get(url, timeout=self.PYPI_TIMEOUT)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"  ⚠️  PyPI verification failed for {pkg_name}: {e}")
+            # Err on the side of caution - assume it exists if PyPI is unreachable
+            return True
 
     @classmethod
     def _extract_requirement_names(cls, requirements_txt: str) -> List[str]:
@@ -543,9 +600,38 @@ class EnvDoctor:
             
             if packages:
                 print(f"  📦 Detected from code (LLM): {packages}")
-                if reasoning:
-                    print(f"      Reason: {reasoning[:100]}...")
-                llm_packages = [f"pip install {pkg}" for pkg in packages if pkg and isinstance(pkg, str)]
+                # Filter out stdlib and local modules
+                filtered_packages = []
+                for pkg in packages:
+                    if not pkg or not isinstance(pkg, str):
+                        continue
+                    
+                    # 1. Stdlib check
+                    if self.is_stdlib(pkg):
+                        print(f"      ⏭️  Skipping {pkg} (Standard Library)")
+                        continue
+                        
+                    # 2. Local module check
+                    if pkg in local_modules:
+                        print(f"      ⏭️  Skipping {pkg} (Local Module)")
+                        continue
+                    
+                    # 3. Resolve package name if it's a known import-to-package discrepancy
+                    resolved_pkg = self.KNOWN_THIRD_PARTY.get(pkg, pkg)
+                    if resolved_pkg != pkg:
+                        print(f"      🔄 Resolved {pkg} -> {resolved_pkg}")
+                    
+                    # 4. PyPI verification (only for "suspicious" or unknown names)
+                    # We skip verification for very common packages to save time
+                    if resolved_pkg.lower() not in self.KNOWN_THIRD_PARTY.values():
+                        print(f"      🔍 Verifying {resolved_pkg} on PyPI...")
+                        if not self.verify_pypi_package(resolved_pkg):
+                            print(f"      ❌ Skipping {resolved_pkg} (Not found on PyPI)")
+                            continue
+                            
+                    filtered_packages.append(resolved_pkg)
+                
+                llm_packages = [f"pip install {pkg}" for pkg in filtered_packages]
             else:
                 llm_packages = []
             
@@ -641,11 +727,16 @@ class EnvDoctor:
         
         # Check each import against known third-party packages
         for module in matches:
+            # 1. Stdlib check
+            if self.is_stdlib(module):
+                continue
+                
+            # 2. Local module check
+            if module in local_modules:
+                continue
+            
             pip_name = self.KNOWN_THIRD_PARTY.get(module)
-            if pip_name:  # None means stdlib or skip
-                # Check if not a local module
-                if module in local_modules:
-                    continue
+            if pip_name:  # None means stdlib (though we checked above) or skip
                 # Check if already in requirements (robust parse)
                 req_names = set(self._extract_requirement_names(requirements_txt))
                 if self._normalize_pkg_name(pip_name) in req_names:
