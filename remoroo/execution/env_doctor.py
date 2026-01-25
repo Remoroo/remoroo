@@ -146,6 +146,19 @@ class EnvDoctor:
         # Fallback to static list
         return module_name in cls._STDLIB_FALLBACK
 
+    def _detect_local_modules(self) -> List[str]:
+        """Detect local files and directories that could be imported."""
+        local_modules = []
+        try:
+            for item in os.listdir(self.repo_root):
+                if item.endswith('.py'):
+                    local_modules.append(item[:-3])  # Remove .py extension
+                elif os.path.isdir(os.path.join(self.repo_root, item)) and not item.startswith('.'):
+                    local_modules.append(item)
+        except Exception:
+            pass
+        return local_modules
+
     def verify_pypi_package(self, pkg_name: str) -> bool:
         """Verify if a package exists on PyPI."""
         if not pkg_name:
@@ -293,7 +306,9 @@ class EnvDoctor:
             print(f"  💊 Fix commands: {diagnosis.fix_commands}")
             
             # Step 3: Execute fix commands
-            for cmd in diagnosis.fix_commands:
+            fix_commands = self._filter_pip_install_commands(diagnosis.fix_commands)
+            
+            for cmd in fix_commands:
                 if cmd in self.commands_tried:
                     print(f"  ⏭️  Skipping (already tried): {cmd}")
                     continue
@@ -413,16 +428,26 @@ class EnvDoctor:
         
         # Detect packages from code imports (LLM-based)
         import_packages = self._detect_imports_from_code()
-        for cmd in import_packages:
-            if cmd not in commands:
-                commands.append(cmd)
+        commands.extend(import_packages)
         
         # Install explicit packages passed by caller (inferred by Brain)
+        explicit_commands = []
         for pkg_name in self.packages_to_install:
-            cmd = f"pip install {pkg_name}"
-            # Avoid duplicate commands
-            if cmd not in commands and not any(pkg_name in c for c in commands):
-                commands.append(cmd)
+            explicit_commands.append(f"pip install {pkg_name}")
+            
+        # Filter all current commands for stdlib/local
+        commands = self._filter_pip_install_commands(commands)
+        commands.extend(self._filter_pip_install_commands(explicit_commands))
+        
+        # Deduplicate while preserving order
+        seen = set()
+        final_commands = []
+        for cmd in commands:
+            if cmd not in seen:
+                final_commands.append(cmd)
+                seen.add(cmd)
+        
+        commands = final_commands
 
         # Safety net: ensure numpy is present for most repos unless explicitly pinned already.
         # Unit tests rely on this default behavior.
@@ -450,13 +475,7 @@ class EnvDoctor:
             Dict containing detected imports, code samples, local modules, etc.
         """
         # Get local modules (files/dirs in repo that are NOT packages to install)
-        local_modules = []
-        for item in os.listdir(self.repo_root):
-            if item.endswith('.py'):
-                local_modules.append(item[:-3])  # Remove .py extension
-            elif os.path.isdir(os.path.join(self.repo_root, item)) and not item.startswith('.'):
-                local_modules.append(item)
-
+        local_modules = self._detect_local_modules()
         local_modules_set = set(local_modules)
 
         def _top_module_from_import_line(s: str) -> Optional[str]:
@@ -748,6 +767,52 @@ class EnvDoctor:
             return [f"pip install {pkg}" for pkg in found_packages]
         
         return []
+
+    def _filter_pip_install_commands(self, commands: List[str]) -> List[str]:
+        """Filter out pip install commands for standard library or local modules."""
+        local_modules = self._detect_local_modules()
+        filtered = []
+        
+        for cmd in commands:
+            if not isinstance(cmd, str):
+                filtered.append(cmd)
+                continue
+                
+            # Only filter pip install commands
+            if not (cmd.startswith("pip install ") or cmd.startswith("pip3 install ")):
+                filtered.append(cmd)
+                continue
+                
+            # Extract package name (simple space split, handles pip install pkg==1.0)
+            parts = cmd.split()
+            if len(parts) < 3:
+                filtered.append(cmd)
+                continue
+                
+            # The package name is usually the last part, or the one after 'install'
+            # e.g. pip install -r req.txt (skip), pip install pkg (pkg)
+            if "-r" in parts or "-e" in parts:
+                filtered.append(cmd)
+                continue
+                
+            pkg = parts[-1]
+            # Clean version specifiers
+            pkg_name = re.split(r'[=<>~!]', pkg)[0]
+            
+            # 1. Stdlib check
+            if self.is_stdlib(pkg_name):
+                print(f"      ⏭️  Skipping {cmd} (Standard Library)")
+                continue
+                
+            # 2. Local module check
+            if pkg_name in local_modules:
+                print(f"      ⏭️  Skipping {cmd} (Local Module)")
+                continue
+                
+            filtered.append(cmd)
+            
+        return filtered
+
     
     def _run_smoke_test(self, cmd: str) -> Tuple[bool, str]:
         """Run smoke test command, return (success, output)."""
@@ -764,6 +829,19 @@ class EnvDoctor:
     
     def _run_fix_command(self, cmd: str) -> Dict[str, Any]:
         """Run a fix command and return outcome."""
+        # Final safety check: if someone tries to install a stdlib, abort here.
+        if "pip install " in cmd or "pip3 install " in cmd:
+            filtered = self._filter_pip_install_commands([cmd])
+            if not filtered:
+                return {
+                    "command": cmd,
+                    "rewritten_command": cmd,
+                    "exit_code": 0,
+                    "stdout": "Skipped (Standard Library or Local Module)",
+                    "stderr": "",
+                    "duration_s": 0.0
+                }
+
         # Rewrite python/pip commands to use venv
         rewritten_cmd = self._rewrite_command(cmd)
         
