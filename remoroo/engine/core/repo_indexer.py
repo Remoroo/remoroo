@@ -19,7 +19,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from pathlib import Path
 from datetime import datetime
 
-from ..utils.configs import DEFAULT_DENY_PATHS, DEFAULT_EXCLUDED_DIRS
+from ..utils.configs import DEFAULT_DENY_PATHS, DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
 
 
 def _compute_sha256_bytes(data: bytes) -> str:
@@ -456,6 +456,7 @@ class RepoIndexer:
         # Centralized deny/exclude policy (configs.py) for consistent repo hygiene.
         self.deny_paths = list(self.config.get("deny_paths", DEFAULT_DENY_PATHS))
         self.excluded_dirs = set(self.config.get("excluded_dirs", DEFAULT_EXCLUDED_DIRS))
+        self.excluded_files = set(self.config.get("excluded_files", DEFAULT_EXCLUDED_FILES))
     
     def index(self, force: bool = False) -> Dict[str, Any]:
         """
@@ -807,9 +808,11 @@ class RepoIndexer:
                     dirs.remove(d)
                     continue
             
-            for file in files:
-                if file.endswith(".py"):
-                    file_path = os.path.join(root, file)
+            for filename in files:
+                if filename.startswith('.') or filename.startswith('__') or filename in self.excluded_files:
+                    continue
+                if filename.endswith(".py"):
+                    file_path = os.path.join(root, filename)
                     rel_path = os.path.relpath(file_path, self.repo_root)
                     rel_posix = rel_path.replace(os.sep, "/")
                     

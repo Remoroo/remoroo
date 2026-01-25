@@ -73,3 +73,12 @@ DEFAULT_EXCLUDED_DIRS: set = {
     "logs",
     ".remoroo"
 }
+
+# Default filenames to exclude from repository scanning
+DEFAULT_EXCLUDED_FILES: set = {
+    "remoroo_monitor.py",
+    "remoroo_metrics.json",
+    "baseline_metrics.json",
+    "current_metrics.json",
+    "metrics.json",
+}

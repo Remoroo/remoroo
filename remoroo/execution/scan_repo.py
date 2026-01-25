@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Set, Optional
 from pathlib import Path
 
 # Import from centralized config
-from ..execution.configs import DEFAULT_EXCLUDED_DIRS
+from ..execution.configs import DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
 
 # Code file extensions
 CODE_EXTENSIONS = {'.py', '.js', '.ts', '.go', '.rs', '.java', '.cpp', '.c', '.h', '.hpp', '.rb', '.php'}
@@ -134,7 +134,7 @@ def scan_repository(repo_root: str, cache_path: Optional[str] = None) -> Dict[st
         
         for filename in files:
             # Skip hidden files and common artifacts
-            if filename.startswith('.') or filename.startswith('__'):
+            if filename.startswith('.') or filename.startswith('__') or filename in DEFAULT_EXCLUDED_FILES:
                 continue
             
             file_path = os.path.join(root, filename)
@@ -233,7 +233,7 @@ def _get_repo_max_mtime(repo_root: str) -> float:
         for root, dirs, files in os.walk(repo_root):
             dirs[:] = [d for d in dirs if d not in DEFAULT_EXCLUDED_DIRS and not d.startswith('.')]
             for file in files:
-                if file.startswith('.') or file.startswith('__'):
+                if file.startswith('.') or file.startswith('__') or file in DEFAULT_EXCLUDED_FILES:
                     continue
                 file_path = os.path.join(root, file)
                 try:

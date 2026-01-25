@@ -12,7 +12,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from pathlib import Path
 
 from jsonschema import validate
-from ..utils.configs import DEFAULT_EXCLUDED_DIRS
+from ..utils.configs import DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
 from ..utils.fs_utils import is_data_folder, ALWAYS_DATA_FOLDERS
 
 # Summarizer version for cache invalidation
@@ -96,8 +96,12 @@ def _should_include_file(
     if ext in DEFAULT_EXCLUDED_EXTENSIONS:
         return False
     
-    # Check filename against excluded patterns
+    # Check filename against excluded files
     filename = os.path.basename(relpath)
+    if filename in DEFAULT_EXCLUDED_FILES:
+        return False
+    
+    # Check filename against excluded patterns
     for pattern in DEFAULT_EXCLUDED_PATTERNS:
         # Simple pattern matching: convert "*.ext" to check if filename ends with ".ext"
         if pattern.startswith("*."):
