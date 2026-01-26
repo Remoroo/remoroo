@@ -236,7 +236,11 @@ def run(
         # Apply Patch Prompt
         if result.success and patch_path.exists():
             console.print("")
-            if typer.confirm("🚀 Do you want to apply the final patch to your repository now?", default=True):
+            should_apply = False
+            if not yes:
+                should_apply = typer.confirm("🚀 Do you want to apply the final patch to your repository now?", default=True)
+            
+            if should_apply:
                 try:
                     import subprocess
                     # Use 'git apply' if in git repo, or 'patch'
