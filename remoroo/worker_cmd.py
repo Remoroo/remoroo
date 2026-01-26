@@ -17,6 +17,11 @@ def worker(
     poll_interval: float = typer.Option(1.0, "--interval", help="Polling interval in seconds."),
 ):
     from .configs import get_api_url
+    from .engine.utils.doctor import ensure_ready
+    
+    # Pre-flight checks
+    ensure_ready()
+
     if server_url is None:
         server_url = get_api_url()
     """

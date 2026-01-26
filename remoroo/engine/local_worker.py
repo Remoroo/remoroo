@@ -934,9 +934,23 @@ class WorkerService:
                         import subprocess
                         source_git = os.path.join(source_path, ".git")
                         if os.path.isdir(source_git):
-                            shutil.copytree(source_git, os.path.join(temp_dir, ".git"))
+                            try:
+                                shutil.copytree(source_git, os.path.join(temp_dir, ".git"))
+                            except Exception as e:
+                                self._log(f"⚠️  Failed to copy .git folder: {e}")
                         else:
-                            subprocess.run(["git", "init"], cwd=temp_dir, capture_output=True)
+                            try:
+                                # Try to init git
+                                subprocess.run(["git", "init"], cwd=temp_dir, capture_output=True, check=True)
+                            except (subprocess.SubprocessError, FileNotFoundError):
+                                error_msg = (
+                                    "❌ Git is not installed or not in PATH.\n"
+                                    "Remoroo requires Git to manage working copies and generate patches.\n"
+                                    "Please install Git (https://git-scm.com/downloads) or run 'remoroo run' "
+                                    "to trigger the automatic installer."
+                                )
+                                self._log(error_msg)
+                                raise RuntimeError("Git dependency missing. Please install Git.")
                     
                     # SWITCH CONTEXT
                     self.repo_root = temp_dir

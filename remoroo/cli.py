@@ -53,6 +53,11 @@ def run(
     engine: str = typer.Option(None, "--engine", help="Execution engine (docker or venv). Defaults to 'docker'."),
 ):
     from .configs import get_api_url, get_default_engine
+    from .engine.utils.doctor import ensure_ready
+    
+    # Pre-flight checks
+    ensure_ready()
+
     if brain_url is None:
         brain_url = get_api_url()
     
