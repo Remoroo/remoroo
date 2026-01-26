@@ -12,11 +12,6 @@ from typing import List, Dict, Any, Optional, Callable, Union
 
 def _print(message: str, show_progress: bool = True, output_callback: Optional[Callable] = None, **kwargs):
     """Internal helper to route prints through callback or standard print."""
-    try:
-        with open("/tmp/remoroo_debug.log", "a") as f:
-            f.write(f"EXEC_PRINT: {message[:50]}... | show_progress={show_progress} | callback={output_callback}\n")
-    except: pass
-    
     if output_callback:
         # Remove print-specific kwargs that callbacks (like console.print) might reject
         cb_kwargs = kwargs.copy()
@@ -24,18 +19,14 @@ def _print(message: str, show_progress: bool = True, output_callback: Optional[C
         cb_kwargs.pop("file", None)
         
         try:
-            # sys.__stderr__.write(f"DEBUG_EXEC: Calling callback with {message[:20]}...\n")
             # Try to pass as single message if it's a simple logger
             output_callback(message, **cb_kwargs)
         except Exception as e1:
-            sys.__stderr__.write(f"DEBUG_EXEC: Callback FAILED 1: {e1}\n")
             try:
                 # Fallback to executor-style (message, stream)
                 output_callback(message, "stdout")
             except Exception as e2:
-                sys.__stderr__.write(f"DEBUG_EXEC: Callback FAILED 2: {e2}\n")
-                # If both fail, print the original message to stderr so we don't lose it, plus the error
-                # using sys.__stderr__ to avoid recursion if print is hooked
+                # If both fail, print the original message to stderr so we don't lose it
                 sys.__stderr__.write(f"Callback failed: {e1} / {e2}\nMessage: {message}\n")
     elif show_progress:
         print(message, **kwargs)
@@ -117,11 +108,6 @@ def run_command_with_timeout(
                 line = line.rstrip()
                 stdout_lines.append(line)
                 output_buffer.append(("stdout", line))
-                
-                try:
-                    with open("/tmp/remoroo_debug.log", "a") as f:
-                        f.write(f"READ_STDOUT: {line[:50]}\n")
-                except: pass
                 
                 if show_progress:
                     # _print handles the callback if present, so we don't need to call it manually above
