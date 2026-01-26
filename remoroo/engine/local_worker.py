@@ -42,7 +42,7 @@ class WorkerService:
         self._execution_buffers: Dict[str, Any] = {} # Store stdout/stderr buffers
 
         
-    def _finalize_artifacts_internal(self) -> list[str]:
+    def _finalize_artifacts_internal(self, dest_filename: str = "final_patch.diff") -> list[str]:
         """Internal helper to generate diff and save artifacts. Returns list of finalized files."""
         try:
             from ..execution.repo_manager import generate_diff
@@ -50,7 +50,7 @@ class WorkerService:
             
             # Use original_repo_root and current repo_root for diff
             if self.is_ephemeral and self.repo_root != self.original_repo_root:
-                print(f"💼 Finalizing Implementation Patch...")
+                print(f"💼 Finalizing Implementation Patch ({dest_filename})...")
                 print(f"📍 Original Repo: {self.original_repo_root}")
                 print(f"📍 Current Repo:  {self.repo_root}")
                 
@@ -82,14 +82,14 @@ class WorkerService:
                             if self.run_id:
                                 dest_dir = os.path.join(self.original_repo_root, ".remoroo", "runs", self.run_id)
                                 os.makedirs(dest_dir, exist_ok=True)
-                                dest_diff = os.path.join(dest_dir, "final_patch.diff")
+                                dest_diff = os.path.join(dest_dir, dest_filename)
                             else:
-                                dest_diff = os.path.join(self.original_repo_root, "final_patch.diff")
+                                dest_diff = os.path.join(self.original_repo_root, dest_filename)
                                 
                             with open(dest_diff, 'w', encoding='utf-8') as f:
                                 f.write(diff_content)
-                            finalized.append("final_patch.diff")
-                            print(f"✅ Saved final_patch.diff to {dest_diff}")
+                            finalized.append(dest_filename)
+                            print(f"✅ Saved {dest_filename} to {dest_diff}")
                         else:
                             print("ℹ️  No significant changes detected in code files.")
                     else:
@@ -708,7 +708,8 @@ class WorkerService:
                     return ExecutionResult(success=False, error=f"Failed to create working copy: {str(e)}")
 
             elif request.type == "finalize_artifacts":
-                finalized = self._finalize_artifacts_internal()
+                dest_filename = request.payload.get("dest_filename", "final_patch.diff")
+                finalized = self._finalize_artifacts_internal(dest_filename=dest_filename)
                 return ExecutionResult(success=True, data={"artifacts_finalized": finalized})
             
             elif request.type == "cleanup_working_copy":
@@ -719,7 +720,8 @@ class WorkerService:
                 if self.is_ephemeral and (is_in_temp or "remoroo_worktree" in self.repo_root):
                     # SAFETY: Finalize artifacts BEFORE deleting the directory
                     # This handles cases where Brain initiates cleanup before CLI finalization
-                    self._finalize_artifacts_internal()
+                    dest_filename = request.payload.get("dest_filename", "final_patch.diff")
+                    self._finalize_artifacts_internal(dest_filename=dest_filename)
                     
                     print(f"🧹 Cleaning up Ephemeral Working Copy: {self.repo_root}")
                     try:
