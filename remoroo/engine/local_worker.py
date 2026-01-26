@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 from .protocol import ExecutionRequest, ExecutionResult
 from .core.worker import Worker
 from .utils import fs_utils, syntax_validator
@@ -6,6 +6,7 @@ from .core import context_packer, env_setup, executor, applier
 import shutil
 import uuid
 import os
+import json
 
 class WorkerService:
     """
@@ -13,8 +14,9 @@ class WorkerService:
     Handles ExecutionRequests and returns ExecutionResults.
     """
     
-    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker"):
-        print("🔧 WorkerService (Patched) Loaded")
+    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None):
+        self.output_callback = output_callback
+        self._log("🔧 WorkerService (Patched) Loaded")
         import tempfile
         self.repo_root = repo_root
         self.original_repo_root = original_repo_root or repo_root # Keep reference to original
@@ -32,7 +34,7 @@ class WorkerService:
             from .sandbox import DockerSandbox
             self.sandbox = DockerSandbox(repo_root, artifact_dir)
         else:
-            print(f"ℹ️  Execution Engine: {self.engine.upper()} (Sandbox Disabled)")
+            self._log(f"ℹ️  Execution Engine: {self.engine.upper()} (Sandbox Disabled)")
         
         # Async Execution Tracking
         # Dictionary mapping execution_id (str) -> subprocess.Popen object
@@ -40,6 +42,70 @@ class WorkerService:
         # but for local worker memory is fine.
         self._running_processes: Dict[str, Any] = {}
         self._execution_buffers: Dict[str, Any] = {} # Store stdout/stderr buffers
+        
+    def _log(self, message: str):
+        """Internal logger that redirects to output_callback or standard print."""
+        if self.output_callback:
+            try:
+                self.output_callback(message)
+            except:
+                print(message)
+        else:
+            print(message)
+        
+    def _robust_extract_metrics(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Robustly extract numerical metrics from various possible JSON structures.
+        Handles:
+        1. Flat dict: {"runtime_s": 10.2}
+        2. Nested metrics: {"metrics": {"runtime_s": 10.2}}
+        3. Metrics with units: {"metrics_with_units": {"runtime_s": {"value": 10.2, "unit": "s"}}}
+        """
+        metrics = {}
+        
+        # 1. Check "metrics" key (Brain standard)
+        if "metrics" in data and isinstance(data["metrics"], dict):
+            for k, v in data["metrics"].items():
+                if isinstance(v, (int, float)):
+                    metrics[k] = v
+        
+        # 2. Check "metrics_with_units" key (Core standard)
+        if "metrics_with_units" in data and isinstance(data["metrics_with_units"], dict):
+            for k, v in data["metrics_with_units"].items():
+                if isinstance(v, dict) and "value" in v:
+                    val = v["value"]
+                    if isinstance(val, (int, float)):
+                        metrics[k] = val
+        
+        # 3. Fallback to top-level keys (Standard monitor)
+        blacklist = ["created_at", "source", "version", "phase", "metrics_with_units", "metrics", "target_files", "baseline_metrics"]
+        for k, v in data.items():
+            if k in blacklist: continue
+            if isinstance(v, (int, float)):
+                if k not in metrics: # Don't overwrite if already found in structured fields
+                    metrics[k] = v
+        
+        return metrics
+
+    def _extract_metrics_from_text(self, text: str) -> Dict[str, Any]:
+        """Simple regex fallback to capture key=value metrics from stdout/stderr."""
+        import re
+        metrics = {}
+        # Pattern: key=value (where value is a number)
+        # We look for lines like 'runtime_s=10.25' or 'accuracy: 0.99'
+        patterns = [
+            r'([a-zA-Z0-9_]+)\s*[:=]\s*([0-9.]+)',
+        ]
+        for line in text.splitlines():
+            for p in patterns:
+                matches = re.findall(p, line)
+                for k, v in matches:
+                    try:
+                        # Skip common false positives or very long numbers that might be hashes
+                        if len(k) < 30 and len(v) < 20:
+                             metrics[k] = float(v)
+                    except: pass
+        return metrics
 
         
     def _finalize_artifacts_internal(self, dest_filename: str = "final_patch.diff") -> list[str]:
@@ -50,9 +116,9 @@ class WorkerService:
             
             # Use original_repo_root and current repo_root for diff
             if self.is_ephemeral and self.repo_root != self.original_repo_root:
-                print(f"💼 Finalizing Implementation Patch ({dest_filename})...")
-                print(f"📍 Original Repo: {self.original_repo_root}")
-                print(f"📍 Current Repo:  {self.repo_root}")
+                self._log(f"💼 Finalizing Implementation Patch ({dest_filename})...")
+                self._log(f"📍 Original Repo: {self.original_repo_root}")
+                self._log(f"📍 Current Repo:  {self.repo_root}")
                 
                 if os.path.exists(self.repo_root):
                     from ..execution.repo_manager import get_modified_files, IGNORED_PATTERNS
@@ -74,7 +140,7 @@ class WorkerService:
                     ]
                     
                     if code_files:
-                        print(f"📊 Generating filtered patch for {len(code_files)} code files...")
+                        self._log(f"📊 Generating filtered patch for {len(code_files)} code files...")
                         diff_content = generate_diff(self.original_repo_root, self.repo_root, files=code_files)
                         
                         if diff_content:
@@ -88,18 +154,25 @@ class WorkerService:
                                 
                             with open(dest_diff, 'w', encoding='utf-8') as f:
                                 f.write(diff_content)
+                            
+                            # ALSO save to artifact_dir (for CLI transparency)
+                            if self.artifact_dir:
+                                cache_diff = os.path.join(self.artifact_dir, dest_filename)
+                                with open(cache_diff, 'w', encoding='utf-8') as f:
+                                    f.write(diff_content)
+                            
                             finalized.append(dest_filename)
-                            print(f"✅ Saved {dest_filename} to {dest_diff}")
+                            self._log(f"✅ Saved {dest_filename} to {dest_diff}")
                         else:
-                            print("ℹ️  No significant changes detected in code files.")
+                            self._log("ℹ️  No significant changes detected in code files.")
                     else:
-                        print("ℹ️  No modified code files found (skipping patch).")
+                        self._log("ℹ️  No modified code files found (skipping patch).")
                 else:
-                    print(f"⚠️  Cannot generate diff: source directory {self.repo_root} no longer exists")
+                    self._log(f"⚠️  Cannot generate diff: source directory {self.repo_root} no longer exists")
                     
             return finalized
         except Exception as e:
-            print(f"⚠️  Artifact finalization failed: {e}")
+            self._log(f"⚠️  Artifact finalization failed: {e}")
             return []
 
     def handle_request(self, request: ExecutionRequest) -> ExecutionResult:
@@ -169,7 +242,7 @@ class WorkerService:
         # 1. Resolve Target Context
         target_root = self._resolve_repo_root(request)
         if target_root != self.repo_root:
-            print(f"🔄 Stateless Context Switch: {target_root}")
+            self._log(f"🔄 Stateless Context Switch: {target_root}")
         
         # 2. Context Switch (Temp)
         # We swap self.repo_root temporarily so that internal methods using self.repo_root
@@ -254,7 +327,7 @@ class WorkerService:
                     self.sandbox.start()
                     
                     for cmd in cmds_to_run:
-                        print(f"📦 Sandbox Install: {cmd}")
+                        self._log(f"📦 Sandbox Install: {cmd}")
                         res = self.sandbox.exec_run(cmd.split())
                         setup_log.append(f"> {cmd}\n{res['stdout']}\n{res['stderr']}")
                         if res['exit_code'] != 0:
@@ -308,6 +381,7 @@ class WorkerService:
                     cwd=self.repo_root,
                     timeout_s=timeout,
                     show_progress=True,
+                    output_callback=self.output_callback,
                     env=self._get_worker_env(),
                     runner_factory=runner
                 )
@@ -339,6 +413,7 @@ class WorkerService:
                         cwd=self.repo_root,
                         timeout_s=timeout,
                         show_progress=True,
+                        output_callback=self.output_callback,
                         env=exec_env,
                         runner_factory=runner
                     )
@@ -425,7 +500,6 @@ class WorkerService:
                     # Usually Brain sends the manifest to be saved.
                     manifest_path = os.path.join(self.artifact_dir, "instrumentation_manifest.json")
                     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-                    import json
                     with open(manifest_path, 'w') as f:
                         json.dump(instrumentation_manifest, f, indent=2)
 
@@ -458,6 +532,7 @@ class WorkerService:
                         cwd=self.repo_root,
                         timeout_s=timeout,
                         show_progress=True,
+                        output_callback=self.output_callback,
                         env=env_vars,
                         runner_factory=runner
                     )
@@ -466,35 +541,72 @@ class WorkerService:
                         success = False
                         # Don't break immediately? Baseline usually runs all.
                 
-                # Capture baseline metrics immediately after run
-                from ..execution import instrumentation_pipeline
-                # Check both possible artifact locations
-                artifact_paths = [
-                    os.path.join(self.repo_root, "artifacts", "baseline_metrics.json"),
-                    os.path.join(self.artifact_dir, "baseline_metrics.json")
-                ]
-                baseline_metrics = {}
-                for fpath in artifact_paths:
-                    exists = os.path.exists(fpath)
-                    print(f"DEBUG: Checking baseline path {fpath}, exists={exists}")
-                    if exists:
-                        data = instrumentation_pipeline._read_json(fpath)
-                        if data:
-                            baseline_metrics.update(data)
+                # --- AUTO-CAPTURE METRICS (SANDBOX DIRECT READ) ---
+                captured_metrics = {}
                 
-                # Also process any partials that might have been emitted
-                for adir in [os.path.join(self.repo_root, "artifacts"), self.artifact_dir]:
-                    if os.path.isdir(adir):
-                        merged = instrumentation_pipeline._collect_and_merge_partial_artifacts(adir)
-                        if merged:
-                            if "metrics" not in baseline_metrics: baseline_metrics["metrics"] = {}
-                            baseline_metrics["metrics"].update(merged)
+                # 1. Read directly via Sandbox (Primary)
+                # This bypasses all host permission issues since we use Docker to read Docker files.
+                if self.sandbox and self.sandbox.available:
+                     # Helper to read and update
+                     def read_sandbox_json(path):
+                         res = self.sandbox.exec_run(["cat", path])
+                         if res.get("exit_code") == 0:
+                            try:
+                                loaded = json.loads(res["stdout"])
+                                captured_metrics.update(self._robust_extract_metrics(loaded))
+                            except Exception as e:
+                                self._log(f"DEBUG: JSON Sandbox Error: {e}")
+                                pass
 
+                     # Check known paths
+                     read_sandbox_json("/app/workdir/artifacts/metrics.json")
+                     read_sandbox_json("/app/workdir/artifacts/baseline_metrics.json")
+                     if not captured_metrics:
+                         read_sandbox_json("/app/workdir/metrics.json")
+                     
+                     # Fire-and-forget permission fix for cleanup (don't block capture)
+                     try:
+                         uid, gid = os.getuid(), os.getgid()
+                         self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", "/app/workdir/artifacts"])
+                         self.sandbox.exec_run(["chmod", "-R", "777", "/app/workdir/artifacts"])
+                     except: pass
+
+                # 2. Host Read Fallback (only if sandbox failed or empty)
+                if not captured_metrics:
+                    host_artifacts = os.path.join(self.repo_root, "artifacts", "metrics.json")
+                    host_root = os.path.join(self.repo_root, "metrics.json")
+                    host_baseline = os.path.join(self.repo_root, "artifacts", "baseline_metrics.json")
+                    
+                    for mpath in [host_baseline, host_artifacts, host_root]:
+                        if os.path.exists(mpath):
+                              try:
+                                  with open(mpath, 'r') as f:
+                                      loaded = json.load(f)
+                                      captured_metrics.update(self._robust_extract_metrics(loaded))
+                              except: pass
+                if not captured_metrics:
+                      # 3. Last Resort: Parse from LOGS (stdout)
+                      for outcome in outcomes:
+                          stdout = outcome.get("stdout", "")
+                          log_metrics = self._extract_metrics_from_text(stdout)
+                          if log_metrics:
+                               self._log(f"📊 [DEBUG] Captured metrics from LOGS: {log_metrics}")
+                               captured_metrics.update(log_metrics)
+
+                if captured_metrics:
+                     self._log(f"📊 [DEBUG] Baseline Step Captured: {captured_metrics}")
+                     pass
+                else:
+                     self._log(f"⚠️ [DEBUG] Metrics Capture Failed (Sandbox & Host). No metrics found in artifacts")
+                     pass
+
+                # Ensure we populate baseline_metrics for protocol, but ALSO metrics for Current scoreboard
+                # NOTE: baseline_metrics goes into data, metrics goes into specific field
                 return ExecutionResult(success=True, data={
                     "success": success,
                     "outcomes": outcomes,
-                    "baseline_metrics": baseline_metrics
-                })
+                    "baseline_metrics": captured_metrics
+                }, metrics=captured_metrics)
 
             elif request.type == "validate_syntax":
                 file_path = request.payload.get("file_path")
@@ -530,9 +642,56 @@ class WorkerService:
                     suggested_timeouts=p.get("suggested_timeouts"),
                     judge_checker_factory=None, 
                     env=exec_env,
-                    runner_factory=runner
+                    runner_factory=runner,
+                    show_progress=True,
+                    output_callback=self.output_callback
                 )
-                return ExecutionResult(success=True, data=command_results)
+                
+                # --- AUTO-CAPTURE METRICS (SANDBOX AWARE) ---
+                captured_metrics = {}
+                
+                # Definition of paths
+                host_artifacts = os.path.join(self.repo_root, "artifacts", "metrics.json")
+                host_root = os.path.join(self.repo_root, "metrics.json")
+                
+                # 1. Try reading via Sandbox (if active) to bypass permission issues
+                if self.sandbox and self.sandbox.available:
+                    # Try artifacts dir
+                    res = self.sandbox.exec_run(["cat", "/app/workdir/artifacts/metrics.json"])
+                    if res.get("exit_code") == 0:
+                         try:
+                             captured_metrics.update(self._robust_extract_metrics(json.loads(res["stdout"])))
+                         except: pass
+                    
+                    # Try root dir if empty
+                    if not captured_metrics:
+                        res = self.sandbox.exec_run(["cat", "/app/workdir/metrics.json"])
+                        if res.get("exit_code") == 0:
+                             try:
+                                 captured_metrics.update(self._robust_extract_metrics(json.loads(res["stdout"])))
+                             except: pass
+
+                # 2. Fallback to Host Read (if not found in sandbox or sandbox disabled)
+                if not captured_metrics:
+                    search_paths = [host_artifacts, host_root]
+                    for mpath in search_paths:
+                        if os.path.exists(mpath):
+                             try:
+                                 with open(mpath, 'r') as f:
+                                     data = json.load(f)
+                                     captured_metrics.update(data)
+                                 self._log(f"📊 [DEBUG] Loaded metrics from Host {mpath}: {data}")
+                             except Exception as e:
+                                 self._log(f"⚠️ [DEBUG] Failed to load from Host {mpath}: {e}")
+                                 pass
+                
+                if not captured_metrics:
+                     self._log(f"⚠️ [DEBUG] No metrics found (Sandbox or Host).")
+                     pass
+                         
+                # ------------------------------------
+
+                return ExecutionResult(success=True, data=command_results, metrics=captured_metrics)
             
             elif request.type == "apply_patch":
                 # Accept both 'patch_proposal' (from Orchestrator RPC) and 'patch' (legacy)
@@ -606,15 +765,102 @@ class WorkerService:
                         return self.sandbox.exec_popen(cmd, env=env or {})
                     runner = sandbox_runner
 
+                # Ensure artifacts directory exists for the script to use
+                artifacts_path = os.path.join(self.repo_root, "artifacts")
+                os.makedirs(artifacts_path, exist_ok=True)
+
                 outcome = executor.run_command_with_timeout(
                     cmd=cmd,
                     cwd=self.repo_root,
                     timeout_s=timeout,
                     show_progress=True,
+                    output_callback=self.output_callback,
                     env=self._get_worker_env(env_vars),
                     runner_factory=runner
                 )
-                return ExecutionResult(success=True, data={"outcome": outcome})
+                
+                # --- AUTO-CAPTURE METRICS (SANDBOX DIRECT READ) ---
+                captured_metrics = {}
+                
+                # 1. Read directly via Sandbox (Primary)
+                if self.sandbox and self.sandbox.available:
+                     def read_sandbox_json(path):
+                         res = self.sandbox.exec_run(["cat", path])
+                         if res.get("exit_code") == 0:
+                             try:
+                                 loaded = json.loads(res["stdout"])
+                                 # Extract inner 'metrics'
+                                 if "metrics" in loaded and isinstance(loaded["metrics"], dict):
+                                     captured_metrics.update(loaded["metrics"])
+                                 else:
+                                     captured_metrics.update(loaded)
+                                 self._log(f"📊 [DEBUG] Loaded metrics via Sandbox: {path}")
+                             except: pass
+
+                     read_sandbox_json("/app/workdir/artifacts/metrics.json")
+                     if not captured_metrics:
+                         read_sandbox_json("/app/workdir/metrics.json")
+                     
+                     # Fire-and-forget permission fix
+                     try:
+                         uid, gid = os.getuid(), os.getgid()
+                         self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", "/app/workdir/artifacts"])
+                         self.sandbox.exec_run(["chmod", "-R", "777", "/app/workdir/artifacts"])
+                     except: pass
+                
+                # 2. Host Read Fallback
+                if not captured_metrics:
+                    host_artifacts = os.path.join(self.repo_root, "artifacts", "metrics.json")
+                    host_root = os.path.join(self.repo_root, "metrics.json")
+                    
+                    search_paths = [host_artifacts, host_root]
+                    for mpath in search_paths:
+                        if os.path.exists(mpath):
+                             try:
+                                 with open(mpath, 'r') as f:
+                                     loaded = json.load(f)
+                                     if "metrics" in loaded and isinstance(loaded["metrics"], dict):
+                                         captured_metrics.update(loaded["metrics"])
+                                     else:
+                                         captured_metrics.update(loaded)
+                                     self._log(f"📊 [DEBUG] Loaded metrics from Host {mpath}: {captured_metrics}")
+                                     pass
+                                     break
+                             except Exception as e:
+                                 self._log(f"⚠️ [DEBUG] Failed to load from Host {mpath}: {e}")
+                                 pass
+                
+                if not captured_metrics:
+                     self._log(f"⚠️ [DEBUG] No metrics found (Sandbox or Host).")
+                     pass
+                     
+                         
+                # ------------------------------------
+                
+                # Fallback: Parse stdout
+                if not captured_metrics and outcome.get("stdout"):
+                    import re
+                    stdout = outcome["stdout"]
+                    # Regex for "key: value" or "key=value" where value is a number
+                    # We look for specific known metric keys to avoid false positives
+                    patterns = [
+                        r"(?i)\b(runtime_s|duration_s|time_s)\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+                        r"(?i)\b(accuracy|score|val_acc)\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+                        r"(?i)\b(error_rate|loss)\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)"
+                    ]
+                    for pat in patterns:
+                        for m in re.finditer(pat, stdout):
+                            key = m.group(1).lower()
+                            try:
+                                val = float(m.group(2))
+                                captured_metrics[key] = val
+                            except: pass
+                    if captured_metrics:
+                         self._log(f"📊 [DEBUG] Extracted metrics from stdout: {captured_metrics}")
+                         pass
+                # ------------------------------------
+
+                return ExecutionResult(success=True, data={"outcome": outcome}, metrics=captured_metrics)
 
             elif request.type == "command_discovery":
                 from .core import command_discovery
@@ -633,7 +879,8 @@ class WorkerService:
                     initial_commands=p.get("initial_commands", []),
                     venv_python=p.get("venv_python"),
                     timeout_s=p.get("timeout_s", 8.0),
-                    runner_factory=runner
+                    runner_factory=runner,
+                    output_callback=self.output_callback
                 )
                 # Persist for debugging
                 command_discovery.persist_command_plan(
@@ -656,7 +903,7 @@ class WorkerService:
                 if os.path.exists(temp_dir):
                     shutil.rmtree(temp_dir)
                 
-                print(f"🌲 Creating Ephemeral Working Copy: {temp_dir}")
+                self._log(f"🌲 Creating Ephemeral Working Copy: {temp_dir}")
                 
                 try:
                     # Case 1: Source is a URL (Cloud/Remote Mode)
@@ -665,7 +912,7 @@ class WorkerService:
                         import zipfile
                         import io
                         
-                        print(f"📥 Downloading repository from: {source_path}")
+                        self._log(f"📥 Downloading repository from: {source_path}")
                         resp = requests.get(source_path)
                         resp.raise_for_status()
                         
@@ -704,7 +951,7 @@ class WorkerService:
                     
                     return ExecutionResult(success=True, data={"working_path": self.repo_root})
                 except Exception as e:
-                    print(f"❌ Failed to create working copy: {e}")
+                    self._log(f"❌ Failed to create working copy: {e}")
                     return ExecutionResult(success=False, error=f"Failed to create working copy: {str(e)}")
 
             elif request.type == "finalize_artifacts":
@@ -723,22 +970,34 @@ class WorkerService:
                     dest_filename = request.payload.get("dest_filename", "final_patch.diff")
                     self._finalize_artifacts_internal(dest_filename=dest_filename)
                     
-                    print(f"🧹 Cleaning up Ephemeral Working Copy: {self.repo_root}")
+                    self._log(f"🧹 Cleaning up Ephemeral Working Copy: {self.repo_root}")
                     try:
+                        # 1. PERMISSION FIX (While sandbox is still running)
+                        if self.sandbox and self.sandbox.available:
+                            try:
+                                uid, gid = os.getuid(), os.getgid()
+                                self._log(f"   👤 Reclaiming ownership: {uid}:{gid}")
+                                self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", "/app/workdir"])
+                                self.sandbox.exec_run(["chmod", "-R", "777", "/app/workdir"])
+                            except: pass
+
+                        # 2. STOP SANDBOX (to release mounts)
+                        if self.sandbox:
+                            self._log("   🛑 Stopping Sandbox...")
+                            self.sandbox.stop()
+                            # Replace with fresh one for future use (if needed)
+                            from .sandbox import DockerSandbox
+                            self.sandbox = DockerSandbox(self.original_repo_root, self.artifact_dir)
+
+                        # 3. DELETE DIRECTORY
                         shutil.rmtree(self.repo_root)
                         # Reset to original
                         self.repo_root = self.original_repo_root
                         self.is_ephemeral = False
                         
-                        # Restore Sandbox
-                        if self.sandbox:
-                            self.sandbox.stop()
-                            from .sandbox import DockerSandbox
-                            self.sandbox = DockerSandbox(self.repo_root, self.artifact_dir)
-                            
                         return ExecutionResult(success=True, data={"cleaned": True})
                     except Exception as e:
-                        print(f"⚠️ Cleanup failed: {e}")
+                        self._log(f"⚠️ Cleanup failed: {e}")
                         return ExecutionResult(success=False, error=str(e))
                 else:
                     return ExecutionResult(success=True, data={"cleaned": False, "reason": "Not ephemeral"})
@@ -751,7 +1010,7 @@ class WorkerService:
                  # Stage files first if requested
                  if files:
                      files_str = " ".join(f'"{f}"' for f in files)
-                     executor.run_command_stepwise(f"git add {files_str}", self.repo_root)
+                     executor.run_command_stepwise(f"git add {files_str}", self.repo_root, output_callback=self.output_callback)
                  
                  # Run diff
                  cmd = "git diff --cached" if staged else "git diff"
@@ -788,7 +1047,7 @@ class WorkerService:
                               os.makedirs(run_output, exist_ok=True)
                               root = run_output
                               
-                         print(f"🚚 Delivering to: {root}/{path}")
+                         self._log(f"🚚 Delivering to: {root}/{path}")
                      elif target_scope == "artifact":
                          root = self.artifact_dir
 
@@ -803,18 +1062,25 @@ class WorkerService:
                      with open(target_path, 'w', encoding='utf-8') as f:
                          f.write(content)
                      
+                     # ALSO save to artifact_dir (for CLI transparency)
+                     if self.artifact_dir and target_scope == "original":
+                         cache_path = os.path.join(self.artifact_dir, path)
+                         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                         with open(cache_path, 'w', encoding='utf-8') as f:
+                             f.write(content)
+
                      # Enhanced logging for debugging
-                     print(f"   ✅ File written successfully")
-                     print(f"   📍 Full path: {target_path}")
-                     print(f"   📊 Size: {len(content)} bytes")
+                     self._log(f"   ✅ File written successfully")
+                     self._log(f"   📍 Full path: {target_path}")
+                     self._log(f"   📊 Size: {len(content)} bytes")
                      
                      if "report" in str(path).lower():
-                         print("   📄 Report preview (first 200 chars):")
-                         print("   " + content[:200].replace("\n", "\n   "))
+                         self._log("   📄 Report preview (first 200 chars):")
+                         self._log("   " + content[:200].replace("\n", "\n   "))
                          
                      return ExecutionResult(success=True, data={"path": target_path})
                  except Exception as e:
-                     print(f"   ❌ Write failed: {e}")
+                     self._log(f"   ❌ Write failed: {e}")
                      import traceback
                      traceback.print_exc()
                      return ExecutionResult(success=False, error=str(e))
@@ -990,7 +1256,8 @@ class WorkerService:
                         "exit_code": None
                     }
                     
-                    print(f"🚀 [Worker] Starting Async Command: {cmd} (ID: {execution_id})")
+                    self._log(f"🚀 [Worker] Starting Async Command: {cmd} (ID: {execution_id})")
+                    pass
 
                     # Running via executor helper would block, so we use subprocess directly
                     # but we need to respect sandbox if active.
@@ -1018,21 +1285,25 @@ class WorkerService:
                         )
                         self._running_processes[execution_id] = process
                         
+                        from rich.console import Console
+                        from rich.panel import Panel
+                        from rich.live import Live
+                        console = Console()
+                        
                         # Background threads to consume pipes (Same as local Popen)
                         def reader(stream, buffer, name="unknown"):
                             if stream:
                                 try:
-                                    print(f"DEBUG: Starting reader for {name}")
                                     for line in stream:
                                         # Use standard output format so User sees the content in their CLI
-                                        # We strip trailing newline because print adds one
                                         clean_line = line.rstrip('\n')
-                                        print(f"[{name}] {clean_line}")
+                                        # Box the output for visibility
+                                        color = "white" if name == "STDOUT" else "red"
+                                        # console.self._log(Panel(clean_line, title=f"[bold {color}]{name}[/bold {color}]", border_style=color, expand=False))
                                         buffer.append(line)
-                                    print(f"DEBUG: {name} stream closed")
                                     stream.close()
-                                except Exception as e:
-                                    print(f"DEBUG: Error in reader {name}: {e}")
+                                except Exception:
+                                    pass
                             
                         threading.Thread(target=reader, args=(process.stdout, stdout_buffer, "STDOUT"), daemon=True).start()
                         threading.Thread(target=reader, args=(process.stderr, stderr_buffer, "STDERR"), daemon=True).start()
@@ -1060,12 +1331,17 @@ class WorkerService:
                         )
                         self._running_processes[execution_id] = process
                         
+                        from rich.console import Console
+                        from rich.panel import Panel
+                        console = Console()
+
                         # Background threads to consume pipes
                         def reader(stream, buffer, name="OUTPUT"):
                             for line in stream:
                                 try:
-                                    # Stream to CLI stdout for visibility
-                                    print(f"[{name}] {line.rstrip()}")
+                                    # Box the output for visibility
+                                    color = "white" if name == "STDOUT" else "red"
+                                    # console.self._log(Panel(line.rstrip(), title=f"[bold {color}]{name}[/bold {color}]", border_style=color, expand=False))
                                 except Exception:
                                     pass
                                 buffer.append(line)
@@ -1111,13 +1387,59 @@ class WorkerService:
                 if len(stderr_full) > limit:
                      stderr_full = stderr_full[:limit] + "\n... [Truncated by Worker] ..."
 
+                # --- AUTO-CAPTURE METRICS (SANDBOX DIRECT READ) ---
+                captured_metrics = {}
+                if not running:
+                    # 1. Read directly via Sandbox (Primary)
+                    if self.sandbox and self.sandbox.available:
+                        def read_sandbox_json(path):
+                            res = self.sandbox.exec_run(["cat", path])
+                            if res.get("exit_code") == 0:
+                                try:
+                                    loaded = json.loads(res["stdout"])
+                                    captured_metrics.update(self._robust_extract_metrics(loaded))
+                                except: pass
+
+                        read_sandbox_json("/app/workdir/artifacts/metrics.json")
+                        if not captured_metrics:
+                            read_sandbox_json("/app/workdir/metrics.json")
+                        
+                        # Fire-and-forget permission fix
+                        try:
+                            uid, gid = os.getuid(), os.getgid()
+                            self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", "/app/workdir/artifacts"])
+                            self.sandbox.exec_run(["chmod", "-R", "777", "/app/workdir/artifacts"])
+                        except: pass
+                    
+                    # 2. Host Read Fallback
+                    if not captured_metrics:
+                        host_artifacts = os.path.join(self.repo_root, "artifacts", "metrics.json")
+                        host_root = os.path.join(self.repo_root, "metrics.json")
+                        
+                        search_paths = [host_artifacts, host_root]
+                        for mpath in search_paths:
+                            if os.path.exists(mpath):
+                                 try:
+                                     with open(mpath, 'r') as f:
+                                         loaded = json.load(f)
+                                         captured_metrics.update(self._robust_extract_metrics(loaded))
+                                         break
+                                 except: pass
+
+                # 3. Last Resort: Parse from snapshot buffers
+                if not captured_metrics:
+                    log_metrics = self._extract_metrics_from_text(stdout_full)
+                    if log_metrics:
+                        captured_metrics.update(log_metrics)
+                # ------------------------------------
+
                 return ExecutionResult(success=True, data={
                     "stdout": stdout_full,
                     "stderr": stderr_full,
                     "is_running": running,
                     "exit_code": state["exit_code"],
                     "elapsed_s": elapsed
-                })
+                }, metrics=captured_metrics)
                 
             elif request.type == "kill_command":
                 exec_id = request.payload.get("execution_id")

@@ -73,8 +73,8 @@ class HttpTransport(Transport):
 
     # --- Proxy Methods matching BrainServer interface ---
 
-    def get_next_step(self, timeout: float = 0.5, run_id: Optional[str] = None) -> Optional[ExecutionRequest]:
-        """Poll the HTTP server for the next step."""
+    def get_next_step(self, timeout: float = 0.5, run_id: Optional[str] = None):
+        """Poll the HTTP server for the next step. Returns (step, latest_metrics, baseline_metrics)."""
         try:
             resp = self.session.post(
                 f"{self.base_url}/workers/poll",
@@ -83,22 +83,25 @@ class HttpTransport(Transport):
             )
             if resp.status_code != 200:
                 print(f"⚠️ Poll failed: {resp.text}")
-                return None
+                return None, None, None
                 
             data = resp.json()
+            metrics = data.get("latest_metrics")
+            baseline = data.get("baseline_metrics")
+
             if data.get("status") == "finished":
-                 return ExecutionRequest(type="workflow_complete", payload={"status": "finished", "reason": "Run marked as completed in DB"})
+                 return ExecutionRequest(type="workflow_complete", payload={"status": "finished", "reason": "Run marked as completed in DB"}), metrics, baseline
                  
             step_data = data.get("step")
             if not step_data:
-                return None
+                return None, metrics, baseline
                 
             # Reconstruct ExecutionRequest
-            return ExecutionRequest(**step_data)
+            return ExecutionRequest(**step_data), metrics, baseline
             
         except Exception as e:
             # print(f"⚠️ Poll error: {e}")
-            return None
+            return None, None, None
 
     def submit_result(self, result: ExecutionResult) -> None:
         """Submit result to the HTTP server with retries."""

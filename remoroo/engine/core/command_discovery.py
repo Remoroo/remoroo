@@ -124,6 +124,7 @@ def discover_command_plan(
     venv_python: Optional[str] = None,
     timeout_s: float = 8.0,
     runner_factory: Optional[Callable] = None,
+    output_callback: Optional[Callable] = None,
 ) -> CommandDiscoveryResult:
     """
     Discover a *valid* command plan by probing likely entry commands.
@@ -159,6 +160,7 @@ def discover_command_plan(
             stage_name="COMMAND_DISCOVERY_HELP",
             env={},
             runner_factory=runner_factory,
+            output_callback=output_callback,
         )
         # run_commands returns a list of dict outcomes
         for oc in help_outcomes:
@@ -180,6 +182,7 @@ def discover_command_plan(
             stage_name="COMMAND_DISCOVERY_RUN",
             env={},
             runner_factory=runner_factory,
+            output_callback=output_callback,
         )
         for oc in exec_outcomes:
             candidates.append({"kind": "run_probe", **oc})

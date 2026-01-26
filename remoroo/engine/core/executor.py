@@ -8,7 +8,37 @@ import signal
 import threading
 import sys
 import os
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Union
+
+def _print(message: str, show_progress: bool = True, output_callback: Optional[Callable] = None, **kwargs):
+    """Internal helper to route prints through callback or standard print."""
+    try:
+        with open("/tmp/remoroo_debug.log", "a") as f:
+            f.write(f"EXEC_PRINT: {message[:50]}... | show_progress={show_progress} | callback={output_callback}\n")
+    except: pass
+    
+    if output_callback:
+        # Remove print-specific kwargs that callbacks (like console.print) might reject
+        cb_kwargs = kwargs.copy()
+        cb_kwargs.pop("flush", None)
+        cb_kwargs.pop("file", None)
+        
+        try:
+            # sys.__stderr__.write(f"DEBUG_EXEC: Calling callback with {message[:20]}...\n")
+            # Try to pass as single message if it's a simple logger
+            output_callback(message, **cb_kwargs)
+        except Exception as e1:
+            sys.__stderr__.write(f"DEBUG_EXEC: Callback FAILED 1: {e1}\n")
+            try:
+                # Fallback to executor-style (message, stream)
+                output_callback(message, "stdout")
+            except Exception as e2:
+                sys.__stderr__.write(f"DEBUG_EXEC: Callback FAILED 2: {e2}\n")
+                # If both fail, print the original message to stderr so we don't lose it, plus the error
+                # using sys.__stderr__ to avoid recursion if print is hooked
+                sys.__stderr__.write(f"Callback failed: {e1} / {e2}\nMessage: {message}\n")
+    elif show_progress:
+        print(message, **kwargs)
 
 def run_command_with_timeout(
     cmd: str,
@@ -36,8 +66,8 @@ def run_command_with_timeout(
     
     if show_progress:
         timeout_str = f" (timeout: {timeout_s}s)" if timeout_s else ""
-        print(f"  ▶️  Running: {cmd}{timeout_str}")
-        print("  " + "-" * 60)
+        _print(f"  ▶️  Running: {cmd}{timeout_str}", show_progress, output_callback)
+        _print("  " + "-" * 60, show_progress, output_callback)
     
     stdout_lines = []
     stderr_lines = []
@@ -88,15 +118,20 @@ def run_command_with_timeout(
                 stdout_lines.append(line)
                 output_buffer.append(("stdout", line))
                 
-                # Call output callback if provided
-                if output_callback:
-                    try:
-                        output_callback(line, "stdout")
-                    except Exception as e:
-                        print(f"  ⚠️  Output callback error: {e}", file=sys.stderr)
+                try:
+                    with open("/tmp/remoroo_debug.log", "a") as f:
+                        f.write(f"READ_STDOUT: {line[:50]}\n")
+                except: pass
                 
                 if show_progress:
-                    print(f"  {line}", flush=True)
+                    # _print handles the callback if present, so we don't need to call it manually above
+                    # unless show_progress is False, but here we are inside if show_progress.
+                    # Wait, if show_progress is False but we have a callback, we WANT to print.
+                    # So we should use _print exclusively.
+                    _print(f"  {line}", show_progress, output_callback)
+                elif output_callback:
+                    # If progress hidden but callback exists (e.g. streaming to file or dashboard)
+                    _print(line, False, output_callback)
                 
                 # Convergence check logic here (simplified for CLI engine port - full logic preserved)
                 current_time = time.time()
@@ -134,8 +169,9 @@ def run_command_with_timeout(
                                 confidence = decision.get("confidence", 0.0)
                                 
                                 if should_stop_flag and confidence >= current_confidence_threshold:
-                                    print(f"\n  🎯 Early stopping detected (confidence: {confidence:.2f}, threshold: {current_confidence_threshold:.2f})")
-                                    print(f"     Reason: {decision.get('reason', 'N/A')[:100]}")
+                                    if show_progress:
+                                        _print(f"\n  🎯 Early stopping detected (confidence: {confidence:.2f}, threshold: {current_confidence_threshold:.2f})", show_progress, output_callback)
+                                        _print(f"     Reason: {decision.get('reason', 'N/A')[:100]}", show_progress, output_callback)
                                     convergence_info = decision
                                     should_stop.set()
                                     stopped_early_container["value"] = True
@@ -148,7 +184,7 @@ def run_command_with_timeout(
                             if show_progress:
                                 error_str = str(e).lower()
                                 if "json" not in error_str and "parse" not in error_str:
-                                    print(f"  ⚠️  Convergence check error: {str(e)[:80]}", file=sys.stderr)
+                                    _print(f"  ⚠️  Convergence check error: {str(e)[:80]}", show_progress, output_callback, file=sys.stderr)
             p.stdout.close()
         
         def read_stderr():
@@ -159,14 +195,10 @@ def run_command_with_timeout(
                 stderr_lines.append(line)
                 output_buffer.append(("stderr", line))
                 
-                if output_callback:
-                    try:
-                        output_callback(line, "stderr")
-                    except Exception as e:
-                        print(f"  ⚠️  Output callback error: {e}", file=sys.stderr)
-                
                 if show_progress:
-                    print(f"  ⚠️  {line}", file=sys.stderr, flush=True)
+                    _print(f"  ⚠️  {line}", show_progress, output_callback)
+                elif output_callback:
+                    _print(line, False, output_callback)
             p.stderr.close()
         
         t1 = threading.Thread(target=read_stdout)
@@ -206,7 +238,7 @@ def run_command_with_timeout(
                                     if current_timeout is None or new_timeout > current_timeout:
                                         timeout_container["value"] = new_timeout
                                         if show_progress:
-                                            print(f"    ⏱️  Judge extends timeout to {new_timeout}s")
+                                            _print(f"    ⏱️  Judge extends timeout to {new_timeout}s", show_progress, output_callback)
                             
                             if decision in ["SUCCESS", "FAIL", "REPLAN_NOW", "PARTIAL_SUCCESS"]:
                                 judge_info = judge_decision
@@ -221,7 +253,7 @@ def run_command_with_timeout(
                         if show_progress:
                             error_str = str(e).lower()
                             if "json" not in error_str and "parse" not in error_str:
-                                print(f"  ⚠️  Judge check error: {str(e)}", file=sys.stderr)
+                                _print(f"  ⚠️  Judge check error: {str(e)}", show_progress, output_callback, file=sys.stderr)
                 
                 time.sleep(0.5)
             
@@ -229,7 +261,7 @@ def run_command_with_timeout(
             t2.join(timeout=2)
         except Exception as e:
             if show_progress:
-                print(f"  ⚠️  Error waiting for process: {e}")
+                _print(f"  ⚠️  Error waiting for process: {e}", show_progress, output_callback)
         finally:
             if p.poll() is None:
                 p.terminate()
@@ -245,19 +277,19 @@ def run_command_with_timeout(
         duration_s = round(time.time() - start_time, 3)
         
         if show_progress:
-            print("  " + "-" * 60)
+            _print("  " + "-" * 60, show_progress, output_callback)
             if stopped_early:
                 status = "🎯"
                 decision_info = judge_info if judge_info else convergence_info
                 decision_type = "Judge decision" if judge_info else "convergence detected"
-                print(f"  {status} Stopped early in {duration_s:.1f}s ({decision_type} - SUCCESS)")
+                _print(f"  {status} Stopped early in {duration_s:.1f}s ({decision_type} - SUCCESS)", show_progress, output_callback)
                 if decision_info:
                     decision = decision_info.get("decision")
                     if decision:
-                        print(f"     Decision: {decision}")
+                        _print(f"     Decision: {decision}", show_progress, output_callback)
             else:
                 status = "✅" if returncode == 0 and not timed_out else "❌"
-                print(f"  {status} Completed in {duration_s:.1f}s (exit code: {returncode})")
+                _print(f"  {status} Completed in {duration_s:.1f}s (exit code: {returncode})", show_progress, output_callback)
         
         result = {
             "cmd": cmd,
@@ -277,8 +309,8 @@ def run_command_with_timeout(
         timed_out = True
         duration_s = round(time.time() - start_time, 3)
         if show_progress:
-            print("  " + "-" * 60)
-            print(f"  ⏱️  TIMEOUT after {duration_s:.1f}s (timeout limit: {timeout_s}s)")
+            _print("  " + "-" * 60, show_progress, output_callback)
+            _print(f"  ⏱️  TIMEOUT after {duration_s:.1f}s (timeout limit: {timeout_s}s)", show_progress, output_callback)
         return {
             "cmd": cmd,
             "exit_code": -1,
@@ -346,7 +378,7 @@ def run_commands(
     total = len(commands)
     for i, cmd in enumerate(commands, 1):
         if stage_name and total > 1:
-            print(f"\n[{stage_name}] Command {i}/{total}:")
+            _print(f"\n[{stage_name}] Command {i}/{total}:", True, output_callback)
         
         cmd_judge_checker = judge_checker
         if judge_checker_factory:
@@ -356,6 +388,7 @@ def run_commands(
             cmd, 
             repo_root, 
             timeout_s,
+            show_progress=True,
             output_callback=output_callback,
             convergence_checker=convergence_checker if cmd_judge_checker is None else None,
             judge_checker=cmd_judge_checker,
@@ -369,11 +402,11 @@ def run_commands(
             judge_decision = outcome["convergence_info"].get("decision")
             if judge_decision in ["REPLAN_NOW", "SUCCESS", "FAIL", "PARTIAL_SUCCESS"]:
                 if stage_name:
-                    print(f"  ⚖️  Stopping {stage_name} due to Judge decision: {judge_decision}")
+                    _print(f"  ⚖️  Stopping {stage_name} due to Judge decision: {judge_decision}", True, output_callback)
                 break
         if outcome["exit_code"] != 0 and not outcome.get("timed_out", False) and not outcome.get("stopped_early", False):
             if stage_name:
-                print(f"  ⚠️  Stopping {stage_name} due to failure")
+                _print(f"  ⚠️  Stopping {stage_name} due to failure", True, output_callback)
             break
     return outcomes
 
@@ -396,8 +429,8 @@ def run_command_plan(
     
     stages = [k for k in command_plan.keys() if k != "diagnostics_on_failure" and isinstance(command_plan[k], list)]
     
-    print(f"\n{'='*60}")
-    print("🚀 EXECUTING COMMAND PLAN")
+    _print(f"\n{'='*60}", True, output_callback)
+    _print("🚀 EXECUTING COMMAND PLAN", True, output_callback)
     if suggested_timeouts:
         timeout_strs = []
         for stage in stages:
@@ -406,9 +439,9 @@ def run_command_plan(
                 timeout_strs.append(f"{stage}={timeout}s")
             else:
                 timeout_strs.append(f"{stage}=no timeout")
-        print(f"   Using LLM-suggested timeouts: {', '.join(timeout_strs)}")
+        _print(f"   Using LLM-suggested timeouts: {', '.join(timeout_strs)}", True, output_callback)
     
-    print(f"{'='*60}")
+    _print(f"{'='*60}", True, output_callback)
     
     all_outcomes = []
     for stage_name in stages:
@@ -427,7 +460,7 @@ def run_command_plan(
                     if has_install_commands:
                         use_convergence = False
             
-            print(f"\n📦 {stage_name.upper()} ({len(commands)} command(s)):")
+            _print(f"\n📦 {stage_name.upper()} ({len(commands)} command(s)):", True, output_callback)
             
             stage_judge_checker_factory = None
             if judge_checker_factory:
@@ -465,18 +498,18 @@ def run_command_plan(
             
             if stage_stopped_due_to_judge:
                 decision = judge_decision_from_stage.get("decision")
-                print(f"  ⚖️  {stage_name.capitalize()} stopped due to Judge decision: {decision}")
+                _print(f"  ⚖️  {stage_name.capitalize()} stopped due to Judge decision: {decision}", True, output_callback)
                 results["_judge_decision"] = judge_decision_from_stage
                 return results
             
             if all(o.get("exit_code", 0) == 0 or o.get("stopped_early", False) for o in stage_results):
-                print(f"  ✅ {stage_name.capitalize()} completed successfully")
+                _print(f"  ✅ {stage_name.capitalize()} completed successfully", True, output_callback)
             else:
-                print(f"  ⚠️  {stage_name.capitalize()} had failures")
+                _print(f"  ⚠️  {stage_name.capitalize()} had failures", True, output_callback)
     
     if diagnostics_on_failure and any(o.get("exit_code", 0) != 0 and not o.get("stopped_early", False) for o in all_outcomes):
         diagnostics_to_run = diagnostics_on_failure[:max_diagnostics]
-        print(f"\n🔍 DIAGNOSTICS ({len(diagnostics_to_run)} command(s)):")
+        _print(f"\n🔍 DIAGNOSTICS ({len(diagnostics_to_run)} command(s)):", True, output_callback)
         results["diagnostics"] = run_commands(
             repo_root,
             diagnostics_to_run,
@@ -492,11 +525,11 @@ def run_command_plan(
     total_commands = len(all_outcomes)
     successful = sum(1 for o in all_outcomes if o.get("exit_code", 0) == 0 or o.get("stopped_early", False))
     early_stops = sum(1 for o in all_outcomes if o.get("stopped_early", False))
-    print(f"\n{'='*60}")
-    print(f"📈 COMMAND PLAN SUMMARY: {successful}/{total_commands} commands succeeded")
+    _print(f"\n{'='*60}", True, output_callback)
+    _print(f"📈 COMMAND PLAN SUMMARY: {successful}/{total_commands} commands succeeded", True, output_callback)
     if early_stops > 0:
-        print(f"   🎯 {early_stops} command(s) stopped early (convergence detected)")
-    print(f"{'='*60}\n")
+        _print(f"   🎯 {early_stops} command(s) stopped early (convergence detected)", True, output_callback)
+    _print(f"{'='*60}\n", True, output_callback)
     
     return results
 
