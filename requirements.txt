@@ -3,3 +3,4 @@ openai>=1.40.0
 requests>=2.31.0
 typer>=0.9.0
 sseclient-py>=1.8.0
+prompt_toolkit>=3.0.0

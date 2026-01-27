@@ -50,23 +50,11 @@ class DockerSandbox:
             # remoroo_cli/remoroo/engine/sandbox.py -> root/Dockerfile.worker
             current_file = Path(__file__).resolve()
             
-            # Try to find engine root where Dockerfile.worker lives
-            # We look up finding the file
-            dockerfile_path = None
-            candidate_dir = current_file.parent
-            for _ in range(5): # Go up 5 levels
-                if (candidate_dir / "Dockerfile.worker").exists():
-                    dockerfile_path = candidate_dir / "Dockerfile.worker"
-                    break
-                candidate_dir = candidate_dir.parent
-                
-            if not dockerfile_path:
-                 # Fallback to CWD if running from root
-                 if Path("Dockerfile.worker").exists():
-                     dockerfile_path = Path("Dockerfile.worker").resolve()
+            # Specialized Dockerfile is always in the same directory as sandbox.py
+            dockerfile_path = current_file.parent / "Dockerfile"
             
-            if not dockerfile_path:
-                 print("⚠️  Warning: Dockerfile.worker not found. Cannot build sandbox.")
+            if not dockerfile_path.exists():
+                 print(f"⚠️  Warning: {dockerfile_path} not found. Cannot build sandbox.")
                  return
 
             # Use the directory containing Dockerfile as build context

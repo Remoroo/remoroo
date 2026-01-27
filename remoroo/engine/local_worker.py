@@ -678,16 +678,34 @@ class WorkerService:
                         if os.path.exists(mpath):
                              try:
                                  with open(mpath, 'r') as f:
-                                     data = json.load(f)
-                                     captured_metrics.update(data)
-                                 self._log(f"📊 [DEBUG] Loaded metrics from Host {mpath}: {data}")
+                                     loaded = json.load(f)
+                                     captured_metrics.update(self._robust_extract_metrics(loaded))
+                                 self._log(f"📊 [DEBUG] Loaded metrics from Host {mpath}: {captured_metrics}")
                              except Exception as e:
                                  self._log(f"⚠️ [DEBUG] Failed to load from Host {mpath}: {e}")
                                  pass
                 
+                # 3. Last Resort: Parse from LOGS (stdout)
+                if not captured_metrics and command_results:
+                    # Flatten the outcomes dictionary of lists (if it is one) or handle single list
+                    flat_outcomes = []
+                    if isinstance(command_results, dict):
+                        for stage_list in command_results.values():
+                            if isinstance(stage_list, list):
+                                flat_outcomes.extend(stage_list)
+                    elif isinstance(command_results, list):
+                        flat_outcomes = command_results
+
+                    for outcome in flat_outcomes:
+                        if isinstance(outcome, dict) and outcome.get("stdout"):
+                            log_metrics = self._extract_metrics_from_text(outcome["stdout"])
+                            if log_metrics:
+                                self._log(f"📊 [DEBUG] Captured metrics from LOGS: {log_metrics}")
+                                captured_metrics.update(log_metrics)
+                
                 if not captured_metrics:
-                     self._log(f"⚠️ [DEBUG] No metrics found (Sandbox or Host).")
-                     pass
+                     self._log(f"⚠️ [DEBUG] No metrics found (Sandbox, Host, or Logs).")
+
                          
                 # ------------------------------------
 
@@ -722,16 +740,43 @@ class WorkerService:
 
                     abs_path = path if os.path.isabs(path) else os.path.join(root, path)
                     
-                    if not os.path.exists(abs_path):
+                    content = None
+                    exists = False
+                    mtime = 0.0
+
+                    # 1. Try Sandbox first if available and relevant
+                    if self.sandbox and self.sandbox.available and target_scope != "original":
+                         # Construct sandbox path (assuming /app/workdir mount)
+                         sandbox_path = path if path.startswith("/") else f"/app/workdir/{path}"
+                         if target_scope == "artifact":
+                             sandbox_path = f"/app/workdir/artifacts/{path}"
+                         
+                         res = self.sandbox.exec_run(["cat", sandbox_path])
+                         if res.get("exit_code") == 0:
+                             content = res["stdout"]
+                             if max_chars: content = content[:max_chars]
+                             exists = True
+                             # Get mtime via stat
+                             stat_res = self.sandbox.exec_run(["stat", "-c", "%Y", sandbox_path])
+                             if stat_res.get("exit_code") == 0:
+                                 try: mtime = float(stat_res["stdout"].strip())
+                                 except: pass
+
+                    # 2. Host Fallback
+                    if not exists:
+                        if os.path.exists(abs_path):
+                            exists = True
+                            with open(abs_path, 'r', encoding='utf-8') as f:
+                                content = f.read(max_chars) if max_chars else f.read()
+                            mtime = os.path.getmtime(abs_path)
+                    
+                    if not exists:
                         return ExecutionResult(success=True, data={"exists": False})
-                    
-                    with open(abs_path, 'r', encoding='utf-8') as f:
-                        content = f.read(max_chars) if max_chars else f.read()
-                    
+
                     return ExecutionResult(success=True, data={
                         "content": content, 
                         "exists": True,
-                        "mtime": os.path.getmtime(abs_path)
+                        "mtime": mtime
                     })
                 except Exception as e:
                     return ExecutionResult(success=False, error=str(e))
@@ -789,12 +834,8 @@ class WorkerService:
                          if res.get("exit_code") == 0:
                              try:
                                  loaded = json.loads(res["stdout"])
-                                 # Extract inner 'metrics'
-                                 if "metrics" in loaded and isinstance(loaded["metrics"], dict):
-                                     captured_metrics.update(loaded["metrics"])
-                                 else:
-                                     captured_metrics.update(loaded)
-                                 self._log(f"📊 [DEBUG] Loaded metrics via Sandbox: {path}")
+                                 captured_metrics.update(self._robust_extract_metrics(loaded))
+                                 self._log(f"📊 [DEBUG] Loaded metrics via Sandbox (Incremental): {path}")
                              except: pass
 
                      read_sandbox_json("/app/workdir/artifacts/metrics.json")
@@ -819,12 +860,8 @@ class WorkerService:
                              try:
                                  with open(mpath, 'r') as f:
                                      loaded = json.load(f)
-                                     if "metrics" in loaded and isinstance(loaded["metrics"], dict):
-                                         captured_metrics.update(loaded["metrics"])
-                                     else:
-                                         captured_metrics.update(loaded)
+                                     captured_metrics.update(self._robust_extract_metrics(loaded))
                                      self._log(f"📊 [DEBUG] Loaded metrics from Host {mpath}: {captured_metrics}")
-                                     pass
                                      break
                              except Exception as e:
                                  self._log(f"⚠️ [DEBUG] Failed to load from Host {mpath}: {e}")
@@ -832,7 +869,7 @@ class WorkerService:
                 
                 if not captured_metrics:
                      self._log(f"⚠️ [DEBUG] No metrics found (Sandbox or Host).")
-                     pass
+
                      
                          
                 # ------------------------------------

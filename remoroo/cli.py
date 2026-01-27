@@ -5,10 +5,48 @@ from .auth import ensure_logged_in
 from .prompts import prompt_goal, prompt_metrics, confirm_run
 from .ids import new_run_id
 from .paths import resolve_repo_path, resolve_out_dir
+import re
+import sys
+
+def robust_confirm(text: str, default: bool = True) -> bool:
+    """A more resilient confirmation prompt that filters out ANSI escape noise."""
+    prompt = f"🚀 {text} [{'Y/n' if default else 'y/N'}]: "
+    while True:
+        try:
+            # Clear input buffer if possible to remove stale noise
+            try:
+                import termios
+                if sys.stdin.isatty():
+                    termios.tcflush(sys.stdin, termios.TCIFLUSH)
+            except Exception:
+                pass
+
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            
+            line = sys.stdin.readline()
+            if not line:
+                return default
+            
+            # Filter out ANSI escape sequences (like DSR responses ^[[25;1R)
+            # and other control characters
+            clean_line = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', line).strip().lower()
+            
+            if not clean_line:
+                return default
+            if clean_line in ('y', 'yes'):
+                return True
+            if clean_line in ('n', 'no'):
+                return False
+            
+            sys.stdout.write(f"Error: invalid input\n")
+        except EOFError:
+            return default
+        except Exception:
+            return default
 
 
 from .run_local import run_local_worker
-
 from .worker_cmd import worker
 app = typer.Typer(no_args_is_help=True)
 app.command(name="worker")(worker)
@@ -241,9 +279,9 @@ def run(
         # Apply Patch Prompt
         if result.success and patch_path.exists():
             console.print("")
-            should_apply = False
+            should_apply = yes
             if not yes:
-                should_apply = typer.confirm("🚀 Do you want to apply the final patch to your repository now?", default=True)
+                should_apply = robust_confirm("Do you want to apply the final patch to your repository now?", default=True)
             
             if should_apply:
                 try:
@@ -258,6 +296,7 @@ def run(
                     console.print("[bold green]✅ Patch applied successfully![/bold green]")
                 except Exception as e:
                     console.print(f"[bold red]❌ Failed to apply patch:[/bold red] {e}")
+
 
         # Exit Codes
         if result.success:

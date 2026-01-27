@@ -136,6 +136,9 @@ def generate_diff(original_repo: str, working_repo: str, files: Optional[list[st
                                 clean_lines.append(f"+++ b/{rel_path}")
                         elif line.startswith("diff --git"):
                             clean_lines.append(f"diff --git a/{rel_path} b/{rel_path}")
+                        elif line.startswith("+"):
+                            # Strip trailing whitespace from added lines to avoid git apply warnings
+                            clean_lines.append(line.rstrip())
                         else:
                             clean_lines.append(line)
                     diff_outputs.append("\n".join(clean_lines))
@@ -153,7 +156,10 @@ def generate_diff(original_repo: str, working_repo: str, files: Optional[list[st
             cwd=str(original_path.parent)
         )
         if result.returncode == 0 or result.returncode == 1:  # 1 means differences found
-            return result.stdout
+            # Post-process to strip trailing whitespace from added lines
+            lines = result.stdout.splitlines()
+            clean_lines = [line.rstrip() if line.startswith("+") else line for line in lines]
+            return "\n".join(clean_lines) + "\n" if clean_lines else ""
     except (FileNotFoundError, subprocess.SubprocessError):
         pass
     
@@ -167,7 +173,10 @@ def generate_diff(original_repo: str, working_repo: str, files: Optional[list[st
         if result.returncode == 0:
             return ""  # No differences
         elif result.returncode == 1:
-            return result.stdout  # Differences found
+            # Post-process to strip trailing whitespace from added lines
+            lines = result.stdout.splitlines()
+            clean_lines = [line.rstrip() if line.startswith("+") else line for line in lines]
+            return "\n".join(clean_lines) + "\n" if clean_lines else ""
         else:
             return f"Error generating diff: {result.stderr}"
     except (FileNotFoundError, subprocess.SubprocessError) as e:
