@@ -72,7 +72,7 @@ def worker(
                     }, timeout=5)
                 except Exception:
                     pass
-            time.sleep(20)
+            time.sleep(5)
 
     hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     hb_thread.start()

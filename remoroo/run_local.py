@@ -179,7 +179,7 @@ def run_local_worker(
                 )
             except Exception:
                 pass # Silent fail
-            time.sleep(10)
+            time.sleep(5)
             
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat_thread.start()
