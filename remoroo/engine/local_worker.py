@@ -229,7 +229,13 @@ class WorkerService:
         env["REMOROO_ARTIFACTS_DIR"] = os.path.join(self.repo_root, "artifacts")
         env["PYTHONUNBUFFERED"] = "1"
         
-        # 3. Apply extra env from request
+        # 3. Headless Operation (Phase 1 Resilience)
+        # Prevent GUI apps (like Pygame or Qt) from hanging or crashing in cloud workers
+        env["SDL_VIDEODRIVER"] = "dummy"
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["DISPLAY"] = ":99" # Virtual display placeholder
+        
+        # 4. Apply extra env from request
         if extra_env:
             for k, v in extra_env.items():
                 if k:

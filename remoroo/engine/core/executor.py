@@ -97,7 +97,8 @@ def run_command_with_timeout(
                 text=True,
                 bufsize=1,  # Line buffered
                 universal_newlines=True,
-                env=proc_env
+                env=proc_env,
+                preexec_fn=os.setsid if sys.platform != 'win32' else None
             )
         
         def read_stdout():
@@ -161,10 +162,25 @@ def run_command_with_timeout(
                                     convergence_info = decision
                                     should_stop.set()
                                     stopped_early_container["value"] = True
-                                    p.terminate()
+                                    
+                                    # Terminate process group
+                                    if sys.platform != 'win32':
+                                        try:
+                                            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                                        except:
+                                            p.terminate()
+                                    else:
+                                        p.terminate()
+                                        
                                     time.sleep(1)
                                     if p.poll() is None:
-                                        p.kill()
+                                        if sys.platform != 'win32':
+                                            try:
+                                                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                                            except:
+                                                p.kill()
+                                        else:
+                                            p.kill()
                                     break
                         except Exception as e:
                             if show_progress:
@@ -201,7 +217,14 @@ def run_command_with_timeout(
                     break
                 
                 if timeout_container["value"] and (time.time() - start_time) > timeout_container["value"]:
-                    p.kill()
+                    if sys.platform != 'win32':
+                        try:
+                            # Kill process group
+                            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                        except:
+                            p.kill()
+                    else:
+                        p.kill()
                     timed_out = True
                     break
                 
@@ -230,10 +253,24 @@ def run_command_with_timeout(
                                 judge_info = judge_decision
                                 should_stop.set()
                                 stopped_early_container["value"] = True
-                                p.terminate()
+                                
+                                if sys.platform != 'win32':
+                                    try:
+                                        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                                    except:
+                                        p.terminate()
+                                else:
+                                    p.terminate()
+                                    
                                 time.sleep(1)
                                 if p.poll() is None:
-                                    p.kill()
+                                    if sys.platform != 'win32':
+                                        try:
+                                            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                                        except:
+                                            p.kill()
+                                    else:
+                                        p.kill()
                                 break
                     except Exception as e:
                         if show_progress:
@@ -250,10 +287,22 @@ def run_command_with_timeout(
                 _print(f"  ⚠️  Error waiting for process: {e}", show_progress, output_callback)
         finally:
             if p.poll() is None:
-                p.terminate()
-                time.sleep(0.5)
-                if p.poll() is None:
-                    p.kill()
+                if sys.platform != 'win32':
+                    try:
+                        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                        time.sleep(0.5)
+                        if p.poll() is None:
+                            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    except:
+                        p.terminate()
+                        time.sleep(0.5)
+                        if p.poll() is None:
+                            p.kill()
+                else:
+                    p.terminate()
+                    time.sleep(0.5)
+                    if p.poll() is None:
+                        p.kill()
         
         stopped_early = stopped_early_container["value"]
         if stopped_early:
