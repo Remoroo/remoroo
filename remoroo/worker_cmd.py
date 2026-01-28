@@ -56,6 +56,26 @@ def worker(
     
     # Session for keep-alive
     session = requests.Session()
+    
+    # --- Background Heartbeat Thread ---
+    active_run_id = None
+    heartbeat_stop_event = threading.Event()
+
+    def heartbeat_loop():
+        while not heartbeat_stop_event.is_set():
+            if active_run_id:
+                try:
+                    session.post(f"{server_url}/workers/heartbeat", json={
+                        "run_id": active_run_id,
+                        "client_id": client_id,
+                        "timestamp": time.time()
+                    }, timeout=5)
+                except Exception:
+                    pass
+            time.sleep(20)
+
+    hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    hb_thread.start()
 
     try:
         while True:
@@ -63,34 +83,29 @@ def worker(
                 # 1. Poll for work
                 resp = session.post(f"{server_url}/workers/poll", json={
                     "capabilities": {"python": True, "bash": True},
-                    "client_id": client_id
+                    "client_id": client_id,
+                    "run_id": active_run_id
                 }, timeout=5)
                 
                 if resp.status_code != 200:
-                    # connection error or server down
-                    pass 
+                    time.sleep(poll_interval)
+                    continue 
                 
                 data = resp.json()
-                
-                # Check if we got a job? 
-                # The current BrainServer implementation of /workers/poll:
-                # It returns the NEXT request from the orchestrator queue.
-                # If null/empty, it means no work.
-                
-                # Server returns {"step": {...} or None}
                 step_data = data.get("step")
                 
                 if not step_data:
+                    # If server says finished, clear active run
+                    if data.get("status") == "finished":
+                        active_run_id = None
                     time.sleep(poll_interval)
                     continue
                 
                 # We got a request!
                 request = ExecutionRequest(**step_data)
                 
-                # Special Case: workflow_complete / workflow_error handling?
-                # The BrainServer puts these on the queue too?
-                # Actually, BrainServer.get_next_step calls transport.get_next_request.
-                # If it returns None, /workers/poll returns None.
+                # Update background heartbeat target
+                active_run_id = request.run_id
                 
                 # 2. Execute Request
                 typer.secho(f"\n📨 Received Job: {request.type}", fg=typer.colors.GREEN)
@@ -99,34 +114,23 @@ def worker(
                 result = worker_service.handle_request(request)
                 
                 # 3. Submit Result
-                # We need to submit back to /jobs/result?
-                # Wait, strictly speaking, /workers/poll usually just GETs.
-                # But here we are using HTTP Transport concepts.
-                
-                # We can't use HttpTransport here because HttpTransport acts as a CLIENT to the Brain.
-                # The Worker IS the client here too.
-                # We need to POST the result back.
-                
-                # BrainServer expects result submission via... wait.
-                # BrainServer wraps QueueTransport.
-                # The /workers/poll endpoint pops from `transport.outbox`.
-                # The /jobs/result endpoint puts into `transport.inbox`.
-                
-                # So we verify /jobs/result endpoint exists? 
-                # Yes, in remoroo_offline/server.py.
-                
                 submit_resp = session.post(f"{server_url}/jobs/result", json={
                     "client_id": client_id,
                     "result": {
                         "request_id": request.request_id,
                         "success": result.success,
                         "data": result.data,
-                        "error": result.error
+                        "error": result.error,
+                        "metrics": result.metrics
                     }
                 })
                 submit_resp.raise_for_status()
                 
                 typer.echo("   ✅ Result submitted.")
+                
+                # Check if this was a terminal step
+                if request.type in ["workflow_complete", "workflow_error", "run_complete"]:
+                    active_run_id = None
                 
             except requests.exceptions.ConnectionError:
                 typer.secho("⚠️  Connection failed. Retrying...", fg=typer.colors.YELLOW)
@@ -136,5 +140,6 @@ def worker(
                 time.sleep(poll_interval)
                 
     except KeyboardInterrupt:
+        heartbeat_stop_event.set()
         typer.secho("\n🛑 Worker stopped.", fg=typer.colors.YELLOW)
 
