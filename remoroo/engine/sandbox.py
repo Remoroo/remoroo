@@ -5,6 +5,7 @@ import time
 import uuid
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
+from .utils import configs
 
 class DockerSandbox:
     def __init__(self, repo_path: str, artifact_dir: str, image_name: str = "remoroo-worker"):
@@ -76,17 +77,18 @@ class DockerSandbox:
 
         print(f"📦 Starting sandbox container '{self.container_name}'...")
         
-        # We mount the repo to /app/repo so we don't overwrite the /app code in the image
-        # But wait, the image has 'COPY . .' to /app. 
-        # Ideally we want to run against the USER's repo.
-        # Let's mount repo to /app/workdir and set WORKDIR there.
+        # v13: Mirrored Mount (Zero-Mapping).
+        # We mount the host repo_path to the exact same path inside the container.
+        # This makes the filesystem layout identical between host and container.
         
         cmd = [
             "docker", "run", "-d", "--rm",
             "--name", self.container_name,
-            "-v", f"{self.repo_path}:/app/workdir",
-            "-v", f"{self.artifact_dir}:/app/workdir/artifacts",
-            # We also might need credentials if pulling deps, but let's skip for now
+            "-v", f"{self.repo_path}:{self.repo_path}",
+            "-v", f"{self.artifact_dir}:{self.artifact_dir}",
+            # v14.1: Mirrored Mounts (Universal Path Unification).
+            # We mirror both the repo and the artifact cache to their exact host paths.
+            "--workdir", self.repo_path, 
             "--entrypoint", "sleep",
             self.image_name, 
             "infinity"
@@ -141,7 +143,7 @@ class DockerSandbox:
             print(f"⚠️  Unexpected error during Docker commit: {e}")
 
 
-    def exec_popen(self, cmd: List[str], env: Dict[str, str] = {}, workdir: str = "/app/workdir") -> subprocess.Popen:
+    def exec_popen(self, cmd: List[str], env: Dict[str, str] = {}, workdir: Optional[str] = None) -> subprocess.Popen:
         """
         Run a command via docker exec, returning a Popen object for streaming.
         """
@@ -152,20 +154,21 @@ class DockerSandbox:
         exec_cmd = ["docker", "exec", "-i"]
         
         # Workdir
-        exec_cmd.extend(["-w", workdir])
+        if workdir:
+            exec_cmd.extend(["-w", workdir])
         
         # Env
         for k, v in env.items():
             exec_cmd.extend(["-e", f"{k}={v}"])
             
         exec_cmd.append(self.container_name)
-        # Check if cmd is string or list
         if isinstance(cmd, str):
             # If shell=True behavior is needed, we should wrap in sh -c
             exec_cmd.extend(["/bin/sh", "-c", cmd])
         else:
             exec_cmd.extend(cmd)
 
+        # print(f"🐳 [DockerSandbox] Executing: {' '.join(exec_cmd)}")
         return subprocess.Popen(
             exec_cmd,
             stdout=subprocess.PIPE,
@@ -175,7 +178,7 @@ class DockerSandbox:
             universal_newlines=True
         )
 
-    def exec_run(self, cmd: List[str], env: Dict[str, str] = {}, workdir: str = "/app/workdir", timeout: Optional[float] = None) -> Dict[str, Any]:
+    def exec_run(self, cmd: List[str], env: Dict[str, str] = {}, workdir: Optional[str] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
         """
         Run a command via docker exec.
         Matches the return signature of executor.run_command_with_timeout mostly.
@@ -187,7 +190,8 @@ class DockerSandbox:
         exec_cmd = ["docker", "exec", "-i"]
         
         # Workdir
-        exec_cmd.extend(["-w", workdir])
+        if workdir:
+            exec_cmd.extend(["-w", workdir])
         
         # Env
         for k, v in env.items():

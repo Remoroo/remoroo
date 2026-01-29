@@ -192,7 +192,14 @@ def discover_command_plan(
         stderr = str(oc0.get("stderr") or "")
 
         # If the base command runs, accept it as a single-stage plan.
-        if exit_code == 0:
+        # Treat timeout as success for long-running/interactive apps (like Pygame)
+        # provided they didn't crash immediately (duration check implied by timeout)
+        is_success = exit_code == 0
+        if not is_success and oc0.get("timed_out"):
+            is_success = True
+            # Optional: Add a note or handle differently if needed
+        
+        if is_success:
             cmd = _maybe_add_common_args(base, help_text=help_text)
             plan = {"Stage_1": [cmd]}
             return CommandDiscoveryResult(
@@ -200,7 +207,7 @@ def discover_command_plan(
                 command_plan=plan,
                 candidates=candidates,
                 chosen_entry_cmd=base,
-                reason="Base entry command succeeded without required flags.",
+                reason="Base entry command succeeded (or timed out safely).",
             )
 
         # If it looks like a usage error, try to infer required mode flags and expand.

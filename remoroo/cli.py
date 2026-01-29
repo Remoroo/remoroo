@@ -181,11 +181,16 @@ def run(
         from rich.style import Style
         console = Console()
 
-        outcome_color = "green" if result.success else "yellow"
-        if result.outcome == "INTERRUPTED":
+        if result.success:
+            outcome_color = "green"
+        elif getattr(result, 'partial_success', False):
+            outcome_color = "yellow"
+        elif result.outcome == "INTERRUPTED":
             outcome_color = "bright_black"
-        elif "ERROR" in result.outcome or "CRASH" in result.outcome:
+        elif "ERROR" in result.outcome or "CRASH" in result.outcome or result.outcome == "FAIL" or result.outcome == "FAILED":
             outcome_color = "red"
+        else:
+            outcome_color = "yellow"
 
         console.print("")
         console.print(Panel(
@@ -277,11 +282,13 @@ def run(
             console.print(f"🩹 [bold]Clean Patch:[/bold] [link=file://{patch_path.absolute()}]{patch_path.name}[/link]")
         
         # Apply Patch Prompt
-        if result.success and patch_path.exists():
+        # v18: Show prompt for SUCCESS or PARTIAL_SUCCESS (anything with a patch)
+        if (result.success or getattr(result, 'partial_success', False) or result.outcome == "COMPLETED") and patch_path.exists():
             console.print("")
-            should_apply = yes
+            should_apply = yes # Initialize should_apply based on --yes flag
             if not yes:
-                should_apply = robust_confirm("Do you want to apply the final patch to your repository now?", default=True)
+                # Only ask for confirmation if --yes was not provided
+                should_apply = typer.confirm("Would you like to apply the generated patch to your local repository?", default=True)
             
             if should_apply:
                 try:

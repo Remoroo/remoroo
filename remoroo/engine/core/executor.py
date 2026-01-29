@@ -42,6 +42,7 @@ def run_command_with_timeout(
     min_runtime_s: float = 30.0,
     env: Optional[Dict[str, str]] = None,
     runner_factory: Optional[Callable[..., subprocess.Popen]] = None
+
 ) -> Dict[str, Any]:
     """
     Run a single command with optional timeout, streaming output in real-time.
@@ -79,12 +80,16 @@ def run_command_with_timeout(
         # Set PYTHONUNBUFFERED=1 to disable Python's output buffering for real-time output
         proc_env = os.environ.copy()
         proc_env['PYTHONUNBUFFERED'] = '1'
+        proc_env['REMOROO_START_TIME'] = str(start_time)
+        if timeout_s:
+            proc_env['REMOROO_TIMEOUT_LIMIT'] = str(timeout_s)
         if env:
             # Per-command env overlay (values must be strings for subprocess)
             for k, v in env.items():
                 if k:
                     proc_env[str(k)] = str(v)
-        
+
+
         if runner_factory:
             p = runner_factory(cmd, env=proc_env)
         else:
@@ -104,35 +109,31 @@ def run_command_with_timeout(
         def read_stdout():
             nonlocal last_check_time, current_min_runtime, current_check_interval, current_confidence_threshold, pattern_keywords, convergence_info
             for line in iter(p.stdout.readline, ''):
-                if not line or should_stop.is_set():
+                if not line:
                     break
+                
                 line = line.rstrip()
                 stdout_lines.append(line)
                 output_buffer.append(("stdout", line))
                 
                 if show_progress:
-                    # _print handles the callback if present, so we don't need to call it manually above
-                    # unless show_progress is False, but here we are inside if show_progress.
-                    # Wait, if show_progress is False but we have a callback, we WANT to print.
-                    # So we should use _print exclusively.
                     _print(f"  {line}", show_progress, output_callback)
                 elif output_callback:
-                    # If progress hidden but callback exists (e.g. streaming to file or dashboard)
                     _print(line, False, output_callback)
                 
-                # Convergence check logic here (simplified for CLI engine port - full logic preserved)
+                # Convergence check logic here
                 current_time = time.time()
                 elapsed = current_time - start_time
                 
                 should_check = False
                 if convergence_checker:
                     time_since_last_check = current_time - last_check_time
-                    pattern_triggered = any(keyword in line.lower() for keyword in pattern_keywords)
+                    # pattern_triggered = any(keyword in line.lower() for keyword in pattern_keywords)
                     interval_triggered = time_since_last_check >= current_check_interval
                     
                     min_throttle_seconds = 10.0
                     if elapsed >= current_min_runtime and time_since_last_check >= min_throttle_seconds:
-                        if pattern_triggered or interval_triggered:
+                        if interval_triggered:
                             should_check = True
                     
                     if should_check:
@@ -174,7 +175,7 @@ def run_command_with_timeout(
                                         
                                     time.sleep(1)
                                     if p.poll() is None:
-                                        if sys.platform != 'win32':
+                                        if sys.platform != 'win32' and is_safe_to_killpg:
                                             try:
                                                 os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                                             except:
@@ -191,8 +192,9 @@ def run_command_with_timeout(
         
         def read_stderr():
             for line in iter(p.stderr.readline, ''):
-                if not line or should_stop.is_set():
+                if not line:
                     break
+                
                 line = line.rstrip()
                 stderr_lines.append(line)
                 output_buffer.append(("stderr", line))
@@ -217,14 +219,39 @@ def run_command_with_timeout(
                     break
                 
                 if timeout_container["value"] and (time.time() - start_time) > timeout_container["value"]:
+                    # Suicide Prevention: Don't killpg if it's our own group
+                    is_safe_to_killpg = False
                     if sys.platform != 'win32':
                         try:
-                            # Kill process group
-                            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                            # Verify we are not killing ourselves
+                            proc_pg = os.getpgid(p.pid)
+                            my_pg = os.getpgrp()
+                            is_safe_to_killpg = (proc_pg != my_pg)
+                        except Exception:
+                            # If we can't determine PGID, assume unsafe
+                            is_safe_to_killpg = False
+
+                    if sys.platform != 'win32' and is_safe_to_killpg:
+                        try:
+                            # Try graceful termination first
+                            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                            # Give it a moment to exit
+                            wait_start = time.time()
+                            while time.time() - wait_start < 1.0:
+                                if p.poll() is not None:
+                                    break
+                                time.sleep(0.1)
+                            
+                            # Force kill if still running
+                            if p.poll() is None:
+                                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                         except:
                             p.kill()
                     else:
-                        p.kill()
+                        p.terminate()
+                        time.sleep(1)
+                        if p.poll() is None:
+                            p.kill()
                     timed_out = True
                     break
                 
@@ -254,7 +281,17 @@ def run_command_with_timeout(
                                 should_stop.set()
                                 stopped_early_container["value"] = True
                                 
+                                # Terminate safely
+                                is_safe_to_killpg = False
                                 if sys.platform != 'win32':
+                                    try:
+                                        proc_pg = os.getpgid(p.pid)
+                                        my_pg = os.getpgrp()
+                                        is_safe_to_killpg = (proc_pg != my_pg)
+                                    except:
+                                        is_safe_to_killpg = False
+
+                                if sys.platform != 'win32' and is_safe_to_killpg:
                                     try:
                                         os.killpg(os.getpgid(p.pid), signal.SIGTERM)
                                     except:
@@ -264,7 +301,7 @@ def run_command_with_timeout(
                                     
                                 time.sleep(1)
                                 if p.poll() is None:
-                                    if sys.platform != 'win32':
+                                    if sys.platform != 'win32' and is_safe_to_killpg:
                                         try:
                                             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                                         except:
@@ -278,7 +315,9 @@ def run_command_with_timeout(
                             if "json" not in error_str and "parse" not in error_str:
                                 _print(f"  ⚠️  Judge check error: {str(e)}", show_progress, output_callback, file=sys.stderr)
                 
-                time.sleep(0.5)
+                # Fast polling (20Hz) provides "instant" detection without the performance hit
+                # of checking disk for every single line of stdout.
+                time.sleep(0.05)
             
             t1.join(timeout=2)
             t2.join(timeout=2)
@@ -287,7 +326,17 @@ def run_command_with_timeout(
                 _print(f"  ⚠️  Error waiting for process: {e}", show_progress, output_callback)
         finally:
             if p.poll() is None:
+                # Cleanup safely
+                is_safe_to_killpg = False
                 if sys.platform != 'win32':
+                    try:
+                        proc_pg = os.getpgid(p.pid)
+                        my_pg = os.getpgrp()
+                        is_safe_to_killpg = (proc_pg != my_pg)
+                    except:
+                        is_safe_to_killpg = False
+
+                if sys.platform != 'win32' and is_safe_to_killpg:
                     try:
                         os.killpg(os.getpgid(p.pid), signal.SIGTERM)
                         time.sleep(0.5)
@@ -305,10 +354,12 @@ def run_command_with_timeout(
                         p.kill()
         
         stopped_early = stopped_early_container["value"]
+        
         if stopped_early:
             returncode = 0
         else:
             returncode = p.returncode if p.returncode is not None else -1
+            
         duration_s = round(time.time() - start_time, 3)
         
         if show_progress:
@@ -316,8 +367,10 @@ def run_command_with_timeout(
             if stopped_early:
                 status = "🎯"
                 decision_info = judge_info if judge_info else convergence_info
-                decision_type = "Judge decision" if judge_info else "convergence detected"
-                _print(f"  {status} Stopped early in {duration_s:.1f}s ({decision_type} - SUCCESS)", show_progress, output_callback)
+                
+                if decision_info:
+                    decision_type = "Judge decision" if judge_info else "convergence detected"
+                    _print(f"  {status} Stopped early in {duration_s:.1f}s ({decision_type} - SUCCESS)", show_progress, output_callback)
                 if decision_info:
                     decision = decision_info.get("decision")
                     if decision:
@@ -326,12 +379,14 @@ def run_command_with_timeout(
                 status = "✅" if returncode == 0 and not timed_out else "❌"
                 _print(f"  {status} Completed in {duration_s:.1f}s (exit code: {returncode})", show_progress, output_callback)
         
+        stderr_final = "\n".join(stderr_lines)
+        
         result = {
             "cmd": cmd,
             "exit_code": int(returncode),
             "duration_s": duration_s,
             "stdout": "\n".join(stdout_lines),
-            "stderr": "\n".join(stderr_lines),
+            "stderr": stderr_final,
             "timed_out": timed_out,
             "stopped_early": stopped_early
         }
@@ -483,6 +538,10 @@ def run_command_plan(
         if stage_name in command_plan and command_plan[stage_name]:
             commands = command_plan[stage_name]
             stage_timeout = suggested_timeouts.get(stage_name, None) if suggested_timeouts else None
+            
+            # Fallback to max_command_time_s if no specific timeout suggested
+            if stage_timeout is None and max_command_time_s:
+                stage_timeout = max_command_time_s
             
             use_convergence = convergence_checker is not None
             if use_convergence:

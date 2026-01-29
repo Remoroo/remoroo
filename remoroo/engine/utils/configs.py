@@ -13,6 +13,13 @@ from typing import Dict, Any
 DEFAULT_ALWAYS_CREATE_VENV: bool = True
 
 # ============================================================================
+# ARTIFACT & PATH CONFIGURATION (v9 Universal)
+# ============================================================================
+
+ARTIFACTS_DIR_NAME: str = "artifacts"
+METRICS_FILENAME: str = "metrics.json"
+
+# ============================================================================
 # REPOSITORY EXCLUSIONS CONFIGURATION
 # ============================================================================
 
@@ -69,7 +76,7 @@ DEFAULT_EXCLUDED_DIRS: set = {
     ".temp",
     # Remoroo System
     "runs",
-    "artifacts",
+    ARTIFACTS_DIR_NAME, # Use constant
     "logs",
     ".remoroo"
 }
@@ -80,5 +87,5 @@ DEFAULT_EXCLUDED_FILES: set = {
     "remoroo_metrics.json",
     "baseline_metrics.json",
     "current_metrics.json",
-    "metrics.json",
+    METRICS_FILENAME, # Use constant
 }

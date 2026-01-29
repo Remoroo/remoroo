@@ -10,6 +10,7 @@ class LocalRunResult:
     run_id: str
     success: bool
     outcome: str
+    partial_success: bool = False
 
 def run_local_worker(
     run_id: str,
@@ -223,6 +224,8 @@ def run_local_worker(
         original_repo_root=original_repo_path, 
         run_id=remote_run_id,
         engine=engine,
+        # v16: Persistence Dir (CLI Cache) for real-time mirroring
+        persistence_dir=str(artifact_dir),
         # Early instance might not have Live console yet, but we'll set it in the loop
         output_callback=console.print 
     )
@@ -361,9 +364,12 @@ def run_local_worker(
                     
                 # 3. Handle Special Control Steps
                 if step.type == "workflow_complete":
-                    final_result = step.payload
-                    success = final_result.get("success", False) if final_result else True
-                    outcome = final_result.get("decision", "COMPLETED") if final_result else "COMPLETED"
+                    final_result = step.payload or {}
+                    # v18: Prioritize explicit outcome and success from Brain
+                    outcome = final_result.get("outcome") or final_result.get("decision", "SUCCESS")
+                    success = final_result.get("success", False)
+                    partial_success = final_result.get("partial_success", False)
+                    
                     scoreboard_data["status"] = "✅ Workflow Complete!"
                     update_dashboard(dashboard_layout, scoreboard_data)
                     break
@@ -455,10 +461,12 @@ def run_local_worker(
 
                          worker_service = WorkerService(
                              repo_root=new_root, 
-                             artifact_dir=str(artifact_dir), 
+                             artifact_dir=None, # v12: Use Ephemeral Artifacts (default) so 'ls' works
                              original_repo_root=original_repo_path, 
                              run_id=remote_run_id,
-                             engine=engine, output_callback=live.console.print
+                             engine=engine, output_callback=live.console.print,
+                             # v16: Persistence Dir (CLI Cache)
+                             persistence_dir=str(artifact_dir)
                          )
                          live.console.print(f"[bold yellow]🔄 Switched execution context to:[/bold yellow] [dim]{new_root}[/dim]")
 
@@ -478,6 +486,17 @@ def run_local_worker(
         typer.secho("🛑 Experiment Paused by User.", fg=typer.colors.YELLOW, bold=True)
         outcome = "INTERRUPTED"
         success = False
+        
+        # Notify Server of Abort (Infrastructure failure)
+        try:
+            requests.post(
+                f"{API_URL}/runs/{remote_run_id}/abort",
+                headers={"Authorization": f"Bearer {session_key}"},
+                timeout=2.0
+            ) 
+        except Exception:
+            pass # Best effort
+        
         # Fall through to cleanup
     except Exception as e:
         typer.secho(f"❌ Execution loop crashed: {e}", fg=typer.colors.RED)
@@ -488,17 +507,21 @@ def run_local_worker(
             traceback.print_exc()
 
     # 7. Finalize Artifacts (Worker generates local diff and delivers it)
-    console.print("\n[bold blue]📦 Finalizing artifacts...[/bold blue]")
-    try:
-        from .engine.protocol import ExecutionRequest
-        finalize_request = ExecutionRequest(
-            type="finalize_artifacts",
-            payload={},
-            request_id=f"finalize-{remote_run_id}"
-        )
-        worker_service.handle_request(finalize_request)
-    except Exception as e:
-        console.print(f"   [yellow]⚠️  Could not finalize artifacts: {e}[/yellow]")
+    # v15: Only call manually if the Brain hasn't already triggered a cleanup
+    if worker_service.is_ephemeral:
+        console.print("\n[bold blue]📦 Finalizing artifacts...[/bold blue]")
+        try:
+            from .engine.protocol import ExecutionRequest
+            finalize_request = ExecutionRequest(
+                type="finalize_artifacts",
+                payload={},
+                request_id=f"finalize-{remote_run_id}"
+            )
+            worker_service.handle_request(finalize_request)
+        except Exception as e:
+            console.print(f"   [yellow]⚠️  Could not finalize artifacts: {e}[/yellow]")
+    else:
+        console.print("\n[dim]ℹ️  Artifacts already finalized by Brain.[/dim]")
     
     # Cleanup Phase: Ensure temporary resources are cleaned up
     console.print("[bold blue]🧹 Cleaning up temporary resources...[/bold blue]")
@@ -513,7 +536,37 @@ def run_local_worker(
             except Exception as e:
                 console.print(f"   [yellow]⚠️  Docker commit failed: {e}[/yellow]")
         
-        # 3. Request cleanup of working copy via RPC (Handles both Mac and Linux)
+        # 3. v14.1: HARDENED ARTIFACT SYNCHRONIZATION
+        # Ensure we sync artifacts from the worker's active directory to the permanent CLI cache.
+        if worker_service.artifact_dir:
+             src_artifacts = Path(worker_service.artifact_dir)
+             dst_artifacts = artifact_dir # This is the permanent path from line 36
+             
+             if src_artifacts.exists() and src_artifacts.resolve() != dst_artifacts.resolve():
+                 console.print(f"   [green]💾 Synchronizing artifacts...[/green]")
+                 try:
+                     # Reclaim ownership first (important for Docker)
+                     if hasattr(worker_service, '_reclaim_ownership'):
+                         worker_service._reclaim_ownership(str(src_artifacts))
+                     
+                     # Sync files
+                     import shutil
+                     count = 0
+                     for item in src_artifacts.iterdir():
+                         s = item
+                         d = dst_artifacts / item.name
+                         if s.is_dir():
+                             if d.exists(): shutil.rmtree(d)
+                             shutil.copytree(s, d)
+                         else:
+                             shutil.copy2(s, d)
+                         count += 1
+                     if count > 0:
+                         console.print(f"   [green]✅ Synchronized {count} artifacts to {dst_artifacts}[/green]")
+                 except Exception as e:
+                      console.print(f"   [red]❌ Failed to synchronize artifacts: {e}[/red]")
+        
+        # 4. Request cleanup of working copy via RPC (Handles both Mac and Linux)
         from .engine.protocol import ExecutionRequest
         cleanup_request = ExecutionRequest(
             type="cleanup_working_copy",
@@ -521,8 +574,10 @@ def run_local_worker(
             request_id=f"cleanup-{remote_run_id}"
         )
         cleanup_res = worker_service.handle_request(cleanup_request)
-        if cleanup_res.success:
+        if cleanup_res.success and cleanup_res.data.get("cleaned"):
             console.print("   [green]✅ Temporary working copy cleaned up[/green]")
+        elif not cleanup_res.success:
+            console.print(f"   [yellow]⚠️ Cleanup failed: {cleanup_res.error}[/yellow]")
         
         # 4. Stop Docker sandbox (stopped by cleanup RPC above, but defensive here)
         if hasattr(worker_service, 'sandbox') and worker_service.sandbox:
@@ -549,7 +604,8 @@ def run_local_worker(
         run_root=artifact_dir,
         run_id=run_id,
         success=success,
-        outcome=outcome
+        outcome=outcome,
+        partial_success=partial_success
     )
     
 

@@ -1,28 +1,49 @@
 from typing import Dict, Any, Optional, Callable
 from .protocol import ExecutionRequest, ExecutionResult
 from .core.worker import Worker
-from .utils import fs_utils, syntax_validator
+from .utils import fs_utils, syntax_validator, configs
 from .core import context_packer, env_setup, executor, applier
 import shutil
 import uuid
 import os
 import json
+import time
+import threading
+import signal
+import subprocess
+from .venv_sandbox import VenvSandbox
+from .harness import RemorooHarness
+from .utils.system_interface import SystemInterface, RealSystem
 
-class WorkerService:
+class LocalWorker:
     """
     Service entrypoint for Validated Execution.
     Handles ExecutionRequests and returns ExecutionResults.
     """
     
-    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None):
+    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None, system: Optional[SystemInterface] = None, persistence_dir: Optional[str] = None):
+        self.system = system or RealSystem()
         self.output_callback = output_callback
-        self._log("🔧 WorkerService (Patched) Loaded")
+        self._log("🔧 LocalWorker (v4-Airtight) Loaded")
+        
         import tempfile
         self.repo_root = repo_root
         self.original_repo_root = original_repo_root or repo_root # Keep reference to original
         # Infer is_ephemeral if repo_root is different from original_repo_root
         self.is_ephemeral = (self.repo_root != self.original_repo_root) 
-        self.artifact_dir = artifact_dir
+        self.is_ephemeral = (self.repo_root != self.original_repo_root) 
+        
+        # UNIVERSAL PATH LOGIC (v9)
+        # If no artifact_dir provided, default to repo_root/artifacts
+        if not artifact_dir:
+            artifact_dir = os.path.join(repo_root, configs.ARTIFACTS_DIR_NAME)
+        
+        self.artifact_dir = os.path.abspath(artifact_dir)
+        self.persistence_dir = os.path.abspath(persistence_dir) if persistence_dir else None
+        self.system.fs.makedirs(self.artifact_dir, exist_ok=True)
+        if self.persistence_dir:
+            self.system.fs.makedirs(self.persistence_dir, exist_ok=True)
+            
         self.run_id = run_id
         self.engine = engine.lower()
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
@@ -89,6 +110,8 @@ class WorkerService:
 
     def _extract_metrics_from_text(self, text: str) -> Dict[str, Any]:
         """Simple regex fallback to capture key=value metrics from stdout/stderr."""
+        if text is None:
+            return {}
         import re
         metrics = {}
         # Pattern: key=value (where value is a number)
@@ -108,14 +131,29 @@ class WorkerService:
         return metrics
 
         
+    def _reclaim_ownership(self, path: str):
+        """Helper to reclaim host ownership of files created by Docker root."""
+        if self.engine == "docker" and self.sandbox and self.sandbox.available:
+            try:
+                uid, gid = os.getuid(), os.getgid()
+                self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", path])
+                self.sandbox.exec_run(["chmod", "-R", "777", path])
+            except: pass
+
     def _finalize_artifacts_internal(self, dest_filename: str = "final_patch.diff") -> list[str]:
         """Internal helper to generate diff and save artifacts. Returns list of finalized files."""
         try:
             from ..execution.repo_manager import generate_diff
             finalized = []
             
+            # v14: Reclaim ownership of artifact dir and repo root before diffing/copying
+            # This ensures that files created by Docker (as root) are readable by the CLI
+            self._reclaim_ownership(self.artifact_dir)
+            self._reclaim_ownership(self.repo_root)
+            
             # Use original_repo_root and current repo_root for diff
-            if self.is_ephemeral and self.repo_root != self.original_repo_root:
+            # v14.1: Be more permissive - if we have two distinct roots, we generate a patch.
+            if self.repo_root != self.original_repo_root:
                 self._log(f"💼 Finalizing Implementation Patch ({dest_filename})...")
                 self._log(f"📍 Original Repo: {self.original_repo_root}")
                 self._log(f"📍 Current Repo:  {self.repo_root}")
@@ -155,10 +193,16 @@ class WorkerService:
                             with open(dest_diff, 'w', encoding='utf-8') as f:
                                 f.write(diff_content)
                             
-                            # ALSO save to artifact_dir (for CLI transparency)
+                            # ALSO save to artifact_dir (for CLI transparency in workspace)
                             if self.artifact_dir:
                                 cache_diff = os.path.join(self.artifact_dir, dest_filename)
                                 with open(cache_diff, 'w', encoding='utf-8') as f:
+                                    f.write(diff_content)
+                            
+                            # v16: ALSO save to persistence_dir (for CLI transparency in summary/prompt)
+                            if self.persistence_dir:
+                                persist_diff = os.path.join(self.persistence_dir, dest_filename)
+                                with open(persist_diff, 'w', encoding='utf-8') as f:
                                     f.write(diff_content)
                             
                             finalized.append(dest_filename)
@@ -168,7 +212,10 @@ class WorkerService:
                     else:
                         self._log("ℹ️  No modified code files found (skipping patch).")
                 else:
-                    self._log(f"⚠️  Cannot generate diff: source directory {self.repo_root} no longer exists")
+                    if self.repo_root == self.original_repo_root:
+                        self._log("ℹ️  Artifacts already finalized and workspace cleaned up.")
+                    else:
+                        self._log(f"⚠️  Cannot generate diff: source directory {self.repo_root} no longer exists")
                     
             return finalized
         except Exception as e:
@@ -226,7 +273,6 @@ class WorkerService:
                     break
         
         # 2. Inject Remoroo defaults
-        env["REMOROO_ARTIFACTS_DIR"] = os.path.join(self.repo_root, "artifacts")
         env["PYTHONUNBUFFERED"] = "1"
         
         # 3. Headless Operation (Phase 1 Resilience)
@@ -240,6 +286,14 @@ class WorkerService:
             for k, v in extra_env.items():
                 if k:
                     env[str(k)] = str(v)
+        
+        # 5. Final Enforced Defaults (Override requested path if it's a Docker path in a local worker)
+        # We enforce the host-path artifacts dir for the local worker.
+        # CRITICAL: Use the absolute host path here to ensure robustness even if symlinks fail.
+        if self.artifact_dir:
+            env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+        else:
+            env["REMOROO_ARTIFACTS_DIR"] = os.path.join(self.repo_root, "artifacts")
                     
         return env
 
@@ -519,33 +573,70 @@ class WorkerService:
                 timeout = p.get("timeout_s", 120)
                 env_vars = p.get("env", {}).copy()
                 
-                runner = None
-                if self.sandbox and self.sandbox.available:
-                    # Inside Docker: use container path
-                    env_vars["REMOROO_ARTIFACTS_DIR"] = "/app/workdir/artifacts"
-                    def sandbox_runner(cmd, env=None):
-                        return self.sandbox.exec_popen(cmd, env=env or {})
-                    runner = sandbox_runner
+                # Setup Sandbox/Runner
+                runner_factory = None
+                if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                    # Inside Docker: use mirrored host path (Zero-Mapping)
+                    env_vars["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                    env_vars["PYTHONUNBUFFERED"] = "1"
+                    # Add headless variables to Docker too
+                    env_vars["SDL_VIDEODRIVER"] = "dummy"
+                    env_vars["QT_QPA_PLATFORM"] = "offscreen"
+                    env_vars["DISPLAY"] = ":99"
+                    runner_factory = lambda c, env=None: self.sandbox.exec_popen(c, env=env or {}, workdir=self.repo_root)
                 else:
-                    # Local execution: use host path
-                    exec_env = self._get_worker_env(env_vars)
+                    # Local/Venv Mode
+                    env_vars = self._get_worker_env(env_vars)
+                    # UNIVERSAL ENFORCEMENT: Always overwrite REMOROO_ARTIFACTS_DIR
+                    env_vars["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                    
+                    venv_sandbox = VenvSandbox(self.repo_root, system=self.system)
+                    runner_factory = lambda c, env=None, sp=subprocess: venv_sandbox.exec_popen(
+                        c, 
+                        env=env or {}, 
+                        shell=True,
+                        stdout=sp.PIPE,
+                        stderr=sp.PIPE,
+                        text=True
+                    )
                 
+                harness = RemorooHarness(system=self.system)
                 outcomes = []
                 success = True
                 for cmd in commands:
-                    outcome = executor.run_command_with_timeout(
+                    # PROACTIVE CLEANUP (Docker Root Fix)
+                    if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                        # Use Docker (root) to remove potential root-owned artifacts from previous steps
+                        # This prevents "PermissionError" in the Harness which runs as user
+                        # UNIVERSAL PATH: Use host paths mirrored in container
+                        clean_cmd = ["/bin/sh", "-c", f"rm -f {self.artifact_dir}/*.json {self.repo_root}/{configs.METRICS_FILENAME}"]
+                        self.sandbox.exec_run(clean_cmd)
+
+                    self._log(f"  ▶️  Running: {cmd} (timeout: {timeout}s)")
+                    h_result = harness.run(
                         cmd=cmd,
-                        cwd=self.repo_root,
-                        timeout_s=timeout,
-                        show_progress=True,
-                        output_callback=self.output_callback,
+                        runner_factory=runner_factory,
+                        timeout=float(timeout),
                         env=env_vars,
-                        runner_factory=runner
+                        artifact_dir=self.artifact_dir,
+                        repo_root=self.repo_root, # Enable CWD scanning
+                        output_callback=self.output_callback
                     )
+                    
+                    # Map Harness ExecutionResult to outcome dict expected by the worker
+                    outcome = {
+                        "cmd": cmd,
+                        "exit_code": h_result.data.get("exit_code"),
+                        "duration_s": h_result.data.get("duration"),
+                        "stdout": h_result.data.get("stdout"),
+                        "stderr": h_result.data.get("stderr"),
+                        "timed_out": h_result.data.get("trigger") == "timeout",
+                        "stopped_early": h_result.data.get("trigger") == "metric_detected"
+                    }
                     outcomes.append(outcome)
-                    if outcome.get("exit_code") != 0:
-                        success = False
-                        # Don't break immediately? Baseline usually runs all.
+                    if outcome.get("exit_code") != 0 and not outcome.get("stopped_early"):
+                         success = False
+                         # Don't break immediately? Baseline usually runs all.
                 
                 # --- AUTO-CAPTURE METRICS (SANDBOX DIRECT READ) ---
                 captured_metrics = {}
@@ -564,36 +655,54 @@ class WorkerService:
                                 self._log(f"DEBUG: JSON Sandbox Error: {e}")
                                 pass
 
-                     # Check known paths
-                     read_sandbox_json("/app/workdir/artifacts/metrics.json")
-                     read_sandbox_json("/app/workdir/artifacts/baseline_metrics.json")
+                     # Check known paths (Universal - Mirrored Host Paths)
+                     read_sandbox_json(f"{self.artifact_dir}/baseline_metrics.json")
                      if not captured_metrics:
-                         read_sandbox_json("/app/workdir/metrics.json")
+                         read_sandbox_json(f"{self.artifact_dir}/{configs.METRICS_FILENAME}")
+                         if not captured_metrics:
+                             # Fallback: Check repo root
+                             read_sandbox_json(f"{self.repo_root}/{configs.METRICS_FILENAME}")
                      
                      # Fire-and-forget permission fix for cleanup (don't block capture)
                      try:
                          uid, gid = os.getuid(), os.getgid()
-                         self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", "/app/workdir/artifacts"])
-                         self.sandbox.exec_run(["chmod", "-R", "777", "/app/workdir/artifacts"])
+                         self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", self.artifact_dir])
+                         self.sandbox.exec_run(["chmod", "-R", "777", self.artifact_dir])
                      except: pass
 
                 # 2. Host Read Fallback (only if sandbox failed or empty)
+                metrics_source = "none"
                 if not captured_metrics:
-                    host_artifacts = os.path.join(self.repo_root, "artifacts", "metrics.json")
-                    host_root = os.path.join(self.repo_root, "metrics.json")
-                    host_baseline = os.path.join(self.repo_root, "artifacts", "baseline_metrics.json")
+                    # AUTHORITATIVE: Phase 1 (Baseline) only accepts baseline_metrics.json or partials
+                    search_paths = []
                     
-                    for mpath in [host_baseline, host_artifacts, host_root]:
-                        if os.path.exists(mpath):
-                              try:
-                                  with open(mpath, 'r') as f:
-                                      loaded = json.load(f)
-                                      captured_metrics.update(self._robust_extract_metrics(loaded))
-                              except: pass
+                    if self.artifact_dir:
+                         search_paths.append(os.path.join(self.artifact_dir, "baseline_metrics.json"))
+                    
+                    # 2b. Legacy Fallback (CWD)
+                    if not captured_metrics:
+                         search_paths.append(os.path.join(self.repo_root, "metrics.json"))
+                    
+                    for mpath in search_paths:
+                        if self.system.fs.exists(mpath):
+                            try:
+                                with self.system.fs.open(mpath, 'r') as f:
+                                    loaded = json.load(f)
+                                    extracted = self._robust_extract_metrics(loaded)
+                                    if extracted:
+                                        self._log(f"  ✅ [Worker] Host Read Success ({mpath}): {extracted}")
+                                        captured_metrics.update(extracted)
+                                        # Distinguish legacy vs artifact
+                                        if os.path.basename(mpath) == "metrics.json" and "artifacts" not in mpath:
+                                            metrics_source = "legacy:metrics.json"
+                                        else:
+                                            metrics_source = os.path.basename(mpath)
+                                        break
+                            except: pass # File might be locked or unreadable
                 if not captured_metrics:
                       # 3. Last Resort: Parse from LOGS (stdout)
                       for outcome in outcomes:
-                          stdout = outcome.get("stdout", "")
+                          stdout = outcome.get("stdout") or ""
                           log_metrics = self._extract_metrics_from_text(stdout)
                           if log_metrics:
                                self._log(f"📊 [DEBUG] Captured metrics from LOGS: {log_metrics}")
@@ -601,17 +710,22 @@ class WorkerService:
 
                 if captured_metrics:
                      self._log(f"📊 [DEBUG] Baseline Step Captured: {captured_metrics}")
-                     pass
                 else:
                      self._log(f"⚠️ [DEBUG] Metrics Capture Failed (Sandbox & Host). No metrics found in artifacts")
-                     pass
 
-                # Ensure we populate baseline_metrics for protocol, but ALSO metrics for Current scoreboard
-                # NOTE: baseline_metrics goes into data, metrics goes into specific field
+                # Wrap for schema consistency: { "metrics": { ... } }
+                baseline_payload = {
+                    "metrics": captured_metrics,
+                    "success": success or bool(captured_metrics), # Mark success if we got metrics!
+                    "outcomes": outcomes
+                }
+
+                # Ensure we populate baseline_metrics for protocol
                 return ExecutionResult(success=True, data={
-                    "success": success,
-                    "outcomes": outcomes,
-                    "baseline_metrics": captured_metrics
+                    "baseline_metrics": baseline_payload,
+                    "metrics": captured_metrics, # Back-compat
+                    "metrics_captured": bool(captured_metrics),
+                    "metrics_source": metrics_source
                 }, metrics=captured_metrics)
 
             elif request.type == "validate_syntax":
@@ -631,7 +745,11 @@ class WorkerService:
                 runner = None
                 if self.sandbox and self.sandbox.available:
                     # Inside Docker: use container path
-                    exec_env["REMOROO_ARTIFACTS_DIR"] = "/app/workdir/artifacts"
+                    exec_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                    # Add headless variables to Docker too
+                    exec_env["SDL_VIDEODRIVER"] = "dummy"
+                    exec_env["QT_QPA_PLATFORM"] = "offscreen"
+                    exec_env["DISPLAY"] = ":99"
                     def sandbox_runner(cmd, env=None):
                         # Convert cmd string to list if strict? exec_popen handles str
                         # env argument to exec_popen expects Dict
@@ -662,20 +780,16 @@ class WorkerService:
                 
                 # 1. Try reading via Sandbox (if active) to bypass permission issues
                 if self.sandbox and self.sandbox.available:
-                    # Try artifacts dir
-                    res = self.sandbox.exec_run(["cat", "/app/workdir/artifacts/metrics.json"])
-                    if res.get("exit_code") == 0:
-                         try:
-                             captured_metrics.update(self._robust_extract_metrics(json.loads(res["stdout"])))
-                         except: pass
-                    
-                    # Try root dir if empty
-                    if not captured_metrics:
-                        res = self.sandbox.exec_run(["cat", "/app/workdir/metrics.json"])
-                        if res.get("exit_code") == 0:
-                             try:
-                                 captured_metrics.update(self._robust_extract_metrics(json.loads(res["stdout"])))
-                             except: pass
+                   # Use mirrored host paths
+                   exec_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                   res = self.sandbox.exec_run(["cat", f"{self.artifact_dir}/metrics.json"])
+                   if res.get("exit_code") != 0:
+                       res = self.sandbox.exec_run(["cat", f"{self.repo_root}/metrics.json"])
+                   
+                   if res.get("exit_code") == 0:
+                        try:
+                            captured_metrics.update(self._robust_extract_metrics(json.loads(res["stdout"])))
+                        except: pass
 
                 # 2. Fallback to Host Read (if not found in sandbox or sandbox disabled)
                 if not captured_metrics:
@@ -752,10 +866,10 @@ class WorkerService:
 
                     # 1. Try Sandbox first if available and relevant
                     if self.sandbox and self.sandbox.available and target_scope != "original":
-                         # Construct sandbox path (assuming /app/workdir mount)
-                         sandbox_path = path if path.startswith("/") else f"/app/workdir/{path}"
-                         if target_scope == "artifact":
-                             sandbox_path = f"/app/workdir/artifacts/{path}"
+                         # Construct mirrored sandbox path
+                         sandbox_path = path if path.startswith("/") else os.path.join(self.repo_root, path)
+                         if not self.system.fs.exists(sandbox_path):
+                             sandbox_path = os.path.join(self.artifact_dir, path)
                          
                          res = self.sandbox.exec_run(["cat", sandbox_path])
                          if res.get("exit_code") == 0:
@@ -844,15 +958,14 @@ class WorkerService:
                                  self._log(f"📊 [DEBUG] Loaded metrics via Sandbox (Incremental): {path}")
                              except: pass
 
-                     read_sandbox_json("/app/workdir/artifacts/metrics.json")
+                     read_sandbox_json(f"{self.artifact_dir}/metrics.json")
                      if not captured_metrics:
-                         read_sandbox_json("/app/workdir/metrics.json")
+                         read_sandbox_json(f"{self.repo_root}/metrics.json")
                      
-                     # Fire-and-forget permission fix
                      try:
                          uid, gid = os.getuid(), os.getgid()
-                         self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", "/app/workdir/artifacts"])
-                         self.sandbox.exec_run(["chmod", "-R", "777", "/app/workdir/artifacts"])
+                         self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", self.artifact_dir])
+                         self.sandbox.exec_run(["chmod", "-R", "777", self.artifact_dir])
                      except: pass
                 
                 # 2. Host Read Fallback
@@ -891,14 +1004,16 @@ class WorkerService:
                         r"(?i)\b(accuracy|score|val_acc)\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
                         r"(?i)\b(error_rate|loss)\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)"
                     ]
+                    found_metric = False
                     for pat in patterns:
                         for m in re.finditer(pat, stdout):
                             key = m.group(1).lower()
                             try:
                                 val = float(m.group(2))
                                 captured_metrics[key] = val
+                                found_metric = True
                             except: pass
-                    if captured_metrics:
+                    if found_metric:
                          self._log(f"📊 [DEBUG] Extracted metrics from stdout: {captured_metrics}")
                          pass
                 # ------------------------------------
@@ -969,12 +1084,21 @@ class WorkerService:
                     # Case 2: Source is a Local Path (Local/Hybrid Mode)
                     else:
                         # Copy Logic with Exclusions
-                        # We exclude heavy/volatile dirs to keep it fast and clean
                         ignore_func = shutil.ignore_patterns('runs', 'artifacts', '.remoroo', '.git', '__pycache__', 'venv', '.env')
                         shutil.copytree(source_path, temp_dir, ignore=ignore_func)
                         
+                        # Fix Venv Mode: Symlink venv from original repo if it exists
+                        for venv_name in ["venv", ".venv"]:
+                            source_venv = os.path.join(source_path, venv_name)
+                            if os.path.isdir(source_venv):
+                                try:
+                                    sym_target = os.path.join(temp_dir, venv_name)
+                                    if not os.path.exists(sym_target):
+                                        os.symlink(source_venv, sym_target)
+                                except OSError: pass
+                                break
+                        
                         # Handle git: copy .git if source has it, otherwise just init empty
-                        import subprocess
                         source_git = os.path.join(source_path, ".git")
                         if os.path.isdir(source_git):
                             try:
@@ -995,6 +1119,19 @@ class WorkerService:
                                 self._log(error_msg)
                                 raise RuntimeError("Git dependency missing. Please install Git.")
                     
+                    # Create Symlink for artifacts to match Docker behavior (bind mount simulation)
+                    # This implies relative writes to ./artifacts/ go to the run's artifact dir.
+                    # CRITICAL: Skip this in Docker mode as it conflicts with the bind mount!
+                    if self.engine != "docker" and self.artifact_dir:
+                        try:
+                            # Re-ensure it exists just in case
+                            os.makedirs(self.artifact_dir, exist_ok=True)
+                            sym_target = os.path.join(temp_dir, "artifacts")
+                            if not os.path.exists(sym_target):
+                                os.symlink(self.artifact_dir, sym_target)
+                        except OSError:
+                            pass 
+
                     # SWITCH CONTEXT
                     self.repo_root = temp_dir
                     self.is_ephemeral = True
@@ -1034,8 +1171,8 @@ class WorkerService:
                             try:
                                 uid, gid = os.getuid(), os.getgid()
                                 self._log(f"   👤 Reclaiming ownership: {uid}:{gid}")
-                                self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", "/app/workdir"])
-                                self.sandbox.exec_run(["chmod", "-R", "777", "/app/workdir"])
+                                self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", self.repo_root])
+                                self.sandbox.exec_run(["chmod", "-R", "777", self.repo_root])
                             except: pass
 
                         # 2. STOP SANDBOX (to release mounts)
@@ -1118,12 +1255,21 @@ class WorkerService:
                      
                      with open(target_path, 'w', encoding='utf-8') as f:
                          f.write(content)
-                     
-                     # ALSO save to artifact_dir (for CLI transparency)
-                     if self.artifact_dir and target_scope == "original":
+                         
+                     # ALSO save to artifact_dir (for CLI transparency in workspace)
+                     # v14.1: Mirror to cache if scope is 'original' OR if we are in non-ephemeral mode 
+                     # (meaning original and current are the same host dir).
+                     if self.artifact_dir and (target_scope == "original" or not self.is_ephemeral):
                          cache_path = os.path.join(self.artifact_dir, path)
                          os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                          with open(cache_path, 'w', encoding='utf-8') as f:
+                             f.write(content)
+
+                     # v16: ALSO save to persistence_dir (for CLI transparency in summary/prompt)
+                     if self.persistence_dir and (target_scope == "original" or not self.is_ephemeral):
+                         persist_path = os.path.join(self.persistence_dir, path)
+                         os.makedirs(os.path.dirname(persist_path), exist_ok=True)
+                         with open(persist_path, 'w', encoding='utf-8') as f:
                              f.write(content)
 
                      # Enhanced logging for debugging
@@ -1293,13 +1439,16 @@ class WorkerService:
                 execution_id = f"exec-{uuid.uuid4().hex[:8]}"
                 
                 # Build execution environment
-                exec_env = self._get_worker_env(env_vars)
+                # CRITICAL: Separate Host vs Docker env logic
+                
+                # Default to safe empty env for Docker, overlay payload
+                docker_env = request.payload.get("env", {}).copy()
+                docker_env["PYTHONUNBUFFERED"] = "1"
+                
+                # For Local, we need full host env + venv
+                local_env = self._get_worker_env(request.payload.get("env", {}))
                 
                 try:
-                    import subprocess
-                    import threading
-                    import time
-                    
                     # Log files for async output
                     stdout_buffer = []
                     stderr_buffer = []
@@ -1314,111 +1463,104 @@ class WorkerService:
                     }
                     
                     self._log(f"🚀 [Worker] Starting Async Command: {cmd} (ID: {execution_id})")
-                    pass
+                    self._log(f"   📂 Repo Root: {self.repo_root}")
+                    self._log(f"   📂 Artifact Dir: {self.artifact_dir} (Exists: {os.path.exists(self.artifact_dir)})")
 
-                    # Running via executor helper would block, so we use subprocess directly
-                    # but we need to respect sandbox if active.
+                    # Select Sandbox Factory
+                    sandbox_factory = None
+                    final_env = {}
                     
-                    process = None
-                    if self.sandbox and self.sandbox.available:
-                        # Use streaming exec_popen to allow real-time output capture
-                        # Path Translation: Host Path -> Container Path
-                        # Sandbox mounts self.repo_root -> /app/workdir
-                        # IF self.repo_root matches what the sandbox was init'd with. 
-                        # (Which it should if we updated sandbox in create_working_copy)
+                    if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                        # Docker Mode
+                        # v13: Mirrored Host Path (Zero-Mapping)
+                        docker_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                        docker_env["SDL_VIDEODRIVER"] = "dummy"
+                        docker_env["QT_QPA_PLATFORM"] = "offscreen"
+                        docker_env["DISPLAY"] = ":99"
                         
-                        container_workdir = "/app/workdir"
-                        # If self.repo_root is not self.sandbox.repo_path, we have a drift issue.
-                        # But assuming they match.
+                        final_env = docker_env
+                        self._log(f"   🐳 Docker Mode. Env artifact dir: {docker_env['REMOROO_ARTIFACTS_DIR']}")
                         
-                        # Ensure artifacts dir exists for the command
-                        # Sandbox mounts self.repo_root -> /app/workdir
-                        exec_env["REMOROO_ARTIFACTS_DIR"] = "/app/workdir/artifacts"
-                        
-                        process = self.sandbox.exec_popen(
-                            cmd, 
-                            env={k: v for k, v in exec_env.items() if k},
-                            workdir=container_workdir 
-                        )
-                        self._running_processes[execution_id] = process
-                        
-                        from rich.console import Console
-                        from rich.panel import Panel
-                        from rich.live import Live
-                        console = Console()
-                        
-                        # Background threads to consume pipes (Same as local Popen)
-                        def reader(stream, buffer, name="unknown"):
-                            if stream:
-                                try:
-                                    for line in stream:
-                                        # Use standard output format so User sees the content in their CLI
-                                        clean_line = line.rstrip('\n')
-                                        # Box the output for visibility
-                                        color = "white" if name == "STDOUT" else "red"
-                                        # console.self._log(Panel(clean_line, title=f"[bold {color}]{name}[/bold {color}]", border_style=color, expand=False))
-                                        buffer.append(line)
-                                    stream.close()
-                                except Exception:
-                                    pass
-                            
-                        threading.Thread(target=reader, args=(process.stdout, stdout_buffer, "STDOUT"), daemon=True).start()
-                        threading.Thread(target=reader, args=(process.stderr, stderr_buffer, "STDERR"), daemon=True).start()
-                        
-                        # Monitor thread to wait for exit
-                        def waiter():
-                            process.wait()
-                            self._execution_buffers[execution_id]["exit_code"] = process.returncode
-                            self._execution_buffers[execution_id]["finished"] = True
-                            
-                        threading.Thread(target=waiter, daemon=True).start()
-                        
+                        sandbox_factory = lambda c, env=None: self.sandbox.exec_popen(c, env=final_env, workdir=self.repo_root)
                     else:
-                        # Local execution using Popen
-                        # Use shell=True for complex commands (like piped ones)
-                        process = subprocess.Popen(
-                            cmd,
-                            cwd=self.repo_root,
-                            env=exec_env,
+                        # Local/Venv Mode
+                        # CRITICAL: Must point to absolute path on host so code writes where Harness looks
+                        local_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                        final_env = local_env
+                        
+                        venv_sandbox = VenvSandbox(self.repo_root, system=self.system)
+                        # VenvSandbox calls proc.spawn.
+                        # CRITICAL: Harness needs stdout/stderr PIPEs to capture output!
+                        sandbox_factory = lambda c, env=None: venv_sandbox.exec_popen(
+                            c, 
+                            env=env or {}, 
+                            shell=True,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            shell=True,
-                            text=True,
-                            bufsize=1 # Line buffered
+                            text=True
                         )
-                        self._running_processes[execution_id] = process
-                        
-                        from rich.console import Console
-                        from rich.panel import Panel
-                        console = Console()
 
-                        # Background threads to consume pipes
-                        def reader(stream, buffer, name="OUTPUT"):
-                            for line in stream:
-                                try:
-                                    # Box the output for visibility
-                                    color = "white" if name == "STDOUT" else "red"
-                                    # console.self._log(Panel(line.rstrip(), title=f"[bold {color}]{name}[/bold {color}]", border_style=color, expand=False))
-                                except Exception:
-                                    pass
-                                buffer.append(line)
-                            stream.close()
-                            
-                        threading.Thread(target=reader, args=(process.stdout, stdout_buffer, "STDOUT"), daemon=True).start()
-                        threading.Thread(target=reader, args=(process.stderr, stderr_buffer, "STDERR"), daemon=True).start()
+                    # Background Thread for Harness
+                    def harness_runner():
+                        harness = RemorooHarness(system=self.system)
                         
-                        # Monitor thread to wait for exit
-                        def waiter():
-                            process.wait()
-                            self._execution_buffers[execution_id]["exit_code"] = process.returncode
-                            self._execution_buffers[execution_id]["finished"] = True
-                            
-                        threading.Thread(target=waiter, daemon=True).start()
+                        # Artifact dir is needed for Metric Watching
+                        
+                        # PROACTIVE CLEANUP (Docker Root Fix)
+                        if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                             clean_cmd = ["/bin/sh", "-c", f"rm -f {self.artifact_dir}/*.json {self.repo_root}/{configs.METRICS_FILENAME}"]
+                             self.sandbox.exec_run(clean_cmd)
+
+                        result = harness.run(
+                            cmd=cmd,
+                            runner_factory=sandbox_factory,
+                            timeout=timeout_s if timeout_s else 3600.0,
+                            env=final_env.copy(), # CRITICAL: Copy to prevent Harness from mutating our captured env (e.g. overwriting REMOROO_ARTIFACTS_DIR)
+                            artifact_dir=self.artifact_dir,
+                            stdout_buffer=stdout_buffer,
+                            stderr_buffer=stderr_buffer,
+                            output_callback=self.output_callback
+                        )
+                        
+                        # Update state when finished
+                        # CRITICAL: Populate results BEFORE setting finished=True to avoid race condition with polling
+                        
+                        if result.success:
+                             self._execution_buffers[execution_id]["exit_code"] = 0
+                        else:
+                             # Safety: result.data might be None if internal error
+                             data = result.data or {}
+                             self._execution_buffers[execution_id]["exit_code"] = data.get("exit_code", -1)
+                             if result.error:
+                                 self._log(f"  ❌ [Worker] Harness Error: {result.error}")
+                        
+                        trigger = result.data.get("trigger") if result.data else "error"
+                        
+                        # CRITICAL: Store new_artifacts to prevent reading stale metrics
+                        new_artifacts = result.data.get("new_artifacts", []) if result.data else []
+                        self._execution_buffers[execution_id]["new_artifacts"] = new_artifacts
+                        
+                        self._log(f"  🏁 [Worker] Async Command Finished: {execution_id} (Trigger: {trigger}, New Artifacts: {len(new_artifacts)})")
+                        
+                        # MARK FINISHED LAST
+                        self._execution_buffers[execution_id]["finished"] = True
+                        
+                        self._log(f"  🏁 [Worker] Async Command Finished: {execution_id} (Trigger: {trigger}, New Artifacts: {len(new_artifacts)})")
+                        
+                        if len(new_artifacts) == 0:
+                            self._log("  ⚠️ [Worker] NO ARTIFACTS captured. Dumping output for debugging:")
+                            stdout_dump = "".join(stdout_buffer[-20:]) # Last 20 lines
+                            stderr_dump = "".join(stderr_buffer[-20:])
+                            self._log(f"  📜 STDOUT (Tail):\n{stdout_dump}")
+                            self._log(f"  📜 STDERR (Tail):\n{stderr_dump}")
+
+                    threading.Thread(target=harness_runner, daemon=True).start()
 
                     return ExecutionResult(success=True, data={"execution_id": execution_id})
                     
                 except Exception as e:
                     return ExecutionResult(success=False, error=str(e))
+
 
             elif request.type == "get_output":
                 # Poll output snapshot
@@ -1427,7 +1569,7 @@ class WorkerService:
                      return ExecutionResult(success=False, error="Execution ID not found")
                 
                 state = self._execution_buffers[exec_id]
-                import time
+
                 elapsed = time.time() - state["start_time"]
                 
                 # Check if process is still running
@@ -1446,7 +1588,30 @@ class WorkerService:
 
                 # --- AUTO-CAPTURE METRICS (SANDBOX DIRECT READ) ---
                 captured_metrics = {}
+                metrics_source = "none"
+                
                 if not running:
+                    self._log(f"🔎 [Worker] Scanning for metrics (ExecId: {exec_id})...")
+                    
+                    # Get provably new artifacts from Harness
+                    new_artifacts = state.get("new_artifacts", [])
+                    
+                    # Filter for metric files - AUTHORITATIVE Phase 2
+                    # We ignore baseline_metrics.json here to prevent leakage.
+                    metric_candidates = [
+                        f for f in new_artifacts 
+                        if f.endswith('.json') and ('metric' in f or 'partial' in f) 
+                        and f != "baseline_metrics.json"
+                    ]
+                    
+                    # Prioritize 'current_metrics.json' if present
+                    if "current_metrics.json" in metric_candidates:
+                        metric_candidates.remove("current_metrics.json")
+                        metric_candidates.insert(0, "current_metrics.json")
+                    
+                    if not metric_candidates:
+                         self._log(f"  ⚠️ [Worker] No new non-baseline metric artifacts found in this run.")
+                    
                     # 1. Read directly via Sandbox (Primary)
                     if self.sandbox and self.sandbox.available:
                         def read_sandbox_json(path):
@@ -1454,40 +1619,72 @@ class WorkerService:
                             if res.get("exit_code") == 0:
                                 try:
                                     loaded = json.loads(res["stdout"])
-                                    captured_metrics.update(self._robust_extract_metrics(loaded))
-                                except: pass
+                                    extracted = self._robust_extract_metrics(loaded)
+                                    if extracted:
+                                        self._log(f"  ✅ [Worker] Sandbox Read Success ({path}): {extracted}")
+                                        captured_metrics.update(extracted)
+                                        return os.path.basename(path)
+                                except Exception as e:
+                                    self._log(f"  ⚠️ [Worker] Sandbox Read Failed ({path}): {e}")
+                            return None
 
-                        read_sandbox_json("/app/workdir/artifacts/metrics.json")
-                        if not captured_metrics:
-                            read_sandbox_json("/app/workdir/metrics.json")
+                        # Only read CANDIDATES
+                        for fname in metric_candidates:
+                             path = os.path.join(self.artifact_dir, fname)
+                             source = read_sandbox_json(path)
+                             if source:
+                                 metrics_source = source
+                                 break # Done if found authoritative sandbox file
                         
-                        # Fire-and-forget permission fix
-                        try:
-                            uid, gid = os.getuid(), os.getgid()
-                            self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", "/app/workdir/artifacts"])
-                            self.sandbox.exec_run(["chmod", "-R", "777", "/app/workdir/artifacts"])
-                        except: pass
+                        # Docker Legacy Fallback
+                        if (not metrics_source or metrics_source == "none") and not captured_metrics:
+                             source = read_sandbox_json(os.path.join(self.repo_root, "metrics.json"))
+                             if source:
+                                 metrics_source = "legacy:metrics.json"
                     
                     # 2. Host Read Fallback
                     if not captured_metrics:
-                        host_artifacts = os.path.join(self.repo_root, "artifacts", "metrics.json")
-                        host_root = os.path.join(self.repo_root, "metrics.json")
-                        
-                        search_paths = [host_artifacts, host_root]
-                        for mpath in search_paths:
-                            if os.path.exists(mpath):
-                                 try:
-                                     with open(mpath, 'r') as f:
-                                         loaded = json.load(f)
-                                         captured_metrics.update(self._robust_extract_metrics(loaded))
-                                         break
-                                 except: pass
+                        for fname in metric_candidates:
+                             if self.artifact_dir:
+                                 mpath = os.path.join(self.artifact_dir, fname)
+                                 if self.system.fs.exists(mpath):
+                                     try:
+                                         with self.system.fs.open(mpath, 'r') as f:
+                                             loaded = json.load(f)
+                                             extracted = self._robust_extract_metrics(loaded)
+                                             if extracted:
+                                                 self._log(f"  ✅ [Worker] Host Read Success ({mpath}): {extracted}")
+                                                 captured_metrics.update(extracted)
+                                                 metrics_source = fname
+                                                 break 
+                                     except Exception as e:
+                                         self._log(f"  ⚠️ [Worker] Host Read Failed ({mpath}): {e}")
+                    
+                    if not captured_metrics:
+                        # 3. Last Resort Fallback (Host/Repo Root)
+                        # MUTANT: STALE_FALLBACK (Restored in v7)
+                        cwd_metric = os.path.join(self.repo_root, "metrics.json")
+                        if self.system.fs.exists(cwd_metric):
+                             try:
+                                 with self.system.fs.open(cwd_metric, 'r') as f:
+                                     loaded = json.load(f)
+                                     extracted = self._robust_extract_metrics(loaded)
+                                     if extracted:
+                                         self._log(f"  ✅ [Worker] Host Read Success (Legacy CWD): {extracted}")
+                                         captured_metrics.update(extracted)
+                                         metrics_source = "legacy:metrics.json"
+                             except Exception as e:
+                                 self._log(f"  ⚠️ [Worker] Host Read Failed (Legacy): {e}")
 
                 # 3. Last Resort: Parse from snapshot buffers
                 if not captured_metrics:
                     log_metrics = self._extract_metrics_from_text(stdout_full)
                     if log_metrics:
+                        self._log(f"  📊 [Worker] Log Parse Success: {log_metrics}")
                         captured_metrics.update(log_metrics)
+                        metrics_source = "stdout_logs"
+                    else:
+                        self._log(f"  ⚠️ [Worker] No metrics found in artifacts or logs.")
                 # ------------------------------------
 
                 return ExecutionResult(success=True, data={
@@ -1495,7 +1692,9 @@ class WorkerService:
                     "stderr": stderr_full,
                     "is_running": running,
                     "exit_code": state["exit_code"],
-                    "elapsed_s": elapsed
+                    "elapsed_s": elapsed,
+                    "metrics_captured": bool(captured_metrics),
+                    "metrics_source": metrics_source
                 }, metrics=captured_metrics)
                 
             elif request.type == "kill_command":
@@ -1505,7 +1704,6 @@ class WorkerService:
                      return ExecutionResult(success=True, data={"killed": False, "reason": "Not running"})
                 
                 proc_or_thread = self._running_processes[exec_id]
-                import subprocess
                 
                 try:
                     if isinstance(proc_or_thread, subprocess.Popen):
@@ -1556,10 +1754,16 @@ class WorkerService:
             traceback.print_exc()
             return ExecutionResult(success=False, error=str(e))
         finally:
-            # Restore Context
-            self.repo_root = previous_root
+            # Restore Context (Stateless behavior)
+            # v15: Safety check - if the command was to PERMANENTLY change/cleanup the root, 
+            # we do NOT restore the old now-deleted/old root.
+            if request.type not in ["cleanup_working_copy", "create_working_copy"]:
+                self.repo_root = previous_root
 
     def _handle_file_exists(self, request: ExecutionRequest) -> ExecutionResult:
         path = request.payload.get("path", "")
         exists = os.path.exists(os.path.join(self.repo_root, path))
         return ExecutionResult(success=True, data={"exists": exists})
+
+# Alias for backward compatibility with CLI and Remote Worker
+WorkerService = LocalWorker
