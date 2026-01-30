@@ -1205,6 +1205,8 @@ class LocalWorker:
                  if files:
                      files_str = " ".join(f'"{f}"' for f in files)
                      executor.run_command_stepwise(f"git add {files_str}", self.repo_root, output_callback=self.output_callback)
+                     # Since we staged specific files, we must look at cached diff to see them
+                     staged = True
                  
                  # Run diff
                  cmd = "git diff --cached" if staged else "git diff"
