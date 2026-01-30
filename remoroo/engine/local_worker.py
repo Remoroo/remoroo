@@ -1158,6 +1158,15 @@ class LocalWorker:
                 import tempfile
                 is_in_temp = self.repo_root.startswith(tempfile.gettempdir())
                 
+                # FIXED: Always clean up the injection monitor, even if running in-place
+                monitor_path = os.path.join(self.repo_root, "remoroo_monitor.py")
+                if os.path.exists(monitor_path):
+                    try:
+                        os.unlink(monitor_path)
+                        self._log(f"🧹 Removed injected monitor: {monitor_path}")
+                    except Exception as e:
+                        self._log(f"⚠️ Failed to remove monitor: {e}")
+                
                 if self.is_ephemeral and (is_in_temp or "remoroo_worktree" in self.repo_root):
                     # SAFETY: Finalize artifacts BEFORE deleting the directory
                     # This handles cases where Brain initiates cleanup before CLI finalization

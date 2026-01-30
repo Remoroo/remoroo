@@ -88,6 +88,7 @@ def run(
     goal: str = typer.Option(None, "--goal", help="Goal of the run."),
     metrics: str = typer.Option(None, "--metrics", help="Comma-separated metrics."),
     brain_url: str = typer.Option(None, "--brain-url", help="URL of the Brain Server."),
+    no_patch: bool = typer.Option(False, "--no-patch", help="Do not ask to apply patch (auto-deny)."),
     engine: str = typer.Option(None, "--engine", help="Execution engine (docker or venv). Defaults to 'docker'."),
 ):
     from .configs import get_api_url, get_default_engine
@@ -285,9 +286,16 @@ def run(
         # v18: Show prompt for SUCCESS or PARTIAL_SUCCESS (anything with a patch)
         if (result.success or getattr(result, 'partial_success', False) or result.outcome == "COMPLETED") and patch_path.exists():
             console.print("")
-            should_apply = yes # Initialize should_apply based on --yes flag
-            if not yes:
-                # Only ask for confirmation if --yes was not provided
+            should_apply = False
+            
+            if no_patch:
+                # Auto-deny
+                should_apply = False
+            elif yes:
+                # Auto-accept
+                should_apply = True
+            else:
+                # Ask
                 should_apply = typer.confirm("Would you like to apply the generated patch to your local repository?", default=True)
             
             if should_apply:
