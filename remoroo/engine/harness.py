@@ -39,11 +39,17 @@ class RemorooHarness:
         # 1. Capture initial state for artifact watching
         if not self.system.fs.exists(artifact_dir):
             self.system.fs.makedirs(artifact_dir, exist_ok=True)
-        
-        # CLEAR stale artifacts (Whack-a-Mole Prevention)
-        self._purify_artifacts(artifact_dir)
-        if repo_root:
-            self._purify_artifacts(repo_root) # Also clear CWD metrics
+
+        # IMPORTANT (multi-command safety):
+        # Do NOT delete artifacts here. `run()` is called per-command, and multi-command workflows
+        # rely on read-modify-write into a shared artifacts directory.
+        #
+        # If you need purging (e.g., debugging stale state), opt-in explicitly via env var.
+        purify = str(env.get("REMOROO_PURIFY_ARTIFACTS", "false")).lower() in ("1", "true", "yes")
+        if purify:
+            self._purify_artifacts(artifact_dir)
+            if repo_root:
+                self._purify_artifacts(repo_root) # Also clear CWD metrics
 
         initial_artifacts = self._scan_artifacts(artifact_dir)
         if repo_root:

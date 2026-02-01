@@ -233,6 +233,8 @@ def run_local_worker(
     final_result = None
     outcome = "UNKNOWN"
     success = False
+    partial_success = False
+
     
 
     # --- Dashboard Components ---
@@ -367,8 +369,11 @@ def run_local_worker(
                     final_result = step.payload or {}
                     # v18: Prioritize explicit outcome and success from Brain
                     outcome = final_result.get("outcome") or final_result.get("decision", "SUCCESS")
-                    success = final_result.get("success", False)
-                    partial_success = final_result.get("partial_success", False)
+                    
+                    # Normalization: Ensure success and partial_success are booleans even if strings arrive
+                    # We accept "SUCCESS" or True as success.
+                    success = final_result.get("success") == True or outcome == "SUCCESS"
+                    partial_success = final_result.get("partial_success") == True or outcome == "PARTIAL_SUCCESS"
                     
                     scoreboard_data["status"] = "✅ Workflow Complete!"
                     update_dashboard(dashboard_layout, scoreboard_data)
@@ -592,17 +597,18 @@ def run_local_worker(
     # 8. Save Metrics for CLI Summary
     try:
         if scoreboard_data["current"]:
-            with open(artifact_dir / "metrics.json", 'w') as f:
+            # SAVE TO RUN-SPECIFIC DIR (Where CLI expects them if we return run_output_dir)
+            with open(run_output_dir / "metrics.json", 'w') as f:
                 json.dump(scoreboard_data["current"], f, indent=2)
         if scoreboard_data["baseline"]:
-            with open(artifact_dir / "baseline_metrics.json", 'w') as f:
+            with open(run_output_dir / "baseline_metrics.json", 'w') as f:
                 json.dump(scoreboard_data["baseline"], f, indent=2)
     except Exception as e:
         console.print(f"   [yellow]⚠️  Could not save metrics to cache: {e}[/yellow]")
 
     return LocalRunResult(
-        run_root=artifact_dir,
-        run_id=run_id,
+        run_root=run_output_dir,
+        run_id=remote_run_id,
         success=success,
         outcome=outcome,
         partial_success=partial_success

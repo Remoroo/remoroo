@@ -16,6 +16,7 @@ from .configs import DEFAULT_DENY_PATHS, DEFAULT_EXCLUDED_DIRS
 from ..engine.core.executor import run_commands
 from .file_access_tracker import FileAccessTracker
 from .instrumentation_targets import select_instrumentation_targets
+from .context_selector import select_reasoning_context
 from .metrics_utils import unwrap_metrics_dict
 from ..engine.core.repo_indexer import RepoIndexer
 from ..engine.schemas import (
@@ -383,6 +384,7 @@ class InstrumentationPipeline:
 
         # Select instrumentation targets based on command plan + metrics
 
+        # Select instrumentation targets based on command plan + metrics
         targets = select_instrumentation_targets(
             repo_root=self.repo_root,
             commands=commands_flat,
@@ -390,8 +392,27 @@ class InstrumentationPipeline:
             select_top_n=5,
         )
 
-        # Promote top-K files and fully hydrate them (instrumentation input files).
-        promoted_files = (targets.get("selected_files") or [])[:5]
+        # [STAGE 2] reasoning context decoupling
+        # We now separately select files needed for REASONING (understanding the bug/test)
+        # vs files needed for INSTRUMENTATION (metrics).
+        reasoning_context = select_reasoning_context(
+            repo_root=self.repo_root,
+            repo_index_summary=repo_index_summary,
+            commands=commands_flat,
+            max_files=10,
+        )
+        
+        # Combine providing sets: promoted instrumented files + reasoning files
+        inst_files = (targets.get("selected_files") or [])[:5]
+        reason_files = (reasoning_context.get("selected_files") or [])
+        
+        # Determine the union of files to hydrate
+        all_files_to_hydrate = list(set(inst_files + reason_files))
+        
+        # Sort for determinism
+        all_files_to_hydrate.sort()
+
+        promoted_files = all_files_to_hydrate
         instrumentation_files_state: Dict[str, Any] = {}
         file_access_tracker = FileAccessTracker()
         for fp in promoted_files:

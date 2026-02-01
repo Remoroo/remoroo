@@ -183,15 +183,15 @@ def run(
         console = Console()
 
         if result.success:
-            outcome_color = "green"
+            outcome_color = "bright_green"
         elif getattr(result, 'partial_success', False):
-            outcome_color = "yellow"
+            outcome_color = "bright_yellow"
         elif result.outcome == "INTERRUPTED":
             outcome_color = "bright_black"
         elif "ERROR" in result.outcome or "CRASH" in result.outcome or result.outcome == "FAIL" or result.outcome == "FAILED":
             outcome_color = "red"
         else:
-            outcome_color = "yellow"
+            outcome_color = "bright_yellow"
 
         console.print("")
         console.print(Panel(
@@ -276,15 +276,18 @@ def run(
         report_path = result.run_root / "final_report.md"
         patch_path = result.run_root / "final_patch.diff"
         
-        console.print("")
         if report_path.exists():
             console.print(f"📄 [bold]Report:[/bold] [link=file://{report_path.absolute()}]{report_path.name}[/link]")
+        
+        # v18: Lead Architect Diagram
+        diagram_path = result.run_root / "system_diagram.md"
+        if diagram_path.exists():
+            console.print(f"🗺️  [bold]System Diagram:[/bold] [link=file://{diagram_path.absolute()}]{diagram_path.name}[/link]")
+
         if patch_path.exists():
             console.print(f"🩹 [bold]Clean Patch:[/bold] [link=file://{patch_path.absolute()}]{patch_path.name}[/link]")
         
-        # Apply Patch Prompt
-        # v18: Show prompt for SUCCESS or PARTIAL_SUCCESS (anything with a patch)
-        if (result.success or getattr(result, 'partial_success', False) or result.outcome == "COMPLETED") and patch_path.exists():
+        if (result.success or getattr(result, 'partial_success', False)) and patch_path.exists():
             console.print("")
             should_apply = False
             
@@ -316,7 +319,7 @@ def run(
         # Exit Codes
         if result.success:
             raise typer.Exit(code=0)
-        elif result.outcome in ["PARTIAL_SUCCESS", "COMPLETED"]:
+        elif getattr(result, 'partial_success', False):
             raise typer.Exit(code=2)
         else:
             raise typer.Exit(code=1)

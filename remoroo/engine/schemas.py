@@ -194,7 +194,7 @@ TURN_REPORT_SCHEMA: Dict[str, Any] = {
 
 EXPERIMENT_CONTRACT_SCHEMA: Dict[str, Any] = {
   "type":"object",
-  "required":["metric_specs","metric_sources","command_plan","non_retryable_conditions","history"],
+  "required":["metric_specs","metric_sources","command_plan","instrumentation_targets","non_retryable_conditions","history"],
   "additionalProperties": False,
   "properties":{
     "metric_specs":{
@@ -228,6 +228,11 @@ EXPERIMENT_CONTRACT_SCHEMA: Dict[str, Any] = {
         "items":{"type":"string"}
       },
       "description":"Command plan with stage names as keys and command lists as values (e.g., {'setup': ['python <file_name>.py'], 'run': ['pytest <test_file>.py']})"
+    },
+    "instrumentation_targets":{
+      "type":["array","null"],
+      "items":{"type":"string"},
+      "description":"Planner-selected files to instrument/hydrate for metric measurement (test harnesses / emitters). Null means unspecified."
     },
     "non_retryable_conditions":{
       "type":"array",

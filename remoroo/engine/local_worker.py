@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, List
 from .protocol import ExecutionRequest, ExecutionResult
 from .core.worker import Worker
 from .utils import fs_utils, syntax_validator, configs
@@ -491,6 +491,7 @@ class LocalWorker:
                 from ..execution import instrumentation_pipeline, instrumentation_targets
                 from ..engine.core.repo_indexer import RepoIndexer
                 from ..execution.file_access_tracker import FileAccessTracker
+                import re
                 
                 # Use explicit repo_root from payload if provided (stateless protocol)
                 target_root = request.payload.get("repo_root") or self.repo_root
@@ -504,15 +505,84 @@ class LocalWorker:
                 metric_specs = contract.get("metric_specs") or []
                 metric_names = [m.get("name") for m in metric_specs if isinstance(m, dict) and m.get("name")]
 
+                # Planner authority: explicit instrumentation targets (if provided).
+                forced_files: List[str] = []
+                raw_forced = contract.get("instrumentation_targets")
+                if isinstance(raw_forced, list):
+                    forced_files = [f for f in raw_forced if isinstance(f, str) and f.strip()]
+
+                # Deterministic metric-definition scan: find repo files that literally mention metric keys.
+                # This is cheap and scales: it doesn't require hydrating entrypoints by count.
+                metric_hit_files: List[str] = []
+                metric_hit_details: List[Dict[str, Any]] = []
+                try:
+                    names = [m for m in metric_names if isinstance(m, str) and m.strip()]
+                    if names:
+                        patterns = [re.compile(re.escape(n)) for n in names]
+                        # Scan python + markdown files only (small, common places for metric emitters/harnesses).
+                        files_list = repo_index.get("files", []) or []
+                        # Hard cap for safety
+                        max_files_to_scan = 4000
+                        max_bytes_per_file = 400_000  # 400KB
+                        for f in files_list[:max_files_to_scan]:
+                            if not isinstance(f, dict):
+                                continue
+                            fp = f.get("path")
+                            if not isinstance(fp, str) or not fp:
+                                continue
+                            # Restrict extensions
+                            if not (fp.endswith(".py") or fp.endswith(".md") or fp.endswith(".txt")):
+                                continue
+                            abs_path = os.path.join(target_root, fp)
+                            if not os.path.isfile(abs_path):
+                                continue
+                            try:
+                                if os.path.getsize(abs_path) > max_bytes_per_file:
+                                    continue
+                                with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                                    content = fh.read()
+                            except Exception:
+                                continue
+                            hits = []
+                            for pat, name in zip(patterns, names):
+                                if pat.search(content):
+                                    hits.append(name)
+                            if hits:
+                                metric_hit_files.append(fp)
+                                metric_hit_details.append({
+                                    "file_path": fp,
+                                    "metric_names": hits[:10],
+                                    "hit_count": len(hits),
+                                })
+                except Exception:
+                    metric_hit_files = []
+                    metric_hit_details = []
+
                 targets = instrumentation_targets.select_instrumentation_targets(
                     repo_root=target_root,
                     commands=commands_flat,
                     metric_names=[m for m in metric_names if isinstance(m, str)],
-                    select_top_n=5
+                    select_top_n=request.payload.get("select_top_n", 5)
                 )
 
+
                 # Promote top-K files
-                promoted_files = (targets.get("selected_files") or [])[:5]
+                budget = request.payload.get("select_top_n", 5)
+                selected_files = list(targets.get("selected_files") or [])
+                # Priority order:
+                # 1) forced planner targets (authoritative)
+                # 2) metric-definition hits (where metric keys are defined/emitted)
+                # 3) reachability-based selection (fallback)
+                promoted: List[str] = []
+                for seq in (forced_files, metric_hit_files, selected_files):
+                    for fp in seq:
+                        if isinstance(fp, str) and fp and fp not in promoted:
+                            promoted.append(fp)
+                promoted_files = promoted[:budget]
+
+                # Ensure the instrumenter is allowed to edit forced/hit files by including them in selected_files.
+                targets["selected_files"] = promoted_files
+
                 instrumentation_files_state = {}
                 file_access_tracker = FileAccessTracker()
                 for fp in promoted_files:
@@ -535,7 +605,9 @@ class LocalWorker:
                 return ExecutionResult(success=True, data={
                     "repo_index_summary": repo_index_summary,
                     "instrumentation_targets": targets,
-                    "instrumentation_files_state": instrumentation_files_state
+                    "instrumentation_files_state": instrumentation_files_state,
+                    "forced_instrumentation_files": forced_files,
+                    "metric_definition_hits": metric_hit_details
                 })
 
             elif request.type == "instrumentation_apply":
@@ -603,15 +675,27 @@ class LocalWorker:
                 harness = RemorooHarness(system=self.system)
                 outcomes = []
                 success = True
-                for cmd in commands:
-                    # PROACTIVE CLEANUP (Docker Root Fix)
-                    if self.engine == "docker" and self.sandbox and self.sandbox.available:
-                        # Use Docker (root) to remove potential root-owned artifacts from previous steps
-                        # This prevents "PermissionError" in the Harness which runs as user
-                        # UNIVERSAL PATH: Use host paths mirrored in container
-                        clean_cmd = ["/bin/sh", "-c", f"rm -f {self.artifact_dir}/*.json {self.repo_root}/{configs.METRICS_FILENAME}"]
-                        self.sandbox.exec_run(clean_cmd)
 
+                # PROACTIVE PERMISSIONS FIX (Docker Root Fix)
+                # IMPORTANT: Do NOT delete artifacts between baseline commands.
+                # Baseline may include multiple commands and must be able to READ-MODIFY-WRITE
+                # a shared artifacts/metrics.json without losing prior metrics.
+                if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                    try:
+                        uid, gid = os.getuid(), os.getgid()
+                        self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", self.artifact_dir])
+                        self.sandbox.exec_run(["chmod", "-R", "777", self.artifact_dir])
+                    except Exception:
+                        pass
+
+                    # Remove only legacy root-level metrics file (stale compatibility path).
+                    try:
+                        clean_cmd = ["/bin/sh", "-c", f"rm -f {self.repo_root}/{configs.METRICS_FILENAME}"]
+                        self.sandbox.exec_run(clean_cmd)
+                    except Exception:
+                        pass
+
+                for cmd in commands:
                     self._log(f"  ▶️  Running: {cmd} (timeout: {timeout}s)")
                     h_result = harness.run(
                         cmd=cmd,
@@ -1247,11 +1331,14 @@ class LocalWorker:
                      if target_scope == "original":
                          root = self.original_repo_root
                          # 🚀 AUTO-ROUTE REPORTS TO RUN-SPECIFIC FOLDER
-                         if self.run_id and ("final_report.md" in path or "report" in path.lower()):
-                              run_output = os.path.join(root, ".remoroo", "runs", self.run_id)
-                              os.makedirs(run_output, exist_ok=True)
-                              root = run_output
-                              
+                         is_report = "final_report.md" in path or "report" in path.lower()
+                         is_diagram = "system_diagram.md" in path
+                         
+                         if self.run_id and (is_report or is_diagram):
+                             run_output = os.path.join(root, ".remoroo", "runs", self.run_id)
+                             os.makedirs(run_output, exist_ok=True)
+                             root = run_output
+                             
                          self._log(f"🚚 Delivering to: {root}/{path}")
                      elif target_scope == "artifact":
                          root = self.artifact_dir
@@ -1517,10 +1604,22 @@ class LocalWorker:
                         
                         # Artifact dir is needed for Metric Watching
                         
-                        # PROACTIVE CLEANUP (Docker Root Fix)
+                        # PROACTIVE PERMISSIONS FIX (Docker Root Fix)
+                        # IMPORTANT: Do NOT delete artifacts between commands.
+                        # Multi-command workflows rely on read-modify-write into a shared artifacts/metrics.json.
                         if self.engine == "docker" and self.sandbox and self.sandbox.available:
-                             clean_cmd = ["/bin/sh", "-c", f"rm -f {self.artifact_dir}/*.json {self.repo_root}/{configs.METRICS_FILENAME}"]
-                             self.sandbox.exec_run(clean_cmd)
+                             try:
+                                 uid, gid = os.getuid(), os.getgid()
+                                 self.sandbox.exec_run(["chown", "-R", f"{uid}:{gid}", self.artifact_dir])
+                                 self.sandbox.exec_run(["chmod", "-R", "777", self.artifact_dir])
+                             except Exception:
+                                 pass
+                             # Remove only legacy root-level metrics file (stale compatibility path).
+                             try:
+                                 clean_cmd = ["/bin/sh", "-c", f"rm -f {self.repo_root}/{configs.METRICS_FILENAME}"]
+                                 self.sandbox.exec_run(clean_cmd)
+                             except Exception:
+                                 pass
 
                         result = harness.run(
                             cmd=cmd,

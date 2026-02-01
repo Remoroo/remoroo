@@ -164,6 +164,9 @@ def select_instrumentation_targets(
         "data",
     }
 
+    # Stage 0: Holistic Discovery - Config Files
+    CONFIG_FILES = {"setup.py", "pyproject.toml", "requirements.txt", "tox.ini", "Makefile", "dockerfile"}
+
     from .repo_manager import get_index_path
     index_path = get_index_path(repo_root)
     index = _safe_read_json(index_path) or {}
@@ -213,9 +216,12 @@ def select_instrumentation_targets(
     entry_files = [p.replace("\\", "/") for p in entry_files if isinstance(p, str)]
     entry_files = [p for p in entry_files if p in by_path]
 
+    # Stage 0: Proactive Config Inclusion (Seeds)
+    config_seeds = [fp for fp in by_path if os.path.basename(fp).lower() in CONFIG_FILES]
+
     # BFS on module imports (best-effort, generic).
     reachable: Dict[str, int] = {}  # file_path -> depth
-    frontier: List[Tuple[str, int]] = [(p, 0) for p in entry_files]
+    frontier: List[Tuple[str, int]] = [(p, 0) for p in entry_files + config_seeds]
     while frontier:
         fp, depth = frontier.pop(0)
         if fp in reachable and reachable[fp] <= depth:
@@ -314,23 +320,46 @@ def select_instrumentation_targets(
             score += min(1.5, 0.5 + 0.25 * io_hits)
             reasons.append(f"imports common I/O stdlib modules ({io_hits} hit(s))")
 
-        # De-risk: avoid tests.
+        # De-risk: Architect Mode (Stage 0) - Neutralize test penalty
         if "/test" in fp.replace("\\", "/") or fp.startswith("tests/") or fp.endswith("_test.py"):
-            score -= 2.0
-            reasons.append("looks like a test file (deprioritized)")
+            # Instead of -2.0, we make it slightly positive to ensure visibility for verification
+            score += 0.5
+            reasons.append("looks like a test file (Architect Mode neutrality)")
+
+        # Stage 0: Config Affinity
+        basename = os.path.basename(fp).lower()
+        if basename in CONFIG_FILES:
+            score += 5.0
+            depth = 0 # Force to root depth
+            reasons.append(f"critical config file ({basename}) - prioritized for Architect Mode")
 
         candidates.append(Candidate(file_path=fp, module=module, depth=depth, score=score, reasons=reasons))
 
     candidates_sorted = sorted(candidates, key=lambda c: (-c.score, c.depth, c.file_path))
-    top = candidates_sorted[: max(1, max_candidates)]
-    selected = top[: max(1, select_top_n)]
 
-    # If we found non-entry reachable candidates, prefer them over the thin entrypoint.
-    # (Thin entrypoints often cannot expose metric signals; "meat" is usually one hop away.)
-    non_entry = [c for c in selected if c.file_path not in entry_files]
-    if non_entry:
-        selected = non_entry + [c for c in selected if c.file_path in entry_files]
-        selected = selected[: max(1, select_top_n)]
+    # Selection Strategy (Fixed for Multi-File Context):
+    # 1. ALWAYS include valid entrypoint files (e.g. quiz.py), regardless of score.
+    #    These are critical for the Planner to understand what is being executed.
+    # 2. Fill the rest of the budget (select_top_n) with the highest-scoring "meat" files.
+    
+    entry_candidates = [c for c in candidates_sorted if c.file_path in entry_files or os.path.basename(c.file_path).lower() in CONFIG_FILES]
+    other_candidates = [c for c in candidates_sorted if c.file_path not in entry_files and os.path.basename(c.file_path).lower() not in CONFIG_FILES]
+    
+    # Start with entrypoints
+    selected = list(entry_candidates)
+    
+    # Fill remaining slots with top-scoring others
+    # Logic: if we have N entrypoints and budget is K:
+    # - If N < K, take K-N others.
+    # - If N >= K, take 0 others (but keep all N entrypoints to be safe).
+    # We allow exceeding select_top_n if there are many entrypoints.
+    
+    slots_remaining = max(0, select_top_n - len(selected))
+    if slots_remaining > 0:
+        selected.extend(other_candidates[:slots_remaining])
+        
+    # Re-sort specific list for determinism (Score DESC, Depth ASC, Path ASC)
+    selected = sorted(selected, key=lambda c: (-c.score, c.depth, c.file_path))
 
     # Provide snippet *requests* (line ranges) for context hydration.
     snippet_requests: List[Dict[str, Any]] = []
@@ -400,7 +429,7 @@ def select_instrumentation_targets(
                 "score": round(float(c.score), 4),
                 "reasons": c.reasons,
             }
-            for c in top
+            for c in candidates_sorted[:max_candidates]
         ],
         "selected_files": [c.file_path for c in selected],
         "snippet_requests": snippet_requests[:25],
