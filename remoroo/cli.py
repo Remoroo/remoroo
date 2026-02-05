@@ -188,7 +188,7 @@ def run(
             outcome_color = "bright_yellow"
         elif result.outcome == "INTERRUPTED":
             outcome_color = "bright_black"
-        elif "ERROR" in result.outcome or "CRASH" in result.outcome or result.outcome == "FAIL" or result.outcome == "FAILED":
+        elif "ERROR" in result.outcome or "CRASH" in result.outcome or result.outcome == "FAIL" or result.outcome == "FAILED" or result.outcome == "ABORT":
             outcome_color = "red"
         else:
             outcome_color = "bright_yellow"

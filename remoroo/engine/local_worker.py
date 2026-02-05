@@ -360,6 +360,7 @@ class LocalWorker:
 
             elif request.type == "env_setup":
                 p = request.payload
+                timeout = p.get("timeout", 300)  # Default 5 minutes for installs
                 
                 # P0 Safer Sandbox: Always use Sandbox if available
                 if self.sandbox and self.sandbox.available:
@@ -380,18 +381,43 @@ class LocalWorker:
                         cmds_to_run = install_commands
                         
                     setup_log = []
+                    outcomes = []
                     failed = False
+                    last_error = None
                     start_t = os.times().elapsed
                     
                     # Ensure container running
                     self.sandbox.start()
                     
+                    # Use streaming execution with progress output
+                    def sandbox_runner(cmd, env=None):
+                        return self.sandbox.exec_popen(cmd, env=env or {})
+                    
+                    exec_env = self._get_worker_env()
+                    
                     for cmd in cmds_to_run:
                         self._log(f"📦 Sandbox Install: {cmd}")
-                        res = self.sandbox.exec_run(cmd.split())
-                        setup_log.append(f"> {cmd}\n{res['stdout']}\n{res['stderr']}")
-                        if res['exit_code'] != 0:
+                        # Use executor with streaming output
+                        outcome = executor.run_command_with_timeout(
+                            cmd=cmd,
+                            cwd=self.repo_root,
+                            timeout_s=timeout,
+                            show_progress=True,
+                            output_callback=self.output_callback,
+                            env=exec_env,
+                            runner_factory=sandbox_runner
+                        )
+                        setup_log.append(f"> {cmd}\n{outcome.get('stdout', '')}\n{outcome.get('stderr', '')}")
+                        outcomes.append({
+                            "command": cmd,
+                            "exit_code": outcome.get("exit_code"),
+                            "stdout": outcome.get("stdout", "")[:3000],
+                            "stderr": outcome.get("stderr", "")[:3000],
+                            "duration_s": outcome.get("duration_s", 0.0)
+                        })
+                        if outcome.get("exit_code") != 0:
                             failed = True
+                            last_error = outcome.get("stderr") or outcome.get("stdout") or f"Exit code {outcome.get('exit_code')}"
                             break
                             
                     return ExecutionResult(
@@ -399,6 +425,8 @@ class LocalWorker:
                         data={
                             "diagnosis": "Sandbox setup completed" if not failed else "Sandbox setup failed",
                             "commands_run": cmds_to_run,
+                            "outcomes": outcomes,
+                            "last_error": last_error,
                             "setup_duration_s": os.times().elapsed - start_t
                         },
                         logs="\n".join(setup_log)
@@ -467,6 +495,7 @@ class LocalWorker:
                 
                 outcomes = []
                 success = True
+                last_error = None
                 for cmd in commands:
                     outcome = executor.run_command_with_timeout(
                         cmd=cmd,
@@ -477,14 +506,25 @@ class LocalWorker:
                         env=exec_env,
                         runner_factory=runner
                     )
-                    outcomes.append(cmd)
+                    # Store the full outcome (not just cmd) to preserve stderr/stdout
+                    outcome_record = {
+                        "command": cmd,
+                        "exit_code": outcome.get("exit_code"),
+                        "stdout": outcome.get("stdout", "")[:3000],  # Truncate for sanity
+                        "stderr": outcome.get("stderr", "")[:3000],
+                        "duration_s": outcome.get("duration_s", 0.0)
+                    }
+                    outcomes.append(outcome_record)
                     if outcome.get("exit_code") != 0:
                         success = False
+                        # Capture the error for easy access
+                        last_error = outcome.get("stderr") or outcome.get("stdout") or f"Command failed with exit code {outcome.get('exit_code')}"
                         break
                 
                 return ExecutionResult(success=True, data={
                     "success": success,
-                    "outcomes": outcomes
+                    "outcomes": outcomes,
+                    "last_error": last_error  # Include error output for LLM diagnosis
                 })
 
             elif request.type == "instrumentation_prepare":

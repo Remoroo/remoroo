@@ -368,7 +368,7 @@ def run_local_worker(
                 if step.type == "workflow_complete":
                     final_result = step.payload or {}
                     # v18: Prioritize explicit outcome and success from Brain
-                    outcome = final_result.get("outcome") or final_result.get("decision", "SUCCESS")
+                    outcome = final_result.get("outcome") or final_result.get("decision", "UNKNOWN")
                     
                     # Normalization: Ensure success and partial_success are booleans even if strings arrive
                     # We accept "SUCCESS" or True as success.

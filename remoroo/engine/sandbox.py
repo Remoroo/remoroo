@@ -8,7 +8,7 @@ from pathlib import Path
 from .utils import configs
 
 class DockerSandbox:
-    def __init__(self, repo_path: str, artifact_dir: str, image_name: str = "remoroo-worker"):
+    def __init__(self, repo_path: str, artifact_dir: str, image_name: str = "remoroo-cli"):
         self.repo_path = os.path.abspath(repo_path)
         self.artifact_dir = os.path.abspath(artifact_dir)
         self.image_name = image_name

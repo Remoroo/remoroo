@@ -1,19 +1,28 @@
 # Dockerfile.cli
-# Purpose: A lightweight distribution container for the Remoroo CLI.
-# Target Size: < 250MB
+# Purpose: A sandbox container for Remoroo experiment execution.
+# Includes build tools for packages with C extensions.
 
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install git as it's needed for the local worker to manage repos
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+# Install git and common build tools needed for packages with C extensions
+# - build-essential: gcc, g++, make
+# - swig: needed for box2d-py, etc.
+# - cmake: needed for some ML packages
+# - python3-dev: Python headers for building extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    build-essential \
+    swig \
+    cmake \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install CLI directly from the new GitHub repository
-# This ensures that we only pull the code in that repo (no remoroo_brain)
-RUN pip install --no-cache-dir git+https://github.com/Remoroo/remoroo.git@main
+# Enable pip cache for faster subsequent installs
+# (removed --no-cache-dir)
+RUN pip install --upgrade pip
 
-# Clean up
-RUN apt-get purge -y --auto-remove && rm -rf /var/lib/apt/lists/*
+# Note: The CLI is not pre-installed. The sandbox mounts the repo and runs commands directly.
 
-ENTRYPOINT ["remoroo"]
+ENTRYPOINT ["/bin/bash"]
