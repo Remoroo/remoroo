@@ -523,13 +523,22 @@ class InstrumentationPipeline:
                     experiment_contract["command_plan"] = {
                         "metrics_capture": cmds
                     }
+                    # CRITICAL: Store the baseline timeout for this stage so the orchestrator can use it
+                    # as a fallback when the Planner doesn't provide suggested_timeouts
+                    # This prevents ML training commands from being killed prematurely
+                    baseline_timeout_for_stage = baseline_capture.get("timeout_s", 1200)  # Default 20 min for ML tasks
+                    experiment_contract["_stage_timeouts"] = {
+                        "metrics_capture": baseline_timeout_for_stage
+                    }
                     if hasattr(self, "_log"):  # Optional logging if available
                          self._log(f"  📝 Updated ExperimentContract.command_plan to match instrumentation: {len(cmds)} commands")
+                         self._log(f"  ⏱️  Stored stage timeout for metrics_capture: {baseline_timeout_for_stage}s")
             else:
                 # Fallback to initial plan if LLM didn't specify commands (unlikely given schema)
                 cmds = commands_flat[:] 
                 
-            timeout_s = min(baseline_capture.get("timeout_s") * 2 , 3600)
+            # Use LLM-suggested timeout (no hardcoded cap - Judge monitors and can stop early)
+            timeout_s = baseline_capture.get("timeout_s", 120)
             
             env_list = baseline_capture.get("env") or []
             env: Dict[str, str] = {}

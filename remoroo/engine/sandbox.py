@@ -143,6 +143,50 @@ class DockerSandbox:
             print(f"⚠️  Unexpected error during Docker commit: {e}")
 
 
+    def kill_process_by_command(self, command_pattern: str) -> bool:
+        """
+        Kill processes inside the container matching the given command pattern.
+        
+        This is critical for cleaning up orphan processes that survive when the
+        host-side `docker exec` wrapper is killed (SIGTERM/SIGKILL to docker exec
+        does NOT propagate to the process inside the container).
+        
+        Uses pkill -9 -f to match by full command line.
+        Returns True if any process was killed.
+        """
+        if not self.is_running:
+            return False
+        
+        try:
+            # First: find matching PIDs for logging
+            pgrep_result = subprocess.run(
+                ["docker", "exec", self.container_name, "pgrep", "-f", command_pattern],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5
+            )
+            pids = pgrep_result.stdout.strip().split("\n") if pgrep_result.returncode == 0 else []
+            pids = [p.strip() for p in pids if p.strip()]
+            
+            if not pids:
+                return False
+            
+            print(f"🐳 [DockerSandbox] Killing {len(pids)} orphan process(es) inside container matching '{command_pattern}': PIDs {pids}")
+            
+            # Kill each PID individually with -9 to ensure termination
+            # Using individual kill instead of pkill to also kill the /bin/sh wrapper
+            for pid in pids:
+                try:
+                    subprocess.run(
+                        ["docker", "exec", self.container_name, "kill", "-9", pid],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+                    )
+                except Exception:
+                    pass
+            
+            return True
+        except Exception as e:
+            print(f"⚠️  [DockerSandbox] Error killing container process: {e}")
+            return False
+
     def exec_popen(self, cmd: List[str], env: Dict[str, str] = {}, workdir: Optional[str] = None) -> subprocess.Popen:
         """
         Run a command via docker exec, returning a Popen object for streaming.

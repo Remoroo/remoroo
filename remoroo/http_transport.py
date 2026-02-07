@@ -90,7 +90,16 @@ class HttpTransport(Transport):
             baseline = data.get("baseline_metrics")
 
             if data.get("status") == "finished":
-                 return ExecutionRequest(type="workflow_complete", payload={"status": "finished", "reason": "Run marked as completed in DB"}), metrics, baseline
+                 # Include outcome from server so CLI can display the correct decision
+                 server_outcome = data.get("outcome", "UNKNOWN")
+                 return ExecutionRequest(type="workflow_complete", payload={
+                     "status": "finished",
+                     "reason": "Run marked as completed in DB",
+                     "outcome": server_outcome,
+                     "decision": server_outcome,
+                     "success": server_outcome == "SUCCESS",
+                     "partial_success": server_outcome == "PARTIAL_SUCCESS",
+                 }), metrics, baseline
                  
             step_data = data.get("step")
             if not step_data:

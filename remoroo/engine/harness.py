@@ -31,7 +31,8 @@ class RemorooHarness:
             repo_root: Optional[str] = None,
             stdout_buffer: Optional[List[str]] = None,
             stderr_buffer: Optional[List[str]] = None,
-            output_callback: Optional[Callable[[str, str], None]] = None) -> ExecutionResult:
+            output_callback: Optional[Callable[[str, str], None]] = None,
+            kill_event: Optional[threading.Event] = None) -> ExecutionResult:
         """
         Execute command with supervision.
         """
@@ -104,23 +105,36 @@ class RemorooHarness:
                     exit_trigger = "natural_exit"
                     break
                 
-                # B. Check Metrics (Early Exit)
-                new_artifacts = get_fresh_artifacts()
-                
-                # Look for partial metrics OR standard metrics.json updates
-                found_metric = any(
-                    (f.startswith("partial_") or f == configs.METRICS_FILENAME or f == "current_metrics.json" or f == "baseline_metrics.json" or f == f"legacy:{configs.METRICS_FILENAME}") and f.endswith(".json") 
-                    for f in new_artifacts
-                )
-                
-                if found_metric:
-                    print(f"✨ [Harness] Metric artifact detected among {len(new_artifacts)} fresh files! Initiating safe shutdown.")
-                    exit_trigger = "metric_detected"
-                    metrics_captured = True
+                # B. Brain-controlled kill (async commands only)
+                # When kill_event is present, the Brain is the kill authority.
+                # The Brain's Mid-Turn Judge decides when to stop via kill_command RPC.
+                if kill_event and kill_event.is_set():
+                    print(f"🛑 [Harness] Brain requested termination. Executing signal ladder.")
+                    exit_trigger = "brain_kill"
                     self._terminate_ladder(process)
                     break
                 
-                # C. Check Timeout
+                # C. Check Metrics (sync commands only)
+                # When kill_event is None, this is a synchronous command (baseline/instrumentation).
+                # Metric detection means the command produced its output — safe to stop.
+                # When kill_event is present (async), skip metric-driven kill entirely —
+                # the Brain decides when to stop.
+                if not kill_event:
+                    new_artifacts = get_fresh_artifacts()
+                    
+                    found_metric = any(
+                        (f.startswith("partial_") or f == configs.METRICS_FILENAME or f == "current_metrics.json" or f == "baseline_metrics.json" or f == f"legacy:{configs.METRICS_FILENAME}") and f.endswith(".json") 
+                        for f in new_artifacts
+                    )
+                    
+                    if found_metric:
+                        print(f"✨ [Harness] Metric artifact detected among {len(new_artifacts)} fresh files! Initiating safe shutdown.")
+                        exit_trigger = "metric_detected"
+                        metrics_captured = True
+                        self._terminate_ladder(process)
+                        break
+                
+                # D. Check Timeout (safety net, both modes)
                 if timeout and (self.system.clock.time() - start_time > timeout):
                     print(f"⏱️ [Harness] Timeout reached ({timeout}s). Killing process.")
                     exit_trigger = "timeout"
@@ -142,11 +156,12 @@ class RemorooHarness:
         
         # Success definition: 
         # - "metric_detected" is ALWAYS success (we got data).
+        # - "brain_kill" is ALWAYS success (Brain decided intentionally).
         # - "natural_exit" is success if return_code == 0.
         # - "timeout" is failure.
         
         success = False
-        if exit_trigger == "metric_detected":
+        if exit_trigger in ("metric_detected", "brain_kill"):
             success = True
         elif exit_trigger == "natural_exit" and return_code == 0:
             success = True

@@ -267,6 +267,127 @@ git stash pop
 
 ---
 
+## Running Long Experiments (ML Training, RL, etc.)
+
+ML training, reinforcement learning, and other compute-heavy experiments can run for **hours**. Your terminal and machine need to stay alive the entire time. Here's how to set that up.
+
+### macOS
+
+**Problem:** Closing the terminal kills the process. Closing the laptop lid suspends it. Logging out kills it.
+
+**Step 1: Use `tmux` (terminal survives disconnect)**
+
+```bash
+# Install tmux (one-time)
+brew install tmux
+
+# Start a named session
+tmux new -s remoroo
+```
+
+Now run your experiment inside the tmux session:
+
+```bash
+remoroo run --local \
+  --goal "Train a PPO agent to achieve avg_reward >= 200 on BipedalWalker-Hardcore-v3" \
+  --metrics "avg_reward >= 200"
+```
+
+Detach anytime with `Ctrl+B` then `D` — the process keeps running in the background.
+
+Reattach later:
+
+```bash
+tmux attach -t remoroo
+```
+
+**Step 2: Prevent Mac from sleeping**
+
+Even with tmux, macOS will freeze everything when your Mac sleeps. Use `caffeinate` to prevent this:
+
+```bash
+# Inside your tmux session:
+caffeinate -s remoroo run --local \
+  --goal "Train a PPO agent..." \
+  --metrics "avg_reward >= 200"
+```
+
+`caffeinate -s` prevents system sleep as long as the command is running (requires power adapter).
+
+**Step 3 (optional): System Settings**
+
+For extra safety, go to **System Settings > Energy** and:
+- Set "Turn display off after" to your preference (display sleep is fine)
+- Disable "Put hard disks to sleep when possible"
+- Enable "Prevent automatic sleeping when the display is off" (if available)
+
+**Quick reference (macOS):**
+
+```bash
+# Full recipe: tmux + caffeinate
+tmux new -s remoroo
+caffeinate -s remoroo run --local --goal "..." --metrics "..."
+# Ctrl+B, D to detach. tmux attach -t remoroo to reattach.
+```
+
+### Linux (local or SSH)
+
+```bash
+# tmux (same as macOS)
+tmux new -s remoroo
+remoroo run --local --goal "..." --metrics "..."
+# Ctrl+B, D to detach
+```
+
+No `caffeinate` needed on servers — they don't sleep. If running over SSH, tmux ensures the process survives SSH disconnections.
+
+### Linux (remote server via SSH)
+
+If you're running over SSH to a remote machine:
+
+```bash
+# SSH into your server
+ssh user@your-server
+
+# Start tmux (critical — without this, SSH disconnect kills everything)
+tmux new -s remoroo
+remoroo run --local --goal "..." --metrics "..."
+# Ctrl+B, D to detach
+# You can now safely close your laptop
+```
+
+Reattach after reconnecting:
+
+```bash
+ssh user@your-server
+tmux attach -t remoroo
+```
+
+### What Happens If...
+
+| Event | Without tmux | With tmux | With tmux + caffeinate |
+|-------|-------------|-----------|----------------------|
+| Close terminal | Process dies | Keeps running | Keeps running |
+| Mac sleeps (lid close) | Process freezes | Process freezes | Keeps running |
+| SSH disconnects | Process dies | Keeps running | Keeps running |
+| Mac logs out | Process dies | Keeps running | Keeps running |
+| Mac reboots | Process dies | Process dies | Process dies |
+
+### Checking on a Running Experiment
+
+While detached from tmux, you can still monitor progress:
+
+```bash
+# Reattach to see live output
+tmux attach -t remoroo
+
+# Or check the latest artifacts without reattaching
+ls -lt runs/latest/
+cat runs/latest/artifacts/metrics.json
+```
+
+---
+
 ## Tips for Success
 
 1. **Use Baseline-Relative Metrics**: `runtime_s < baseline runtime_s` is more robust than hardcoded thresholds.

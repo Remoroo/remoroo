@@ -108,26 +108,45 @@ class LocalWorker:
         
         return metrics
 
-    def _extract_metrics_from_text(self, text: str) -> Dict[str, Any]:
-        """Simple regex fallback to capture key=value metrics from stdout/stderr."""
-        if text is None:
+    def _extract_metrics_from_text(self, text: str, expected_metrics: List[str] = None) -> Dict[str, Any]:
+        """
+        Extract metrics from stdout/stderr text.
+        
+        Builds targeted regex patterns FROM expected_metrics to avoid capturing noise.
+        """
+        if text is None or not expected_metrics:
             return {}
         import re
         metrics = {}
-        # Pattern: key=value (where value is a number)
-        # We look for lines like 'runtime_s=10.25' or 'accuracy: 0.99'
-        patterns = [
-            r'([a-zA-Z0-9_]+)\s*[:=]\s*([0-9.]+)',
-        ]
-        for line in text.splitlines():
-            for p in patterns:
-                matches = re.findall(p, line)
-                for k, v in matches:
-                    try:
-                        # Skip common false positives or very long numbers that might be hashes
-                        if len(k) < 30 and len(v) < 20:
-                             metrics[k] = float(v)
-                    except: pass
+        
+        # Build targeted patterns for each expected metric
+        # e.g., "avg_reward" -> matches "avg_reward: 123" or "Avg Reward: 123"
+        for metric_name in expected_metrics:
+            if not isinstance(metric_name, str) or not metric_name.strip():
+                continue
+            
+            name = metric_name.strip()
+            
+            # Build variations: "avg_reward" -> ["avg_reward", "Avg Reward", "avg reward"]
+            variations = [
+                name,  # exact: avg_reward
+                name.replace('_', ' '),  # with spaces: avg reward
+                name.replace('_', ' ').title(),  # title case: Avg Reward
+            ]
+            
+            # Build pattern that matches any variation followed by : or = and a number
+            escaped_variations = [re.escape(v) for v in variations]
+            pattern = r'(?:' + '|'.join(escaped_variations) + r')\s*[:=]\s*(-?[0-9][0-9,]*\.?[0-9]*)'
+            
+            # Search for this specific metric (case-insensitive)
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                try:
+                    value_str = match.group(1).replace(',', '')
+                    value = float(value_str)
+                    metrics[name.lower().replace(' ', '_')] = value
+                except:
+                    pass
+        
         return metrics
 
         
@@ -684,6 +703,7 @@ class LocalWorker:
                 commands = p.get("commands", [])
                 timeout = p.get("timeout_s", 120)
                 env_vars = p.get("env", {}).copy()
+                expected_metrics = p.get("expected_metrics", [])
                 
                 # Setup Sandbox/Runner
                 runner_factory = None
@@ -823,19 +843,20 @@ class LocalWorker:
                                             metrics_source = os.path.basename(mpath)
                                         break
                             except: pass # File might be locked or unreadable
-                if not captured_metrics:
-                      # 3. Last Resort: Parse from LOGS (stdout)
-                      for outcome in outcomes:
-                          stdout = outcome.get("stdout") or ""
-                          log_metrics = self._extract_metrics_from_text(stdout)
-                          if log_metrics:
-                               self._log(f"📊 [DEBUG] Captured metrics from LOGS: {log_metrics}")
-                               captured_metrics.update(log_metrics)
+                
+                # 3. Last Resort: Parse stdout with ExperimentContract filter
+                if not captured_metrics and expected_metrics:
+                    combined_stdout = "\n".join(o.get("stdout", "") for o in outcomes if o.get("stdout"))
+                    log_metrics = self._extract_metrics_from_text(combined_stdout, expected_metrics=expected_metrics)
+                    if log_metrics:
+                        self._log(f"  📊 [Worker] Baseline Log Parse Success (filtered): {log_metrics}")
+                        captured_metrics.update(log_metrics)
+                        metrics_source = "stdout_filtered"
 
                 if captured_metrics:
                      self._log(f"📊 [DEBUG] Baseline Step Captured: {captured_metrics}")
                 else:
-                     self._log(f"⚠️ [DEBUG] Metrics Capture Failed (Sandbox & Host). No metrics found in artifacts")
+                     self._log(f"⚠️ [DEBUG] Metrics Capture Failed. No metrics found in artifacts or logs (expected: {expected_metrics}).")
 
                 # Wrap for schema consistency: { "metrics": { ... } }
                 baseline_payload = {
@@ -929,26 +950,12 @@ class LocalWorker:
                                  self._log(f"⚠️ [DEBUG] Failed to load from Host {mpath}: {e}")
                                  pass
                 
-                # 3. Last Resort: Parse from LOGS (stdout)
-                if not captured_metrics and command_results:
-                    # Flatten the outcomes dictionary of lists (if it is one) or handle single list
-                    flat_outcomes = []
-                    if isinstance(command_results, dict):
-                        for stage_list in command_results.values():
-                            if isinstance(stage_list, list):
-                                flat_outcomes.extend(stage_list)
-                    elif isinstance(command_results, list):
-                        flat_outcomes = command_results
-
-                    for outcome in flat_outcomes:
-                        if isinstance(outcome, dict) and outcome.get("stdout"):
-                            log_metrics = self._extract_metrics_from_text(outcome["stdout"])
-                            if log_metrics:
-                                self._log(f"📊 [DEBUG] Captured metrics from LOGS: {log_metrics}")
-                                captured_metrics.update(log_metrics)
+                # NOTE: Removed "Last Resort" log parsing from Worker.
+                # The Brain handles stdout parsing with ExperimentContract filtering.
+                # Worker only returns metrics from artifact files to avoid noise.
                 
                 if not captured_metrics:
-                     self._log(f"⚠️ [DEBUG] No metrics found (Sandbox, Host, or Logs).")
+                     self._log(f"⚠️ [DEBUG] No metrics found in artifacts (Sandbox or Host).")
 
                          
                 # ------------------------------------
@@ -1570,6 +1577,9 @@ class LocalWorker:
                 cmd = request.payload.get("command", "")
                 timeout_s = request.payload.get("timeout_s")
                 env_vars = request.payload.get("env", {})
+                # Get expected metrics from ExperimentContract for filtered extraction
+                expected_metrics = request.payload.get("expected_metrics", [])
+                is_baseline = request.payload.get("is_baseline", False)
                 
                 if not cmd:
                     return ExecutionResult(success=False, error="No command provided")
@@ -1596,6 +1606,8 @@ class LocalWorker:
                         "stderr": stderr_buffer,
                         "start_time": time.time(),
                         "command": cmd,
+                        "expected_metrics": expected_metrics,  # For filtered extraction
+                        "is_baseline": is_baseline,  # For CLI scoreboard routing
                         "finished": False,
                         "exit_code": None
                     }
@@ -1638,6 +1650,11 @@ class LocalWorker:
                             text=True
                         )
 
+                    # Thread-safe kill bridge: Brain sets this event via kill_command RPC,
+                    # Harness checks it in its 0.1s supervision loop and executes _terminate_ladder.
+                    kill_event = threading.Event()
+                    self._execution_buffers[execution_id]["kill_event"] = kill_event
+
                     # Background Thread for Harness
                     def harness_runner():
                         harness = RemorooHarness(system=self.system)
@@ -1669,7 +1686,8 @@ class LocalWorker:
                             artifact_dir=self.artifact_dir,
                             stdout_buffer=stdout_buffer,
                             stderr_buffer=stderr_buffer,
-                            output_callback=self.output_callback
+                            output_callback=self.output_callback,
+                            kill_event=kill_event  # Brain-controlled kill: Brain sets event, Harness executes signal ladder
                         )
                         
                         # Update state when finished
@@ -1685,6 +1703,16 @@ class LocalWorker:
                                  self._log(f"  ❌ [Worker] Harness Error: {result.error}")
                         
                         trigger = result.data.get("trigger") if result.data else "error"
+                        
+                        # DOCKER ORPHAN CLEANUP (safety net):
+                        # When Harness kills a docker exec process (brain_kill or timeout),
+                        # the process INSIDE the container survives as an orphan.
+                        # Clean it up here as a secondary defense (primary is in kill_command handler).
+                        if trigger in ("brain_kill", "timeout") and self.engine == "docker" and self.sandbox and self.sandbox.available:
+                            try:
+                                self.sandbox.kill_process_by_command(cmd)
+                            except Exception as e:
+                                self._log(f"  ⚠️  Docker orphan cleanup failed: {e}")
                         
                         # CRITICAL: Store new_artifacts to prevent reading stale metrics
                         new_artifacts = result.data.get("new_artifacts", []) if result.data else []
@@ -1740,6 +1768,8 @@ class LocalWorker:
                 captured_metrics = {}
                 metrics_source = "none"
                 
+                # Read metrics both when finished AND while still running (for long-lived async commands).
+                # When running, we attempt to read live artifact files written by the process.
                 if not running:
                     self._log(f"🔎 [Worker] Scanning for metrics (ExecId: {exec_id})...")
                     
@@ -1826,17 +1856,89 @@ class LocalWorker:
                              except Exception as e:
                                  self._log(f"  ⚠️ [Worker] Host Read Failed (Legacy): {e}")
 
-                # 3. Last Resort: Parse from snapshot buffers
-                if not captured_metrics:
-                    log_metrics = self._extract_metrics_from_text(stdout_full)
-                    if log_metrics:
-                        self._log(f"  📊 [Worker] Log Parse Success: {log_metrics}")
-                        captured_metrics.update(log_metrics)
-                        metrics_source = "stdout_logs"
+                # 2.5. Live Artifact Read (while process is STILL running)
+                # For long-running async commands (ML training), metrics are written
+                # to artifact files periodically. Read them directly.
+                # ─── Closing-the-loops Fix 2: dedup live metric reads ───
+                # Only attempt live read if enough time passed since last read or
+                # if we haven't read yet.  Prevents flooding the brain with
+                # duplicate metric snapshots every 5s.
+                import hashlib as _hl_dedup
+                _last_live_read_hash = state.get("_last_live_metrics_hash", "")
+                _live_read_interval = state.get("_live_read_interval", 15.0)  # start at 15s
+                _last_live_read_time = state.get("_last_live_read_time", 0)
+                _now_lr = time.time()
+                _skip_live_read = running and (_now_lr - _last_live_read_time < _live_read_interval)
+                if running and not captured_metrics and not _skip_live_read:
+                    live_candidates = ["current_metrics.json", configs.METRICS_FILENAME]
+                    # Try sandbox read first (Docker)
+                    if self.sandbox and self.sandbox.available:
+                        for fname in live_candidates:
+                            path = os.path.join(self.artifact_dir, fname)
+                            try:
+                                res = self.sandbox.exec_run(["cat", path])
+                                if res.get("exit_code") == 0 and res.get("stdout", "").strip():
+                                    loaded = json.loads(res["stdout"])
+                                    extracted = self._robust_extract_metrics(loaded)
+                                    if extracted:
+                                        captured_metrics.update(extracted)
+                                        metrics_source = f"live:{fname}"
+                                        break
+                            except Exception:
+                                pass
+                    # Host fallback for live read
+                    if not captured_metrics and self.artifact_dir:
+                        for fname in live_candidates:
+                            mpath = os.path.join(self.artifact_dir, fname)
+                            if self.system.fs.exists(mpath):
+                                try:
+                                    with self.system.fs.open(mpath, 'r') as f:
+                                        loaded = json.load(f)
+                                        extracted = self._robust_extract_metrics(loaded)
+                                        if extracted:
+                                            captured_metrics.update(extracted)
+                                            metrics_source = f"live:{fname}"
+                                            break
+                                except Exception:
+                                    pass
+
+                # ─── Fix 2 continued: dedup captured metrics ───
+                if running and captured_metrics:
+                    _metrics_hash = _hl_dedup.sha256(
+                        json.dumps(captured_metrics, sort_keys=True).encode()
+                    ).hexdigest()
+                    if _metrics_hash == _last_live_read_hash:
+                        # Same metrics as last poll — drop and increase backoff
+                        captured_metrics = {}
+                        metrics_source = "dedup_skip"
+                        state["_live_read_interval"] = min(_live_read_interval * 1.5, 60.0)
                     else:
-                        self._log(f"  ⚠️ [Worker] No metrics found in artifacts or logs.")
+                        # Genuinely new metrics — reset backoff
+                        state["_last_live_metrics_hash"] = _metrics_hash
+                        state["_live_read_interval"] = 15.0
+                    state["_last_live_read_time"] = _now_lr
+
+                # 3. Last Resort: Parse stdout with ExperimentContract filter
+                if not captured_metrics:
+                    expected = state.get("expected_metrics", [])
+                    self._log(f"  🔍 [DEBUG] expected_metrics = {expected}")
+                    # DEBUG: Show buffer state to diagnose timing issues
+                    self._log(f"  🔍 [DEBUG] stdout_buffer_lines = {len(state['stdout'])}, last_line = {repr(state['stdout'][-1][:80]) if state['stdout'] else 'empty'}")
+                    if expected:
+                        log_metrics = self._extract_metrics_from_text(stdout_full, expected_metrics=expected)
+                        if log_metrics:
+                            self._log(f"  📊 [Worker] Log Parse Success (filtered): {log_metrics}")
+                            captured_metrics.update(log_metrics)
+                            metrics_source = "stdout_filtered"
+                        else:
+                            self._log(f"  ⚠️ [Worker] No metrics found in artifacts or logs (expected: {expected}).")
+                    else:
+                        self._log(f"  ⚠️ [Worker] No metrics found in artifacts (no expected_metrics filter).")
                 # ------------------------------------
 
+                # Determine phase for CLI scoreboard routing
+                phase = "baseline" if state.get("is_baseline") else "current"
+                
                 return ExecutionResult(success=True, data={
                     "stdout": stdout_full,
                     "stderr": stderr_full,
@@ -1844,31 +1946,59 @@ class LocalWorker:
                     "exit_code": state["exit_code"],
                     "elapsed_s": elapsed,
                     "metrics_captured": bool(captured_metrics),
-                    "metrics_source": metrics_source
+                    "metrics_source": metrics_source,
+                    "phase": phase  # Tell CLI where to put metrics in scoreboard
                 }, metrics=captured_metrics)
                 
             elif request.type == "kill_command":
                 exec_id = request.payload.get("execution_id")
-                if not exec_id or exec_id not in self._running_processes:
-                    # Maybe already finished?
-                     return ExecutionResult(success=True, data={"killed": False, "reason": "Not running"})
                 
-                proc_or_thread = self._running_processes[exec_id]
+                # Primary path: use kill_event from _execution_buffers (Harness-managed async commands)
+                buf = self._execution_buffers.get(exec_id)
+                if buf:
+                    kill_event = buf.get("kill_event")
+                    if kill_event:
+                        kill_event.set()  # Harness checks this in its 0.1s loop and executes _terminate_ladder
+                        
+                        # CRITICAL: Docker orphan kill.
+                        # When running in Docker, SIGTERM/SIGKILL to the host-side `docker exec`
+                        # process does NOT propagate to the process INSIDE the container.
+                        # The container process survives as an orphan, continuing to write to
+                        # artifact files (metrics.json, baseline_metrics.json) and corrupting
+                        # subsequent turn executions.
+                        # Fix: directly kill the process inside the container by command pattern.
+                        if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                            cmd_to_kill = buf.get("command", "")
+                            if cmd_to_kill:
+                                try:
+                                    self.sandbox.kill_process_by_command(cmd_to_kill)
+                                except Exception as e:
+                                    self._log(f"⚠️  Docker orphan kill failed: {e}")
+                        
+                        return ExecutionResult(success=True, data={"killed": True, "mechanism": "event"})
                 
-                try:
-                    if isinstance(proc_or_thread, subprocess.Popen):
-                        proc_or_thread.terminate() # SIGTERM
-                        # Give it a sec then kill?
-                        self._execution_buffers[exec_id]["finished"] = True # Force semantics
-                        self._execution_buffers[exec_id]["exit_code"] = -15 # SIGTERM
-                        return ExecutionResult(success=True, data={"killed": True})
-                    else:
-                        # Thread/Sandbox - can't easily kill thread.
-                        # If sandbox, we might need container.exec_run("kill ...")?
-                        # For now, simplistic.
-                        return ExecutionResult(success=True, data={"killed": False, "reason": "Sandbox kill not impl"})
-                except Exception as e:
-                     return ExecutionResult(success=False, error=str(e))
+                # Fallback: legacy direct-process kill (non-harness commands)
+                if exec_id and exec_id in self._running_processes:
+                    proc_or_thread = self._running_processes[exec_id]
+                    try:
+                        if isinstance(proc_or_thread, subprocess.Popen):
+                            proc_or_thread.terminate()  # SIGTERM
+                            try:
+                                proc_or_thread.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                proc_or_thread.kill()  # SIGKILL
+                                proc_or_thread.wait(timeout=3)
+                            if exec_id in self._execution_buffers:
+                                self._execution_buffers[exec_id]["finished"] = True
+                                self._execution_buffers[exec_id]["exit_code"] = -15  # SIGTERM
+                            return ExecutionResult(success=True, data={"killed": True, "mechanism": "direct"})
+                        else:
+                            return ExecutionResult(success=True, data={"killed": False, "reason": "Sandbox kill not impl"})
+                    except Exception as e:
+                         return ExecutionResult(success=False, error=str(e))
+                
+                # Not found anywhere
+                return ExecutionResult(success=True, data={"killed": False, "reason": "Not found"})
 
             elif request.type == "run_commands":
                 # Alias for execute_plan (Brain Refactor)

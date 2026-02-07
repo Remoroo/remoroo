@@ -62,7 +62,7 @@ def run_local_worker(
         typer.echo("✅ Server is reachable.")
     except Exception as e:
          typer.secho(f"❌ Could not connect to Brain Server at {API_URL}.", fg=typer.colors.RED)
-         typer.echo(f"   Please ensure 'remoroo server' is running in another terminal.")
+         typer.echo(f"   Check connectivity by running 'curl {API_URL}/health' in a terminal.")
          if verbose:
              typer.echo(f"   Error: {e}")
          raise typer.Exit(code=1)
@@ -351,7 +351,8 @@ def run_local_worker(
                     elif "Applying" in scoreboard_data["status"]:
                         pass
                     else:
-                        scoreboard_data["status"] = "🧠 Brain is analyzing results & planning next step..."
+                        #scoreboard_data["status"] = "🧠 Brain is analyzing results & planning next step..."
+                        pass
                     
                     update_dashboard(dashboard_layout, scoreboard_data)
                     time.sleep(0.5)
@@ -431,14 +432,25 @@ def run_local_worker(
                         return clean
 
                     # Update scoreboard immediately with local result metrics
+                    # Note: For run_command_async, the Brain polls get_output and those steps come through here too.
+                    # Each get_output result updates the scoreboard since result.metrics is populated.
+                    # Check phase to route metrics to correct column (baseline vs current)
+                    phase = result.data.get("phase", "current") if result.data else "current"
+                    
+                    # DEBUG: Log what we receive
+                    if step.type == "get_output":
+                        live.console.print(f"[dim]📊 [DEBUG] get_output step - phase={phase}, metrics={result.metrics}[/dim]")
+                    
                     if result.metrics:
                         cleaned = clean_metrics_dict(result.metrics)
                         if cleaned:
-                             # live.console.print(f"[green]📈 Local Metrics Captured: {cleaned}[/green]")
+                             # Route to correct column based on phase
+                             target = scoreboard_data["baseline"] if phase == "baseline" else scoreboard_data["current"]
                              for k, v in cleaned.items():
-                                  scoreboard_data["current"][k] = v
+                                  target[k] = v
+                             live.console.print(f"[dim]📊 [DEBUG] Updated {phase} scoreboard: {cleaned}[/dim]")
                     
-                    # Check for baseline in specific artifact fields if available
+                    # Check for baseline in specific artifact fields if available (legacy support)
                     if result.data.get("baseline_metrics"):
                         cleaned_base = clean_metrics_dict(result.data["baseline_metrics"])
                         for k, v in cleaned_base.items():

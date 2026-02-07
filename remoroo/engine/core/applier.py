@@ -112,6 +112,17 @@ def edit_already_satisfied(repo_root: str, e: Dict[str, Any]) -> bool:
         desired_content = e.get("replacement", "")
         return current_content == desired_content
 
+    if kind == "search_replace":
+        if not os.path.exists(abs_path):
+            return False
+        current_content = _read_text(abs_path)
+        search_text = e.get("search", "")
+        replace_text = e.get("replacement", "")
+        # Already satisfied if search text is gone and replacement is present
+        if search_text and search_text not in current_content and replace_text in current_content:
+            return True
+        return False
+
     return False
 
 def apply_patchproposal(
@@ -130,7 +141,12 @@ def apply_patchproposal(
         file_path = e["path"]
         kind = e["kind"]
         
-        if kind == "replace_file":
+        if kind == "search_replace":
+            if not e.get("search"):
+                raise ApplyError(f"search_replace operation requires non-empty 'search' field for {e['path']}")
+            if e.get("replacement") is None:
+                raise ApplyError(f"search_replace operation requires 'replacement' field for {e['path']}")
+        elif kind == "replace_file":
             if not e.get("replacement"):
                 raise ApplyError(f"replace_file operation requires non-empty 'replacement' field for {e['path']}")
         elif kind == "create_file":
@@ -150,7 +166,7 @@ def apply_patchproposal(
         print(f"\n  Edit {i}/{len(patch.get('edits', []))}: {kind} on {e['path']}")
         
         if file_access_tracker:
-            if kind in ["replace_file", "insert", "delete"]:
+            if kind in ["search_replace", "replace_file", "insert", "delete"]:
                 if os.path.exists(abs_path):
                     if not file_access_tracker.can_edit(file_path):
                         status = file_access_tracker.get_status(file_path)
@@ -178,6 +194,64 @@ def apply_patchproposal(
                     if os.path.exists(abs_path):
                         os.remove(abs_path)
                     raise ApplyError(f"Syntax error in {e['path']} after create_file: {error_msg}")
+            
+            applied.append(e)
+            continue
+
+        if kind == "search_replace":
+            if not os.path.exists(abs_path):
+                raise ApplyError(f"search_replace operation failed: File '{e['path']}' does not exist.")
+            
+            search_text = e.get("search", "")
+            replace_text = e.get("replacement", "")
+            original_content = _read_text(abs_path)
+            
+            # 1. Exact match
+            match_count = original_content.count(search_text)
+            
+            if match_count == 0:
+                # 2. Whitespace-normalized match: strip trailing spaces per line, normalize newlines
+                def _normalize_ws(text: str) -> str:
+                    return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").split("\n"))
+                
+                norm_content = _normalize_ws(original_content)
+                norm_search = _normalize_ws(search_text)
+                norm_match_count = norm_content.count(norm_search)
+                
+                if norm_match_count == 0:
+                    search_preview = search_text[:120].replace("\n", "\\n")
+                    raise ApplyError(
+                        f"search_replace failed for {e['path']}: search text not found. "
+                        f"Search preview: '{search_preview}'"
+                    )
+                elif norm_match_count > 1:
+                    raise ApplyError(
+                        f"search_replace failed for {e['path']}: search text matches {norm_match_count} locations (ambiguous). "
+                        f"Include more context lines to get a unique match."
+                    )
+                else:
+                    # Apply on normalized content, then write back
+                    new_content = norm_content.replace(norm_search, _normalize_ws(replace_text), 1)
+                    # Preserve original trailing newline behavior
+                    if original_content.endswith("\n") and not new_content.endswith("\n"):
+                        new_content += "\n"
+                    print(f"    (whitespace-normalized match)")
+            elif match_count > 1:
+                raise ApplyError(
+                    f"search_replace failed for {e['path']}: search text matches {match_count} locations (ambiguous). "
+                    f"Include more context lines to get a unique match."
+                )
+            else:
+                # Exact single match — apply directly
+                new_content = original_content.replace(search_text, replace_text, 1)
+            
+            _write_text(abs_path, new_content)
+            
+            if abs_path.endswith('.py'):
+                is_valid, error_msg = validate_python_syntax(abs_path)
+                if not is_valid:
+                    _write_text(abs_path, original_content)
+                    raise ApplyError(f"Syntax error in {e['path']} after search_replace: {error_msg}")
             
             applied.append(e)
             continue
