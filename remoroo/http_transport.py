@@ -112,6 +112,22 @@ class HttpTransport(Transport):
             # print(f"⚠️ Poll error: {e}")
             return None, None, None
 
+    @staticmethod
+    def _sanitize_floats(obj):
+        """Recursively convert nan/inf/-inf to string representations so json.dumps won't choke."""
+        import math
+        if isinstance(obj, float):
+            if math.isnan(obj):
+                return "NaN"
+            if math.isinf(obj):
+                return "Infinity" if obj > 0 else "-Infinity"
+            return obj
+        if isinstance(obj, dict):
+            return {k: HttpTransport._sanitize_floats(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [HttpTransport._sanitize_floats(v) for v in obj]
+        return obj
+
     def submit_result(self, result: ExecutionResult) -> None:
         """Submit result to the HTTP server with retries."""
         import time
@@ -119,7 +135,7 @@ class HttpTransport(Transport):
         base_delay = 1.0
         
         # Convert to dict via asdict, ensuring JSON serializable
-        payload = asdict(result)
+        payload = self._sanitize_floats(asdict(result))
         
         for attempt in range(max_retries):
             try:

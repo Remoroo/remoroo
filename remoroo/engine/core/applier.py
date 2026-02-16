@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json as _json
 import os
 import codecs
 from pathlib import Path
@@ -98,12 +99,34 @@ def validate_patch_before_apply(
                 errors.append(PatchError("validation_failed", path, "Invalid range for delete", edit_kind=kind))
                 continue
         
+        if kind == "json_set":
+            key_path = e.get("key_path", "")
+            value = e.get("value")
+            if not key_path:
+                errors.append(PatchError("validation_failed", path, "json_set requires 'key_path'", edit_kind=kind))
+                continue
+            if not path.endswith(".json"):
+                errors.append(PatchError("validation_failed", path, "json_set only works on .json files", edit_kind=kind))
+                continue
+            try:
+                data = _json.loads(current_content) if current_content.strip() else {}
+                _json_set_nested(data, key_path, value)
+                new_content = _json.dumps(data, indent=2) + "\n"
+            except (KeyError, IndexError, TypeError, _json.JSONDecodeError) as exc:
+                errors.append(PatchError("validation_failed", path, f"json_set failed: {exc}", edit_kind=kind))
+                continue
+
         if new_content is not None:
             vfs[path] = new_content
             if path.endswith(".py") and new_content.strip():
                 is_valid, error_msg = validate_python_code_string(new_content, filename=path)
                 if not is_valid:
                     errors.append(PatchError("syntax_error", path, error_msg, edit_kind=kind))
+            elif path.endswith(".json") and new_content.strip():
+                try:
+                    _json.loads(new_content)
+                except _json.JSONDecodeError as exc:
+                    errors.append(PatchError("syntax_error", path, f"Invalid JSON: {exc}", edit_kind=kind))
 
     return errors
 
@@ -143,6 +166,26 @@ def _normalize_repl(repl: str) -> str:
     if repl == "":
         return ""
     return repl if repl.endswith("\n") else (repl + "\n")
+
+
+def _json_set_nested(data: Any, key_path: str, value: Any) -> None:
+    """Set a value in a nested dict/list using a dotted key path.
+
+    Supports dict keys and integer list indices, e.g. ``"model.layers.0.dim"``.
+    Intermediate containers must already exist.
+    """
+    keys = key_path.split(".")
+    target = data
+    for k in keys[:-1]:
+        if isinstance(target, list):
+            target = target[int(k)]
+        else:
+            target = target[k]
+    final = keys[-1]
+    if isinstance(target, list):
+        target[int(final)] = value
+    else:
+        target[final] = value
 
 def edit_already_satisfied(repo_root: str, e: Dict[str, Any]) -> bool:
     abs_path = os.path.join(repo_root, e["path"])
@@ -219,6 +262,21 @@ def edit_already_satisfied(repo_root: str, e: Dict[str, Any]) -> bool:
             return True
         return False
 
+    if kind == "json_set":
+        if not os.path.exists(abs_path):
+            return False
+        try:
+            data = _json.loads(_read_text(abs_path))
+            keys = e.get("key_path", "").split(".")
+            target = data
+            for k in keys[:-1]:
+                target = target[int(k)] if isinstance(target, list) else target[k]
+            final = keys[-1]
+            current = target[int(final)] if isinstance(target, list) else target[final]
+            return current == e.get("value")
+        except Exception:
+            return False
+
     return False
 
 def apply_patchproposal(
@@ -288,6 +346,14 @@ def apply_patchproposal(
                         os.remove(abs_path)
                     raise ApplyError(f"Syntax error in {e['path']} after create_file: {error_msg}", 
                                    patch_error=PatchError("syntax_error", file_path, error_msg, edit_kind=kind))
+            elif abs_path.endswith('.json') and replacement.strip():
+                try:
+                    _json.loads(replacement)
+                except _json.JSONDecodeError as exc:
+                    if os.path.exists(abs_path):
+                        os.remove(abs_path)
+                    raise ApplyError(f"Invalid JSON in {e['path']} after create_file: {exc}",
+                                   patch_error=PatchError("syntax_error", file_path, f"Invalid JSON: {exc}", edit_kind=kind))
             
             applied.append(e)
             continue
@@ -359,6 +425,13 @@ def apply_patchproposal(
                     _write_text(abs_path, original_content)
                     raise ApplyError(f"Syntax error after search_replace: {error_msg}", 
                                    patch_error=PatchError("syntax_error", file_path, error_msg, edit_kind=kind))
+            elif abs_path.endswith('.json') and new_content.strip():
+                try:
+                    _json.loads(new_content)
+                except _json.JSONDecodeError as exc:
+                    _write_text(abs_path, original_content)
+                    raise ApplyError(f"Invalid JSON after search_replace: {exc}",
+                                   patch_error=PatchError("syntax_error", file_path, f"Invalid JSON: {exc}", edit_kind=kind))
             
             applied.append(e)
             continue
@@ -406,6 +479,13 @@ def apply_patchproposal(
                     _write_lines(abs_path, original_lines)
                     raise ApplyError(f"Syntax error after insert: {error_msg}", 
                                    patch_error=PatchError("syntax_error", file_path, error_msg, edit_kind=kind))
+            elif abs_path.endswith('.json'):
+                try:
+                    _json.loads("".join(lines))
+                except _json.JSONDecodeError as exc:
+                    _write_lines(abs_path, original_lines)
+                    raise ApplyError(f"Invalid JSON after insert: {exc}",
+                                   patch_error=PatchError("syntax_error", file_path, f"Invalid JSON: {exc}", edit_kind=kind))
             
             applied.append(e)
             continue
@@ -441,6 +521,13 @@ def apply_patchproposal(
                     _write_lines(abs_path, original_lines)
                     raise ApplyError(f"Syntax error after delete: {error_msg}", 
                                    patch_error=PatchError("syntax_error", file_path, error_msg, edit_kind=kind))
+            elif abs_path.endswith('.json'):
+                try:
+                    _json.loads("".join(lines))
+                except _json.JSONDecodeError as exc:
+                    _write_lines(abs_path, original_lines)
+                    raise ApplyError(f"Invalid JSON after delete: {exc}",
+                                   patch_error=PatchError("syntax_error", file_path, f"Invalid JSON: {exc}", edit_kind=kind))
             
             applied.append(e)
             continue
@@ -461,7 +548,39 @@ def apply_patchproposal(
                     _write_text(abs_path, original_content)
                     raise ApplyError(f"Syntax error after replace_file: {error_msg}", 
                                    patch_error=PatchError("syntax_error", file_path, error_msg, edit_kind=kind))
+            elif abs_path.endswith('.json') and replacement.strip():
+                try:
+                    _json.loads(replacement)
+                except _json.JSONDecodeError as exc:
+                    _write_text(abs_path, original_content)
+                    raise ApplyError(f"Invalid JSON after replace_file: {exc}",
+                                   patch_error=PatchError("syntax_error", file_path, f"Invalid JSON: {exc}", edit_kind=kind))
             
+            applied.append(e)
+            continue
+
+        if kind == "json_set":
+            key_path = e.get("key_path", "")
+            value = e.get("value")
+
+            if not abs_path.endswith('.json'):
+                raise ApplyError(f"json_set only works on .json files, got '{e['path']}'",
+                               patch_error=PatchError("validation_failed", file_path, "json_set requires a .json file", edit_kind=kind))
+            if not os.path.exists(abs_path):
+                raise ApplyError(f"File '{e['path']}' does not exist.",
+                               patch_error=PatchError("file_not_found", file_path, "File not found", edit_kind=kind))
+
+            original_content = _read_text(abs_path)
+            try:
+                data = _json.loads(original_content)
+                _json_set_nested(data, key_path, value)
+                new_content = _json.dumps(data, indent=2) + "\n"
+            except (_json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+                raise ApplyError(f"json_set failed on '{e['path']}': {exc}",
+                               patch_error=PatchError("validation_failed", file_path, f"json_set failed: {exc}", edit_kind=kind))
+
+            _write_text(abs_path, new_content)
+            print(f"    json_set {key_path} = {_json.dumps(value)}")
             applied.append(e)
             continue
         
