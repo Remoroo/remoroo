@@ -90,6 +90,7 @@ def run(
     brain_url: str = typer.Option(None, "--brain-url", help="URL of the Brain Server."),
     no_patch: bool = typer.Option(False, "--no-patch", help="Do not ask to apply patch (auto-deny)."),
     engine: str = typer.Option(None, "--engine", help="Execution engine (docker or venv). Defaults to 'docker'."),
+    cache_env: bool = typer.Option(True, "--cache-env", help="Cache Docker environment (skip already-installed packages, commit changes)."),
 ):
     from .configs import get_api_url, get_default_engine
     from .engine.utils.doctor import ensure_ready
@@ -174,6 +175,7 @@ def run(
             brain_url=brain_url,
             engine=engine,
             verbose=verbose,
+            cache_env=cache_env,
         )
 
         from rich.console import Console

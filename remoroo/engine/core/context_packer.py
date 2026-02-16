@@ -197,8 +197,31 @@ def _get_analysis_suggestions(file_format: str, path: str) -> List[str]:
 
 def _extract_semantic_chunks(file_path: str, contents: str) -> List[Dict[str, Any]]:
     """
-    Extract semantic chunks (imports, classes, functions) from a Python file using AST.
+    Extract semantic chunks (imports, classes, functions) using tree-sitter (industry standard).
+    Falls back to Python AST if tree-sitter is not available or fails.
     Returns list of chunks with line ranges and metadata.
+    """
+    # Try tree-sitter first (multi-language support)
+    from .code_parser import extract_code_blocks_treesitter, supports_tree_sitter
+    
+    if supports_tree_sitter(file_path):
+        try:
+            chunks = extract_code_blocks_treesitter(file_path, contents)
+            if chunks and chunks[0]['type'] != 'raw':
+                # Tree-sitter succeeded
+                return chunks
+        except Exception as e:
+            # Tree-sitter failed, fall back to AST
+            print(f"⚠️  Tree-sitter failed for {file_path}, falling back to AST: {e}")
+    
+    # Fallback to Python AST (legacy, Python-only)
+    return _extract_semantic_chunks_ast(file_path, contents)
+
+
+def _extract_semantic_chunks_ast(file_path: str, contents: str) -> List[Dict[str, Any]]:
+    """
+    Legacy AST-based extraction for Python files.
+    Used as fallback when tree-sitter is not available or fails.
     """
     chunks = []
     

@@ -21,6 +21,7 @@ def run_local_worker(
     brain_url: str = None,
     engine: str = "docker",
     verbose: bool = False,
+    cache_env: bool = False,
 ) -> LocalRunResult:
     from .configs import get_api_url
     if brain_url is None:
@@ -227,7 +228,8 @@ def run_local_worker(
         # v16: Persistence Dir (CLI Cache) for real-time mirroring
         persistence_dir=str(artifact_dir),
         # Early instance might not have Live console yet, but we'll set it in the loop
-        output_callback=console.print 
+        output_callback=console.print,
+        cache_env=cache_env  # Enable environment caching
     )
     
     final_result = None
@@ -483,7 +485,8 @@ def run_local_worker(
                              run_id=remote_run_id,
                              engine=engine, output_callback=live.console.print,
                              # v16: Persistence Dir (CLI Cache)
-                             persistence_dir=str(artifact_dir)
+                             persistence_dir=str(artifact_dir),
+                             cache_env=cache_env  # Enable environment caching
                          )
                          live.console.print(f"[bold yellow]🔄 Switched execution context to:[/bold yellow] [dim]{new_root}[/dim]")
 

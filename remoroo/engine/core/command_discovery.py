@@ -122,7 +122,8 @@ def discover_command_plan(
     metric_names: List[str],
     initial_commands: List[str],
     venv_python: Optional[str] = None,
-    timeout_s: float = 8.0,
+    timeout_s: float = 4.0,
+    include_repo_index_entrypoints: bool = True,
     runner_factory: Optional[Callable] = None,
     output_callback: Optional[Callable] = None,
 ) -> CommandDiscoveryResult:
@@ -139,14 +140,37 @@ def discover_command_plan(
 
     candidates: List[Dict[str, Any]] = []
     base_cmds = [c for c in (initial_commands or []) if isinstance(c, str) and c.strip()]
-    if not base_cmds:
-        # Minimal fallback: try python main.py if present.
-        if os.path.exists(os.path.join(repo_root, "main.py")):
-            base_cmds = ["python main.py"]
+    
+    # Add repo_indexer entrypoints (default on). For targeted retries, callers can disable this
+    # to avoid re-running already-successful commands.
+    if include_repo_index_entrypoints:
+        # repo_index.json is in .remoroo/ directory in repo root, not artifacts
+        repo_index_path = os.path.join(repo_root, ".remoroo", "repo_index.json")
+        if os.path.exists(repo_index_path):
+            try:
+                with open(repo_index_path, "r", encoding="utf-8") as f:
+                    repo_index = json.load(f)
+                    entrypoints = repo_index.get("entrypoints", [])
+                    # print(f"  📋 Found {len(entrypoints)} entrypoint(s) in repo_index.json")
+                    for ep in entrypoints:
+                        how = ep.get("how_to_run") or ep.get("how")  # Support both field names
+                        if how:
+                            # print(f"    → {how}")
+                            base_cmds.append(how)
+            except Exception as e:
+                print(f"  ⚠️ Failed to load repo_index.json: {e}")
+                pass  # Ignore repo_index errors
+    
+    # Fallback: try python main.py if present
+    if not base_cmds and os.path.exists(os.path.join(repo_root, "main.py")):
+        base_cmds = ["python main.py"]
 
     # Deduplicate while preserving order
     seen = set()
     base_cmds = [c for c in base_cmds if not (c in seen or seen.add(c))]
+
+    # Collect all successful commands (don't return early)
+    successful_commands = []
 
     for base in base_cmds[:6]:
         base = _rewrite_python_launcher(base, venv_python=venv_python)
@@ -201,14 +225,8 @@ def discover_command_plan(
         
         if is_success:
             cmd = _maybe_add_common_args(base, help_text=help_text)
-            plan = {"Stage_1": [cmd]}
-            return CommandDiscoveryResult(
-                success=True,
-                command_plan=plan,
-                candidates=candidates,
-                chosen_entry_cmd=base,
-                reason="Base entry command succeeded (or timed out safely).",
-            )
+            successful_commands.append({"base": base, "cmd": cmd, "help_text": help_text})
+            continue  # Try next entrypoint
 
         # If it looks like a usage error, try to infer required mode flags and expand.
         mode_flags = _infer_required_mode_flags(stderr)
@@ -239,6 +257,21 @@ def discover_command_plan(
                 chosen_entry_cmd=base,
                 reason=f"Expanded required mode flags from usage error: {mode_flags}",
             )
+    
+    # If we collected multiple successful commands, build a multi-stage plan
+    if successful_commands:
+        plan: Dict[str, List[str]] = {}
+        for i, cmd_info in enumerate(successful_commands, start=1):
+            stage_name = f"Stage_{i}"
+            plan[stage_name] = [cmd_info["cmd"]]
+        
+        return CommandDiscoveryResult(
+            success=True,
+            command_plan=plan,
+            candidates=candidates,
+            chosen_entry_cmd=successful_commands[0]["base"],
+            reason=f"Found {len(successful_commands)} working entrypoint(s).",
+        )
 
     return CommandDiscoveryResult(
         success=False,

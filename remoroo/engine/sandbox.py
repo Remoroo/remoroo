@@ -8,10 +8,11 @@ from pathlib import Path
 from .utils import configs
 
 class DockerSandbox:
-    def __init__(self, repo_path: str, artifact_dir: str, image_name: str = "remoroo-cli"):
+    def __init__(self, repo_path: str, artifact_dir: str, image_name: str = "remoroo-cli", cache_env: bool = False):
         self.repo_path = os.path.abspath(repo_path)
         self.artifact_dir = os.path.abspath(artifact_dir)
         self.image_name = image_name
+        self.cache_env = cache_env  # Enable environment caching
         self.container_name = f"remoroo-sandbox-{uuid.uuid4().hex[:8]}"
         self.is_running = False
         self.available = self.check_docker()
@@ -100,6 +101,39 @@ class DockerSandbox:
         # Fix permissions? In Docker usually root.
         # For now, we assume user mapping is not strict p0.
 
+    def commit_state(self, success: bool = True):
+        """
+        Commit the current container state to the image for reuse in future runs.
+        This enables environment caching - installed packages persist across runs.
+        """
+        if not self.is_running:
+            print("ℹ️  Container not running, skipping commit")
+            return
+        
+        if not success:
+            print("⚠️  Run failed. Skipping Docker commit to avoid persisting bad state.")
+            return
+        
+        if not self.cache_env:
+            return  # Caching disabled, don't commit
+        
+        try:
+            # Commit container state to the same image name (overwrite)
+            commit_tag = f"{self.image_name}:latest"
+            print(f"💾 Committing Docker container state to {commit_tag}...")
+            
+            subprocess.check_call(
+                ["docker", "commit", self.container_name, commit_tag],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            print(f"✅ Docker environment cached for future runs")
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️  Docker commit failed: {e}")
+        except Exception as e:
+            print(f"⚠️  Unexpected error during Docker commit: {e}")
+
     def stop(self):
         """Stop and remove the container."""
         if self.is_running:
@@ -186,6 +220,69 @@ class DockerSandbox:
         except Exception as e:
             print(f"⚠️  [DockerSandbox] Error killing container process: {e}")
             return False
+
+    def check_package_installed(self, package: str) -> bool:
+        """
+        Check if a Python package is already installed in the container.
+        Returns True if installed, False otherwise.
+        """
+        if not self.is_running:
+            return False
+        
+        try:
+            # Use pip show to check if package exists
+            result = subprocess.run(
+                ["docker", "exec", self.container_name, "pip", "show", package],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+    
+    def filter_install_command(self, cmd: str) -> Optional[str]:
+        """
+        Filter pip install commands if cache_env is enabled.
+        Returns None if all packages are already installed, otherwise returns filtered command.
+        """
+        if not self.cache_env:
+            return cmd  # No filtering if caching disabled
+        
+        if not ("pip install" in cmd or "pip3 install" in cmd):
+            return cmd  # Not a pip install command
+        
+        # Skip special flags that we always want to run
+        if any(flag in cmd for flag in ["-r", "--requirement", "-e", "--editable", "."]):
+            return cmd  # Always run requirements.txt, editable installs
+        
+        # Extract package names from command
+        parts = cmd.split()
+        try:
+            install_idx = next(i for i, p in enumerate(parts) if p == "install")
+            packages = parts[install_idx + 1:]
+            
+            # Filter out packages that are already installed
+            packages_to_install = []
+            for pkg in packages:
+                # Remove version specifiers for checking
+                pkg_name = pkg.split(">=")[0].split("==")[0].split("<")[0].split(">")[0].strip("'\"")
+                if not self.check_package_installed(pkg_name):
+                    packages_to_install.append(pkg)
+                else:
+                    print(f"  ✓ {pkg_name} already installed (skipping)")
+            
+            if not packages_to_install:
+                print(f"  ℹ️  All packages already installed, skipping: {cmd}")
+                return None  # All packages installed, skip command
+            
+            # Reconstruct command with only missing packages
+            filtered_cmd = " ".join(parts[:install_idx + 1] + packages_to_install)
+            if filtered_cmd != cmd:
+                print(f"  📦 Filtered install command: {filtered_cmd}")
+            return filtered_cmd
+        except (StopIteration, IndexError):
+            return cmd  # Couldn't parse, run as-is
 
     def exec_popen(self, cmd: List[str], env: Dict[str, str] = {}, workdir: Optional[str] = None) -> subprocess.Popen:
         """

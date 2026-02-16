@@ -11,6 +11,20 @@ import time
 import threading
 import signal
 import subprocess
+import platform
+import sys
+import re
+import tempfile
+import dataclasses
+import hashlib
+import traceback
+import zipfile
+import io
+try:
+    import requests
+except ImportError:
+    requests = None
+
 from .venv_sandbox import VenvSandbox
 from .harness import RemorooHarness
 from .utils.system_interface import SystemInterface, RealSystem
@@ -21,12 +35,11 @@ class LocalWorker:
     Handles ExecutionRequests and returns ExecutionResults.
     """
     
-    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None, system: Optional[SystemInterface] = None, persistence_dir: Optional[str] = None):
+    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None, system: Optional[SystemInterface] = None, persistence_dir: Optional[str] = None, cache_env: bool = False):
         self.system = system or RealSystem()
         self.output_callback = output_callback
         self._log("🔧 LocalWorker (v4-Airtight) Loaded")
         
-        import tempfile
         self.repo_root = repo_root
         self.original_repo_root = original_repo_root or repo_root # Keep reference to original
         # Infer is_ephemeral if repo_root is different from original_repo_root
@@ -46,6 +59,7 @@ class LocalWorker:
             
         self.run_id = run_id
         self.engine = engine.lower()
+        self.cache_env = cache_env  # Enable environment caching (skip already-installed packages)
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
         
         # Initialize Sandbox (Lazy start)
@@ -53,7 +67,7 @@ class LocalWorker:
         self.sandbox = None
         if self.engine == "docker":
             from .sandbox import DockerSandbox
-            self.sandbox = DockerSandbox(repo_root, artifact_dir)
+            self.sandbox = DockerSandbox(repo_root, artifact_dir, cache_env=cache_env)
         else:
             self._log(f"ℹ️  Execution Engine: {self.engine.upper()} (Sandbox Disabled)")
         
@@ -116,7 +130,6 @@ class LocalWorker:
         """
         if text is None or not expected_metrics:
             return {}
-        import re
         metrics = {}
         
         # Build targeted patterns for each expected metric
@@ -128,15 +141,27 @@ class LocalWorker:
             name = metric_name.strip()
             
             # Build variations: "avg_reward" -> ["avg_reward", "Avg Reward", "avg reward"]
-            variations = [
-                name,  # exact: avg_reward
-                name.replace('_', ' '),  # with spaces: avg reward
-                name.replace('_', ' ').title(),  # title case: Avg Reward
-            ]
+            # Build variations: "avg_reward" -> ["avg_reward", "Avg Reward", "avg reward"]
+            var_set = {name, name.replace('_', ' '), name.replace('_', ' ').title()}
             
-            # Build pattern that matches any variation followed by : or = and a number
-            escaped_variations = [re.escape(v) for v in variations]
-            pattern = r'(?:' + '|'.join(escaped_variations) + r')\s*[:=]\s*(-?[0-9][0-9,]*\.?[0-9]*)'
+            # ─── New Architecture Fix: Dynamic Stemming ───
+            # If name has a common unit suffix, also match the base name (stem)
+            # This handles 'runtime_s' -> 'Runtime', 'accuracy_pct' -> 'Accuracy' etc.
+            # WITHOUT an explicit alias map.
+            parts = name.split('_')
+            if len(parts) > 1:
+                stem = parts[0]
+                var_set.add(stem)
+                var_set.add(stem.title())
+                # Also handle 'total_duration_s' -> 'total duration'
+                stem_full = "_".join(parts[:-1])
+                var_set.add(stem_full)
+                var_set.add(stem_full.replace('_', ' '))
+                var_set.add(stem_full.replace('_', ' ').title())
+            
+            # Support slashes and dots in metric names for regex
+            escaped_variations = [re.escape(v) for v in var_set]
+            pattern = r'(?:' + '|'.join(escaped_variations) + r')\s*(?:\([^)]*\))?\s*[:=]\s*(-?[0-9][0-9,]*\.?[0-9]*)'
             
             # Search for this specific metric (case-insensitive)
             for match in re.finditer(pattern, text, re.IGNORECASE):
@@ -515,7 +540,30 @@ class LocalWorker:
                 outcomes = []
                 success = True
                 last_error = None
+                packages_installed = False  # Track if any packages were installed
+                
                 for cmd in commands:
+                    # Filter install commands if cache_env is enabled
+                    original_cmd = cmd
+                    if self.sandbox and self.sandbox.available and self.cache_env:
+                        filtered_cmd = self.sandbox.filter_install_command(cmd)
+                        if filtered_cmd is None:
+                            # All packages already installed, skip this command
+                            outcome_record = {
+                                "command": original_cmd,
+                                "exit_code": 0,
+                                "stdout": "(cached - packages already installed)",
+                                "stderr": "",
+                                "duration_s": 0.0,
+                                "skipped": True
+                            }
+                            outcomes.append(outcome_record)
+                            continue
+                        cmd = filtered_cmd
+                        if cmd != original_cmd:
+                            packages_installed = True
+                    
+                    # Execute the command
                     outcome = executor.run_command_with_timeout(
                         cmd=cmd,
                         cwd=self.repo_root,
@@ -525,13 +573,20 @@ class LocalWorker:
                         env=exec_env,
                         runner_factory=runner
                     )
+                    
+                    # Track if packages were installed
+                    if "pip install" in cmd or "pip3 install" in cmd:
+                        if outcome.get("exit_code") == 0:
+                            packages_installed = True
+                    
                     # Store the full outcome (not just cmd) to preserve stderr/stdout
                     outcome_record = {
-                        "command": cmd,
+                        "command": original_cmd,
                         "exit_code": outcome.get("exit_code"),
                         "stdout": outcome.get("stdout", "")[:3000],  # Truncate for sanity
                         "stderr": outcome.get("stderr", "")[:3000],
-                        "duration_s": outcome.get("duration_s", 0.0)
+                        "duration_s": outcome.get("duration_s", 0.0),
+                        "skipped": False
                     }
                     outcomes.append(outcome_record)
                     if outcome.get("exit_code") != 0:
@@ -539,6 +594,14 @@ class LocalWorker:
                         # Capture the error for easy access
                         last_error = outcome.get("stderr") or outcome.get("stdout") or f"Command failed with exit code {outcome.get('exit_code')}"
                         break
+                
+                # Commit Docker container state if cache_env is enabled and packages were installed
+                if self.cache_env and self.sandbox and self.sandbox.available and packages_installed and success:
+                    try:
+                        self._log("💾 Committing Docker environment (packages installed)...")
+                        self.sandbox.commit_state(success=True)
+                    except Exception as e:
+                        self._log(f"⚠️  Failed to commit Docker state: {e}")
                 
                 return ExecutionResult(success=True, data={
                     "success": success,
@@ -550,8 +613,6 @@ class LocalWorker:
                 from ..execution import instrumentation_pipeline, instrumentation_targets
                 from ..engine.core.repo_indexer import RepoIndexer
                 from ..execution.file_access_tracker import FileAccessTracker
-                import re
-                
                 # Use explicit repo_root from payload if provided (stateless protocol)
                 target_root = request.payload.get("repo_root") or self.repo_root
                 repo_index = RepoIndexer(target_root).index(force=True)
@@ -974,6 +1035,12 @@ class LocalWorker:
                         patch=patch_proposal
                     )
                     return ExecutionResult(success=True, data={"applied": applied, "skipped": skipped})
+                except applier.ApplyError as e:
+                    # Propagate structured error if available
+                    payload = {"message": str(e)}
+                    if e.patch_error:
+                        payload["patch_error"] = e.patch_error.to_dict()
+                    return ExecutionResult(success=False, error=str(e), data=payload)
                 except Exception as e:
                     return ExecutionResult(success=False, error=f"Patch application failed: {str(e)}")
 
@@ -1048,6 +1115,79 @@ class LocalWorker:
                      return ExecutionResult(success=True, data={"files": items})
                  except Exception as e:
                      return ExecutionResult(success=False, error=str(e))
+
+            elif request.type == "snapshot_files":
+                # Recursively snapshot the working directory for artifact manifest diffing.
+                # Returns lightweight manifest: [{path, size_bytes, mtime}]
+                # Excludes: excluded dirs, source code extensions (tracked by context pack).
+                SOURCE_CODE_EXTENSIONS = {
+                    ".py", ".json", ".yaml", ".yml", ".toml", ".txt", ".md", ".sh", ".bash", ".zsh",
+                    ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
+                    ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".hh", ".hxx",
+                    ".make", ".cmake", ".sql", ".proto", ".ini", ".cfg", ".xml",
+                    ".css", ".html", ".htm", ".lock",
+                }
+                SNAPSHOT_EXCLUDED_DIRS = configs.DEFAULT_EXCLUDED_DIRS - {"artifacts"}  # DO scan artifacts/
+                SNAPSHOT_EXCLUDED_DIRS.add(".git")  # Always exclude .git
+
+                try:
+                    snapshot = []
+                    scan_root = self.repo_root
+                    for dirpath, dirnames, filenames in os.walk(scan_root):
+                        # Prune excluded dirs in-place
+                        dirnames[:] = [
+                            d for d in dirnames
+                            if d not in SNAPSHOT_EXCLUDED_DIRS
+                            and "venv" not in d.lower()
+                            and "site-packages" not in d.lower()
+                        ]
+                        for fname in filenames:
+                            ext = os.path.splitext(fname)[1].lower()
+                            if ext in SOURCE_CODE_EXTENSIONS:
+                                continue
+                            if fname in configs.DEFAULT_EXCLUDED_FILES or fname == ".DS_Store":
+                                continue
+                            fpath = os.path.join(dirpath, fname)
+                            try:
+                                stat = os.stat(fpath)
+                                relpath = os.path.relpath(fpath, scan_root)
+                                snapshot.append({
+                                    "path": relpath,
+                                    "size_bytes": stat.st_size,
+                                    "mtime": stat.st_mtime,
+                                })
+                            except OSError:
+                                continue
+                    return ExecutionResult(success=True, data={"files": snapshot})
+                except Exception as e:
+                    return ExecutionResult(success=False, error=str(e))
+
+            elif request.type == "persist_runtime_artifacts":
+                # Copy runtime artifacts from ephemeral worktree to original_repo_root
+                # so they survive worktree cleanup and are available in the next turn.
+                artifact_paths = request.payload.get("artifact_paths", [])
+                if not artifact_paths or not self.is_ephemeral:
+                    return ExecutionResult(success=True, data={"persisted": 0, "reason": "nothing to persist" if not artifact_paths else "not ephemeral"})
+
+                persisted = 0
+                errors = []
+                for relpath in artifact_paths:
+                    src = os.path.join(self.repo_root, relpath)
+                    dst = os.path.join(self.original_repo_root, relpath)
+                    try:
+                        if os.path.isfile(src):
+                            os.makedirs(os.path.dirname(dst), exist_ok=True)
+                            shutil.copy2(src, dst)
+                            persisted += 1
+                    except Exception as e:
+                        errors.append({"path": relpath, "error": str(e)})
+
+                self._log(f"📦 Persisted {persisted}/{len(artifact_paths)} runtime artifacts to original repo")
+                return ExecutionResult(success=True, data={
+                    "persisted": persisted,
+                    "total": len(artifact_paths),
+                    "errors": errors[:5] if errors else []
+                })
 
             elif request.type == "execute_command":
                 # Direct command execution
@@ -1126,7 +1266,6 @@ class LocalWorker:
                 
                 # Fallback: Parse stdout
                 if not captured_metrics and outcome.get("stdout"):
-                    import re
                     stdout = outcome["stdout"]
                     # Regex for "key: value" or "key=value" where value is a number
                     # We look for specific known metric keys to avoid false positives
@@ -1167,7 +1306,8 @@ class LocalWorker:
                     metric_names=p.get("metric_names", []),
                     initial_commands=p.get("initial_commands", []),
                     venv_python=p.get("venv_python"),
-                    timeout_s=p.get("timeout_s", 8.0),
+                    timeout_s=p.get("timeout_s", 4.0),
+                    include_repo_index_entrypoints=p.get("include_repo_index_entrypoints", True),
                     runner_factory=runner,
                     output_callback=self.output_callback
                 )
@@ -1177,7 +1317,6 @@ class LocalWorker:
                     artifact_dir=self.artifact_dir,
                     result=res
                 )
-                import dataclasses
                 return ExecutionResult(success=True, data=dataclasses.asdict(res))
 
             elif request.type == "create_working_copy":
@@ -1185,7 +1324,6 @@ class LocalWorker:
                 source_path = request.payload.get("source_path") or self.original_repo_root
                 
                 # Create ephemeral path
-                import tempfile
                 temp_dir = os.path.join(tempfile.gettempdir(), f"remoroo_worktree_{run_id}")
                 
                 # Cleanup if exists (unlikely but safe)
@@ -1197,9 +1335,8 @@ class LocalWorker:
                 try:
                     # Case 1: Source is a URL (Cloud/Remote Mode)
                     if source_path.startswith("http://") or source_path.startswith("https://"):
-                        import requests
-                        import zipfile
-                        import io
+                        if not requests:
+                            raise RuntimeError("requests library missing. Cannot download repository.")
                         
                         self._log(f"📥 Downloading repository from: {source_path}")
                         resp = requests.get(source_path)
@@ -1249,11 +1386,30 @@ class LocalWorker:
                                 )
                                 self._log(error_msg)
                                 raise RuntimeError("Git dependency missing. Please install Git.")
+                        
+                        # v18: Pre-populate artifacts directory with existing files from source
+                        # This ensures the model/baseline files are available in the working copy
+                        # while still using the isolated run-specific outputs directory.
+                        source_artifacts = os.path.join(source_path, "artifacts")
+                        if os.path.isdir(source_artifacts) and self.artifact_dir:
+                             self._log(f"📦 Pre-populating artifacts from source: {source_artifacts}")
+                             try:
+                                 # Re-ensure artifact_dir exists
+                                 os.makedirs(self.artifact_dir, exist_ok=True)
+                                 # Copy all items from source artifacts to run artifacts
+                                 for item in os.listdir(source_artifacts):
+                                     s = os.path.join(source_artifacts, item)
+                                     d = os.path.join(self.artifact_dir, item)
+                                     if os.path.isfile(s):
+                                         shutil.copy2(s, d)
+                                     elif os.path.isdir(s):
+                                         shutil.copytree(s, d, dirs_exist_ok=True)
+                             except Exception as e:
+                                 self._log(f"⚠️  Failed to pre-populate artifacts: {e}")
                     
                     # Create Symlink for artifacts to match Docker behavior (bind mount simulation)
                     # This implies relative writes to ./artifacts/ go to the run's artifact dir.
-                    # CRITICAL: Skip this in Docker mode as it conflicts with the bind mount!
-                    if self.engine != "docker" and self.artifact_dir:
+                    if self.artifact_dir:
                         try:
                             # Re-ensure it exists just in case
                             os.makedirs(self.artifact_dir, exist_ok=True)
@@ -1272,7 +1428,7 @@ class LocalWorker:
                     if self.sandbox:
                         self.sandbox.stop()
                         from .sandbox import DockerSandbox
-                        self.sandbox = DockerSandbox(self.repo_root, self.artifact_dir)
+                        self.sandbox = DockerSandbox(self.repo_root, self.artifact_dir, cache_env=self.cache_env)
                     
                     return ExecutionResult(success=True, data={"working_path": self.repo_root})
                 except Exception as e:
@@ -1286,7 +1442,6 @@ class LocalWorker:
             
             elif request.type == "cleanup_working_copy":
                 # Robust check for EPC (Ephemeral Working Copy) cleanup
-                import tempfile
                 is_in_temp = self.repo_root.startswith(tempfile.gettempdir())
                 
                 # FIXED: Always clean up the injection monitor, even if running in-place
@@ -1321,7 +1476,7 @@ class LocalWorker:
                             self.sandbox.stop()
                             # Replace with fresh one for future use (if needed)
                             from .sandbox import DockerSandbox
-                            self.sandbox = DockerSandbox(self.original_repo_root, self.artifact_dir)
+                            self.sandbox = DockerSandbox(self.original_repo_root, self.artifact_dir, cache_env=self.cache_env)
 
                         # 3. DELETE DIRECTORY
                         shutil.rmtree(self.repo_root)
@@ -1429,7 +1584,6 @@ class LocalWorker:
                      return ExecutionResult(success=True, data={"path": target_path})
                  except Exception as e:
                      self._log(f"   ❌ Write failed: {e}")
-                     import traceback
                      traceback.print_exc()
                      return ExecutionResult(success=False, error=str(e))
 
@@ -1554,11 +1708,19 @@ class LocalWorker:
                         except Exception:
                            result_success = False
                 
-                return ExecutionResult(success=result_success, data={
-                    "files_updated": files_updated, 
-                    "merged_count": total_merged,
-                    "metrics_data": final_data
-                })
+                result_args = {
+                    "success": result_success,
+                    "data": {
+                        "files_updated": files_updated, 
+                        "merged_count": total_merged,
+                        "metrics_data": final_data
+                    },
+                    "metrics": final_data
+                }
+                if hasattr(ExecutionResult, "metrics_changed"):
+                    result_args["metrics_changed"] = bool(final_data)
+                
+                return ExecutionResult(**result_args)
 
             elif request.type == "env_scan_imports":
                 from ..execution import env_doctor
@@ -1681,7 +1843,9 @@ class LocalWorker:
                         result = harness.run(
                             cmd=cmd,
                             runner_factory=sandbox_factory,
-                            timeout=timeout_s if timeout_s else 3600.0,
+                            # "Let it Rain": Default to 24h for async commands. 
+                            # This ignores LLM caps and lets the Mid-Turn Judge be the authority.
+                            timeout=86400.0,
                             env=final_env.copy(), # CRITICAL: Copy to prevent Harness from mutating our captured env (e.g. overwriting REMOROO_ARTIFACTS_DIR)
                             artifact_dir=self.artifact_dir,
                             stdout_buffer=stdout_buffer,
@@ -1777,11 +1941,13 @@ class LocalWorker:
                     new_artifacts = state.get("new_artifacts", [])
                     
                     # Filter for metric files - AUTHORITATIVE Phase 2
-                    # We ignore baseline_metrics.json here to prevent leakage.
+                    is_baseline = state.get("is_baseline", False)
+                    # We usually ignore baseline_metrics.json to prevent leakage,
+                    # but we must ALLOW it specifically during the baseline phase.
                     metric_candidates = [
                         f for f in new_artifacts 
                         if f.endswith('.json') and ('metric' in f or 'partial' in f) 
-                        and f != "baseline_metrics.json"
+                        and (f != "baseline_metrics.json" or is_baseline)
                     ]
                     
                     # Prioritize 'current_metrics.json' if present
@@ -1863,7 +2029,6 @@ class LocalWorker:
                 # Only attempt live read if enough time passed since last read or
                 # if we haven't read yet.  Prevents flooding the brain with
                 # duplicate metric snapshots every 5s.
-                import hashlib as _hl_dedup
                 _last_live_read_hash = state.get("_last_live_metrics_hash", "")
                 _live_read_interval = state.get("_live_read_interval", 15.0)  # start at 15s
                 _last_live_read_time = state.get("_last_live_read_time", 0)
@@ -1904,7 +2069,7 @@ class LocalWorker:
 
                 # ─── Fix 2 continued: dedup captured metrics ───
                 if running and captured_metrics:
-                    _metrics_hash = _hl_dedup.sha256(
+                    _metrics_hash = hashlib.sha256(
                         json.dumps(captured_metrics, sort_keys=True).encode()
                     ).hexdigest()
                     if _metrics_hash == _last_live_read_hash:
@@ -1939,16 +2104,25 @@ class LocalWorker:
                 # Determine phase for CLI scoreboard routing
                 phase = "baseline" if state.get("is_baseline") else "current"
                 
-                return ExecutionResult(success=True, data={
-                    "stdout": stdout_full,
-                    "stderr": stderr_full,
-                    "is_running": running,
-                    "exit_code": state["exit_code"],
-                    "elapsed_s": elapsed,
-                    "metrics_captured": bool(captured_metrics),
-                    "metrics_source": metrics_source,
-                    "phase": phase  # Tell CLI where to put metrics in scoreboard
-                }, metrics=captured_metrics)
+                result_args = {
+                    "success": True,
+                    "data": {
+                        "stdout": stdout_full,
+                        "stderr": stderr_full,
+                        "is_running": running,
+                        "exit_code": state["exit_code"],
+                        "elapsed_s": elapsed,
+                        "metrics_captured": bool(captured_metrics),
+                        "metrics_source": metrics_source,
+                        "phase": phase
+                    },
+                    "metrics": captured_metrics
+                }
+                # Architecture Migration: Only pass metrics_changed if the protocol supports it
+                if hasattr(ExecutionResult, "metrics_changed"):
+                    result_args["metrics_changed"] = bool(captured_metrics)
+                
+                return ExecutionResult(**result_args)
                 
             elif request.type == "kill_command":
                 exec_id = request.payload.get("execution_id")
@@ -2025,12 +2199,59 @@ class LocalWorker:
                 except Exception as e:
                     return ExecutionResult(success=False, error=str(e))
 
+            elif request.type == "get_worker_info":
+                # Enhanced hardware capability detection
+                cpu_count = os.cpu_count()
+                memory_gb = 0
+                gpu_info = "none"
+                
+                try:
+                    if sys.platform == 'darwin':
+                        # macOS
+                        mem_bytes = subprocess.check_output(['sysctl', '-n', 'hw.memsize'], stderr=subprocess.DEVNULL).decode().strip()
+                        memory_gb = round(int(mem_bytes) / (1024**3), 1)
+                        if platform.machine() == 'arm64':
+                            gpu_info = "Apple Silicon GPU (MPS available)"
+                    elif sys.platform == 'win32':
+                        # Windows (simplified)
+                        gpu_info = "unknown (windows)"
+                    else:
+                        # Linux
+                        if os.path.exists('/proc/meminfo'):
+                            with open('/proc/meminfo', 'r') as f:
+                                for line in f:
+                                    if 'MemTotal' in line:
+                                        mem_kb = line.split()[1]
+                                        memory_gb = round(int(mem_kb) / (1024**2), 1)
+                                        break
+                        # Basic nvidia-smi check
+                        try:
+                            gpu_info = subprocess.check_output(['nvidia-smi', '--query-gpu=gpu_name', '--format=csv,noheader'], stderr=subprocess.DEVNULL).decode().strip()
+                        except:
+                            pass
+
+                except Exception:
+                    pass
+
+                info = {
+                    "platform": platform.platform(),
+                    "machine": platform.machine(),
+                    "processor": platform.processor(),
+                    "python_version": platform.python_version(),
+                    "os": platform.system(),
+                    "release": platform.release(),
+                    "version": platform.version(),
+                    "cpu_count": cpu_count,
+                    "memory_gb": memory_gb,
+                    "gpu_info": gpu_info
+                }
+                return ExecutionResult(success=True, data=info)
+
             else:
                 return ExecutionResult(success=False, error=f"Unknown request type: {request.type}")
 
 
         except Exception as e:
-            import traceback
             traceback.print_exc()
             return ExecutionResult(success=False, error=str(e))
         finally:

@@ -728,6 +728,18 @@ class RepoIndexer:
         """Extract entrypoints from files."""
         entrypoints = []
         
+        # Treat ALL top-level .py files (not in subdirs) as potential entrypoints
+        # This catches scripts like train.py, evaluate.py, test.py without __main__
+        top_level_scripts = []
+        for file_info in files:
+            file_path = file_info.get("path", "")
+            # Check if it's a top-level .py file (no "/" in path after stripping)
+            if file_path and file_path.endswith(".py") and "/" not in file_path:
+                # Exclude common non-runnable files
+                basename = os.path.basename(file_path)
+                if basename not in ["__init__.py", "setup.py", "conftest.py"]:
+                    top_level_scripts.append(file_path)
+        
         # If a file has a __main__ block, prefer that as the canonical entrypoint.
         # Many single-file scripts define a `main()` function AND call it under
         # `if __name__ == "__main__": main()`. In those cases, generating a
@@ -781,6 +793,18 @@ class RepoIndexer:
                         "symbol_id": symbol_id,
                         "how_to_run": how
                     })
+        
+        # Add top-level scripts that weren't already added
+        already_added = {ep.get("file_path") for ep in entrypoints}
+        for script in top_level_scripts:
+            if script not in already_added:
+                entrypoints.append({
+                    "kind": "python_script",
+                    "file_path": script,
+                    "symbol_id": f"script:{script}",
+                    "how": f"python {script}",  # Command discovery expects "how" field
+                    "how_to_run": f"python {script}"
+                })
         
         return entrypoints
     
