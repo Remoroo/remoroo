@@ -3,10 +3,10 @@ import typer
 import time
 import sys
 import os
+import threading
 import requests
 from pathlib import Path
 
-from .http_transport import HttpTransport
 from .http_transport import HttpTransport
 from .engine.local_worker import WorkerService
 from .engine.protocol import ExecutionRequest, ExecutionResult

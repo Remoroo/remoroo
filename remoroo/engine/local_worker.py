@@ -255,6 +255,61 @@ class LocalWorker:
                             self._log("ℹ️  No significant changes detected in code files.")
                     else:
                         self._log("ℹ️  No modified code files found (skipping patch).")
+                    
+                    # ── Transfer non-code files (models, checkpoints, data) ──
+                    # Detect files that aren't covered by the code patch and copy them
+                    # at their exact relative paths so code references stay valid.
+                    non_code_files = [
+                        f for f in all_modified
+                        if not any(f.endswith(ext) for ext in code_extensions)
+                        and not any(ignored in f for ignored in IGNORED_PATTERNS)
+                    ]
+                    
+                    if non_code_files:
+                        max_file_size = 500 * 1024 * 1024  # 500 MB cap per file
+                        copied_count = 0
+                        skipped_count = 0
+                        
+                        for rel_path in non_code_files:
+                            src = os.path.join(self.repo_root, rel_path)
+                            dst = os.path.join(self.original_repo_root, rel_path)
+                            
+                            if not os.path.exists(src):
+                                continue  # File was deleted, not created
+                            
+                            # Skip files that are too large
+                            skip_large_files = False
+                            if skip_large_files:
+                                try:
+                                    file_size = os.path.getsize(src)
+                                    if file_size > max_file_size:
+                                        self._log(f"⚠️  Skipping large file ({file_size // (1024*1024)}MB): {rel_path}")
+                                        skipped_count += 1
+                                        continue
+                                except OSError:
+                                    continue
+                                
+                            try:
+                                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                                shutil.copy2(src, dst)
+                                copied_count += 1
+                                
+                                # Also save to run artifact dir for provenance
+                                if self.run_id:
+                                    run_dir = os.path.join(self.original_repo_root, ".remoroo", "runs", self.run_id)
+                                    artifact_copy = os.path.join(run_dir, "transferred_files", rel_path)
+                                    os.makedirs(os.path.dirname(artifact_copy), exist_ok=True)
+                                    shutil.copy2(src, artifact_copy)
+                            except Exception as e:
+                                self._log(f"⚠️  Failed to transfer {rel_path}: {e}")
+                                skipped_count += 1
+                        
+                        if copied_count:
+                            self._log(f"📦 Transferred {copied_count} non-code file(s) to original repo")
+                            finalized.append(f"{copied_count}_transferred_files")
+                        if skipped_count:
+                            self._log(f"⚠️  Skipped {skipped_count} file(s) (too large or error)")
+
                 else:
                     if self.repo_root == self.original_repo_root:
                         self._log("ℹ️  Artifacts already finalized and workspace cleaned up.")
@@ -2086,19 +2141,19 @@ class LocalWorker:
                 # 3. Last Resort: Parse stdout with ExperimentContract filter
                 if not captured_metrics:
                     expected = state.get("expected_metrics", [])
-                    self._log(f"  🔍 [DEBUG] expected_metrics = {expected}")
+                    #self._log(f"  🔍 [DEBUG] expected_metrics = {expected}")
                     # DEBUG: Show buffer state to diagnose timing issues
-                    self._log(f"  🔍 [DEBUG] stdout_buffer_lines = {len(state['stdout'])}, last_line = {repr(state['stdout'][-1][:80]) if state['stdout'] else 'empty'}")
+                    #self._log(f"  🔍 [DEBUG] stdout_buffer_lines = {len(state['stdout'])}, last_line = {repr(state['stdout'][-1][:80]) if state['stdout'] else 'empty'}")
                     if expected:
                         log_metrics = self._extract_metrics_from_text(stdout_full, expected_metrics=expected)
                         if log_metrics:
                             self._log(f"  📊 [Worker] Log Parse Success (filtered): {log_metrics}")
                             captured_metrics.update(log_metrics)
                             metrics_source = "stdout_filtered"
-                        else:
-                            self._log(f"  ⚠️ [Worker] No metrics found in artifacts or logs (expected: {expected}).")
-                    else:
-                        self._log(f"  ⚠️ [Worker] No metrics found in artifacts (no expected_metrics filter).")
+                    #     else:
+                    #         self._log(f"  ⚠️ [Worker] No metrics found in artifacts or logs (expected: {expected}).")
+                    # else:
+                    #     self._log(f"  ⚠️ [Worker] No metrics found in artifacts (no expected_metrics filter).")
                 # ------------------------------------
 
                 # Determine phase for CLI scoreboard routing
