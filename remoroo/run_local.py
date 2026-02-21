@@ -370,8 +370,17 @@ def run_local_worker(
                 # 3. Handle Special Control Steps
                 if step.type == "workflow_complete":
                     final_result = step.payload or {}
+                    # v19: Debug – log what we actually received so we can diagnose UNKNOWN issues
+                    live.console.print(f"[dim]📡 workflow_complete payload: {final_result}[/dim]")
+                    
                     # v18: Prioritize explicit outcome and success from Brain
                     outcome = final_result.get("outcome") or final_result.get("decision", "UNKNOWN")
+                    
+                    # v19: Deep Debug - Why is outcome UNKNOWN?
+                    if outcome == "UNKNOWN":
+                        live.console.print(f"[bold red]❌ CRITICAL: Outcome remains UNKNOWN! Payload: {json.dumps(final_result)}[/bold red]")
+                    else:
+                        live.console.print(f"[green]✅ Outcome confirmed: {outcome}[/green]")
                     
                     # Normalization: Ensure success and partial_success are booleans even if strings arrive
                     # We accept "SUCCESS" or True as success.
@@ -406,7 +415,7 @@ def run_local_worker(
                 update_dashboard(dashboard_layout, scoreboard_data)
                 
                 try:
-                    live.console.print(f"\n[bold cyan]🛠️  Executing: {step.type}[/bold cyan]")
+                    # live.console.print(f"\n[bold cyan]🛠️  Executing: {step.type}[/bold cyan]")
                     result = worker_service.handle_request(step)
                     
                     # --- INSTANT METRIC UPDATE (LOCAL) ---
@@ -441,7 +450,8 @@ def run_local_worker(
                     
                     # DEBUG: Log what we receive
                     if step.type == "get_output":
-                        live.console.print(f"[dim]📊 [DEBUG] get_output step - phase={phase}, metrics={result.metrics}[/dim]")
+                        pass
+                        # live.console.print(f"[dim]📊 [DEBUG] get_output step - phase={phase}, metrics={result.metrics}[/dim]")
                     
                     if result.metrics:
                         cleaned = clean_metrics_dict(result.metrics)
@@ -525,6 +535,10 @@ def run_local_worker(
         if verbose:
             import traceback
             traceback.print_exc()
+
+    # v19: Fallback outcome detection from final_report.md
+    # Removed as requested (root cause fixed in Brain).
+    pass
 
     # 7. Finalize Artifacts (Worker generates local diff and delivers it)
     # v15: Only call manually if the Brain hasn't already triggered a cleanup
