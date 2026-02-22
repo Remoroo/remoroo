@@ -61,6 +61,26 @@ def validate_patch_before_apply(
             if not search:
                 errors.append(PatchError("validation_failed", path, "search_replace requires 'search'", edit_kind=kind))
                 continue
+                
+            search_lines = len(search.splitlines())
+            if search_lines > 50:
+                # Provide strict feedback to the LLM to constrain context window usage
+                errors.append(PatchError(
+                    "validation_failed", 
+                    path, 
+                    f"Search string is too long ({search_lines} lines). Keep search blocks between 3-8 lines to save tokens and avoid ambiguity.", 
+                    edit_kind=kind
+                ))
+                continue
+            elif search_lines < 2:
+                # Provide strict feedback to the LLM to prevent overly loose matches
+                errors.append(PatchError(
+                    "validation_failed", 
+                    path, 
+                    f"Search string is too short ({search_lines} lines). Include at least 2-3 lines of context to ensure a unique match.", 
+                    edit_kind=kind
+                ))
+                continue
             
             match_count = current_content.count(search)
             if match_count == 0:
@@ -366,6 +386,14 @@ def apply_patchproposal(
             search_text = e.get("search", "")
             replace_text = e.get("replacement", "")
             original_content = _read_text(abs_path)
+            
+            search_lines = len(search_text.splitlines())
+            if search_lines > 15:
+                raise ApplyError(f"Search string is too long ({search_lines} lines). Keep search blocks between 3-8 lines to save tokens and avoid ambiguity.",
+                               patch_error=PatchError("validation_failed", file_path, f"Search string is too long ({search_lines} lines). Keep search blocks between 3-8 lines to save tokens and avoid ambiguity.", edit_kind=kind))
+            elif search_lines < 2:
+                raise ApplyError(f"Search string is too short ({search_lines} lines). Include at least 2-3 lines of context to ensure a unique match.",
+                               patch_error=PatchError("validation_failed", file_path, f"Search string is too short ({search_lines} lines). Include at least 2-3 lines of context to ensure a unique match.", edit_kind=kind))
             
             # 1. Exact match
             match_count = original_content.count(search_text)

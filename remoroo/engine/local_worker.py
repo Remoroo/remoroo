@@ -38,7 +38,7 @@ class LocalWorker:
     def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None, system: Optional[SystemInterface] = None, persistence_dir: Optional[str] = None, cache_env: bool = False):
         self.system = system or RealSystem()
         self.output_callback = output_callback
-        self._log("🔧 LocalWorker (v4-Airtight) Loaded")
+        # self._log("🔧 LocalWorker (v4-Airtight) Loaded")
         
         self.repo_root = repo_root
         self.original_repo_root = original_repo_root or repo_root # Keep reference to original
@@ -1563,7 +1563,8 @@ class LocalWorker:
                  outcome = executor.run_command_stepwise(
                      cmd,
                      self.repo_root,
-                     timeout_s=30
+                     timeout_s=30,
+                     show_progress=False
                  )
                  
                  diff_content = outcome.get("stdout", "")
@@ -1830,8 +1831,8 @@ class LocalWorker:
                     }
                     
                     self._log(f"🚀 [Worker] Starting Async Command: {cmd} (ID: {execution_id})")
-                    self._log(f"   📂 Repo Root: {self.repo_root}")
-                    self._log(f"   📂 Artifact Dir: {self.artifact_dir} (Exists: {os.path.exists(self.artifact_dir)})")
+                    # self._log(f"   📂 Repo Root: {self.repo_root}")
+                    # self._log(f"   📂 Artifact Dir: {self.artifact_dir} (Exists: {os.path.exists(self.artifact_dir)})")
 
                     # Select Sandbox Factory
                     sandbox_factory = None
@@ -1846,7 +1847,7 @@ class LocalWorker:
                         docker_env["DISPLAY"] = ":99"
                         
                         final_env = docker_env
-                        self._log(f"   🐳 Docker Mode. Env artifact dir: {docker_env['REMOROO_ARTIFACTS_DIR']}")
+                        # self._log(f"   🐳 Docker Mode. Env artifact dir: {docker_env['REMOROO_ARTIFACTS_DIR']}")
                         
                         sandbox_factory = lambda c, env=None: self.sandbox.exec_popen(c, env=final_env, workdir=self.repo_root)
                     else:

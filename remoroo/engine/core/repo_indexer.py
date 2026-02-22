@@ -953,5 +953,5 @@ class RepoIndexer:
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
         
-        print(f"  ✅ Index saved to {index_path}")
+        # print(f"  ✅ Index saved to {index_path}")
 

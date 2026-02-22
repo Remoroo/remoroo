@@ -433,7 +433,8 @@ def run_command_stepwise(
     timeout_s: Optional[float] = None,
     output_callback: Optional[Callable[[str, str], None]] = None,
     env: Optional[Dict[str, str]] = None,
-    runner_factory: Optional[Callable] = None
+    runner_factory: Optional[Callable] = None,
+    show_progress: Optional[bool] = True
 ) -> Dict[str, Any]:
     """
     Runs a single command without convergence checking.
@@ -442,7 +443,7 @@ def run_command_stepwise(
         cmd=cmd,
         cwd=repo_root,
         timeout_s=timeout_s,
-        show_progress=True,
+        show_progress=show_progress,
         output_callback=output_callback,
         convergence_checker=None,
         min_runtime_s=0.0,

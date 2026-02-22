@@ -129,13 +129,32 @@ def run_local_worker(
     typer.echo(f"   Remote Run ID: {remote_run_id}")
     
     # 4. Start Log Streamer (Background)
+    # Mutable holder so the thread can write to Live console once it exists.
+    # _token_sink removed: streaming now displayed via dashboard activity indicator
+
+    _llm_activity = {"active": False, "tokens": 0, "start": 0.0}
     def stream_logs():
         try:
-            # sseclient-py usage
-            messages = sseclient.SSEClient(f"{API_URL}/runs/{remote_run_id}/stream")
-            for msg in messages:
+            import requests as _req
+            resp = _req.get(f"{API_URL}/runs/{remote_run_id}/stream", stream=True)
+            client = sseclient.SSEClient(resp)
+            for msg in client.events():
                 if msg.event == "finish":
+                    _llm_activity["active"] = False
                     break
+                if msg.event == "llm_token":
+                    try:
+                        data = json.loads(msg.data)
+                        chunks = data.get("tokens", [])
+                        n = sum(len(c) for c in chunks)
+                        if n:
+                            if not _llm_activity["active"]:
+                                _llm_activity["active"] = True
+                                _llm_activity["tokens"] = 0
+                                _llm_activity["start"] = time.time()
+                            _llm_activity["tokens"] += n
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -251,7 +270,8 @@ def run_local_worker(
     dashboard_layout.split_column(
         Layout(name="header", size=3),
         Layout(name="metrics", size=8),
-        Layout(name="footer", size=3)
+        Layout(name="llm_activity", size=3),
+        Layout(name="footer", size=3),
     )
 
     def update_dashboard(layout, data):
@@ -295,6 +315,22 @@ def run_local_worker(
             
         layout["metrics"].update(Panel(table, title="[bold]Scoreboard[/bold]", border_style="blue"))
         
+        # LLM Activity indicator
+        if _llm_activity["active"]:
+            elapsed = time.time() - _llm_activity["start"]
+            chars = _llm_activity["tokens"]
+            bar_ticks = int(elapsed) % 4
+            bar = "●" * (bar_ticks + 1) + "○" * (3 - bar_ticks)
+            activity_text = Text.assemble(
+                ("  🤖 AI Thinking  ", "bold cyan"),
+                (bar, "cyan"),
+                (f"  {elapsed:.0f}s  ", "dim"),
+                (f"~{chars:,} chars generated", "dim italic"),
+            )
+            layout["llm_activity"].update(Panel(activity_text, border_style="cyan"))
+        else:
+            layout["llm_activity"].update(Panel(Text("", justify="center"), border_style="dim"))
+
         # Footer / Status
         status_msg = data.get("status", "")
         layout["footer"].update(Panel(Text(f" {status_msg}", justify="center", style="italic yellow"), border_style="dim"))
@@ -314,8 +350,8 @@ def run_local_worker(
     
     try:
         with Live(dashboard_layout, console=console, refresh_per_second=10, vertical_overflow="visible") as live:
-            # Connect Live console to worker for flicker-free logs
             worker_service.output_callback = live.console.print
+            # Streaming tokens are tracked in _llm_activity and shown in dashboard
             
             while True:
                 # 1. Get next step
@@ -344,6 +380,7 @@ def run_local_worker(
                          scoreboard_data["status"] = "🧠 Brain is analyzing results..."
                 else:
                     scoreboard_data["status"] = f"🛠️ Executing {step.type}"
+                    _llm_activity["active"] = False
                 
                 # 2. Check for completion or timeout
                 if step is None:
@@ -460,7 +497,7 @@ def run_local_worker(
                              target = scoreboard_data["baseline"] if phase == "baseline" else scoreboard_data["current"]
                              for k, v in cleaned.items():
                                   target[k] = v
-                             live.console.print(f"[dim]📊 [DEBUG] Updated {phase} scoreboard: {cleaned}[/dim]")
+                             # live.console.print(f"[dim]📊 [DEBUG] Updated {phase} scoreboard: {cleaned}[/dim]")
                     
                     # Check for baseline in specific artifact fields if available (legacy support)
                     if result.data.get("baseline_metrics"):
