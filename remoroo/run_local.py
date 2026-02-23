@@ -22,6 +22,7 @@ def run_local_worker(
     engine: str = "docker",
     verbose: bool = False,
     cache_env: bool = False,
+    agentic: bool = False,
 ) -> LocalRunResult:
     from .configs import get_api_url
     if brain_url is None:
@@ -108,7 +109,8 @@ def run_local_worker(
             "repo_path": str(repo_path),
             "goal": goal,
             "metrics": metrics_str,
-            "artifact_dir": str(artifact_dir) 
+            "artifact_dir": str(artifact_dir),
+            "agentic": "true" if agentic else "false",
         }, headers=headers)
         
         if resp.status_code == 402:
