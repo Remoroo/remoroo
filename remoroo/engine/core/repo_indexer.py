@@ -955,3 +955,114 @@ class RepoIndexer:
         
         # print(f"  ✅ Index saved to {index_path}")
 
+    def get_index_data(self) -> Dict[str, Any]:
+        """Helper to get current index data, building it if missing."""
+        index_path = self._get_index_path()
+        if os.path.exists(index_path):
+            with open(index_path, "r") as f:
+                return json.load(f)
+        return self.index()
+
+    def get_scaffolding(self) -> str:
+        """
+        Returns a highly compressed text Tree (paths + classes + function signatures).
+        """
+        repo_index = self.get_index_data()
+        files = repo_index.get("files", [])
+        
+        scaffold = []
+        for file_info in sorted(files, key=lambda x: x.get("path", "")):
+            path = file_info.get("path", "")
+            if not path:
+                continue
+            scaffold.append(path)
+            
+            file_symbols = [s for s in repo_index.get("symbols", []) if s.get("file_path") == path]
+            
+            classes = [s for s in file_symbols if s.get("kind") == "class"]
+            functions = [s for s in file_symbols if s.get("kind") == "function"]
+            methods = [s for s in file_symbols if s.get("kind") == "method"]
+            
+            for cls in sorted(classes, key=lambda x: x.get("span", {}).get("line_start", 0)):
+                scaffold.append(f"  class {cls.get('name')}")
+                cls_methods = [m for m in methods if m.get("qualified_name", "").startswith(f"{cls.get('qualified_name')}.")]
+                for method in sorted(cls_methods, key=lambda x: x.get("span", {}).get("line_start", 0)):
+                    sig = method.get("signature", f"def {method.get('name')}(...)")
+                    scaffold.append(f"    {sig}")
+            
+            for func in sorted(functions, key=lambda x: x.get("span", {}).get("line_start", 0)):
+                sig = func.get("signature", f"def {func.get('name')}(...)")
+                scaffold.append(f"  {sig}")
+                
+        return "\n".join(scaffold)
+
+    def get_file_symbols(self, file_path: str) -> List[Dict[str, Any]]:
+        """
+        Returns a list of available symbol signatures and docstrings for a file.
+        """
+        repo_index = self.get_index_data()
+        return [s for s in repo_index.get("symbols", []) if s.get("file_path") == file_path]
+        
+    def get_snippet(self, file_path: str, symbol_name: str) -> str:
+        """
+        Uses AST to slice out and return ONLY the specific function/class requested.
+        If symbol_name is empty or "*", returns the entire file.
+        If symbol_name is "module_level", returns a skeleton of the file (functions/classes collapsed).
+        """
+        abs_path = os.path.join(self.repo_root, file_path)
+        if not os.path.exists(abs_path):
+            return f"# Error: File '{file_path}' not found."
+            
+        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+            source_code = f.read()
+            
+        if not symbol_name or symbol_name == "*":
+            return source_code
+            
+        try:
+            tree = ast.parse(source_code, filename=file_path)
+        except SyntaxError as e:
+            return f"# Error: Cannot parse AST of {file_path}. SyntaxError: {e}"
+            
+        lines = source_code.splitlines()
+
+        def _get_skeleton() -> str:
+            ranges_to_hide = []
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    start_hide = node.lineno
+                    end_hide = getattr(node, "end_lineno", start_hide)
+                    if end_hide > start_hide:
+                        ranges_to_hide.append((start_hide, end_hide))
+            ranges_to_hide.sort()
+            
+            result = []
+            current_line = 1
+            for start, end in ranges_to_hide:
+                while current_line <= start:
+                    result.append(lines[current_line - 1])
+                    current_line += 1
+                hidden_count = end - start
+                if hidden_count > 0:
+                    result.append(f"    # ... {hidden_count} lines hidden ...")
+                current_line = end + 1
+            while current_line <= len(lines):
+                result.append(lines[current_line - 1])
+                current_line += 1
+            return "\n".join(result)
+
+        if symbol_name == "module_level":
+            return _get_skeleton()
+        
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == symbol_name:
+                    start_line = node.lineno - 1
+                    if node.decorator_list:
+                        start_line = node.decorator_list[0].lineno - 1
+                    end_line = getattr(node, "end_lineno", start_line + 1)
+                    snippet_lines = lines[start_line:end_line]
+                    return "\n".join(snippet_lines)
+                    
+        return f"# Note: Symbol '{symbol_name}' not found as a function/class in {file_path}. Returning module-level skeleton instead.\n\n{_get_skeleton()}"
+

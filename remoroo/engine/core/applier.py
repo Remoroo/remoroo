@@ -63,7 +63,7 @@ def validate_patch_before_apply(
                 continue
                 
             search_lines = len(search.splitlines())
-            if search_lines > 50:
+            if search_lines > 500:
                 # Provide strict feedback to the LLM to constrain context window usage
                 errors.append(PatchError(
                     "validation_failed", 
@@ -388,12 +388,12 @@ def apply_patchproposal(
             original_content = _read_text(abs_path)
             
             search_lines = len(search_text.splitlines())
-            if search_lines > 15:
+            if search_lines > 100:
                 raise ApplyError(f"Search string is too long ({search_lines} lines). Keep search blocks between 3-8 lines to save tokens and avoid ambiguity.",
                                patch_error=PatchError("validation_failed", file_path, f"Search string is too long ({search_lines} lines). Keep search blocks between 3-8 lines to save tokens and avoid ambiguity.", edit_kind=kind))
-            elif search_lines < 2:
-                raise ApplyError(f"Search string is too short ({search_lines} lines). Include at least 2-3 lines of context to ensure a unique match.",
-                               patch_error=PatchError("validation_failed", file_path, f"Search string is too short ({search_lines} lines). Include at least 2-3 lines of context to ensure a unique match.", edit_kind=kind))
+            #elif search_lines < 2:
+            #    raise ApplyError(f"Search string is too short ({search_lines} lines). Include at least 2-3 lines of context to ensure a unique match.",
+            #                   patch_error=PatchError("validation_failed", file_path, f"Search string is too short ({search_lines} lines). Include at least 2-3 lines of context to ensure a unique match.", edit_kind=kind))
             
             # 1. Exact match
             match_count = original_content.count(search_text)

@@ -415,6 +415,18 @@ class LocalWorker:
             if request.type == "scan_repository":
                 force = request.payload.get("force_refresh", False)
                 structure = fs_utils.scan_repository(self.repo_root, self.artifact_dir, force)
+                
+                # Enrich with symbols if possible
+                try:
+                    from .core.repo_indexer import RepoIndexer
+                    indexer = RepoIndexer(self.repo_root)
+                    repo_index = indexer.index()
+                    structure["symbols"] = repo_index.get("symbols", [])
+                    structure["entrypoints"] = repo_index.get("entrypoints", [])
+                    print('Structure', structure)
+                except Exception as e:
+                    self._log(f"Error enriching repository index: {e}")
+                
                 return ExecutionResult(success=True, data=structure)
                 
             elif request.type == "file_exists":
@@ -424,6 +436,22 @@ class LocalWorker:
                 path = request.payload.get("path", "")
                 is_data = fs_utils.is_data_file(path, self.repo_root)
                 return ExecutionResult(success=True, data={"is_data_file": is_data})
+                
+            elif request.type == "get_scaffolding":
+                self._log(f"Executing: get_scaffolding")
+                from .core.repo_indexer import RepoIndexer
+                indexer = RepoIndexer(target_root)
+                scaffolding = indexer.get_scaffolding()
+                return ExecutionResult(success=True, data={"scaffolding": scaffolding})
+
+            elif request.type == "get_snippet":
+                self._log(f"Executing: get_snippet")
+                file_path = request.payload.get("file_path", "")
+                symbol_name = request.payload.get("symbol_name", "")
+                from .core.repo_indexer import RepoIndexer
+                indexer = RepoIndexer(target_root)
+                code = indexer.get_snippet(file_path, symbol_name)
+                return ExecutionResult(success=True, data={"code": code})
                 
             elif request.type == "build_context":
                 # Extract args
@@ -765,15 +793,17 @@ class LocalWorker:
                     abs_path = os.path.join(target_root, fp)
                     if not os.path.exists(abs_path) or not os.path.isfile(abs_path): continue
                     try:
-                        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                             content = f.read()
+                        # Architecture Migration: Smart Context
+                        # We NO LONGER hydrate full file contents here. 
+                        # The LLM must use `get_snippet` to read the files actively.
+                        # We just tell it which files exist and are promoted.
                         instrumentation_files_state[fp] = {
                             "exists": True,
-                            "content": content,
+                            "content": "<Content hidden. Use `get_snippet` tool to view actual file contents.>",
                             "issues": [],
                             "syntax_errors": []
                         }
-                        file_access_tracker.mark_full(fp)
+                        # We do not mark_full(fp) because the content isn't in context yet.
                     except Exception:
                         continue
 
