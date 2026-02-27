@@ -64,6 +64,50 @@ class Worker:
                 except:
                     pass
 
+    def run_probe_script(self, script: str, ext: str = ".py", python_path: Optional[str] = None) -> Tuple[str, int]:
+        """
+        Write and run a multi-language probe script in the repo root.
+        """
+        filename = f"__remoroo_probe_worker{ext}"
+        path = os.path.join(self.repo_root, filename)
+        try:
+            with open(path, "w") as f:
+                f.write(script)
+            
+            if ext == ".py":
+                cmd = f"{python_path or 'python'} {filename}"
+            elif ext == ".js":
+                cmd = f"node {filename}"
+            elif ext == ".ts":
+                cmd = f"ts-node {filename}"
+            elif ext == ".sh":
+                cmd = f"bash {filename}"
+            else:
+                cmd = f"python {filename}" # Fallback
+            
+            probe_env = {"REMOROO_ARTIFACTS_DIR": os.path.join(self.repo_root, "artifacts")}
+            
+            outcome = run_command_stepwise(
+                cmd=cmd,
+                repo_root=self.repo_root,
+                timeout_s=30,
+                env=probe_env
+            )
+            
+            stdout = outcome.get("stdout", "")
+            stderr = outcome.get("stderr", "")
+            exit_code = outcome.get("exit_code", 1)
+            
+            combined = stdout
+            if stderr:
+                combined += f"\n[STDERR]\n{stderr}"
+                
+            return combined.strip(), exit_code
+        finally:
+            if os.path.exists(path):
+                try: os.remove(path)
+                except: pass
+
     def normalize_command_plan(
         self,
         command_plan: Dict[str, Any],
@@ -386,11 +430,17 @@ class Worker:
             if toolsmith_agent:
                 # Milestone 3: 'toolsmith_agent' is now ToolsmithPlanner
                 # It generates intent, we execute.
-                script, rationale = toolsmith_agent.generate_probe(query)
+                res = toolsmith_agent.generate_probe(query)
+                if len(res) == 3:
+                    script, rationale, ext = res
+                else:
+                    script, rationale = res
+                    ext = ".py"
+
                 if not script:
                     return f"Error: Toolsmith failed to generate probe ({rationale})"
                 
-                output, exit_code = self.run_python_script(script, filename="__remoroo_probe_toolsmith.py")
+                output, exit_code = self.run_probe_script(script, ext=ext)
                 
                 # Feed back result to update planner context/memory
                 return toolsmith_agent.register_result(query, output, exit_code)

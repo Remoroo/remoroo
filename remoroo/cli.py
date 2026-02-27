@@ -92,6 +92,7 @@ def run(
     engine: str = typer.Option(None, "--engine", help="Execution engine (docker or venv). Defaults to 'docker'."),
     cache_env: bool = typer.Option(True, "--cache-env", help="Cache Docker environment (skip already-installed packages, commit changes)."),
     agentic: bool = typer.Option(True, "--agentic", help="Use Conductor-driven agentic loop instead of the legacy pipeline."),
+    v2: bool = typer.Option(True, "--v2/--v1", help="Use v2 agent loop (default) or legacy v1."),
 ):
     from .configs import get_api_url, get_default_engine
     from .engine.utils.doctor import ensure_ready
@@ -178,6 +179,7 @@ def run(
             verbose=verbose,
             cache_env=cache_env,
             agentic=agentic,
+            engine_version="v2" if v2 else "v1",
         )
 
         from rich.console import Console

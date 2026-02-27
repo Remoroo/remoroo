@@ -20,6 +20,7 @@ import hashlib
 import traceback
 import zipfile
 import io
+import collections
 try:
     import requests
 except ImportError:
@@ -77,6 +78,8 @@ class LocalWorker:
         # but for local worker memory is fine.
         self._running_processes: Dict[str, Any] = {}
         self._execution_buffers: Dict[str, Any] = {} # Store stdout/stderr buffers
+        self._interactive_sessions: Dict[str, Any] = {} # Store pexpect sessions
+        self._supervised_jobs: Dict[str, Any] = {}  # job_id → SupervisedJob
         
     def _log(self, message: str):
         """Internal logger that redirects to output_callback or standard print."""
@@ -2332,6 +2335,489 @@ class LocalWorker:
                     "gpu_info": gpu_info
                 }
                 return ExecutionResult(success=True, data=info)
+
+            elif request.type == "interact":
+                session_id = request.payload.get("session_id", "default")
+                stdin = request.payload.get("stdin", "")
+                is_init = request.payload.get("init", False)
+                timeout = request.payload.get("timeout", 5.0)
+
+                if is_init or session_id not in self._interactive_sessions:
+                    try:
+                        import pexpect
+                        cmd_to_run = request.payload.get("cmd", "bash")
+                        child = pexpect.spawn(cmd_to_run, cwd=self.repo_root, encoding='utf-8', dimensions=(24, 80))
+                        
+                        # Set common environment vars for the prompt to be cleaner
+                        # and to avoid ANSI color codes if possible
+                        # We won't block them totally, but standard PTY initialization applies
+                        
+                        # Wait for initial prompt or settle
+                        time.sleep(1)
+                        initial_out = ""
+                        # Python re-read wrapper fallback
+                        try:
+                            initial_out = child.read_nonblocking(size=10000, timeout=1)
+                        except pexpect.TIMEOUT:
+                            initial_out = child.before if child.before else ""
+                        except pexpect.EOF:
+                            initial_out = child.before if child.before else "Process terminated immediately."
+                            return ExecutionResult(success=False, error="Process terminated during initialization.", data={"output": initial_out})
+
+                        self._interactive_sessions[session_id] = child
+                        return ExecutionResult(success=True, data={"output": initial_out})
+                    except ImportError:
+                        return ExecutionResult(success=False, error="pexpect module is required for interactive sessions.")
+                    except Exception as e:
+                        return ExecutionResult(success=False, error=str(e))
+                
+                # We have an active session, send stdin and wait
+                child = self._interactive_sessions[session_id]
+                try:
+                    import pexpect
+                    if not child.isalive():
+                        output = child.before if child.before else ""
+                        del self._interactive_sessions[session_id]
+                        return ExecutionResult(success=True, data={"output": f"{output}\n[Process Exited with status {child.exitstatus}]"})
+                    
+                    if stdin:
+                        child.send(stdin)
+                    
+                    # Wait and read
+                    time.sleep(0.5)
+                    try:
+                        # Try to read whatever is available
+                        output = ""
+                        while True:
+                            chunk = child.read_nonblocking(size=4096, timeout=timeout)
+                            output += chunk
+                    except pexpect.TIMEOUT:
+                        pass
+                    except pexpect.EOF:
+                        output += f"\n[Process Exited with status {child.exitstatus}]"
+                        del self._interactive_sessions[session_id]
+                    
+                    return ExecutionResult(success=True, data={"output": output})
+                except Exception as e:
+                    return ExecutionResult(success=False, error=str(e))
+
+            # ── .remoroo/ workspace state & local memory ──
+
+            elif request.type == "read_workspace_state":
+                ws_path = os.path.join(self.original_repo_root, ".remoroo", "workspace_state.json")
+                if os.path.exists(ws_path):
+                    try:
+                        with open(ws_path, "r", encoding="utf-8") as f:
+                            data = json.loads(f.read())
+                        return ExecutionResult(success=True, data=data)
+                    except Exception as e:
+                        return ExecutionResult(success=False, error=f"Failed to read workspace state: {e}")
+                return ExecutionResult(success=True, data={})
+
+            elif request.type == "write_workspace_state":
+                ws_dir = os.path.join(self.original_repo_root, ".remoroo")
+                os.makedirs(ws_dir, exist_ok=True)
+                ws_path = os.path.join(ws_dir, "workspace_state.json")
+                try:
+                    state_data = request.payload.get("state", {})
+                    with open(ws_path, "w", encoding="utf-8") as f:
+                        f.write(json.dumps(state_data, indent=2, default=str))
+                    return ExecutionResult(success=True, data={"path": ws_path})
+                except Exception as e:
+                    return ExecutionResult(success=False, error=f"Failed to write workspace state: {e}")
+
+            elif request.type == "read_local_memory":
+                mem_path = os.path.join(self.original_repo_root, ".remoroo", "local_memory.json")
+                if os.path.exists(mem_path):
+                    try:
+                        with open(mem_path, "r", encoding="utf-8") as f:
+                            data = json.loads(f.read())
+                        return ExecutionResult(success=True, data=data)
+                    except Exception as e:
+                        return ExecutionResult(success=False, error=f"Failed to read local memory: {e}")
+                return ExecutionResult(success=True, data={})
+
+            elif request.type == "write_local_memory":
+                mem_dir = os.path.join(self.original_repo_root, ".remoroo")
+                os.makedirs(mem_dir, exist_ok=True)
+                mem_path = os.path.join(mem_dir, "local_memory.json")
+                try:
+                    mem_data = request.payload.get("memory", {})
+                    with open(mem_path, "w", encoding="utf-8") as f:
+                        f.write(json.dumps(mem_data, indent=2, default=str))
+                    return ExecutionResult(success=True, data={"path": mem_path})
+                except Exception as e:
+                    return ExecutionResult(success=False, error=f"Failed to write local memory: {e}")
+
+            # ── Background job management (probe_live_run support) ──
+
+            elif request.type == "start_background_job":
+                cmd = request.payload.get("command", "")
+                cwd = request.payload.get("cwd") or self.repo_root
+                env_vars = request.payload.get("env", {})
+                if not cmd:
+                    return ExecutionResult(success=False, error="Missing 'command' parameter")
+
+                job_id = f"job-{uuid.uuid4().hex[:8]}"
+
+                # Use the same sandbox/env infrastructure as run_command_async
+                if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                    docker_env = env_vars.copy()
+                    docker_env["PYTHONUNBUFFERED"] = "1"
+                    docker_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                    docker_env["SDL_VIDEODRIVER"] = "dummy"
+                    docker_env["QT_QPA_PLATFORM"] = "offscreen"
+                    docker_env["DISPLAY"] = ":99"
+                    proc = self.sandbox.exec_popen(cmd, env=docker_env, workdir=cwd)
+                else:
+                    local_env = self._get_worker_env(env_vars)
+                    local_env["PYTHONUNBUFFERED"] = "1"
+                    local_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                    local_env["SDL_VIDEODRIVER"] = "dummy"
+                    local_env["QT_QPA_PLATFORM"] = "offscreen"
+                    venv_sandbox = VenvSandbox(self.repo_root, system=self.system)
+                    proc = venv_sandbox.exec_popen(
+                        cmd, env=local_env, shell=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+
+                buffer = collections.deque(maxlen=10000)
+
+                def _stream_reader(stream, buf):
+                    try:
+                        if stream:
+                            for line in iter(stream.readline, ""):
+                                buf.append(line)
+                            stream.close()
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_stream_reader, args=(proc.stdout, buffer), daemon=True).start()
+                threading.Thread(target=_stream_reader, args=(proc.stderr, buffer), daemon=True).start()
+
+                self._running_processes[job_id] = proc
+                self._execution_buffers[job_id] = buffer
+
+                self._log(f"🚀 [Worker] Starting Background Job: {cmd} (ID: {job_id})")
+                return ExecutionResult(success=True, data={"job_id": job_id, "pid": proc.pid})
+
+            elif request.type == "tail_background_job":
+                job_id = request.payload.get("job_id", "")
+                lines = request.payload.get("lines", 50)
+                if job_id not in self._execution_buffers:
+                    return ExecutionResult(success=False, error=f"Unknown job_id: {job_id}")
+
+                buffer = self._execution_buffers[job_id]
+                proc = self._running_processes.get(job_id)
+                is_running = proc.poll() is None if proc else False
+                exit_code = proc.returncode if proc and not is_running else None
+
+                tail = list(buffer)[-lines:]
+                tail_text = "".join(tail)
+
+                return ExecutionResult(success=True, data={
+                    "tail": tail_text,
+                    "is_running": is_running,
+                    "exit_code": exit_code,
+                    "buffer_size": len(buffer),
+                })
+
+            elif request.type == "kill_background_job":
+                job_id = request.payload.get("job_id", "")
+                if job_id not in self._running_processes:
+                    return ExecutionResult(success=False, error=f"Unknown job_id: {job_id}")
+
+                proc = self._running_processes[job_id]
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+
+                exit_code = proc.returncode
+                del self._running_processes[job_id]
+                if job_id in self._execution_buffers:
+                    del self._execution_buffers[job_id]
+
+                return ExecutionResult(success=True, data={"killed": True, "exit_code": exit_code})
+
+            # ── Knowledge Graph RPCs (Phase 5) ──
+
+            elif request.type == "kg_query":
+                kg_db_path = os.path.join(self.original_repo_root, ".remoroo", "knowledge_graph.db")
+                try:
+                    from .core.knowledge_graph import KnowledgeGraphDB
+                    kg = KnowledgeGraphDB(kg_db_path)
+                    query_type = request.payload.get("query_type", "summary")
+                    entity_path = request.payload.get("entity_path", "")
+                    depth = request.payload.get("depth", 2)
+
+                    if query_type == "summary":
+                        result_data = kg.get_summary()
+                    elif query_type == "dependents":
+                        result_data = {"dependents": kg.query_dependents(entity_path, depth=depth)}
+                    elif query_type == "decision_history":
+                        result_data = {"decisions": kg.query_decision_history(entity_path)}
+                    elif query_type == "impact_radius":
+                        result_data = kg.query_impact_radius(entity_path, depth=depth)
+                    elif query_type == "entity":
+                        result_data = kg.get_entity(entity_path) or {}
+                    elif query_type == "search":
+                        prefix = request.payload.get("prefix", "")
+                        entity_type = request.payload.get("entity_type", "")
+                        result_data = {"entities": kg.search_entities(prefix=prefix, entity_type=entity_type)}
+                    else:
+                        result_data = {"error": f"Unknown kg query_type: {query_type}"}
+
+                    kg.close()
+                    return ExecutionResult(success=True, data=result_data)
+                except Exception as e:
+                    return ExecutionResult(success=False, error=f"kg_query failed: {e}")
+
+            elif request.type == "kg_update":
+                kg_db_path = os.path.join(self.original_repo_root, ".remoroo", "knowledge_graph.db")
+                try:
+                    from .core.knowledge_graph import KnowledgeGraphDB
+                    kg = KnowledgeGraphDB(kg_db_path)
+                    update_type = request.payload.get("update_type", "")
+
+                    if update_type == "upsert_entity":
+                        kg.upsert_entity(
+                            path=request.payload.get("path", ""),
+                            entity_type=request.payload.get("entity_type", "unknown"),
+                            summary=request.payload.get("summary", ""),
+                        )
+                    elif update_type == "add_relationship":
+                        kg.add_relationship(
+                            source_path=request.payload.get("source_path", ""),
+                            target_path=request.payload.get("target_path", ""),
+                            rel_type=request.payload.get("rel_type", ""),
+                            metadata=request.payload.get("metadata"),
+                        )
+                    elif update_type == "record_decision":
+                        kg.record_decision(
+                            run_id=request.payload.get("run_id", ""),
+                            entity_path=request.payload.get("entity_path", ""),
+                            decision_type=request.payload.get("decision_type", ""),
+                            rationale=request.payload.get("rationale", ""),
+                            outcome=request.payload.get("outcome", ""),
+                        )
+                    elif update_type == "populate_from_index":
+                        kg.populate_from_index(request.payload.get("repo_index", {}))
+                    else:
+                        kg.close()
+                        return ExecutionResult(success=False, error=f"Unknown kg update_type: {update_type}")
+
+                    kg.close()
+                    return ExecutionResult(success=True, data={"updated": True})
+                except Exception as e:
+                    return ExecutionResult(success=False, error=f"kg_update failed: {e}")
+
+            # ── v2 Process Execution Protocol ──
+
+            elif request.type == "v2_exec_start":
+                from .process_supervisor import SupervisedJob, JobMetadata, TargetMetric
+
+                cmd = request.payload.get("command", "")
+                env_vars = request.payload.get("env", {})
+                cwd = request.payload.get("cwd") or self.repo_root
+                raw_meta = request.payload.get("metadata", {})
+
+                if not cmd:
+                    return ExecutionResult(success=False, error="Missing 'command' parameter")
+
+                job_id = f"v2-{uuid.uuid4().hex[:8]}"
+
+                stdout_buf = collections.deque(maxlen=50000)
+                stderr_buf = collections.deque(maxlen=10000)
+
+                if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                    run_env = env_vars.copy()
+                    run_env["PYTHONUNBUFFERED"] = "1"
+                    run_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                    run_env["SDL_VIDEODRIVER"] = "dummy"
+                    run_env["QT_QPA_PLATFORM"] = "offscreen"
+                    run_env["DISPLAY"] = ":99"
+                    proc = self.sandbox.exec_popen(cmd, env=run_env, workdir=cwd)
+                else:
+                    run_env = self._get_worker_env(env_vars)
+                    run_env["PYTHONUNBUFFERED"] = "1"
+                    run_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
+                    run_env["SDL_VIDEODRIVER"] = "dummy"
+                    run_env["QT_QPA_PLATFORM"] = "offscreen"
+                    venv_sandbox = VenvSandbox(self.repo_root, system=self.system)
+                    proc = venv_sandbox.exec_popen(
+                        cmd, env=run_env, shell=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+
+                log_cb = self.output_callback
+
+                def _reader(stream, buf, is_stderr=False):
+                    try:
+                        if stream:
+                            for line in iter(stream.readline, ""):
+                                buf.append(line)
+                                if log_cb:
+                                    stripped = line.rstrip()
+                                    if stripped:
+                                        try:
+                                            if is_stderr:
+                                                log_cb(f"[dim red]   {stripped}[/dim red]")
+                                            else:
+                                                log_cb(f"[dim]   {stripped}[/dim]")
+                                        except Exception:
+                                            pass
+                            stream.close()
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_reader, args=(proc.stdout, stdout_buf, False), daemon=True).start()
+                threading.Thread(target=_reader, args=(proc.stderr, stderr_buf, True), daemon=True).start()
+
+                raw_targets = raw_meta.get("target_metrics", [])
+                parsed_targets = []
+                for t in raw_targets:
+                    if isinstance(t, dict) and "name" in t and "operator" in t and "value" in t:
+                        parsed_targets.append(TargetMetric(
+                            name=t["name"], operator=t["operator"], value=float(t["value"]),
+                        ))
+
+                metadata = JobMetadata(
+                    expected_kind=raw_meta.get("expected_kind", "unknown"),
+                    cost_sensitivity=raw_meta.get("cost_sensitivity", "medium"),
+                    gpu_expected=raw_meta.get("gpu_expected", False),
+                    progress_hint_paths=raw_meta.get("progress_hint_paths", []),
+                    file_watch_paths=raw_meta.get("file_watch_paths", []),
+                    silent_phase_ok=raw_meta.get("silent_phase_ok", False),
+                    target_metrics=parsed_targets,
+                )
+
+                supervised = SupervisedJob(
+                    job_id=job_id,
+                    pid=proc.pid,
+                    command=cmd,
+                    cwd=cwd,
+                    stdout_buf=stdout_buf,
+                    stderr_buf=stderr_buf,
+                    metadata=metadata,
+                )
+                supervised.start_monitoring()
+
+                self._running_processes[job_id] = proc
+                self._supervised_jobs[job_id] = supervised
+                self._execution_buffers[job_id] = {
+                    "stdout": stdout_buf,
+                    "stderr": stderr_buf,
+                    "start_time": time.time(),
+                    "command": cmd,
+                }
+
+                # Exit watcher: no timeout, just waits for process to finish
+                def _exit_watcher():
+                    try:
+                        proc.wait()
+                        supervised.mark_finished(proc.returncode)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_exit_watcher, daemon=True).start()
+
+                display_cmd = cmd
+                if display_cmd.startswith("cd ") and " && " in display_cmd:
+                    display_cmd = display_cmd.split(" && ", 1)[1]
+                if len(display_cmd) > 120:
+                    display_cmd = display_cmd[:60] + " ... " + display_cmd[-55:]
+                self._log(f"  [v2] Started: {display_cmd} (job={job_id})")
+                return ExecutionResult(success=True, data={"job_id": job_id, "pid": proc.pid})
+
+            elif request.type == "v2_exec_poll":
+                job_id = request.payload.get("job_id", "")
+                wait_s = request.payload.get("wait_s", 5)
+                tail_lines = request.payload.get("tail_lines", 80)
+                print(f"  [DBG-SUPERVISOR] v2_exec_poll: job={job_id}, wait_s={wait_s}, drain_events={request.payload.get('drain_events', True)}", flush=True)  # DBG-SUPERVISOR
+
+                supervised = self._supervised_jobs.get(job_id)
+                if supervised is None:
+                    return ExecutionResult(success=True, data={
+                        "status": "finished",
+                        "exit_code": None,
+                        "stdout_tail": "",
+                        "stderr_tail": f"Job {job_id} no longer tracked.",
+                        "elapsed_s": 0,
+                        "output_lines": 0,
+                        "events": [],
+                        "fps": 0.0,
+                        "ws": 0.0,
+                        "resource_snapshot": {},
+                        "progress": {},
+                        "milestones": [],
+                    })
+
+                # Wait loop: block up to wait_s for exit or new events
+                proc = self._running_processes.get(job_id)
+                deadline = time.time() + wait_s
+
+                while time.time() < deadline:
+                    if supervised.status != "running":
+                        break
+                    if supervised.event_queue:
+                        break
+                    if proc and proc.poll() is not None:
+                        if supervised.status == "running":
+                            supervised.mark_finished(proc.returncode)
+                        break
+                    time.sleep(0.5)
+
+                # Final check
+                if proc and proc.poll() is not None and supervised.status == "running":
+                    supervised.mark_finished(proc.returncode)
+
+                drain = request.payload.get("drain_events", True)
+                response = supervised.build_poll_response(tail_lines=tail_lines, drain=drain)
+                return ExecutionResult(success=True, data=response)
+
+            elif request.type == "v2_exec_kill":
+                job_id = request.payload.get("job_id", "")
+
+                supervised = self._supervised_jobs.get(job_id)
+                proc = self._running_processes.get(job_id)
+
+                if proc is None:
+                    return ExecutionResult(success=True, data={
+                        "killed": True, "exit_code": None,
+                        "note": f"Job {job_id} already finished or was already killed.",
+                    })
+
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+
+                    if self.engine == "docker" and self.sandbox and self.sandbox.available:
+                        try:
+                            cmd_str = supervised.command if supervised else ""
+                            if cmd_str:
+                                self.sandbox.kill_process_by_command(cmd_str)
+                        except Exception:
+                            pass
+
+                exit_code = proc.returncode
+                if supervised:
+                    supervised.mark_killed()
+                    supervised.stop_monitoring()
+
+                self._running_processes.pop(job_id, None)
+                self._execution_buffers.pop(job_id, None)
+                self._supervised_jobs.pop(job_id, None)
+
+                self._log(f"  [v2] Killed: {job_id} (exit_code={exit_code})")
+                return ExecutionResult(success=True, data={"killed": True, "exit_code": exit_code})
 
             else:
                 return ExecutionResult(success=False, error=f"Unknown request type: {request.type}")

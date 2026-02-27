@@ -10,78 +10,119 @@ from typing import Dict, Any, List
 
 def extract_tracebacks(output: str) -> List[Dict[str, Any]]:
     """
-    Extract Python tracebacks from command output.
-    Returns list of dicts with traceback info: error_type, error_message, file_location, full_traceback.
-    Generic - works for any Python error type.
+    Extract tracebacks from command output across multiple languages (Python, JS/V8, Rust, C++).
     """
     lines = output.split('\n')
     tracebacks = []
     current_traceback = None
     traceback_lines = []
     in_traceback = False
+    language_mode = None  # 'python', 'node', 'rust', 'gcc'
     
-    # Common Python error patterns (generic)
+    # Generic error pattern
     error_pattern = re.compile(
-        r'^(\w+Error|Exception|Warning|Error):\s*(.+)$',
+        r'^(\w+Error|Exception|Warning|Error|Panic|fatal error|error):\s*(.+)$',
         re.IGNORECASE
     )
     
-    # Pattern to match file locations in tracebacks
-    file_location_pattern = re.compile(
-        r'File\s+["\']([^"\']+)["\'],\s+line\s+(\d+)',
-        re.IGNORECASE
-    )
+    # Python Location
+    py_loc_pattern = re.compile(r'File\s+["\']([^"\']+)["\'],\s+line\s+(\d+)', re.IGNORECASE)
+    # Node Location
+    node_loc_pattern = re.compile(r'^\s+at\s+(?:.*?\s+)?\(?(.*?):(\d+):\d+\)?')
+    # Rust panic location
+    rust_loc_pattern = re.compile(r'panicked at.*?([^\\/]+\.rs):(\d+):(\d+)')
     
     for i, line in enumerate(lines, 1):
-        # Check if this line starts a traceback
-        if line.strip().startswith('Traceback (most recent call last):'):
-            # Save previous traceback if exists
+        stripped = line.strip()
+        
+        # 1. Detect Traceback Start
+        is_python_start = stripped.startswith('Traceback (most recent call last):')
+        is_node_start = bool(re.match(r'^[\w]*Error:\s', stripped)) and i < len(lines) and '    at ' in lines[i]
+        is_rust_start = stripped.startswith("thread ") and "panicked at" in stripped
+        
+        if is_python_start or is_node_start or is_rust_start:
             if current_traceback and traceback_lines:
                 current_traceback['full_traceback'] = '\n'.join(traceback_lines)
                 tracebacks.append(current_traceback)
             
-            # Start new traceback
+            lang = 'python' if is_python_start else 'node' if is_node_start else 'rust'
             current_traceback = {
                 'error_type': None,
                 'error_message': None,
                 'file_location': None,
                 'line_number': None,
                 'full_traceback': None,
-                'traceback_start_line': i
+                'traceback_start_line': i,
+                'language': lang
             }
             traceback_lines = [line]
             in_traceback = True
+            language_mode = lang
+            
+            # Immediately extract info if possible
+            if is_node_start:
+                m = re.match(r'^([\w]*Error):\s*(.+)', stripped)
+                if m:
+                    current_traceback['error_type'] = m.group(1)
+                    current_traceback['error_message'] = m.group(2)
+            elif is_rust_start:
+                current_traceback['error_type'] = 'Panic'
+                msg_match = re.search(r'panicked at \'(.*?)\'', stripped)
+                current_traceback['error_message'] = msg_match.group(1) if msg_match else "Rust Panic"
+                loc_match = rust_loc_pattern.search(stripped)
+                if loc_match:
+                    current_traceback['file_location'] = loc_match.group(1)
+                    current_traceback['line_number'] = int(loc_match.group(2))
             continue
-        
+            
         if in_traceback:
             traceback_lines.append(line)
             
-            # Check for file location
-            file_match = file_location_pattern.search(line)
-            if file_match and not current_traceback.get('file_location'):
-                current_traceback['file_location'] = file_match.group(1)
-                try:
-                    current_traceback['line_number'] = int(file_match.group(2))
-                except ValueError:
-                    pass
+            if language_mode == 'python':
+                loc_m = py_loc_pattern.search(line)
+                if loc_m and not current_traceback.get('file_location'):
+                    current_traceback['file_location'] = loc_m.group(1)
+                    try: current_traceback['line_number'] = int(loc_m.group(2))
+                    except ValueError: pass
+                
+                err_m = error_pattern.match(stripped)
+                if err_m and not loc_m:
+                    current_traceback['error_type'] = err_m.group(1)
+                    current_traceback['error_message'] = err_m.group(2)
+                    current_traceback['full_traceback'] = '\n'.join(traceback_lines)
+                    tracebacks.append(current_traceback)
+                    in_traceback = False
+                    current_traceback = None
+                    traceback_lines = []
             
-            # Check for error type and message (usually the last line of traceback)
-            error_match = error_pattern.match(line.strip())
-            if error_match:
-                current_traceback['error_type'] = error_match.group(1)
-                current_traceback['error_message'] = error_match.group(2)
-                # Traceback ends here
-                in_traceback = False
-                current_traceback['full_traceback'] = '\n'.join(traceback_lines)
-                tracebacks.append(current_traceback)
-                current_traceback = None
-                traceback_lines = []
-    
-    # Handle case where traceback doesn't end with an error line
+            elif language_mode == 'node':
+                loc_m = node_loc_pattern.search(line)
+                if loc_m and not current_traceback.get('file_location'):
+                    current_traceback['file_location'] = loc_m.group(1)
+                    try: current_traceback['line_number'] = int(loc_m.group(2))
+                    except ValueError: pass
+                # Node tracebacks end when indentation stops
+                if not line.startswith('    ') and stripped:
+                    current_traceback['full_traceback'] = '\n'.join(traceback_lines[:-1]) # Don't include this non-traceback line
+                    tracebacks.append(current_traceback)
+                    in_traceback = False
+                    current_traceback = None
+                    traceback_lines = []
+                    
+            elif language_mode == 'rust':
+                # Rust traces end at empty lines
+                if not stripped:
+                    current_traceback['full_traceback'] = '\n'.join(traceback_lines)
+                    tracebacks.append(current_traceback)
+                    in_traceback = False
+                    current_traceback = None
+                    traceback_lines = []
+                    
+    # GC remainder
     if current_traceback and traceback_lines:
         current_traceback['full_traceback'] = '\n'.join(traceback_lines)
         tracebacks.append(current_traceback)
-    
+        
     return tracebacks
 
 def extract_errors(output: str) -> Dict[str, Any]:
@@ -128,9 +169,15 @@ def extract_errors(output: str) -> Dict[str, Any]:
                 error_type = error_match.group(1)
                 error_message = error_match.group(2)
             else:
-                # Generic error without specific type
-                error_type = "Error"
-                error_message = line.strip()
+                # C++/GCC single line errors
+                gcc_match = re.search(r'^([^:]+):(\d+):(?:\d+:)?\s+(error|fatal error):\s+(.*)$', line)
+                if gcc_match:
+                    error_type = "GCC_Error"
+                    error_message = f"{gcc_match.group(3)}: {gcc_match.group(4)}"
+                    # Sneak in a faux traceback object for GCC if needed, or just standalone
+                else:
+                    error_type = "Error"
+                    error_message = line.strip()
             
             errors.append({
                 'line_number': i,

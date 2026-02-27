@@ -23,6 +23,7 @@ def run_local_worker(
     verbose: bool = False,
     cache_env: bool = False,
     agentic: bool = False,
+    engine_version: str = "v2",
 ) -> LocalRunResult:
     from .configs import get_api_url
     if brain_url is None:
@@ -104,13 +105,13 @@ def run_local_worker(
         headers = {}
         headers["Authorization"] = f"Bearer {session_key}"
         
-        # Stage 6.5 Compat: Server expects Form Data now
         resp = requests.post(f"{API_URL}/runs", data={
             "repo_path": str(repo_path),
             "goal": goal,
             "metrics": metrics_str,
             "artifact_dir": str(artifact_dir),
             "agentic": "true" if agentic else "false",
+            "engine_version": engine_version,
         }, headers=headers)
         
         if resp.status_code == 402:
@@ -225,7 +226,15 @@ def run_local_worker(
         else:
             gitignore_path.write_text("# Remoroo Metadata\n.remoroo/\n")
     except Exception:
-        pass # Ignore gitignore failures 
+        pass # Ignore gitignore failures
+
+    # Initialize local memory file if it doesn't exist
+    local_memory_path = remoroo_dir / "local_memory.json"
+    if not local_memory_path.exists():
+        try:
+            local_memory_path.write_text('{"repo_url": "", "last_updated": "", "world_facts": [], "entity_summaries": {}, "experiences": [], "beliefs": []}')
+        except Exception:
+            pass
 
     from rich.console import Console, Group
     from rich.live import Live
@@ -261,9 +270,28 @@ def run_local_worker(
     
 
     # --- Dashboard Components ---
+    # Normalize metric keys: strip operator+target suffix so "val_accuracy>0.97"
+    # becomes "val_accuracy", matching what metric_gate extracts.
+    import re as _re_norm
+    _METRIC_OP_RE = _re_norm.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*(?:==|>=|<=|!=|>|<)')
+
+    def _normalize_metric_key(raw: str) -> str:
+        m = _METRIC_OP_RE.match(raw.strip())
+        if m:
+            return m.group(1)
+        return raw.split(",")[0].strip()
+
+    _metric_targets = {}
+    _normalized_metrics = []
+    for m in metrics:
+        base = _normalize_metric_key(m)
+        _normalized_metrics.append(base)
+        if any(op in m for op in ("==", ">=", "<=", "!=", ">", "<")):
+            _metric_targets[base] = m
+
     scoreboard_data = {
-        "baseline": {m: None for m in metrics}, 
-        "current": {m: None for m in metrics}, 
+        "baseline": {m: None for m in _normalized_metrics}, 
+        "current": {m: None for m in _normalized_metrics}, 
         "status": "Initializing..."
     }
 
@@ -381,7 +409,8 @@ def run_local_worker(
                     if "Brain" not in scoreboard_data["status"]:
                          scoreboard_data["status"] = "🧠 Brain is analyzing results..."
                 else:
-                    scoreboard_data["status"] = f"🛠️ Executing {step.type}"
+                    if step.type != "metrics_update":
+                        scoreboard_data["status"] = f"🛠️ Executing {step.type}"
                     _llm_activity["active"] = False
                 
                 # 2. Check for completion or timeout
@@ -426,10 +455,33 @@ def run_local_worker(
                     success = final_result.get("success") == True or outcome == "SUCCESS"
                     partial_success = final_result.get("partial_success") == True or outcome == "PARTIAL_SUCCESS"
                     
+                    # v2: Extract metrics from workflow_complete payload
+                    if final_result.get("metrics") and isinstance(final_result["metrics"], dict):
+                        for k, v in final_result["metrics"].items():
+                            if isinstance(v, (int, float)):
+                                scoreboard_data["current"][k] = v
+                    if final_result.get("baseline_metrics") and isinstance(final_result["baseline_metrics"], dict):
+                        for k, v in final_result["baseline_metrics"].items():
+                            if isinstance(v, (int, float)):
+                                scoreboard_data["baseline"][k] = v
+
                     scoreboard_data["status"] = "✅ Workflow Complete!"
                     update_dashboard(dashboard_layout, scoreboard_data)
                     break
                     
+                if step.type == "metrics_update":
+                    mu_phase = step.payload.get("phase", "current")
+                    mu_metrics = step.payload.get("metrics", {})
+                    mu_target = scoreboard_data["baseline"] if mu_phase == "baseline" else scoreboard_data["current"]
+                    for k, v in mu_metrics.items():
+                        if isinstance(v, (int, float)):
+                            mu_target[k] = v
+                    update_dashboard(dashboard_layout, scoreboard_data)
+                    ack_result = ExecutionResult(success=True, data={})
+                    ack_result.request_id = step.request_id
+                    server.submit_result(ack_result)
+                    continue
+
                 if step.type == "workflow_error":
                     outcome = f"ERROR: {step.payload.get('error')}"
                     success = False

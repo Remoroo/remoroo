@@ -258,36 +258,63 @@ class PythonIndexer:
         module_name = self._path_to_module(file_path)
         
         lines = content.split("\n") if content else []
+
+        # Try tree-sitter first (Phase 7C migration), fall back to AST
+        imports, exports, top_level_symbols, entrypoints = [], [], [], []
+        _used_treesitter = False
         try:
-            tree = ast.parse(content, filename=file_path)
-            visitor = self._Visitor(module_name, file_path, lines)
-            visitor.visit(tree)
-            visitor.finalize()
-            imports = sorted(visitor.imports)
-            exports = sorted(visitor.exports)
-            top_level_symbols = visitor.top_level_symbols
-            entrypoints = []
+            from .code_parser import extract_code_blocks_treesitter, TREE_SITTER_AVAILABLE
+            if TREE_SITTER_AVAILABLE:
+                blocks = extract_code_blocks_treesitter(file_path, content)
+                for block in blocks:
+                    btype = block.get("type", "raw")
+                    name = block.get("name")
+                    line_range = block.get("line_range", [1, 1])
+                    if btype == "import":
+                        snippet = block.get("content", "").strip()
+                        parts = snippet.split()
+                        if len(parts) > 1:
+                            imports.append(parts[1])
+                    elif btype == "main_block":
+                        entrypoints.append({"kind": "__main__", "line_start": line_range[0], "line_end": line_range[1]})
+                    elif btype in ("function", "class") and name:
+                        sym_id = f"sym:{module_name}:{name}#L{line_range[0]}"
+                        top_level_symbols.append(sym_id)
+                        if btype == "function" and name.lower() in ("main", "cli", "entrypoint"):
+                            entrypoints.append({"kind": "function", "name": name, "line_start": line_range[0], "line_end": line_range[1]})
+                imports = sorted(set(imports))
+                _used_treesitter = True
+        except ImportError:
+            pass
 
-            # Entrypoint: __main__ block (cheap string scan)
-            if 'if __name__ == "__main__"' in content:
-                main_start, main_end = self._find_main_block_lines(content)
-                if main_start:
-                    entrypoints.append({"kind": "__main__", "line_start": main_start, "line_end": main_end})
+        if not _used_treesitter:
+            try:
+                tree = ast.parse(content, filename=file_path)
+                visitor = self._Visitor(module_name, file_path, lines)
+                visitor.visit(tree)
+                visitor.finalize()
+                imports = sorted(visitor.imports)
+                exports = sorted(visitor.exports)
+                top_level_symbols = visitor.top_level_symbols
 
-            # Entrypoint: top-level main/cli/etc (name-based + cheap body scan)
-            for sym in visitor.symbols:
-                if sym.get("kind") == "function":
-                    name = sym.get("name", "")
-                    if name and name.lower() in ["main", "cli", "entrypoint"]:
-                        entrypoints.append({
-                            "kind": "function",
-                            "name": name,
-                            "line_start": sym["span"]["line_start"],
-                            "line_end": sym["span"]["line_end"]
-                        })
-        except SyntaxError:
-            imports, exports, top_level_symbols, entrypoints = [], [], [], []
-        
+                if 'if __name__ == "__main__"' in content:
+                    main_start, main_end = self._find_main_block_lines(content)
+                    if main_start:
+                        entrypoints.append({"kind": "__main__", "line_start": main_start, "line_end": main_end})
+
+                for sym in visitor.symbols:
+                    if sym.get("kind") == "function":
+                        name = sym.get("name", "")
+                        if name and name.lower() in ["main", "cli", "entrypoint"]:
+                            entrypoints.append({
+                                "kind": "function",
+                                "name": name,
+                                "line_start": sym["span"]["line_start"],
+                                "line_end": sym["span"]["line_end"]
+                            })
+            except SyntaxError:
+                imports, exports, top_level_symbols, entrypoints = [], [], [], []
+
         return {
             "path": file_path,
             "sha256": file_hash,
@@ -331,29 +358,78 @@ class PythonIndexer:
             "entrypoints": []
         }
 
+        # Try tree-sitter first (Phase 7C), fall back to AST
+        _used_treesitter = False
+        symbols = []
         try:
-            tree = ast.parse(content, filename=file_path)
-            visitor = self._Visitor(module_name, file_path, lines)
-            visitor.visit(tree)
-            visitor.finalize()
-            file_info["imports"] = sorted(visitor.imports)
-            file_info["exports"] = sorted(visitor.exports)
-            file_info["top_level_symbols"] = visitor.top_level_symbols
+            from .code_parser import extract_code_blocks_treesitter, TREE_SITTER_AVAILABLE
+            if TREE_SITTER_AVAILABLE:
+                blocks = extract_code_blocks_treesitter(file_path, content)
+                ts_imports = []
+                eps = []
+                for block in blocks:
+                    btype = block.get("type", "raw")
+                    name = block.get("name")
+                    line_range = block.get("line_range", [1, 1])
+                    if btype == "import":
+                        snippet = block.get("content", "").strip()
+                        parts = snippet.split()
+                        if len(parts) > 1:
+                            ts_imports.append(parts[1])
+                    elif btype == "main_block":
+                        eps.append({"kind": "__main__", "line_start": line_range[0], "line_end": line_range[1]})
+                    elif btype in ("function", "class") and name:
+                        sym_id = f"sym:{module_name}:{name}#L{line_range[0]}"
+                        sig_content = block.get("content", "")
+                        first_line = sig_content.split("\n")[0].strip()[:120] if sig_content else ""
+                        symbols.append({
+                            "id": sym_id,
+                            "kind": btype,
+                            "name": name,
+                            "qualified_name": f"{module_name}.{name}",
+                            "file_path": file_path,
+                            "span": {"line_start": line_range[0], "line_end": line_range[1]},
+                            "signature": first_line,
+                            "doc": "",
+                            "exports": [],
+                            "references": {"calls": [], "called_by": [], "imports_used": sorted(set(ts_imports))},
+                            "visibility": "public" if not name.startswith("_") else "private",
+                        })
+                        file_info["top_level_symbols"].append(sym_id)
+                        if btype == "function" and name.lower() in ("main", "cli", "entrypoint"):
+                            eps.append({"kind": "function", "name": name, "line_start": line_range[0], "line_end": line_range[1]})
+                file_info["imports"] = sorted(set(ts_imports))
+                file_info["entrypoints"] = eps
+                _used_treesitter = True
+        except ImportError:
+            pass
 
-            eps: List[Dict[str, Any]] = []
-            if 'if __name__ == "__main__"' in content:
-                main_start, main_end = self._find_main_block_lines(content)
-                if main_start:
-                    eps.append({"kind": "__main__", "line_start": main_start, "line_end": main_end})
-            for sym in visitor.symbols:
-                if sym.get("kind") == "function":
-                    name = sym.get("name", "")
-                    if name and name.lower() in ["main", "cli", "entrypoint"]:
-                        eps.append({"kind": "function", "name": name, "line_start": sym["span"]["line_start"], "line_end": sym["span"]["line_end"]})
-            file_info["entrypoints"] = eps
-            return file_info, visitor.symbols
-        except SyntaxError:
-            return file_info, []
+        if not _used_treesitter:
+            try:
+                tree = ast.parse(content, filename=file_path)
+                visitor = self._Visitor(module_name, file_path, lines)
+                visitor.visit(tree)
+                visitor.finalize()
+                file_info["imports"] = sorted(visitor.imports)
+                file_info["exports"] = sorted(visitor.exports)
+                file_info["top_level_symbols"] = visitor.top_level_symbols
+                symbols = visitor.symbols
+
+                eps = []
+                if 'if __name__ == "__main__"' in content:
+                    main_start, main_end = self._find_main_block_lines(content)
+                    if main_start:
+                        eps.append({"kind": "__main__", "line_start": main_start, "line_end": main_end})
+                for sym in symbols:
+                    if sym.get("kind") == "function":
+                        name = sym.get("name", "")
+                        if name and name.lower() in ["main", "cli", "entrypoint"]:
+                            eps.append({"kind": "function", "name": name, "line_start": sym["span"]["line_start"], "line_end": sym["span"]["line_end"]})
+                file_info["entrypoints"] = eps
+            except SyntaxError:
+                pass
+
+        return file_info, symbols
     
     def extract_symbols(self, file_path: str) -> List[Dict[str, Any]]:
         """Backward-compatible API: now uses single-pass implementation."""
@@ -431,6 +507,201 @@ class PythonIndexer:
     # file-level imports as a best-effort "imports_used" list for each symbol.
 
 
+import re
+
+class PolyglotGrepIndexer:
+    def __init__(self, repo_root: str):
+        self.repo_root = repo_root
+        self.patterns = {
+            "python": [
+                (r"^\s*class\s+([A-Za-z0-9_]+)", "class"),
+                (r"^\s*def\s+([A-Za-z0-9_]+)", "function"),
+            ],
+            "js_ts": [
+                (r"^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z0-9_]+)", "class"),
+                (r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)", "function"),
+                (r"^\s*(?:export\s+)?const\s+([A-Za-z0-9_]+)\s*=\s*(?:async\s+)?\(", "function"),
+            ],
+            "rust": [
+                (r"^\s*(?:pub\s+)?struct\s+([A-Za-z0-9_]+)", "class"),
+                (r"^\s*(?:pub\s+)?enum\s+([A-Za-z0-9_]+)", "class"),
+                (r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)", "function"),
+            ],
+            "go": [
+                (r"^\s*type\s+([A-Za-z0-9_]+)\s+struct", "class"),
+                (r"^\s*func\s+(?:\[[^\]]+\]\s*)?(?:\([^)]+\)\s*)?([A-Za-z0-9_]+)", "function"),
+            ],
+            "cpp": [
+                (r"^\s*class\s+([A-Za-z0-9_]+)", "class"),
+                (r"^\s*struct\s+([A-Za-z0-9_]+)", "class"),
+            ]
+        }
+
+    def _get_lang_patterns(self, file_path: str):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".py": return "python", self.patterns["python"]
+        if ext in (".js", ".jsx", ".ts", ".tsx"): return "javascript", self.patterns["js_ts"]
+        if ext == ".rs": return "rust", self.patterns["rust"]
+        if ext == ".go": return "go", self.patterns["go"]
+        if ext in (".cpp", ".cc", ".c", ".h", ".hpp", ".java"): return "cpp", self.patterns["cpp"]
+        return "unknown", []
+
+    def index_file_with_symbols(self, file_path: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        abs_path = os.path.join(self.repo_root, file_path)
+        with open(abs_path, "rb") as f:
+            raw = f.read()
+            content = raw.decode("utf-8", "ignore")
+            
+        size_bytes, mtime = _safe_stat(abs_path)
+        file_hash = _compute_sha256_bytes(raw) if raw else ""
+        
+        lang, patterns = self._get_lang_patterns(file_path)
+        module_name = file_path.replace(os.sep, ".")
+        
+        file_info = {
+            "path": file_path, "sha256": file_hash, "size_bytes": size_bytes,
+            "mtime": mtime, "language": lang, "module": module_name,
+            "imports": [], "exports": [], "top_level_symbols": [], "entrypoints": []
+        }
+        
+        symbols = []
+        if patterns:
+            lines = content.split("\n")
+            for i, line in enumerate(lines, 1):
+                # Optimization: skip lines without space/parens assuming no definition
+                if " " not in line and "(" not in line:
+                    continue
+                for pat, kind in patterns:
+                    m = re.search(pat, line)
+                    if m:
+                        name = m.group(1)
+                        sym_id = f"sym:{module_name}:{name}#L{i}"
+                        symbols.append({
+                            "id": sym_id,
+                            "kind": kind,
+                            "name": name,
+                            "qualified_name": f"{module_name}.{name}",
+                            "file_path": file_path,
+                            "span": {"line_start": i, "line_end": i},
+                            "signature": line.strip()[:100],
+                            "doc": "", "exports": [],
+                            "references": {"calls": [], "called_by": [], "imports_used": []},
+                            "visibility": "public" if not name.startswith("_") else "private"
+                        })
+                        file_info["top_level_symbols"].append(sym_id)
+                        break
+                        
+        # Basic entrypoint sniffing
+        if lang == "python" and 'if __name__ == "__main__":' in content:
+            file_info["entrypoints"].append({"kind": "__main__", "line_start": 1, "line_end": 1})
+        elif lang == "javascript" and "app.listen(" in content:
+            file_info["entrypoints"].append({"kind": "node_main", "line_start": 1, "line_end": 1})
+        elif lang == "rust" and "fn main(" in content:
+            file_info["entrypoints"].append({"kind": "rust_main", "line_start": 1, "line_end": 1})
+        elif lang == "go" and "func main()" in content:
+            file_info["entrypoints"].append({"kind": "go_main", "line_start": 1, "line_end": 1})
+
+        return file_info, symbols
+
+
+class TreeSitterIndexer:
+    """Tree-sitter based indexer for all supported languages.
+
+    Uses :mod:`code_parser.extract_code_blocks_treesitter` for robust,
+    multi-language symbol extraction with error recovery. Falls back to
+    :class:`PolyglotGrepIndexer` when tree-sitter is unavailable.
+    """
+
+    def __init__(self, repo_root: str):
+        self.repo_root = repo_root
+        self._grep_fallback = PolyglotGrepIndexer(repo_root)
+
+    def index_file_with_symbols(self, file_path: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        abs_path = os.path.join(self.repo_root, file_path)
+        with open(abs_path, "rb") as f:
+            raw = f.read()
+        content = raw.decode("utf-8", "ignore")
+        size_bytes, mtime = _safe_stat(abs_path)
+        file_hash = _compute_sha256_bytes(raw) if raw else ""
+
+        ext = os.path.splitext(file_path)[1].lower()
+
+        try:
+            from .code_parser import extract_code_blocks_treesitter, TREE_SITTER_AVAILABLE, LANGUAGE_MAP
+            if not TREE_SITTER_AVAILABLE or ext not in LANGUAGE_MAP:
+                return self._grep_fallback.index_file_with_symbols(file_path)
+        except ImportError:
+            return self._grep_fallback.index_file_with_symbols(file_path)
+
+        lang = LANGUAGE_MAP.get(ext, "unknown")
+        blocks = extract_code_blocks_treesitter(file_path, content)
+        module_name = file_path.replace(os.sep, ".")
+
+        file_info = {
+            "path": file_path,
+            "sha256": file_hash,
+            "size_bytes": size_bytes,
+            "mtime": mtime,
+            "language": lang,
+            "module": module_name,
+            "imports": [],
+            "exports": [],
+            "top_level_symbols": [],
+            "entrypoints": [],
+        }
+
+        symbols = []
+        for block in blocks:
+            btype = block.get("type", "raw")
+            name = block.get("name")
+            line_range = block.get("line_range", [1, 1])
+
+            if btype == "import":
+                snippet = block.get("content", "").strip()
+                if snippet:
+                    file_info["imports"].append(snippet.split()[1] if len(snippet.split()) > 1 else snippet[:80])
+                continue
+
+            if btype == "main_block":
+                file_info["entrypoints"].append({
+                    "kind": "__main__" if lang == "python" else f"{lang}_main",
+                    "line_start": line_range[0],
+                    "line_end": line_range[1],
+                })
+                continue
+
+            if btype in ("function", "class") and name:
+                sym_id = f"sym:{module_name}:{name}#L{line_range[0]}"
+                sig_content = block.get("content", "")
+                first_line = sig_content.split("\n")[0].strip()[:120] if sig_content else ""
+
+                symbols.append({
+                    "id": sym_id,
+                    "kind": btype,
+                    "name": name,
+                    "qualified_name": f"{module_name}.{name}",
+                    "file_path": file_path,
+                    "span": {"line_start": line_range[0], "line_end": line_range[1]},
+                    "signature": first_line,
+                    "doc": "",
+                    "exports": [],
+                    "references": {"calls": [], "called_by": [], "imports_used": []},
+                    "visibility": "public" if not name.startswith("_") else "private",
+                })
+                file_info["top_level_symbols"].append(sym_id)
+
+        # Entrypoint sniffing for non-Python
+        if not file_info["entrypoints"]:
+            if lang in ("javascript", "typescript") and "app.listen(" in content:
+                file_info["entrypoints"].append({"kind": "node_main", "line_start": 1, "line_end": 1})
+            elif lang == "rust" and "fn main(" in content:
+                file_info["entrypoints"].append({"kind": "rust_main", "line_start": 1, "line_end": 1})
+            elif lang == "go" and "func main()" in content:
+                file_info["entrypoints"].append({"kind": "go_main", "line_start": 1, "line_end": 1})
+
+        return file_info, symbols
+
+
 class RepoIndexer:
     """Repository indexer with plugin interface for multiple languages."""
     
@@ -438,13 +709,14 @@ class RepoIndexer:
         self.repo_root = os.path.abspath(repo_root)
         self.config = config or {}
         
-        # Plugin registry (Python-only for now, extensible)
+        # Plugin registry: Python keeps AST indexer, everything else uses tree-sitter
         self.indexers = {
-            "python": PythonIndexer(self.repo_root)
+            "python": PythonIndexer(self.repo_root),
+            "polyglot": TreeSitterIndexer(self.repo_root),
         }
         
         # Default config
-        self.include_globs = self.config.get("include_globs", ["**/*.py"])
+        self.include_globs = self.config.get("include_globs", ["**/*.py", "**/*.js", "**/*.ts", "**/*.jsx", "**/*.tsx", "**/*.rs", "**/*.go", "**/*.cpp", "**/*.cc", "**/*.c", "**/*.h", "**/*.java"])
         self.exclude_globs = self.config.get("exclude_globs", [
             "**/venv/**",
             "**/__pycache__/**",
@@ -569,7 +841,10 @@ class RepoIndexer:
         
         for file_path in python_files:
             try:
-                file_info, symbols = self.indexers["python"].index_file_with_symbols(file_path)
+                if file_path.endswith(".py"):
+                    file_info, symbols = self.indexers["python"].index_file_with_symbols(file_path)
+                else:
+                    file_info, symbols = self.indexers["polyglot"].index_file_with_symbols(file_path)
                 files.append(file_info)
                 all_symbols.extend(symbols)
             except Exception as e:
@@ -647,7 +922,10 @@ class RepoIndexer:
         # Index changed files
         for file_path in changed_files:
             try:
-                file_info, symbols = self.indexers["python"].index_file_with_symbols(file_path)
+                if file_path.endswith(".py"):
+                    file_info, symbols = self.indexers["python"].index_file_with_symbols(file_path)
+                else:
+                    file_info, symbols = self.indexers["polyglot"].index_file_with_symbols(file_path)
                 existing_index["files"].append(file_info)
                 existing_index["symbols"].extend(symbols)
             except Exception as e:
@@ -809,8 +1087,9 @@ class RepoIndexer:
         return entrypoints
     
     def _find_python_files(self) -> List[str]:
-        """Find all Python files in repository."""
+        """Find all target files in repository."""
         python_files = []
+        valid_exts = {".py", ".js", ".jsx", ".ts", ".tsx", ".rs", ".go", ".c", ".cc", ".cpp", ".h", ".hpp", ".java"}
         
         for root, dirs, files in os.walk(self.repo_root):
             # Skip excluded directories early (fast path).
@@ -835,7 +1114,9 @@ class RepoIndexer:
             for filename in files:
                 if filename.startswith('.') or filename.startswith('__') or filename in self.excluded_files:
                     continue
-                if filename.endswith(".py"):
+                
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in valid_exts:
                     file_path = os.path.join(root, filename)
                     rel_path = os.path.relpath(file_path, self.repo_root)
                     rel_posix = rel_path.replace(os.sep, "/")
@@ -1012,7 +1293,9 @@ class RepoIndexer:
         abs_path = os.path.join(self.repo_root, file_path)
         if not os.path.exists(abs_path):
             return f"# Error: File '{file_path}' not found."
-            
+        if os.path.isdir(abs_path):
+            return f"# Error: '{file_path}' is a directory, not a file. Use explore_structure to list directory contents."
+
         with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
             source_code = f.read()
             
