@@ -22,7 +22,7 @@ def prompt_metrics() -> list[str]:
     
     typer.echo("")
     typer.secho("📈 What metric(s) should improve?", fg=typer.colors.CYAN, bold=True)
-    typer.echo("(Enter one per line, empty line to finish)")
+    typer.echo("(Enter one per line, empty line to finish. Press Enter immediately for goal-only mode.)")
     metrics: list[str] = []
     while True:
         m = prompt(HTML("<b>> </b>"))
@@ -30,8 +30,12 @@ def prompt_metrics() -> list[str]:
         if not m:
             if metrics:
                 return metrics
-            typer.secho("At least one metric is required.", fg=typer.colors.RED)
-            continue
+            # No metrics entered — use goal-only mode
+            typer.secho(
+                "⚡ No metrics provided — running in goal-only mode (task_complete==true).",
+                fg=typer.colors.YELLOW,
+            )
+            return []
         metrics.append(m)
 
 def confirm_run(repo_path: Path, goal: str, metrics: list[str], mode: str) -> bool:

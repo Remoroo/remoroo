@@ -45,6 +45,12 @@ def validate_patch_before_apply(
 
     for i, e in enumerate(patch.get("edits", []), 1):
         path = e.get("path", "unknown")
+        
+        # HOTFIX: Rebase /app paths back to workspace explicitly
+        if path.startswith("/app/"):
+            path = path[5:]
+            e["path"] = path
+
         kind = e.get("kind", "unknown")
         
         # Simulation
@@ -322,6 +328,10 @@ def apply_patchproposal(
         print(f"   ✅ Pre-validation passed")
 
     for i, e in enumerate(patch.get("edits", []), 1):
+        # HOTFIX: Rebase /app paths back to workspace explicitly
+        if e.get("path", "").startswith("/app/"):
+            e["path"] = e["path"][5:]
+
         abs_path = os.path.join(repo_root, e["path"])
         file_path = e["path"]
         kind = e["kind"]

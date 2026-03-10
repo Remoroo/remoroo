@@ -45,6 +45,7 @@ class JobMetadata:
     file_watch_paths: List[str] = field(default_factory=list)
     silent_phase_ok: bool = False
     target_metrics: List[TargetMetric] = field(default_factory=list)
+    max_silent_s: Optional[float] = None  # Agent contract: fire SILENT_TIMEOUT if zero output after this many seconds
 
 
 @dataclass
@@ -56,6 +57,7 @@ class ResourceSnapshot:
     disk_io_mb_s: Optional[float] = None
     gpu_util_pct: Optional[float] = None
     gpu_mem_mb: Optional[float] = None
+    memory_pressure: Optional[str] = None  # macOS only: "normal" | "warning" | "critical"
 
 
 @dataclass
@@ -100,6 +102,7 @@ EVENT_CONFIDENCE_THRESHOLDS: Dict[str, float] = {
     "FAILED": 0.0,                # always wake — process exited non-zero
     "METRIC_TARGET_REACHED": 0.0, # always wake — task goal achieved
     "ERROR_SIGNATURE": 0.7,       # OOM, missing deps, stack traces
+    "SILENT_TIMEOUT": 0.0,        # agent-declared max_silent_s contract violated
 }
 
 # These event types are "primary" — they should wake the LLM
@@ -116,6 +119,13 @@ SECONDARY_EVENT_TYPES = {
 # ---------------------------------------------------------------------------
 # Resource sampler
 # ---------------------------------------------------------------------------
+
+# Caches for expensive subprocess probes (MPS, memory_pressure).
+# Shared across calls to sample_resources() to avoid spawning subprocesses
+# every 5-second sample interval.
+_mps_probe_state: Dict[str, Any] = {}
+_mem_pressure_state: Dict[str, Any] = {}
+
 
 def _try_import_psutil():
     try:
@@ -140,7 +150,7 @@ def sample_resources(pid: int) -> ResourceSnapshot:
     except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
         pass
 
-    # GPU sampling (best-effort)
+    # GPU sampling (best-effort) — NVIDIA first, then MPS fallback
     try:
         import subprocess as _sp
         result = _sp.run(
@@ -155,6 +165,71 @@ def sample_resources(pid: int) -> ResourceSnapshot:
                 snap.gpu_mem_mb = float(parts[1].strip())
     except Exception:
         pass
+
+    # MPS fallback: probe Apple Silicon GPU memory via torch.mps
+    # Gated behind a 30s interval to avoid spawning a Python subprocess every sample.
+    import sys as _sys
+    if snap.gpu_util_pct is None and _sys.platform == "darwin":
+        now = time.time()
+        if now - _mps_probe_state.get("last_probe", 0) >= 30:
+            _mps_probe_state["last_probe"] = now
+            try:
+                import subprocess as _sp
+                result = _sp.run(
+                    [_sys.executable, "-c",
+                     "import torch; "
+                     "a=torch.mps.current_allocated_memory(); "
+                     "d=torch.mps.driver_allocated_memory(); "
+                     "print(f'{a},{d}')"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    parts = result.stdout.strip().split(",")
+                    if len(parts) >= 2:
+                        allocated_mb = int(parts[0]) / (1024 * 1024)
+                        driver_mb = int(parts[1]) / (1024 * 1024)
+                        _mps_probe_state["gpu_util_pct"] = round(
+                            (allocated_mb / driver_mb * 100) if driver_mb > 0 else 0, 1
+                        )
+                        _mps_probe_state["gpu_mem_mb"] = round(allocated_mb, 1)
+                else:
+                    _mps_probe_state["gpu_util_pct"] = None
+                    _mps_probe_state["gpu_mem_mb"] = None
+            except Exception:
+                _mps_probe_state["gpu_util_pct"] = None
+                _mps_probe_state["gpu_mem_mb"] = None
+
+        cached_util = _mps_probe_state.get("gpu_util_pct")
+        cached_mem = _mps_probe_state.get("gpu_mem_mb")
+        if cached_util is not None:
+            snap.gpu_util_pct = cached_util
+        if cached_mem is not None:
+            snap.gpu_mem_mb = cached_mem
+
+    # macOS system memory pressure (unified memory — critical for MPS stability)
+    # Also gated to run at most every 30s (memory_pressure command is slow).
+    if _sys.platform == "darwin":
+        now = time.time()
+        if now - _mem_pressure_state.get("last_probe", 0) >= 30:
+            _mem_pressure_state["last_probe"] = now
+            try:
+                import subprocess as _sp
+                result = _sp.run(
+                    ["memory_pressure"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.returncode == 0:
+                    out = result.stdout
+                    if "CRITICAL" in out.upper():
+                        _mem_pressure_state["level"] = "critical"
+                    elif "WARN" in out.upper():
+                        _mem_pressure_state["level"] = "warning"
+                    else:
+                        _mem_pressure_state["level"] = "normal"
+            except Exception:
+                pass
+
+        snap.memory_pressure = _mem_pressure_state.get("level")
 
     return snap
 
@@ -200,6 +275,11 @@ ERROR_SIGNATURES: List[Tuple[re.Pattern, str, float]] = [
     (re.compile(r"(Segmentation fault|core dumped|SIGSEGV)", re.I), "segfault", 0.95),
     (re.compile(r"(Address already in use)", re.I), "port_conflict", 0.85),
     (re.compile(r"\b(nan|inf)\b.*(?:loss|reward|gradient)", re.I), "divergence", 0.80),
+    # MPS (Apple Silicon) specific errors
+    (re.compile(r"(MPS backend out of memory|MPS framework error)", re.I), "mps_oom", 0.95),
+    (re.compile(r"(MPSNDArray error|metal\.MTLCompileError)", re.I), "mps_compile", 0.90),
+    (re.compile(r"(mps\.?driver\.abort|GPU Timeout|GPU Hang)", re.I), "mps_hang", 0.90),
+    (re.compile(r"not (currently )?supported on (the )?MPS backend", re.I), "mps_unsupported_op", 0.85),
 ]
 
 
@@ -260,8 +340,30 @@ def parse_progress_line(line: str, state: ProgressState) -> bool:
 
 
 def extract_metric_values(line: str) -> Dict[str, float]:
-    """Extract all key=value numeric pairs from a line."""
+    """Extract all key=value numeric pairs from a line.
+
+    Handles two sources:
+    1. REMOROO_METRIC name = value  (authoritative, supports booleans)
+    2. Generic key=value numeric pairs via _METRIC_KV_RE
+    """
     metrics: Dict[str, float] = {}
+
+    # Authoritative REMOROO_METRIC pass — supports boolean values True/False
+    rm = re.match(r"REMOROO_METRIC\s+(\w+)\s*=\s*(.+)", line.strip())
+    if rm:
+        name, raw = rm.group(1).lower(), rm.group(2).strip()
+        if raw.lower() == "true":
+            metrics[name] = 1.0
+        elif raw.lower() == "false":
+            metrics[name] = 0.0
+        else:
+            try:
+                metrics[name] = float(raw)
+            except ValueError:
+                pass
+        return metrics  # REMOROO_METRIC lines are authoritative; skip generic scan
+
+    # Generic numeric key=value scan
     for m in _METRIC_KV_RE.finditer(line):
         name = m.group(1).lower()
         try:
@@ -344,6 +446,7 @@ class SupervisedJob:
         self._last_file_sizes: Dict[str, int] = {}
         self._consecutive_low_fps: int = 0
         self._emitted_event_types: Dict[str, float] = {}  # event_type → last_emit_time
+        self._last_new_output_time: float = time.time()  # updated each time new stdout lines arrive
 
         # Multi-metric: track which targets have been individually satisfied.
         # Only fire METRIC_TARGET_REACHED when ALL are met.
@@ -447,6 +550,15 @@ class SupervisedJob:
                 snap = sample_resources(self.pid)
                 self.resource_samples.append(snap)
 
+                if snap.memory_pressure == "critical":
+                    self._emit_event(
+                        event_type="RESOURCE_RISK",
+                        severity="warning",
+                        confidence=0.9,
+                        reason="macOS memory pressure is CRITICAL — system may freeze or swap heavily",
+                        evidence={"memory_pressure": "critical"},
+                    )
+
                 # Parse recent output for progress + errors
                 self._scan_output()
 
@@ -471,8 +583,9 @@ class SupervisedJob:
 
         # Scan new stdout lines for progress, metrics, and errors
         if current_stdout_len > self._last_output_lines:
+            self._last_new_output_time = time.time()  # track when output last grew
             new_lines = list(self.stdout_buf)[-max(1, current_stdout_len - self._last_output_lines):]
-            print(f"  [DBG-SUPERVISOR] _scan_output: {len(new_lines)} new lines (total={current_stdout_len}, last={self._last_output_lines}), targets={len(self.metadata.target_metrics)}", flush=True)  # DBG-SUPERVISOR
+            # print(f"  [DBG-SUPERVISOR] _scan_output: {len(new_lines)} new lines (total={current_stdout_len}, last={self._last_output_lines}), targets={len(self.metadata.target_metrics)}", flush=True)  # DBG-SUPERVISOR
             for line in new_lines:
                 stripped = line.strip()
                 if not stripped:
@@ -484,12 +597,12 @@ class SupervisedJob:
                 if self.metadata.target_metrics:
                     line_metrics = extract_metric_values(stripped)
                     if line_metrics:
-                        print(f"  [DBG-SUPERVISOR] Extracted metrics: {line_metrics} from: {stripped[:100]}", flush=True)  # DBG-SUPERVISOR
+                        # print(f"  [DBG-SUPERVISOR] Extracted metrics: {line_metrics} from: {stripped[:100]}", flush=True)  # DBG-SUPERVISOR
                         hits = check_targets(line_metrics, self.metadata.target_metrics)
-                        print(f"  [DBG-SUPERVISOR] Target check hits: {len(hits)} (targets={[(t.name,t.operator,t.value) for t in self.metadata.target_metrics]})", flush=True)  # DBG-SUPERVISOR
+                        # print(f"  [DBG-SUPERVISOR] Target check hits: {len(hits)} (targets={[(t.name,t.operator,t.value) for t in self.metadata.target_metrics]})", flush=True)  # DBG-SUPERVISOR
                         for target, observed in hits:
                             self._satisfied_targets[target.name.lower()] = observed
-                            print(f"  [DBG-SUPERVISOR] >>> METRIC HIT: {target.name} {target.operator} {target.value}, observed={observed} (satisfied={len(self._satisfied_targets)}/{len(self.metadata.target_metrics)})", flush=True)  # DBG-SUPERVISOR
+                            # print(f"  [DBG-SUPERVISOR] >>> METRIC HIT: {target.name} {target.operator} {target.value}, observed={observed} (satisfied={len(self._satisfied_targets)}/{len(self.metadata.target_metrics)})", flush=True)  # DBG-SUPERVISOR
 
                         # Fire METRIC_TARGET_REACHED only when ALL targets are met
                         all_target_names = {t.name.lower() for t in self.metadata.target_metrics}
@@ -665,6 +778,36 @@ class SupervisedJob:
                 },
             )
 
+        # Agent-declared max_silent_s contract: fire SILENT_TIMEOUT (PRIMARY event)
+        # Semantic: "no new stdout has arrived for max_silent_s seconds".
+        # Fires regardless of how much prior output existed — this catches:
+        #   - pygame/import hangs (zero output from start)
+        #   - silent deadlocks (produced N lines then hung)
+        # NOT suppressed by target_metrics. Fires at most once (debounced).
+        # Skip when silent_phase_ok (e.g. output redirected to file: > run.log 2>&1).
+        if (
+            self.metadata.max_silent_s is not None
+            and not self.metadata.silent_phase_ok
+        ):
+            silent_for = time.time() - self._last_new_output_time
+            total_output = len(self.stdout_buf)
+            if silent_for > self.metadata.max_silent_s:
+                self._emit_event(
+                    event_type="SILENT_TIMEOUT",
+                    severity="warning",
+                    confidence=1.0,
+                    reason=(
+                        f"No new stdout for {silent_for:.0f}s "
+                        f"(max_silent_s={self.metadata.max_silent_s:.0f}s contract violated, "
+                        f"{total_output} total lines emitted)"
+                    ),
+                    evidence={
+                        "max_silent_s": self.metadata.max_silent_s,
+                        "silent_for_s": round(silent_for, 1),
+                        "total_output_lines": total_output,
+                    },
+                )
+
         # Runaway cost detection
         if self.ws > 0.7 and not self.metadata.silent_phase_ok:
             self._emit_event(
@@ -714,17 +857,17 @@ class SupervisedJob:
         """Create and queue an event, with debouncing and confidence gating."""
         threshold = EVENT_CONFIDENCE_THRESHOLDS.get(event_type, 0.7)
         if confidence < threshold:
-            print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): BLOCKED by confidence ({confidence} < {threshold})", flush=True)  # DBG-SUPERVISOR
+            # print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): BLOCKED by confidence ({confidence} < {threshold})", flush=True)  # DBG-SUPERVISOR
             return
 
         # Debounce: don't emit the same event type more than once per eval window
         now = time.time()
         last_emit = self._emitted_event_types.get(event_type, 0.0)
         if event_type not in ("COMPLETED", "FAILED", "METRIC_TARGET_REACHED") and (now - last_emit) < self.EVAL_WINDOW_S:
-            print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): DEBOUNCED ({now - last_emit:.1f}s < {self.EVAL_WINDOW_S}s)", flush=True)  # DBG-SUPERVISOR
+            # print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): DEBOUNCED ({now - last_emit:.1f}s < {self.EVAL_WINDOW_S}s)", flush=True)  # DBG-SUPERVISOR
             return
         self._emitted_event_types[event_type] = now
-        print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): QUEUED (confidence={confidence}, reason={reason[:80]})", flush=True)  # DBG-SUPERVISOR
+        # print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): QUEUED (confidence={confidence}, reason={reason[:80]})", flush=True)  # DBG-SUPERVISOR
 
         # Build log tail
         stdout_lines = list(self.stdout_buf)
@@ -769,10 +912,10 @@ class SupervisedJob:
 
         snap = self.get_resource_snapshot()
         events = self.drain_events() if drain else self.peek_events()
-        print(f"  [DBG-SUPERVISOR] build_poll_response(drain={drain}): status={self.status}, events={len(events)}, queue_remaining={len(self.event_queue)}, fps={self.fps:.3f}, ws={self.ws:.3f}", flush=True)  # DBG-SUPERVISOR
-        if events:  # DBG-SUPERVISOR
-            for e in events:  # DBG-SUPERVISOR
-                print(f"  [DBG-SUPERVISOR]   event: {e.event_type} conf={e.confidence} reason={e.reason[:100]}", flush=True)  # DBG-SUPERVISOR
+        # print(f"  [DBG-SUPERVISOR] build_poll_response(drain={drain}): status={self.status}, events={len(events)}, queue_remaining={len(self.event_queue)}, fps={self.fps:.3f}, ws={self.ws:.3f}", flush=True)  # DBG-SUPERVISOR
+        # if events:  # DBG-SUPERVISOR
+            # for e in events:  # DBG-SUPERVISOR
+                # print(f"  [DBG-SUPERVISOR]   event: {e.event_type} conf={e.confidence} reason={e.reason[:100]}", flush=True)  # DBG-SUPERVISOR
 
         return {
             "status": self.status,

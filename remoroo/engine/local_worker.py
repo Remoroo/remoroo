@@ -21,6 +21,7 @@ import traceback
 import zipfile
 import io
 import collections
+from pathlib import Path
 try:
     import requests
 except ImportError:
@@ -36,7 +37,7 @@ class LocalWorker:
     Handles ExecutionRequests and returns ExecutionResults.
     """
     
-    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None, system: Optional[SystemInterface] = None, persistence_dir: Optional[str] = None, cache_env: bool = False):
+    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None, system: Optional[SystemInterface] = None, persistence_dir: Optional[str] = None, cache_env: bool = False, sandbox_override: Optional[Any] = None):
         self.system = system or RealSystem()
         self.output_callback = output_callback
         # self._log("🔧 LocalWorker (v4-Airtight) Loaded")
@@ -63,14 +64,18 @@ class LocalWorker:
         self.cache_env = cache_env  # Enable environment caching (skip already-installed packages)
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
         
-        # Initialize Sandbox (Lazy start)
-        # Conditional initialization: Only if engine is 'docker'
+        # Initialize Sandbox
+        # sandbox_override takes priority — used by harbor/test adapters to inject a custom sandbox.
         self.sandbox = None
-        if self.engine == "docker":
+        if sandbox_override is not None:
+            self.sandbox = sandbox_override
+            self._log(f"ℹ️  Execution Engine: OVERRIDE (injected sandbox)")
+        elif self.engine == "docker":
             from .sandbox import DockerSandbox
             self.sandbox = DockerSandbox(repo_root, artifact_dir, cache_env=cache_env)
         else:
             self._log(f"ℹ️  Execution Engine: {self.engine.upper()} (Sandbox Disabled)")
+
         
         # Async Execution Tracking
         # Dictionary mapping execution_id (str) -> subprocess.Popen object
@@ -1122,6 +1127,17 @@ class LocalWorker:
                         repo_root=self.repo_root,
                         patch=patch_proposal
                     )
+                    
+                    # v18: Sync applied files to Harbor sandbox IMMEDIATELY
+                    if self.sandbox and hasattr(self.sandbox, "upload_file"):
+                        for f_path in applied:
+                            abs_host = os.path.join(self.repo_root, f_path)
+                            try:
+                                container_path = self.sandbox.host_to_container(abs_host)
+                                self.sandbox.upload_file(abs_host, container_path)
+                            except Exception as e:
+                                self._log(f"⚠️  Sandbox upload failed for {f_path}: {e}")
+
                     return ExecutionResult(success=True, data={"applied": applied, "skipped": skipped})
                 except applier.ApplyError as e:
                     # Propagate structured error if available
@@ -1440,19 +1456,26 @@ class LocalWorker:
                     # Case 2: Source is a Local Path (Local/Hybrid Mode)
                     else:
                         # Copy Logic with Exclusions
-                        ignore_func = shutil.ignore_patterns('runs', 'artifacts', '.remoroo', '.git', '__pycache__', 'venv', '.env')
+                        ignore_func = shutil.ignore_patterns(
+                            'runs', 'artifacts', '.remoroo', '.git', '__pycache__',
+                            'venv', '.venv', '.env',
+                            '*.log', 'run.log', 'prepare.log',
+                            'node_modules', '.tox', '.mypy_cache', '.pytest_cache',
+                        )
                         shutil.copytree(source_path, temp_dir, ignore=ignore_func)
                         
-                        # Fix Venv Mode: Symlink venv from original repo if it exists
-                        for venv_name in ["venv", ".venv"]:
-                            source_venv = os.path.join(source_path, venv_name)
-                            if os.path.isdir(source_venv):
-                                try:
-                                    sym_target = os.path.join(temp_dir, venv_name)
-                                    if not os.path.exists(sym_target):
-                                        os.symlink(source_venv, sym_target)
-                                except OSError: pass
-                                break
+                        # Symlink host venv into worktree ONLY for non-Docker (VenvSandbox) mode.
+                        # In Docker mode, a macOS venv causes "Exec format error" inside Linux.
+                        if not getattr(self, 'sandbox', None) or not hasattr(self.sandbox, 'container_name'):
+                            for venv_name in ["venv", ".venv"]:
+                                source_venv = os.path.join(source_path, venv_name)
+                                if os.path.isdir(source_venv):
+                                    try:
+                                        sym_target = os.path.join(temp_dir, venv_name)
+                                        if not os.path.exists(sym_target):
+                                            os.symlink(source_venv, sym_target)
+                                    except OSError: pass
+                                    break
                         
                         # Handle git: copy .git if source has it, otherwise just init empty
                         source_git = os.path.join(source_path, ".git")
@@ -1621,6 +1644,12 @@ class LocalWorker:
                      root = self.repo_root
                      if target_scope == "original":
                          root = self.original_repo_root
+                         
+                         # HOTFIX: In TB2/Harbor mode, original_repo_root is "/app" which is a read-only container path.
+                         # Fallback to the host artifact_dir to safely write the report.
+                         if root == "/app" and self.artifact_dir:
+                             root = self.artifact_dir
+
                          # 🚀 AUTO-ROUTE REPORTS TO RUN-SPECIFIC FOLDER
                          is_report = "final_report.md" in path or "report" in path.lower()
                          is_diagram = "system_diagram.md" in path
@@ -1630,41 +1659,75 @@ class LocalWorker:
                              os.makedirs(run_output, exist_ok=True)
                              root = run_output
                              
-                         self._log(f"🚚 Delivering to: {root}/{path}")
                      elif target_scope == "artifact":
                          root = self.artifact_dir
 
-                     if not os.path.isabs(path):
-                         target_path = os.path.join(root, path)
-                     else:
+                     # HOTFIX: The agent sees /app in bash and uses absolute paths.
+                     # Since this worker runs on the host (Mac), /app is a read-only root volume.
+                     # Rebase any /app paths back to our intended root.
+                     if path.startswith("/app/"):
+                         target_path = os.path.join(root, path[5:])
+                     elif path == "/app":
+                         target_path = root
+                     elif os.path.isabs(path):
                          target_path = path
+                     else:
+                         target_path = os.path.join(root, path)
 
                      # Ensure dir exists
                      os.makedirs(os.path.dirname(target_path), exist_ok=True)
                      
+                     # v17.1: Log the path that makes sense for the agent's environment
+                     display_path = target_path
+                     if self.sandbox and hasattr(self.sandbox, "host_to_container"):
+                         try:
+                             display_path = self.sandbox.host_to_container(target_path)
+                         except Exception as e:
+                             self._log(f"⚠️  Path translation failed: {e}")
+                     # self._log(f"🚚 Delivering to: {display_path}")
+
                      with open(target_path, 'w', encoding='utf-8') as f:
                          f.write(content)
                          
+                     # v18: Sync to Harbor sandbox after ANY workspace write.
+                     # Harbor sandbox uses explicit file transfer (no volume mount),
+                     # so edits must be uploaded for bash commands to see them.
+                     # Standard DockerSandbox has no upload_file — unaffected.
+                     if self.sandbox and hasattr(self.sandbox, "upload_file") and target_scope != "artifact":
+                         try:
+                             container_path = self.sandbox.host_to_container(target_path)
+                             self.sandbox.upload_file(target_path, container_path)
+                         except Exception as e:
+                             self._log(f"⚠️  Sandbox upload failed for {path}: {e}")
+
                      # ALSO save to artifact_dir (for CLI transparency in workspace)
                      # v14.1: Mirror to cache if scope is 'original' OR if we are in non-ephemeral mode 
                      # (meaning original and current are the same host dir).
+                     
+                     # Normalize path so os.path.join doesn't ignore the base dir if path is absolute
+                     rel_path = path[5:] if path.startswith("/app/") else (path[1:] if path.startswith("/") else path)
+                     
                      if self.artifact_dir and (target_scope == "original" or not self.is_ephemeral):
-                         cache_path = os.path.join(self.artifact_dir, path)
+                         cache_path = os.path.join(self.artifact_dir, rel_path)
                          os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                          with open(cache_path, 'w', encoding='utf-8') as f:
                              f.write(content)
 
                      # v16: ALSO save to persistence_dir (for CLI transparency in summary/prompt)
                      if self.persistence_dir and (target_scope == "original" or not self.is_ephemeral):
-                         persist_path = os.path.join(self.persistence_dir, path)
+                         persist_path = os.path.join(self.persistence_dir, rel_path)
                          os.makedirs(os.path.dirname(persist_path), exist_ok=True)
                          with open(persist_path, 'w', encoding='utf-8') as f:
                              f.write(content)
 
-                     # Enhanced logging for debugging
-                     self._log(f"   ✅ File written successfully")
-                     self._log(f"   📍 Full path: {target_path}")
-                     self._log(f"   📊 Size: {len(content)} bytes")
+                     log_skip_files = {"checkpoint.json", "run_manifest.json", "trace.jsonl"}
+
+                     if Path(target_path).name not in log_skip_files:
+                         self._log("   ✅ File written successfully")
+                         self._log(f"   📍 Full path: {target_path}")
+                         self._log(f"   📊 Size: {len(content)} bytes")
+
+
                      
                      if "report" in str(path).lower():
                          self._log("   📄 Report preview (first 200 chars):")
@@ -2426,28 +2489,189 @@ class LocalWorker:
                 except Exception as e:
                     return ExecutionResult(success=False, error=f"Failed to write workspace state: {e}")
 
-            elif request.type == "read_local_memory":
-                mem_path = os.path.join(self.original_repo_root, ".remoroo", "local_memory.json")
+            elif request.type in ("read_local_memory", "read_workspace_memory"):
+                mem_dir = os.path.join(self.original_repo_root, ".remoroo")
+                mem_path = os.path.join(mem_dir, "memory.json")
+                old_path = os.path.join(mem_dir, "local_memory.json")
+                if not os.path.exists(mem_path) and os.path.exists(old_path):
+                    os.rename(old_path, mem_path)
                 if os.path.exists(mem_path):
                     try:
                         with open(mem_path, "r", encoding="utf-8") as f:
                             data = json.loads(f.read())
                         return ExecutionResult(success=True, data=data)
                     except Exception as e:
-                        return ExecutionResult(success=False, error=f"Failed to read local memory: {e}")
+                        return ExecutionResult(success=False, error=f"Failed to read workspace memory: {e}")
                 return ExecutionResult(success=True, data={})
 
-            elif request.type == "write_local_memory":
+            elif request.type in ("write_local_memory", "write_workspace_memory"):
                 mem_dir = os.path.join(self.original_repo_root, ".remoroo")
                 os.makedirs(mem_dir, exist_ok=True)
-                mem_path = os.path.join(mem_dir, "local_memory.json")
+                mem_path = os.path.join(mem_dir, "memory.json")
+                old_path = os.path.join(mem_dir, "local_memory.json")
+                if os.path.exists(old_path) and not os.path.exists(mem_path):
+                    os.rename(old_path, mem_path)
                 try:
                     mem_data = request.payload.get("memory", {})
                     with open(mem_path, "w", encoding="utf-8") as f:
                         f.write(json.dumps(mem_data, indent=2, default=str))
                     return ExecutionResult(success=True, data={"path": mem_path})
                 except Exception as e:
-                    return ExecutionResult(success=False, error=f"Failed to write local memory: {e}")
+                    return ExecutionResult(success=False, error=f"Failed to write workspace memory: {e}")
+
+            # ── Repo exploration tools (V2) ──
+
+            elif request.type == "list_repo_files":
+                try:
+                    rel_path = request.payload.get("path", ".")
+                    max_depth = request.payload.get("max_depth", 3)
+                    repo_root = request.payload.get("repo_root", self.repo_root)
+                    base = os.path.normpath(os.path.join(repo_root, rel_path))
+
+                    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".remoroo",
+                                 ".tox", ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs",
+                                 "htmlcov", ".next", ".nuxt", "coverage"}
+                    skip_exts = {".pyc", ".pyo", ".so", ".dylib", ".o", ".class"}
+
+                    lines = []
+                    total_files = 0
+                    for root, dirs, files in os.walk(base):
+                        depth = root[len(base):].count(os.sep)
+                        dirs[:] = [d for d in sorted(dirs) if d not in skip_dirs and not d.startswith(".")]
+
+                        if depth > max_depth:
+                            dirs.clear()
+                            continue
+
+                        visible_files = [f for f in sorted(files)
+                                         if os.path.splitext(f)[1] not in skip_exts]
+                        total_files += len(visible_files)
+
+                        indent = "  " * depth
+                        if depth == 0:
+                            for fname in visible_files:
+                                lines.append(f"{fname}")
+                            for dname in dirs:
+                                sub_count = sum(1 for _, _, fs in os.walk(os.path.join(root, dname))
+                                                for f in fs) if depth < max_depth else 0
+                                lines.append(f"{dname}/ ({sub_count} files)")
+                        else:
+                            if visible_files and depth <= max_depth:
+                                for fname in visible_files[:50]:
+                                    lines.append(f"{indent}{fname}")
+                                if len(visible_files) > 50:
+                                    lines.append(f"{indent}... and {len(visible_files) - 50} more files")
+
+                    tree = "\n".join(lines[:500])
+                    if len(lines) > 500:
+                        tree += f"\n... ({len(lines) - 500} more entries)"
+                    return ExecutionResult(success=True, data={"tree": tree, "total_files": total_files})
+                except Exception as e:
+                    return ExecutionResult(success=False, error=f"list_repo_files failed: {e}")
+
+            elif request.type == "scan_repo":
+                try:
+                    query = request.payload.get("query", "")
+                    repo_root = request.payload.get("repo_root", self.repo_root)
+                    max_results = request.payload.get("max_results", 20)
+
+                    query_tokens = set(query.lower().replace("_", " ").replace("-", " ").split())
+
+                    ext_affinity = {
+                        ".py": {"python", "train", "model", "test", "api", "server", "script"},
+                        ".ts": {"typescript", "component", "frontend", "ui", "react", "api"},
+                        ".tsx": {"typescript", "component", "frontend", "ui", "react"},
+                        ".js": {"javascript", "frontend", "ui", "script", "api"},
+                        ".go": {"go", "server", "handler", "api", "middleware"},
+                        ".rs": {"rust", "server", "handler", "parser"},
+                        ".java": {"java", "service", "controller", "handler"},
+                    }
+
+                    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".remoroo",
+                                 ".tox", ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs"}
+
+                    scored = []
+                    for root, dirs, files in os.walk(repo_root):
+                        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+                        for fname in files:
+                            rel = os.path.relpath(os.path.join(root, fname), repo_root)
+                            _, ext = os.path.splitext(fname)
+                            path_tokens = set(rel.lower().replace("/", " ").replace("_", " ").replace("-", " ").replace(".", " ").split())
+                            jaccard = len(query_tokens & path_tokens) / max(len(query_tokens | path_tokens), 1)
+                            ext_bonus = 0.1 if ext in ext_affinity and query_tokens & ext_affinity[ext] else 0
+                            score = jaccard + ext_bonus
+                            if score > 0:
+                                scored.append({"path": rel, "score": round(score, 3), "skeleton": ""})
+
+                    scored.sort(key=lambda x: -x["score"])
+                    top = scored[:max_results]
+
+                    for entry in top[:10]:
+                        try:
+                            if hasattr(self, "_repo_indexer") and self._repo_indexer:
+                                skel = self._repo_indexer.get_snippet(entry["path"], "module_level")
+                                if skel:
+                                    entry["skeleton"] = skel[:500]
+                        except Exception:
+                            pass
+
+                    return ExecutionResult(success=True, data={"files": top})
+                except Exception as e:
+                    return ExecutionResult(success=False, error=f"scan_repo failed: {e}")
+
+            elif request.type == "get_snippet":
+                try:
+                    path = request.payload.get("path", "")
+                    symbol_name = request.payload.get("symbol_name", "")
+                    repo_root = request.payload.get("repo_root", self.repo_root)
+                    full_path = os.path.normpath(os.path.join(repo_root, path))
+
+                    if not os.path.isfile(full_path):
+                        return ExecutionResult(success=False, error=f"File not found: {path}")
+
+                    _, ext = os.path.splitext(full_path)
+                    language = {
+                        ".py": "python", ".ts": "typescript", ".tsx": "typescript",
+                        ".js": "javascript", ".jsx": "javascript",
+                        ".go": "go", ".rs": "rust", ".java": "java",
+                        ".c": "c", ".cpp": "cpp", ".h": "c", ".hpp": "cpp",
+                    }.get(ext, "unknown")
+
+                    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                        source = f.read()
+
+                    # Try RepoIndexer first (handles Python AST)
+                    if hasattr(self, "_repo_indexer") and self._repo_indexer:
+                        try:
+                            snippet = self._repo_indexer.get_snippet(path, symbol_name)
+                            if snippet:
+                                symbols = self._repo_indexer.get_snippet(path, "*") if symbol_name != "*" else snippet
+                                found = [line.strip().split("(")[0].split(":")[0]
+                                         for line in (symbols or "").splitlines()
+                                         if line.strip().startswith(("def ", "class ", "func ", "fn "))]
+                                return ExecutionResult(success=True, data={
+                                    "snippet": snippet, "language": language,
+                                    "symbols_found": found[:30],
+                                })
+                        except Exception:
+                            pass
+
+                    # Fallback: simple AST extraction for Python
+                    if language == "python":
+                        snippet, symbols = self._python_extract(source, symbol_name)
+                        return ExecutionResult(success=True, data={
+                            "snippet": snippet, "language": language,
+                            "symbols_found": symbols,
+                        })
+
+                    # Fallback: regex-based extraction for other languages
+                    snippet, symbols = self._generic_extract(source, symbol_name, language)
+                    return ExecutionResult(success=True, data={
+                        "snippet": snippet, "language": language,
+                        "symbols_found": symbols,
+                    })
+                except Exception as e:
+                    return ExecutionResult(success=False, error=f"get_snippet failed: {e}")
 
             # ── Background job management (probe_live_run support) ──
 
@@ -2658,18 +2882,34 @@ class LocalWorker:
                 def _reader(stream, buf, is_stderr=False):
                     try:
                         if stream:
-                            for line in iter(stream.readline, ""):
-                                buf.append(line)
-                                if log_cb:
-                                    stripped = line.rstrip()
-                                    if stripped:
-                                        try:
-                                            if is_stderr:
-                                                log_cb(f"[dim red]   {stripped}[/dim red]")
-                                            else:
-                                                log_cb(f"[dim]   {stripped}[/dim]")
-                                        except Exception:
-                                            pass
+                            remainder = ""
+                            while True:
+                                chunk = stream.read(4096)
+                                if not chunk:
+                                    if remainder:
+                                        buf.append(remainder + "\n")
+                                        if log_cb:
+                                            stripped = remainder.strip()
+                                            if stripped:
+                                                try:
+                                                    tag = "dim red" if is_stderr else "dim"
+                                                    log_cb(f"[{tag}]   {stripped}[/{tag}]")
+                                                except Exception:
+                                                    pass
+                                    break
+                                text = remainder + chunk
+                                parts = re.split(r"\r\n|\n|\r", text)
+                                remainder = parts.pop()
+                                for line in parts:
+                                    buf.append(line + "\n")
+                                    if log_cb:
+                                        stripped = line.strip()
+                                        if stripped:
+                                            try:
+                                                tag = "dim red" if is_stderr else "dim"
+                                                log_cb(f"[{tag}]   {stripped}[/{tag}]")
+                                            except Exception:
+                                                pass
                             stream.close()
                     except Exception:
                         pass
@@ -2693,6 +2933,7 @@ class LocalWorker:
                     file_watch_paths=raw_meta.get("file_watch_paths", []),
                     silent_phase_ok=raw_meta.get("silent_phase_ok", False),
                     target_metrics=parsed_targets,
+                    max_silent_s=float(raw_meta["max_silent_s"]) if raw_meta.get("max_silent_s") is not None else None,
                 )
 
                 supervised = SupervisedJob(
@@ -2737,7 +2978,7 @@ class LocalWorker:
                 job_id = request.payload.get("job_id", "")
                 wait_s = request.payload.get("wait_s", 5)
                 tail_lines = request.payload.get("tail_lines", 80)
-                print(f"  [DBG-SUPERVISOR] v2_exec_poll: job={job_id}, wait_s={wait_s}, drain_events={request.payload.get('drain_events', True)}", flush=True)  # DBG-SUPERVISOR
+                # print(f"  [DBG-SUPERVISOR] v2_exec_poll: job={job_id}, wait_s={wait_s}, drain_events={request.payload.get('drain_events', True)}", flush=True)  # DBG-SUPERVISOR
 
                 supervised = self._supervised_jobs.get(job_id)
                 if supervised is None:
@@ -2774,6 +3015,11 @@ class LocalWorker:
                 # Final check
                 if proc and proc.poll() is not None and supervised.status == "running":
                     supervised.mark_finished(proc.returncode)
+
+                # Force a final output scan when the process is done so we
+                # don't miss metrics printed in the last moments before exit.
+                if supervised.status in ("finished", "failed", "killed"):
+                    supervised._scan_output()
 
                 drain = request.payload.get("drain_events", True)
                 response = supervised.build_poll_response(tail_lines=tail_lines, drain=drain)
@@ -2837,6 +3083,111 @@ class LocalWorker:
         path = request.payload.get("path", "")
         exists = os.path.exists(os.path.join(self.repo_root, path))
         return ExecutionResult(success=True, data={"exists": exists})
+
+    @staticmethod
+    def _python_extract(source: str, symbol_name: str):
+        """Extract Python symbols using the ast module."""
+        import ast
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return "", []
+
+        symbols = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbols.append(node.name)
+            elif isinstance(node, ast.ClassDef):
+                symbols.append(node.name)
+
+        if symbol_name == "*":
+            return source, symbols
+        if symbol_name == "module_level":
+            lines = source.splitlines()
+            skeleton_lines = []
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, ast.ClassDef):
+                    skeleton_lines.append(f"class {node.name}:")
+                    for item in ast.iter_child_nodes(node):
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            prefix = "async def" if isinstance(item, ast.AsyncFunctionDef) else "def"
+                            sig = ast.get_source_segment(source, item)
+                            if sig:
+                                first_line = sig.split("\n")[0]
+                                skeleton_lines.append(f"    {first_line}")
+                            else:
+                                skeleton_lines.append(f"    {prefix} {item.name}(...)")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+                    sig = ast.get_source_segment(source, node)
+                    if sig:
+                        first_line = sig.split("\n")[0]
+                        skeleton_lines.append(first_line)
+                    else:
+                        skeleton_lines.append(f"{prefix} {node.name}(...)")
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    skeleton_lines.append(ast.get_source_segment(source, node) or "")
+            return "\n".join(skeleton_lines), symbols
+
+        # Specific symbol
+        lines = source.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == symbol_name:
+                    start = node.lineno - 1
+                    end = node.end_lineno if hasattr(node, "end_lineno") and node.end_lineno else start + 1
+                    snippet = "\n".join(lines[start:end])
+                    return snippet, symbols
+
+        return "", symbols
+
+    @staticmethod
+    def _generic_extract(source: str, symbol_name: str, language: str):
+        """Regex-based symbol extraction for non-Python languages."""
+        import re
+        patterns = {
+            "typescript": r'(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|const|let)\s+(\w+)',
+            "javascript": r'(?:export\s+)?(?:async\s+)?(?:function|class|const|let|var)\s+(\w+)',
+            "go": r'(?:func|type|var|const)\s+(?:\([^)]*\)\s+)?(\w+)',
+            "rust": r'(?:pub\s+)?(?:fn|struct|enum|trait|type|const|static|impl)\s+(\w+)',
+            "java": r'(?:public|private|protected|static|final|abstract)?\s*(?:class|interface|enum|void|int|String|boolean)\s+(\w+)',
+            "c": r'(?:struct|enum|typedef|void|int|char|float|double|static|extern)\s+(?:\*\s*)?(\w+)',
+            "cpp": r'(?:class|struct|enum|void|int|char|float|double|static|virtual|template)\s+(?:\*\s*)?(\w+)',
+        }
+        pattern = patterns.get(language, r'(?:function|class|def|fn|func)\s+(\w+)')
+        symbols = re.findall(pattern, source)
+
+        if symbol_name == "*":
+            return source, symbols
+        if symbol_name == "module_level":
+            lines = source.splitlines()
+            skeleton = []
+            for line in lines:
+                stripped = line.strip()
+                if re.match(pattern, stripped) or stripped.startswith(("import ", "#include ", "use ", "package ")):
+                    skeleton.append(line)
+            return "\n".join(skeleton), symbols
+
+        # Find specific symbol definition
+        lines = source.splitlines()
+        for i, line in enumerate(lines):
+            if re.search(rf'\b{re.escape(symbol_name)}\b', line) and re.search(pattern, line):
+                start = i
+                brace_count = 0
+                found_brace = False
+                end = i + 1
+                for j in range(i, len(lines)):
+                    brace_count += lines[j].count("{") - lines[j].count("}")
+                    if "{" in lines[j]:
+                        found_brace = True
+                    if found_brace and brace_count <= 0:
+                        end = j + 1
+                        break
+                    end = j + 1
+                return "\n".join(lines[start:end]), symbols
+
+        return "", symbols
+
 
 # Alias for backward compatibility with CLI and Remote Worker
 WorkerService = LocalWorker

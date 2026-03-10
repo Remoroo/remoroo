@@ -23,6 +23,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (removed --no-cache-dir)
 RUN pip install --upgrade pip
 
+# PyTorch CPU for autoresearch (and similar ML workloads) inside Docker
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Common ML/data deps used by autoresearch and similar workloads
+RUN pip install tiktoken pyarrow requests matplotlib numpy pandas
+
+# uv package manager — required by autoresearch for `uv run` execution
+RUN pip install uv
+
 # Note: The CLI is not pre-installed. The sandbox mounts the repo and runs commands directly.
 
 ENTRYPOINT ["/bin/bash"]

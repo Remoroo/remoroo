@@ -19,6 +19,10 @@ class DockerSandbox:
         if not self.available:
             print("⚠️  Docker not available. Sandbox disabled.")
 
+    def host_to_container(self, host_path: str) -> str:
+        """Map a host path to its container equivalent. identity mapping for DockerSandbox."""
+        return host_path
+
     def check_docker(self) -> bool:
         """Check if docker daemon is accessible."""
         try:
@@ -82,13 +86,17 @@ class DockerSandbox:
         # We mount the host repo_path to the exact same path inside the container.
         # This makes the filesystem layout identical between host and container.
         
+        host_home = os.path.expanduser("~")
+        host_cache = os.path.join(host_home, ".cache")
+
         cmd = [
             "docker", "run", "-d", "--rm",
             "--name", self.container_name,
             "-v", f"{self.repo_path}:{self.repo_path}",
             "-v", f"{self.artifact_dir}:{self.artifact_dir}",
-            # v14.1: Mirrored Mounts (Universal Path Unification).
-            # We mirror both the repo and the artifact cache to their exact host paths.
+            # Mirror host ~/.cache into /root/.cache so pre-built data
+            # (tokenizers, datasets, model weights, etc.) is available inside the sandbox.
+            "-v", f"{host_cache}:/root/.cache",
             "--workdir", self.repo_path, 
             "--entrypoint", "sleep",
             self.image_name, 
@@ -97,9 +105,16 @@ class DockerSandbox:
         
         subprocess.check_call(cmd)
         self.is_running = True
-        
-        # Fix permissions? In Docker usually root.
-        # For now, we assume user mapping is not strict p0.
+
+        # Purge any host-created .venv that contains wrong-platform binaries
+        # (e.g. macOS venv mounted into a Linux container → "Exec format error").
+        try:
+            subprocess.run(
+                ["docker", "exec", self.container_name, "/bin/sh", "-c", "rm -rf .venv __pycache__"],
+                timeout=10, capture_output=True,
+            )
+        except Exception as e:
+            print(f"  ⚠️ .venv cleanup failed (non-fatal): {e}")
 
     def commit_state(self, success: bool = True):
         """

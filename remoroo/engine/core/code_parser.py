@@ -8,7 +8,7 @@ import traceback
 
 # Tree-sitter imports with graceful fallback
 try:
-    from tree_sitter_languages import get_parser
+    from tree_sitter_language_pack import get_parser
     TREE_SITTER_AVAILABLE = True
 except ImportError:
     TREE_SITTER_AVAILABLE = False

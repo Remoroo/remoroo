@@ -228,11 +228,17 @@ def run_local_worker(
     except Exception:
         pass # Ignore gitignore failures
 
-    # Initialize local memory file if it doesn't exist
-    local_memory_path = remoroo_dir / "local_memory.json"
-    if not local_memory_path.exists():
+    # Initialize workspace memory file if it doesn't exist; migrate old name
+    memory_path = remoroo_dir / "memory.json"
+    old_memory_path = remoroo_dir / "local_memory.json"
+    if not memory_path.exists() and old_memory_path.exists():
         try:
-            local_memory_path.write_text('{"repo_url": "", "last_updated": "", "world_facts": [], "entity_summaries": {}, "experiences": [], "beliefs": []}')
+            old_memory_path.rename(memory_path)
+        except Exception:
+            pass
+    if not memory_path.exists():
+        try:
+            memory_path.write_text('{"repo_url": "", "last_updated": "", "world_facts": [], "entity_summaries": {}, "experiences": [], "beliefs": []}')
         except Exception:
             pass
 
