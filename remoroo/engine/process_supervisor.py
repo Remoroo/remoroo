@@ -1,9 +1,15 @@
-"""Process Supervisor: monitors spawned processes with resource sampling,
-forward-progress scoring, waste detection, and event generation.
+"""Process Supervisor: minimal watchdog for spawned processes.
 
-Every process started by the Worker is wrapped in a SupervisedJob.  The
-Supervisor runs monitoring threads that sample resources, parse progress,
-and generate events.  Events are queued and drained by v2_exec_poll.
+Every process started by the Worker is wrapped in a SupervisedJob.
+The watchdog thread does 4 things every 5 seconds:
+  1. Check readiness (STARTING -> RUNNING)
+  2. Scan new output for error signatures + metric targets
+  3. Check watched files for growth (resets silence timer)
+  4. Fire SILENT_TIMEOUT if past the LLM-declared limit
+
+All LLM parameters are printed loudly at creation time.
+Missing params get warnings, not silent defaults.
+Exceptions are logged, not swallowed.
 """
 from __future__ import annotations
 
@@ -11,15 +17,27 @@ import collections
 import dataclasses
 import os
 import re
+import socket
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+
+class JobState(str, Enum):
+    STARTING = "starting"
+    RUNNING = "running"
+    FINISHED = "finished"
+    FAILED = "failed"
+    KILLED = "killed"
+    BACKOFF = "backoff"
+
 
 @dataclass
 class TargetMetric:
@@ -37,318 +55,62 @@ class TargetMetric:
 
 @dataclass
 class JobMetadata:
-    """Lightweight hints from the LLM to improve classification accuracy."""
-    expected_kind: str = "unknown"       # tests | build | training | server | interactive | unknown
-    cost_sensitivity: str = "medium"     # low | medium | high
+    """Hints from the LLM about the workload."""
+    expected_kind: str = "unknown"
+    cost_sensitivity: str = "medium"
     gpu_expected: bool = False
     progress_hint_paths: List[str] = field(default_factory=list)
     file_watch_paths: List[str] = field(default_factory=list)
-    silent_phase_ok: bool = False
+    silent_phase_ok: bool = False  # legacy, unused
     target_metrics: List[TargetMetric] = field(default_factory=list)
-    max_silent_s: Optional[float] = None  # Agent contract: fire SILENT_TIMEOUT if zero output after this many seconds
-
-
-@dataclass
-class ResourceSnapshot:
-    """Point-in-time resource reading for a process."""
-    timestamp: float = 0.0
-    cpu_pct: Optional[float] = None
-    rss_mb: Optional[float] = None
-    disk_io_mb_s: Optional[float] = None
-    gpu_util_pct: Optional[float] = None
-    gpu_mem_mb: Optional[float] = None
-    memory_pressure: Optional[str] = None  # macOS only: "normal" | "warning" | "critical"
-
-
-@dataclass
-class ProgressState:
-    """Parsed progress extracted from output or structured hints."""
-    pct: Optional[float] = None      # 0–100
-    step: Optional[str] = None       # "epoch 5/15", "test 23/100"
-    phase: Optional[str] = None      # "training", "evaluation", "downloading"
-    eta_s: Optional[float] = None
-    last_update: float = 0.0
+    max_silent_s: Optional[float] = None
+    readiness_regex: Optional[str] = None
+    readiness_port: Optional[int] = None
+    redirect_output_file: Optional[str] = None
 
 
 @dataclass
 class SupervisorEvent:
-    """An observation the Supervisor wants to communicate."""
+    """An event the watchdog wants to communicate."""
     job_id: str
     timestamp: float
-    event_type: str          # COMPLETED, FAILED, STALL_SUSPECTED, RUNAWAY_COST, ...
-    severity: str            # info, warning, critical
-    confidence: float        # 0.0 – 1.0
+    event_type: str
+    severity: str
+    confidence: float
     reason: str
     evidence: Dict[str, Any] = field(default_factory=dict)
     log_tail: str = ""
-    resource_snapshot: Optional[ResourceSnapshot] = None
-    progress_snapshot: Optional[ProgressState] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        d = dataclasses.asdict(self)
-        if d.get("resource_snapshot") is None:
-            d["resource_snapshot"] = {}
-        if d.get("progress_snapshot") is None:
-            d["progress_snapshot"] = {}
-        return d
+        return dataclasses.asdict(self)
 
 
-# Confidence thresholds for primary events (wake the LLM).
-# Only include events backed by RELIABLE evidence. Speculative events
-# (stall, runaway cost, GPU) depend on resource metrics that don't work
-# in Docker/sandbox and cause the LLM to kill working processes.
+# Primary events — these wake the LLM.
 EVENT_CONFIDENCE_THRESHOLDS: Dict[str, float] = {
-    "COMPLETED": 0.0,             # always wake — process exited 0
-    "FAILED": 0.0,                # always wake — process exited non-zero
-    "METRIC_TARGET_REACHED": 0.0, # always wake — task goal achieved
-    "ERROR_SIGNATURE": 0.7,       # OOM, missing deps, stack traces
-    "SILENT_TIMEOUT": 0.0,        # agent-declared max_silent_s contract violated
+    "COMPLETED": 0.0,
+    "FAILED": 0.0,
+    "METRIC_TARGET_REACHED": 0.0,
+    "ERROR_SIGNATURE": 0.7,
+    "SILENT_TIMEOUT": 0.0,
+    "CRASH_LOOP": 0.0,
 }
 
-# These event types are "primary" — they should wake the LLM
 PRIMARY_EVENT_TYPES = set(EVENT_CONFIDENCE_THRESHOLDS.keys())
 
-# Secondary events — stored as milestones, do NOT wake the LLM
-SECONDARY_EVENT_TYPES = {
-    "PROGRESS_MILESTONE", "OUTPUT_MILESTONE", "HEARTBEAT",
-    "STALL_SUSPECTED", "RUNAWAY_COST", "THRASHING_DETECTED",
-    "GPU_UNDERUTILIZED", "INTERACTIVE_OR_DAEMON_LIKELY", "RESOURCE_RISK",
-}
-
 
 # ---------------------------------------------------------------------------
-# Resource sampler
+# Metric extraction
 # ---------------------------------------------------------------------------
 
-# Caches for expensive subprocess probes (MPS, memory_pressure).
-# Shared across calls to sample_resources() to avoid spawning subprocesses
-# every 5-second sample interval.
-_mps_probe_state: Dict[str, Any] = {}
-_mem_pressure_state: Dict[str, Any] = {}
-
-
-def _try_import_psutil():
-    try:
-        import psutil
-        return psutil
-    except ImportError:
-        return None
-
-
-def sample_resources(pid: int) -> ResourceSnapshot:
-    """Best-effort resource snapshot for a process."""
-    snap = ResourceSnapshot(timestamp=time.time())
-    psutil = _try_import_psutil()
-    if psutil is None:
-        return snap
-
-    try:
-        proc = psutil.Process(pid)
-        snap.cpu_pct = proc.cpu_percent(interval=0.1)
-        mem = proc.memory_info()
-        snap.rss_mb = round(mem.rss / (1024 * 1024), 1)
-    except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
-        pass
-
-    # GPU sampling (best-effort) — NVIDIA first, then MPS fallback
-    try:
-        import subprocess as _sp
-        result = _sp.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            parts = result.stdout.strip().split("\n")[0].split(",")
-            if len(parts) >= 2:
-                snap.gpu_util_pct = float(parts[0].strip())
-                snap.gpu_mem_mb = float(parts[1].strip())
-    except Exception:
-        pass
-
-    # MPS fallback: probe Apple Silicon GPU memory via torch.mps
-    # Gated behind a 30s interval to avoid spawning a Python subprocess every sample.
-    import sys as _sys
-    if snap.gpu_util_pct is None and _sys.platform == "darwin":
-        now = time.time()
-        if now - _mps_probe_state.get("last_probe", 0) >= 30:
-            _mps_probe_state["last_probe"] = now
-            try:
-                import subprocess as _sp
-                result = _sp.run(
-                    [_sys.executable, "-c",
-                     "import torch; "
-                     "a=torch.mps.current_allocated_memory(); "
-                     "d=torch.mps.driver_allocated_memory(); "
-                     "print(f'{a},{d}')"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    parts = result.stdout.strip().split(",")
-                    if len(parts) >= 2:
-                        allocated_mb = int(parts[0]) / (1024 * 1024)
-                        driver_mb = int(parts[1]) / (1024 * 1024)
-                        _mps_probe_state["gpu_util_pct"] = round(
-                            (allocated_mb / driver_mb * 100) if driver_mb > 0 else 0, 1
-                        )
-                        _mps_probe_state["gpu_mem_mb"] = round(allocated_mb, 1)
-                else:
-                    _mps_probe_state["gpu_util_pct"] = None
-                    _mps_probe_state["gpu_mem_mb"] = None
-            except Exception:
-                _mps_probe_state["gpu_util_pct"] = None
-                _mps_probe_state["gpu_mem_mb"] = None
-
-        cached_util = _mps_probe_state.get("gpu_util_pct")
-        cached_mem = _mps_probe_state.get("gpu_mem_mb")
-        if cached_util is not None:
-            snap.gpu_util_pct = cached_util
-        if cached_mem is not None:
-            snap.gpu_mem_mb = cached_mem
-
-    # macOS system memory pressure (unified memory — critical for MPS stability)
-    # Also gated to run at most every 30s (memory_pressure command is slow).
-    if _sys.platform == "darwin":
-        now = time.time()
-        if now - _mem_pressure_state.get("last_probe", 0) >= 30:
-            _mem_pressure_state["last_probe"] = now
-            try:
-                import subprocess as _sp
-                result = _sp.run(
-                    ["memory_pressure"],
-                    capture_output=True, text=True, timeout=3,
-                )
-                if result.returncode == 0:
-                    out = result.stdout
-                    if "CRITICAL" in out.upper():
-                        _mem_pressure_state["level"] = "critical"
-                    elif "WARN" in out.upper():
-                        _mem_pressure_state["level"] = "warning"
-                    else:
-                        _mem_pressure_state["level"] = "normal"
-            except Exception:
-                pass
-
-        snap.memory_pressure = _mem_pressure_state.get("level")
-
-    return snap
-
-
-# ---------------------------------------------------------------------------
-# Progress parsers
-# ---------------------------------------------------------------------------
-
-# Training patterns
-_EPOCH_RE = re.compile(
-    r"[Ee]poch\s+(\d+)[/:](\d+)", re.IGNORECASE
-)
-_LOSS_RE = re.compile(
-    r"(?:loss|train_loss|val_loss)\s*[=:]\s*([\d.eE+-]+)", re.IGNORECASE
-)
-_ACCURACY_RE = re.compile(
-    r"(?:accuracy|acc|val_accuracy|val_acc)\s*[=:]\s*([\d.eE+-]+)", re.IGNORECASE
-)
-_STEP_RE = re.compile(
-    r"[Ss]tep\s+(\d+)[/:](\d+)", re.IGNORECASE
-)
-
-# Pytest patterns
-_PYTEST_COLLECTED_RE = re.compile(r"collected\s+(\d+)\s+items?")
-_PYTEST_PROGRESS_RE = re.compile(r"(\d+)%")
-
-# Download patterns
-_DOWNLOAD_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%", re.IGNORECASE)
-
-# Generic structured progress
-_REMOROO_PROGRESS_RE = re.compile(r"REMOROO_PROGRESS\s+({.+})")
-
-# Generic metric value extraction: "metric_name=0.983" or "metric_name: 0.983"
 _METRIC_KV_RE = re.compile(
     r"(\w[\w_]*)\s*[=:]\s*(-?[\d]+\.[\d]+|-?[\d]+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
 )
 
-# Error signatures
-ERROR_SIGNATURES: List[Tuple[re.Pattern, str, float]] = [
-    (re.compile(r"(MemoryError|OOM|CUDA out of memory|out of memory)", re.I), "oom", 0.95),
-    (re.compile(r"(ModuleNotFoundError|ImportError)", re.I), "missing_dep", 0.90),
-    (re.compile(r"(PermissionError|Permission denied)", re.I), "permission", 0.90),
-    (re.compile(r"(Segmentation fault|core dumped|SIGSEGV)", re.I), "segfault", 0.95),
-    (re.compile(r"(Address already in use)", re.I), "port_conflict", 0.85),
-    (re.compile(r"\b(nan|inf)\b.*(?:loss|reward|gradient)", re.I), "divergence", 0.80),
-    # MPS (Apple Silicon) specific errors
-    (re.compile(r"(MPS backend out of memory|MPS framework error)", re.I), "mps_oom", 0.95),
-    (re.compile(r"(MPSNDArray error|metal\.MTLCompileError)", re.I), "mps_compile", 0.90),
-    (re.compile(r"(mps\.?driver\.abort|GPU Timeout|GPU Hang)", re.I), "mps_hang", 0.90),
-    (re.compile(r"not (currently )?supported on (the )?MPS backend", re.I), "mps_unsupported_op", 0.85),
-]
-
-
-def parse_progress_line(line: str, state: ProgressState) -> bool:
-    """Try to extract progress from a single output line.
-    Returns True if state was updated."""
-    changed = False
-
-    # Structured progress
-    m = _REMOROO_PROGRESS_RE.search(line)
-    if m:
-        try:
-            import json
-            data = json.loads(m.group(1))
-            if "pct" in data:
-                state.pct = float(data["pct"])
-            if "step" in data:
-                state.step = str(data["step"])
-            if "phase" in data:
-                state.phase = str(data["phase"])
-            if "eta_s" in data:
-                state.eta_s = float(data["eta_s"])
-            state.last_update = time.time()
-            return True
-        except Exception:
-            pass
-
-    # Epoch progress (training)
-    m = _EPOCH_RE.search(line)
-    if m:
-        current, total = int(m.group(1)), int(m.group(2))
-        state.step = f"epoch {current}/{total}"
-        state.pct = round(100.0 * current / total, 1) if total > 0 else None
-        state.phase = "training"
-        state.last_update = time.time()
-        changed = True
-
-    # Step progress
-    if not changed:
-        m = _STEP_RE.search(line)
-        if m:
-            current, total = int(m.group(1)), int(m.group(2))
-            state.step = f"step {current}/{total}"
-            state.pct = round(100.0 * current / total, 1) if total > 0 else None
-            state.last_update = time.time()
-            changed = True
-
-    # Pytest collected
-    if not changed:
-        m = _PYTEST_COLLECTED_RE.search(line)
-        if m:
-            state.phase = "testing"
-            state.step = f"collected {m.group(1)} tests"
-            state.last_update = time.time()
-            changed = True
-
-    return changed
-
 
 def extract_metric_values(line: str) -> Dict[str, float]:
-    """Extract all key=value numeric pairs from a line.
-
-    Handles two sources:
-    1. REMOROO_METRIC name = value  (authoritative, supports booleans)
-    2. Generic key=value numeric pairs via _METRIC_KV_RE
-    """
+    """Extract all key=value numeric pairs from a line."""
     metrics: Dict[str, float] = {}
 
-    # Authoritative REMOROO_METRIC pass — supports boolean values True/False
     rm = re.match(r"REMOROO_METRIC\s+(\w+)\s*=\s*(.+)", line.strip())
     if rm:
         name, raw = rm.group(1).lower(), rm.group(2).strip()
@@ -361,9 +123,8 @@ def extract_metric_values(line: str) -> Dict[str, float]:
                 metrics[name] = float(raw)
             except ValueError:
                 pass
-        return metrics  # REMOROO_METRIC lines are authoritative; skip generic scan
+        return metrics
 
-    # Generic numeric key=value scan
     for m in _METRIC_KV_RE.finditer(line):
         name = m.group(1).lower()
         try:
@@ -374,7 +135,7 @@ def extract_metric_values(line: str) -> Dict[str, float]:
 
 
 def check_targets(line_metrics: Dict[str, float], targets: List[TargetMetric]) -> List[Tuple[TargetMetric, float]]:
-    """Check extracted metrics against targets. Returns list of (target, observed_value) hits."""
+    """Check extracted metrics against targets."""
     hits = []
     for target in targets:
         target_name = target.name.lower()
@@ -383,6 +144,24 @@ def check_targets(line_metrics: Dict[str, float], targets: List[TargetMetric]) -
                 if target.check(obs_val):
                     hits.append((target, obs_val))
     return hits
+
+
+# ---------------------------------------------------------------------------
+# Error signatures
+# ---------------------------------------------------------------------------
+
+ERROR_SIGNATURES: List[Tuple[re.Pattern, str, float]] = [
+    (re.compile(r"(MemoryError|OOM|CUDA out of memory|out of memory)", re.I), "oom", 0.95),
+    (re.compile(r"(ModuleNotFoundError|ImportError)", re.I), "missing_dep", 0.90),
+    (re.compile(r"(PermissionError|Permission denied)", re.I), "permission", 0.90),
+    (re.compile(r"(Segmentation fault|core dumped|SIGSEGV)", re.I), "segfault", 0.95),
+    (re.compile(r"(Address already in use)", re.I), "port_conflict", 0.85),
+    (re.compile(r"\b(nan|inf)\b.*(?:loss|reward|gradient)", re.I), "divergence", 0.80),
+    (re.compile(r"(MPS backend out of memory|MPS framework error)", re.I), "mps_oom", 0.95),
+    (re.compile(r"(MPSNDArray error|metal\.MTLCompileError)", re.I), "mps_compile", 0.90),
+    (re.compile(r"(mps\.?driver\.abort|GPU Timeout|GPU Hang)", re.I), "mps_hang", 0.90),
+    (re.compile(r"not (currently )?supported on (the )?MPS backend", re.I), "mps_unsupported_op", 0.85),
+]
 
 
 def detect_error_signature(line: str) -> Optional[Tuple[str, float]]:
@@ -394,15 +173,18 @@ def detect_error_signature(line: str) -> Optional[Tuple[str, float]]:
 
 
 # ---------------------------------------------------------------------------
-# SupervisedJob
+# SupervisedJob — the minimal watchdog
 # ---------------------------------------------------------------------------
 
 class SupervisedJob:
-    """Wraps a subprocess with monitoring, scoring, and event generation."""
+    """Minimal process watchdog.
 
-    EVAL_WINDOW_S = 30.0        # how often to recompute FPS/WS
-    SAMPLE_INTERVAL_S = 5.0     # resource sampling frequency
-    STALL_WINDOWS = 2           # consecutive low-FPS windows before STALL_SUSPECTED
+    Monitors output activity, file watches, error signatures, and metric
+    targets.  Fires events only for hard facts: completion, failure,
+    silence timeout, error signature, metric target reached, crash loop.
+    """
+
+    POLL_INTERVAL_S = 5.0
 
     def __init__(
         self,
@@ -425,80 +207,86 @@ class SupervisedJob:
         self.artifact_log_path = artifact_log_path
         self.start_time = time.time()
 
-        # Monitoring state
-        self.resource_samples: Deque[ResourceSnapshot] = collections.deque(maxlen=120)
-        self.progress = ProgressState()
-        self.watched_files: Dict[str, Tuple[int, float]] = {}  # path → (size, mtime)
-
-        # Event queue — drained by poll
-        self.event_queue: Deque[SupervisorEvent] = collections.deque(maxlen=50)
-        self.milestones: Deque[str] = collections.deque(maxlen=20)
-
-        # Scores
-        self.fps: float = 1.0   # start optimistic
-        self.ws: float = 0.0
-
-        # Tracking for FPS computation
-        self._last_eval_time: float = time.time()
-        self._last_output_lines: int = 0
-        self._last_stderr_lines: int = 0
-        self._last_progress_update: float = 0.0
-        self._last_file_sizes: Dict[str, int] = {}
-        self._consecutive_low_fps: int = 0
-        self._emitted_event_types: Dict[str, float] = {}  # event_type → last_emit_time
-        self._last_new_output_time: float = time.time()  # updated each time new stdout lines arrive
-
-        # Multi-metric: track which targets have been individually satisfied.
-        # Only fire METRIC_TARGET_REACHED when ALL are met.
-        self._satisfied_targets: Dict[str, float] = {}  # target_name → observed_value
-
-        # Terminal state
+        self.state: JobState = JobState.STARTING
         self.exit_code: Optional[int] = None
         self.exit_signal: Optional[int] = None
-        self.status: str = "running"
 
-        # Threads
+        self.event_queue: Deque[SupervisorEvent] = collections.deque(maxlen=50)
+
+        self._last_new_output_time: float = time.time()
+        self._last_stdout_len: int = 0
+        self._last_stderr_len: int = 0
+        self._last_file_sizes: Dict[str, int] = {}
+        self._satisfied_targets: Dict[str, float] = {}
+        self._last_event_times: Dict[str, float] = {}
+
+        self._readiness_re = re.compile(self.metadata.readiness_regex) if self.metadata.readiness_regex else None
         self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
 
-        # Initialize file watches
         for path in self.metadata.file_watch_paths:
-            self._snapshot_file(path)
+            try:
+                self._last_file_sizes[path] = os.stat(path).st_size
+            except OSError:
+                self._last_file_sizes[path] = 0
+
+        self._log_config()
+
+    # ------------------------------------------------------------------
+    # Transparent config logging
+    # ------------------------------------------------------------------
+
+    def _log_config(self) -> None:
+        print(f"  [watch] job={self.job_id} cmd={self.command[:100]}", flush=True)
+        if self.metadata.max_silent_s is not None:
+            print(f"  [watch] job={self.job_id} max_silent_s={self.metadata.max_silent_s}", flush=True)
+        else:
+            print(f"  [watch] job={self.job_id} WARNING: max_silent_s not set — no hang detection", flush=True)
+        if self.metadata.redirect_output_file:
+            exists = os.path.exists(self.metadata.redirect_output_file)
+            print(f"  [watch] job={self.job_id} redirect_file={self.metadata.redirect_output_file} exists={exists}", flush=True)
+        for path in self.metadata.file_watch_paths:
+            exists = os.path.exists(path)
+            print(f"  [watch] job={self.job_id} file_watch={path} exists={exists}", flush=True)
+        for t in self.metadata.target_metrics:
+            print(f"  [watch] job={self.job_id} target: {t.name} {t.operator} {t.value}", flush=True)
+        if self.metadata.readiness_regex:
+            print(f"  [watch] job={self.job_id} readiness_regex={self.metadata.readiness_regex}", flush=True)
+        if self.metadata.readiness_port:
+            print(f"  [watch] job={self.job_id} readiness_port={self.metadata.readiness_port}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def start_monitoring(self) -> None:
-        """Start the background monitoring thread."""
         self._monitor_thread = threading.Thread(
-            target=self._monitor_loop, daemon=True, name=f"supervisor-{self.job_id}"
+            target=self._monitor_loop, daemon=True, name=f"watch-{self.job_id}"
         )
         self._monitor_thread.start()
 
     def stop_monitoring(self) -> None:
-        """Signal the monitoring thread to stop."""
         self._stop_event.set()
 
     def mark_finished(self, exit_code: int, signal_num: Optional[int] = None) -> None:
-        """Called when the process exits."""
+        if self.state in (JobState.KILLED, JobState.FINISHED, JobState.FAILED):
+            return
         self.exit_code = exit_code
         self.exit_signal = signal_num
-        self.status = "failed" if exit_code != 0 else "finished"
+        self.state = JobState.FINISHED if exit_code == 0 else JobState.FAILED
         self._stop_event.set()
-
-        event_type = "COMPLETED" if exit_code == 0 else "FAILED"
-        self._emit_event(
-            event_type=event_type,
-            severity="info" if exit_code == 0 else "critical",
-            confidence=1.0,
-            reason=f"Process exited with code {exit_code}",
-            evidence={"exit_code": exit_code, "signal": signal_num,
-                      "elapsed_s": round(time.time() - self.start_time, 1)},
-        )
+        etype = "COMPLETED" if exit_code == 0 else "FAILED"
+        self._emit(etype, f"Process exited with code {exit_code}",
+                   {"exit_code": exit_code, "signal": signal_num,
+                    "elapsed_s": round(time.time() - self.start_time, 1)})
 
     def mark_killed(self) -> None:
-        self.status = "killed"
+        if self.state in (JobState.KILLED, JobState.FINISHED, JobState.FAILED):
+            return
+        self.state = JobState.KILLED
         self._stop_event.set()
 
     def drain_events(self) -> List[SupervisorEvent]:
-        """Return and clear all queued primary events."""
         events = []
         while self.event_queue:
             try:
@@ -508,432 +296,199 @@ class SupervisedJob:
         return events
 
     def peek_events(self) -> List[SupervisorEvent]:
-        """Return queued primary events WITHOUT clearing them."""
         return list(self.event_queue)
 
-    def drain_milestones(self) -> List[str]:
-        """Return and clear secondary milestone messages."""
-        milestones = []
-        while self.milestones:
-            try:
-                milestones.append(self.milestones.popleft())
-            except IndexError:
-                break
-        return milestones
-
-    def get_resource_snapshot(self) -> ResourceSnapshot:
-        """Return latest resource snapshot, or sample now if stale."""
-        if self.resource_samples:
-            latest = self.resource_samples[-1]
-            if time.time() - latest.timestamp < self.SAMPLE_INTERVAL_S * 2:
-                return latest
-        return sample_resources(self.pid)
-
-    def get_progress_dict(self) -> Dict[str, Any]:
-        p = self.progress
-        return {
-            "pct": p.pct,
-            "step": p.step,
-            "phase": p.phase,
-            "eta_s": p.eta_s,
-        }
-
     # ------------------------------------------------------------------
-    # Internal monitoring loop
+    # Monitor loop — 4 checks, nothing else
     # ------------------------------------------------------------------
 
     def _monitor_loop(self) -> None:
-        """Background thread: sample resources, parse output, compute scores."""
+        if not self.metadata.readiness_regex and not self.metadata.readiness_port:
+            self.state = JobState.RUNNING
+
         while not self._stop_event.is_set():
             try:
-                # Resource sample
-                snap = sample_resources(self.pid)
-                self.resource_samples.append(snap)
-
-                if snap.memory_pressure == "critical":
-                    self._emit_event(
-                        event_type="RESOURCE_RISK",
-                        severity="warning",
-                        confidence=0.9,
-                        reason="macOS memory pressure is CRITICAL — system may freeze or swap heavily",
-                        evidence={"memory_pressure": "critical"},
-                    )
-
-                # Parse recent output for progress + errors
-                self._scan_output()
-
-                # Check watched files
-                self._check_file_watches()
-
-                # Evaluate FPS/WS on schedule
-                now = time.time()
-                if now - self._last_eval_time >= self.EVAL_WINDOW_S:
-                    self._evaluate_scores()
-                    self._last_eval_time = now
-
+                if self.state == JobState.STARTING:
+                    self._check_readiness()
+                self._check_output()
+                self._check_files()
+                self._check_silent()
             except Exception:
+                print(f"  [watch] ERROR job={self.job_id}:\n{traceback.format_exc()}", flush=True)
+            self._stop_event.wait(timeout=self.POLL_INTERVAL_S)
+
+    def _check_readiness(self) -> None:
+        ready = False
+        if self.metadata.readiness_port:
+            try:
+                with socket.create_connection(("127.0.0.1", self.metadata.readiness_port), timeout=0.1):
+                    ready = True
+            except (OSError, ConnectionRefusedError):
                 pass
+        if not ready and self._readiness_re:
+            try:
+                for line in list(self.stdout_buf)[-50:]:
+                    if self._readiness_re.search(line):
+                        ready = True
+                        break
+            except RuntimeError:
+                pass
+        if ready:
+            self.state = JobState.RUNNING
+            print(f"  [watch] job={self.job_id} READY -> RUNNING", flush=True)
 
-            self._stop_event.wait(timeout=self.SAMPLE_INTERVAL_S)
+    def _check_output(self) -> None:
+        """Scan new stdout/stderr for errors and metrics; reset silence timer on new output."""
+        current_stdout = len(self.stdout_buf)
+        current_stderr = len(self.stderr_buf)
 
-    def _scan_output(self) -> None:
-        """Scan new stdout/stderr lines for progress and errors."""
-        current_stdout_len = len(self.stdout_buf)
-        current_stderr_len = len(self.stderr_buf)
+        if current_stdout > self._last_stdout_len:
+            self._last_new_output_time = time.time()
+            try:
+                new_lines = list(self.stdout_buf)[-max(1, current_stdout - self._last_stdout_len):]
+            except RuntimeError:
+                new_lines = []
+            self._last_stdout_len = current_stdout
 
-        # Scan new stdout lines for progress, metrics, and errors
-        if current_stdout_len > self._last_output_lines:
-            self._last_new_output_time = time.time()  # track when output last grew
-            new_lines = list(self.stdout_buf)[-max(1, current_stdout_len - self._last_output_lines):]
-            # print(f"  [DBG-SUPERVISOR] _scan_output: {len(new_lines)} new lines (total={current_stdout_len}, last={self._last_output_lines}), targets={len(self.metadata.target_metrics)}", flush=True)  # DBG-SUPERVISOR
             for line in new_lines:
                 stripped = line.strip()
                 if not stripped:
                     continue
-                if parse_progress_line(stripped, self.progress):
-                    self.milestones.append(f"Progress: {self.progress.step or self.progress.phase or stripped[:80]}")
 
-                # Check for target metric hits (multi-metric aware)
+                err = detect_error_signature(stripped)
+                if err:
+                    sig_id, confidence = err
+                    if confidence >= EVENT_CONFIDENCE_THRESHOLDS.get("ERROR_SIGNATURE", 0.7):
+                        self._emit("ERROR_SIGNATURE", f"Detected {sig_id} in stdout",
+                                   {"signature_id": sig_id, "line": stripped[:200]})
+
                 if self.metadata.target_metrics:
-                    line_metrics = extract_metric_values(stripped)
-                    if line_metrics:
-                        # print(f"  [DBG-SUPERVISOR] Extracted metrics: {line_metrics} from: {stripped[:100]}", flush=True)  # DBG-SUPERVISOR
-                        hits = check_targets(line_metrics, self.metadata.target_metrics)
-                        # print(f"  [DBG-SUPERVISOR] Target check hits: {len(hits)} (targets={[(t.name,t.operator,t.value) for t in self.metadata.target_metrics]})", flush=True)  # DBG-SUPERVISOR
+                    metrics = extract_metric_values(stripped)
+                    if metrics:
+                        hits = check_targets(metrics, self.metadata.target_metrics)
                         for target, observed in hits:
                             self._satisfied_targets[target.name.lower()] = observed
-                            # print(f"  [DBG-SUPERVISOR] >>> METRIC HIT: {target.name} {target.operator} {target.value}, observed={observed} (satisfied={len(self._satisfied_targets)}/{len(self.metadata.target_metrics)})", flush=True)  # DBG-SUPERVISOR
 
-                        # Fire METRIC_TARGET_REACHED only when ALL targets are met
-                        all_target_names = {t.name.lower() for t in self.metadata.target_metrics}
-                        if all_target_names and all_target_names <= set(self._satisfied_targets.keys()):
-                            evidence_all = {
-                                name: self._satisfied_targets[name]
-                                for name in sorted(self._satisfied_targets)
-                            }
+                        all_names = {t.name.lower() for t in self.metadata.target_metrics}
+                        if all_names and all_names <= set(self._satisfied_targets.keys()):
                             summary = ", ".join(
                                 f"{t.name} {t.operator} {t.value} (observed: {self._satisfied_targets.get(t.name.lower(), '?')})"
                                 for t in self.metadata.target_metrics
                             )
-                            self._emit_event(
-                                event_type="METRIC_TARGET_REACHED",
-                                severity="info",
-                                confidence=1.0,
-                                reason=f"All target metrics reached: {summary}",
-                                evidence={
-                                    "satisfied_targets": evidence_all,
-                                    "target_count": len(self.metadata.target_metrics),
-                                },
-                            )
+                            self._emit("METRIC_TARGET_REACHED", f"All targets met: {summary}",
+                                       {"satisfied_targets": dict(self._satisfied_targets)})
 
-                sig = detect_error_signature(stripped)
-                if sig:
-                    sig_id, confidence = sig
-                    self._emit_event(
-                        event_type="ERROR_SIGNATURE",
-                        severity="warning" if confidence < 0.9 else "critical",
-                        confidence=confidence,
-                        reason=f"Detected {sig_id} in stdout",
-                        evidence={"signature_id": sig_id, "line": stripped[:200]},
-                    )
+        if current_stderr > self._last_stderr_len:
+            try:
+                new_lines = list(self.stderr_buf)[-max(1, current_stderr - self._last_stderr_len):]
+            except RuntimeError:
+                new_lines = []
+            self._last_stderr_len = current_stderr
 
-        # Scan new stderr lines for errors
-        if current_stderr_len > self._last_stderr_lines:
-            new_lines = list(self.stderr_buf)[-max(1, current_stderr_len - self._last_stderr_lines):]
             for line in new_lines:
                 stripped = line.strip()
                 if not stripped:
                     continue
-                sig = detect_error_signature(stripped)
-                if sig:
-                    sig_id, confidence = sig
-                    self._emit_event(
-                        event_type="ERROR_SIGNATURE",
-                        severity="warning" if confidence < 0.9 else "critical",
-                        confidence=confidence,
-                        reason=f"Detected {sig_id} in stderr",
-                        evidence={"signature_id": sig_id, "line": stripped[:200]},
-                    )
+                err = detect_error_signature(stripped)
+                if err:
+                    sig_id, confidence = err
+                    if confidence >= EVENT_CONFIDENCE_THRESHOLDS.get("ERROR_SIGNATURE", 0.7):
+                        self._emit("ERROR_SIGNATURE", f"Detected {sig_id} in stderr",
+                                   {"signature_id": sig_id, "line": stripped[:200]})
 
-        self._last_output_lines = current_stdout_len
-        self._last_stderr_lines = current_stderr_len
-
-    def _check_file_watches(self) -> None:
-        """Check watched file paths for growth."""
+    def _check_files(self) -> None:
+        """Check watched files for growth — resets silence timer."""
         for path in self.metadata.file_watch_paths:
             try:
-                st = os.stat(path)
-                size = st.st_size
-                prev_size = self._last_file_sizes.get(path, 0)
-                if size > prev_size:
+                size = os.stat(path).st_size
+                prev = self._last_file_sizes.get(path, 0)
+                if size > prev:
+                    self._last_new_output_time = time.time()
                     self._last_file_sizes[path] = size
-                    basename = os.path.basename(path)
-                    self.milestones.append(f"File growth: {basename} ({prev_size} → {size} bytes)")
             except OSError:
                 pass
 
-    def _snapshot_file(self, path: str) -> None:
-        try:
-            st = os.stat(path)
-            self.watched_files[path] = (st.st_size, st.st_mtime)
-            self._last_file_sizes[path] = st.st_size
-        except OSError:
-            self.watched_files[path] = (0, 0.0)
-            self._last_file_sizes[path] = 0
+    def _check_silent(self) -> None:
+        """Fire SILENT_TIMEOUT if no output or file activity past the LLM-declared limit."""
+        if self.metadata.max_silent_s is None:
+            return
+        effective_limit = self.metadata.max_silent_s * 1.10
+        silent_for = time.time() - self._last_new_output_time
+        if silent_for <= effective_limit:
+            return
 
-    # ------------------------------------------------------------------
-    # FPS / WS scoring
-    # ------------------------------------------------------------------
-
-    def _evaluate_scores(self) -> None:
-        """Recompute Forward Progress Score and Waste Score."""
-        now = time.time()
-
-        # Signal 1: Progress changed since last eval?
-        progress_signal = 1.0 if self.progress.last_update > self._last_progress_update else 0.0
-        self._last_progress_update = self.progress.last_update
-
-        # Signal 2: Meaningful output growth?
-        # Use a dedicated counter so _scan_output doesn't steal our baseline
-        current_lines = len(self.stdout_buf)
-        if not hasattr(self, '_eval_output_lines'):
-            self._eval_output_lines = 0
-        output_growth = current_lines - self._eval_output_lines
-        self._eval_output_lines = current_lines
-        output_signal = min(1.0, output_growth / 5.0) if output_growth > 0 else 0.0
-
-        # Signal 3: File growth in watched paths?
-        file_growth = False
+        # Double-check file watches right now before firing
         for path in self.metadata.file_watch_paths:
             try:
-                st = os.stat(path)
-                prev = self.watched_files.get(path, (0, 0.0))
-                if st.st_size > prev[0] or st.st_mtime > prev[1]:
-                    file_growth = True
-                    self.watched_files[path] = (st.st_size, st.st_mtime)
+                size = os.stat(path).st_size
+                prev = self._last_file_sizes.get(path, 0)
+                if size > prev:
+                    self._last_new_output_time = time.time()
+                    self._last_file_sizes[path] = size
+                    return
             except OSError:
                 pass
-        file_signal = 1.0 if file_growth else 0.0
 
-        # Signal 4: Sustained compute activity?
-        compute_signal = 0.0
-        if self.resource_samples:
-            recent = list(self.resource_samples)[-6:]  # last ~30s
-            cpu_vals = [s.cpu_pct for s in recent if s.cpu_pct is not None]
-            gpu_vals = [s.gpu_util_pct for s in recent if s.gpu_util_pct is not None]
-            avg_cpu = sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0
-            avg_gpu = sum(gpu_vals) / len(gpu_vals) if gpu_vals else 0
-            compute_signal = min(1.0, max(avg_cpu, avg_gpu) / 30.0)  # 30% threshold
-
-        # Weights: adjust if resource sampling unavailable
-        has_resources = any(s.cpu_pct is not None for s in list(self.resource_samples)[-3:])
-        if has_resources:
-            w_progress, w_output, w_file, w_compute = 0.40, 0.25, 0.20, 0.15
-        else:
-            w_progress, w_output, w_file, w_compute = 0.45, 0.35, 0.20, 0.00
-
-        self.fps = (
-            progress_signal * w_progress +
-            output_signal * w_output +
-            file_signal * w_file +
-            compute_signal * w_compute
-        )
-
-        # Waste Score: high resource utilization with no forward signal
-        resource_util = 0.0
-        if self.resource_samples:
-            recent = list(self.resource_samples)[-6:]
-            cpu_vals = [s.cpu_pct for s in recent if s.cpu_pct is not None]
-            gpu_vals = [s.gpu_util_pct for s in recent if s.gpu_util_pct is not None]
-            resource_util = max(
-                (sum(cpu_vals) / len(cpu_vals) / 100.0) if cpu_vals else 0,
-                (sum(gpu_vals) / len(gpu_vals) / 100.0) if gpu_vals else 0,
-            )
-        self.ws = resource_util * (1.0 - self.fps)
-
-        # Stall detection — skip entirely when target metrics are set (we wait
-        # for METRIC_TARGET_REACHED or process exit, not arbitrary silence).
-        has_targets = bool(self.metadata.target_metrics)
-        if self.fps < 0.15 and not has_targets:
-            self._consecutive_low_fps += 1
-        else:
-            self._consecutive_low_fps = 0
-
-        if (self._consecutive_low_fps >= self.STALL_WINDOWS
-                and not self.metadata.silent_phase_ok):
-            self._emit_event(
-                event_type="STALL_SUSPECTED",
-                severity="warning",
-                confidence=min(0.95, 0.6 + 0.1 * self._consecutive_low_fps),
-                reason=(
-                    f"No forward progress for {self._consecutive_low_fps * self.EVAL_WINDOW_S:.0f}s "
-                    f"(FPS={self.fps:.2f}, WS={self.ws:.2f})"
-                ),
-                evidence={
-                    "fps": round(self.fps, 3),
-                    "ws": round(self.ws, 3),
-                    "consecutive_low_fps_windows": self._consecutive_low_fps,
-                    "output_lines": len(self.stdout_buf),
-                    "resource_util": round(resource_util, 3),
-                },
-            )
-
-        # Agent-declared max_silent_s contract: fire SILENT_TIMEOUT (PRIMARY event)
-        # Semantic: "no new stdout has arrived for max_silent_s seconds".
-        # Fires regardless of how much prior output existed — this catches:
-        #   - pygame/import hangs (zero output from start)
-        #   - silent deadlocks (produced N lines then hung)
-        # NOT suppressed by target_metrics. Fires at most once (debounced).
-        # Skip when silent_phase_ok (e.g. output redirected to file: > run.log 2>&1).
-        if (
-            self.metadata.max_silent_s is not None
-            and not self.metadata.silent_phase_ok
-        ):
-            silent_for = time.time() - self._last_new_output_time
-            total_output = len(self.stdout_buf)
-            if silent_for > self.metadata.max_silent_s:
-                self._emit_event(
-                    event_type="SILENT_TIMEOUT",
-                    severity="warning",
-                    confidence=1.0,
-                    reason=(
-                        f"No new stdout for {silent_for:.0f}s "
-                        f"(max_silent_s={self.metadata.max_silent_s:.0f}s contract violated, "
-                        f"{total_output} total lines emitted)"
-                    ),
-                    evidence={
-                        "max_silent_s": self.metadata.max_silent_s,
-                        "silent_for_s": round(silent_for, 1),
-                        "total_output_lines": total_output,
-                    },
-                )
-
-        # Runaway cost detection
-        if self.ws > 0.7 and not self.metadata.silent_phase_ok:
-            self._emit_event(
-                event_type="RUNAWAY_COST",
-                severity="warning",
-                confidence=min(0.95, 0.7 + 0.05 * self._consecutive_low_fps),
-                reason=(
-                    f"High resource burn with no forward signal "
-                    f"(WS={self.ws:.2f}, FPS={self.fps:.2f}, CPU/GPU util={resource_util:.0%})"
-                ),
-                evidence={
-                    "fps": round(self.fps, 3),
-                    "ws": round(self.ws, 3),
-                    "resource_util": round(resource_util, 3),
-                },
-            )
-
-        # GPU underutilization
-        if (self.metadata.gpu_expected and self.resource_samples):
-            recent = list(self.resource_samples)[-6:]
-            gpu_vals = [s.gpu_util_pct for s in recent if s.gpu_util_pct is not None]
-            cpu_vals = [s.cpu_pct for s in recent if s.cpu_pct is not None]
-            if gpu_vals and cpu_vals:
-                avg_gpu = sum(gpu_vals) / len(gpu_vals)
-                avg_cpu = sum(cpu_vals) / len(cpu_vals)
-                if avg_gpu < 5.0 and avg_cpu > 30.0:
-                    self._emit_event(
-                        event_type="GPU_UNDERUTILIZED",
-                        severity="warning",
-                        confidence=0.8,
-                        reason=f"GPU util ~{avg_gpu:.0f}% while CPU ~{avg_cpu:.0f}% (expected GPU usage)",
-                        evidence={"avg_gpu_pct": round(avg_gpu, 1), "avg_cpu_pct": round(avg_cpu, 1)},
-                    )
+        self._emit("SILENT_TIMEOUT",
+                    f"No stdout or file activity for {silent_for:.0f}s (limit: {self.metadata.max_silent_s:.0f}s + 10% margin)",
+                    {"silent_for_s": round(silent_for, 1), "max_silent_s": self.metadata.max_silent_s})
+        self._last_new_output_time = time.time()  # debounce
 
     # ------------------------------------------------------------------
-    # Event emission with debouncing
+    # Event emission — always printed
     # ------------------------------------------------------------------
 
-    def _emit_event(
-        self,
-        event_type: str,
-        severity: str,
-        confidence: float,
-        reason: str,
-        evidence: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Create and queue an event, with debouncing and confidence gating."""
+    def _emit(self, event_type: str, reason: str, evidence: Optional[Dict[str, Any]] = None) -> None:
+        if event_type not in PRIMARY_EVENT_TYPES:
+            return
+
         threshold = EVENT_CONFIDENCE_THRESHOLDS.get(event_type, 0.7)
-        if confidence < threshold:
-            # print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): BLOCKED by confidence ({confidence} < {threshold})", flush=True)  # DBG-SUPERVISOR
-            return
+        # For ERROR_SIGNATURE the caller already checked confidence; for
+        # everything else confidence is 1.0 and threshold is 0.0.
 
-        # Debounce: don't emit the same event type more than once per eval window
         now = time.time()
-        last_emit = self._emitted_event_types.get(event_type, 0.0)
-        if event_type not in ("COMPLETED", "FAILED", "METRIC_TARGET_REACHED") and (now - last_emit) < self.EVAL_WINDOW_S:
-            # print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): DEBOUNCED ({now - last_emit:.1f}s < {self.EVAL_WINDOW_S}s)", flush=True)  # DBG-SUPERVISOR
-            return
-        self._emitted_event_types[event_type] = now
-        # print(f"  [DBG-SUPERVISOR] _emit_event({event_type}): QUEUED (confidence={confidence}, reason={reason[:80]})", flush=True)  # DBG-SUPERVISOR
+        if event_type not in ("COMPLETED", "FAILED", "METRIC_TARGET_REACHED"):
+            last = self._last_event_times.get(event_type, 0.0)
+            if now - last < 30.0:
+                return
+        self._last_event_times[event_type] = now
 
-        # Build log tail
-        stdout_lines = list(self.stdout_buf)
-        log_tail = "".join(stdout_lines[-20:]) if stdout_lines else ""
+        try:
+            log_tail = "".join(list(self.stdout_buf)[-20:])
+        except RuntimeError:
+            log_tail = ""
 
         event = SupervisorEvent(
             job_id=self.job_id,
             timestamp=now,
             event_type=event_type,
-            severity=severity,
-            confidence=confidence,
+            severity="critical" if event_type in ("FAILED", "ERROR_SIGNATURE") else "info",
+            confidence=1.0,
             reason=reason,
             evidence=evidence or {},
             log_tail=log_tail,
-            resource_snapshot=self.get_resource_snapshot() if self.resource_samples else None,
-            progress_snapshot=ProgressState(
-                pct=self.progress.pct, step=self.progress.step,
-                phase=self.progress.phase, eta_s=self.progress.eta_s,
-                last_update=self.progress.last_update,
-            ),
         )
-
-        if event_type in PRIMARY_EVENT_TYPES:
-            self.event_queue.append(event)
-        else:
-            self.milestones.append(f"[{event_type}] {reason[:100]}")
+        self.event_queue.append(event)
+        print(f"  [watch] job={self.job_id} EVENT: {event_type} — {reason}", flush=True)
 
     # ------------------------------------------------------------------
-    # Enriched poll response
+    # Poll response
     # ------------------------------------------------------------------
 
     def build_poll_response(self, tail_lines: int = 80, drain: bool = True) -> Dict[str, Any]:
-        """Build the enriched poll response for v2_exec_poll.
+        try:
+            stdout_lines = list(self.stdout_buf)
+            stderr_lines = list(self.stderr_buf)
+        except RuntimeError:
+            stdout_lines, stderr_lines = [], []
 
-        Args:
-            drain: If True, events are removed from the queue (watch mode).
-                   If False, events are peeked without clearing (turn context).
-        """
-        stdout_lines = list(self.stdout_buf)
-        stderr_lines = list(self.stderr_buf)
-        elapsed_s = round(time.time() - self.start_time, 1)
-
-        snap = self.get_resource_snapshot()
         events = self.drain_events() if drain else self.peek_events()
-        # print(f"  [DBG-SUPERVISOR] build_poll_response(drain={drain}): status={self.status}, events={len(events)}, queue_remaining={len(self.event_queue)}, fps={self.fps:.3f}, ws={self.ws:.3f}", flush=True)  # DBG-SUPERVISOR
-        # if events:  # DBG-SUPERVISOR
-            # for e in events:  # DBG-SUPERVISOR
-                # print(f"  [DBG-SUPERVISOR]   event: {e.event_type} conf={e.confidence} reason={e.reason[:100]}", flush=True)  # DBG-SUPERVISOR
-
         return {
-            "status": self.status,
+            "status": self.state.value,
             "exit_code": self.exit_code,
-            "elapsed_s": elapsed_s,
+            "elapsed_s": round(time.time() - self.start_time, 1),
             "stdout_tail": "".join(stdout_lines[-tail_lines:]),
             "stderr_tail": "".join(stderr_lines[-min(20, tail_lines):]),
             "output_lines": len(stdout_lines),
             "events": [e.to_dict() for e in events],
-            "fps": round(self.fps, 3),
-            "ws": round(self.ws, 3),
-            "resource_snapshot": {
-                "cpu_pct": snap.cpu_pct,
-                "rss_mb": snap.rss_mb,
-                "disk_io_mb_s": snap.disk_io_mb_s,
-                "gpu_util_pct": snap.gpu_util_pct,
-                "gpu_mem_mb": snap.gpu_mem_mb,
-            },
-            "progress": self.get_progress_dict(),
-            "milestones": self.drain_milestones(),
         }

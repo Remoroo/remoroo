@@ -85,7 +85,7 @@ class LocalWorker:
         self._execution_buffers: Dict[str, Any] = {} # Store stdout/stderr buffers
         self._interactive_sessions: Dict[str, Any] = {} # Store pexpect sessions
         self._supervised_jobs: Dict[str, Any] = {}  # job_id → SupervisedJob
-        
+        self._signature_tracker: Dict[str, List[float]] = {}  # cmd_signature -> list of crash timestamps
     def _log(self, message: str):
         """Internal logger that redirects to output_callback or standard print."""
         if self.output_callback:
@@ -2842,7 +2842,7 @@ class LocalWorker:
             # ── v2 Process Execution Protocol ──
 
             elif request.type == "v2_exec_start":
-                from .process_supervisor import SupervisedJob, JobMetadata, TargetMetric
+                from .process_supervisor import SupervisedJob, JobMetadata, TargetMetric, JobState
 
                 cmd = request.payload.get("command", "")
                 env_vars = request.payload.get("env", {})
@@ -2853,6 +2853,28 @@ class LocalWorker:
                     return ExecutionResult(success=False, error="Missing 'command' parameter")
 
                 job_id = f"v2-{uuid.uuid4().hex[:8]}"
+                
+                # Check Crash-Loop Backoff
+                sig_key = f"{cwd}::{cmd}"
+                now = time.time()
+                recent_crashes = [t for t in self._signature_tracker.get(sig_key, []) if now - t < 120]
+                self._signature_tracker[sig_key] = recent_crashes
+                
+                if len(recent_crashes) >= 3:
+                    # Instantly backoff without executing
+                    supervised = SupervisedJob(
+                        job_id=job_id, pid=0, command=cmd, cwd=cwd,
+                        stdout_buf=collections.deque(), stderr_buf=collections.deque()
+                    )
+                    supervised.state = JobState.BACKOFF
+                    supervised.exit_code = 1
+                    supervised._emit(
+                        "CRASH_LOOP",
+                        f"Crash Loop Detected: command crashed {len(recent_crashes)} times in the last 120s. "
+                        f"Execution blocked to save resources. Inspect logs and fix the root cause.",
+                    )
+                    self._supervised_jobs[job_id] = supervised
+                    return ExecutionResult(success=True, data={"job_id": job_id, "pid": 0})
 
                 stdout_buf = collections.deque(maxlen=50000)
                 stderr_buf = collections.deque(maxlen=10000)
@@ -2882,34 +2904,16 @@ class LocalWorker:
                 def _reader(stream, buf, is_stderr=False):
                     try:
                         if stream:
-                            remainder = ""
-                            while True:
-                                chunk = stream.read(4096)
-                                if not chunk:
-                                    if remainder:
-                                        buf.append(remainder + "\n")
-                                        if log_cb:
-                                            stripped = remainder.strip()
-                                            if stripped:
-                                                try:
-                                                    tag = "dim red" if is_stderr else "dim"
-                                                    log_cb(f"[{tag}]   {stripped}[/{tag}]")
-                                                except Exception:
-                                                    pass
-                                    break
-                                text = remainder + chunk
-                                parts = re.split(r"\r\n|\n|\r", text)
-                                remainder = parts.pop()
-                                for line in parts:
-                                    buf.append(line + "\n")
-                                    if log_cb:
-                                        stripped = line.strip()
-                                        if stripped:
-                                            try:
-                                                tag = "dim red" if is_stderr else "dim"
-                                                log_cb(f"[{tag}]   {stripped}[/{tag}]")
-                                            except Exception:
-                                                pass
+                            for line in iter(stream.readline, ""):
+                                buf.append(line)
+                                if log_cb:
+                                    stripped = line.strip()
+                                    if stripped:
+                                        try:
+                                            tag = "dim red" if is_stderr else "dim"
+                                            log_cb(f"[{tag}]   {stripped}[/{tag}]")
+                                        except Exception:
+                                            pass
                             stream.close()
                     except Exception:
                         pass
@@ -2925,15 +2929,25 @@ class LocalWorker:
                             name=t["name"], operator=t["operator"], value=float(t["value"]),
                         ))
 
+                file_watches = raw_meta.get("file_watch_paths", [])
+                redirect_file = raw_meta.get("redirect_output_file")
+                if redirect_file:
+                    abs_redirect = os.path.join(cwd, redirect_file) if not os.path.isabs(redirect_file) else redirect_file
+                    if abs_redirect not in file_watches:
+                        file_watches.append(abs_redirect)
+
                 metadata = JobMetadata(
                     expected_kind=raw_meta.get("expected_kind", "unknown"),
                     cost_sensitivity=raw_meta.get("cost_sensitivity", "medium"),
                     gpu_expected=raw_meta.get("gpu_expected", False),
                     progress_hint_paths=raw_meta.get("progress_hint_paths", []),
-                    file_watch_paths=raw_meta.get("file_watch_paths", []),
+                    file_watch_paths=file_watches,
                     silent_phase_ok=raw_meta.get("silent_phase_ok", False),
                     target_metrics=parsed_targets,
                     max_silent_s=float(raw_meta["max_silent_s"]) if raw_meta.get("max_silent_s") is not None else None,
+                    readiness_regex=raw_meta.get("readiness_regex"),
+                    readiness_port=int(raw_meta["readiness_port"]) if raw_meta.get("readiness_port") is not None else None,
+                    redirect_output_file=abs_redirect if redirect_file else None,
                 )
 
                 supervised = SupervisedJob(
@@ -2961,6 +2975,10 @@ class LocalWorker:
                     try:
                         proc.wait()
                         supervised.mark_finished(proc.returncode)
+                        if proc.returncode != 0:
+                            elapsed = time.time() - supervised.start_time
+                            if elapsed < 60:
+                                self._signature_tracker.setdefault(sig_key, []).append(time.time())
                     except Exception:
                         pass
 
@@ -2982,44 +3000,40 @@ class LocalWorker:
 
                 supervised = self._supervised_jobs.get(job_id)
                 if supervised is None:
-                    return ExecutionResult(success=True, data={
-                        "status": "finished",
-                        "exit_code": None,
-                        "stdout_tail": "",
-                        "stderr_tail": f"Job {job_id} no longer tracked.",
-                        "elapsed_s": 0,
-                        "output_lines": 0,
-                        "events": [],
-                        "fps": 0.0,
-                        "ws": 0.0,
-                        "resource_snapshot": {},
-                        "progress": {},
-                        "milestones": [],
-                    })
+                    return ExecutionResult(
+                        success=False,
+                        error=f"Job {job_id} is not tracked (already finished or never started).",
+                    )
+
+                meta_update = request.payload.get("metadata_update")
+                if meta_update and isinstance(meta_update, dict):
+                    if "max_silent_s" in meta_update:
+                        new_val = meta_update["max_silent_s"]
+                        old_val = supervised.metadata.max_silent_s
+                        if new_val is not None:
+                            supervised.metadata.max_silent_s = float(new_val)
+                        else:
+                            supervised.metadata.max_silent_s = None
+                        print(f"  [watch] job={job_id} max_silent_s updated: {old_val} -> {supervised.metadata.max_silent_s}", flush=True)
 
                 # Wait loop: block up to wait_s for exit or new events
                 proc = self._running_processes.get(job_id)
                 deadline = time.time() + wait_s
 
                 while time.time() < deadline:
-                    if supervised.status != "running":
+                    if supervised.state.value not in ("starting", "running"):
                         break
                     if supervised.event_queue:
                         break
                     if proc and proc.poll() is not None:
-                        if supervised.status == "running":
-                            supervised.mark_finished(proc.returncode)
+                        supervised.mark_finished(proc.returncode)
                         break
                     time.sleep(0.5)
 
-                # Final check
-                if proc and proc.poll() is not None and supervised.status == "running":
-                    supervised.mark_finished(proc.returncode)
-
                 # Force a final output scan when the process is done so we
                 # don't miss metrics printed in the last moments before exit.
-                if supervised.status in ("finished", "failed", "killed"):
-                    supervised._scan_output()
+                if supervised.state.value in ("finished", "failed", "killed"):
+                    supervised._check_output()
 
                 drain = request.payload.get("drain_events", True)
                 response = supervised.build_poll_response(tail_lines=tail_lines, drain=drain)
@@ -3038,11 +3052,18 @@ class LocalWorker:
                     })
 
                 if proc.poll() is None:
-                    proc.terminate()
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except (OSError, AttributeError):
+                        proc.terminate()
+                        
                     try:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except (OSError, AttributeError):
+                            proc.kill()
                         proc.wait(timeout=2)
 
                     if self.engine == "docker" and self.sandbox and self.sandbox.available:
