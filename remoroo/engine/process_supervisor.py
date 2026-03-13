@@ -412,7 +412,7 @@ class SupervisedJob:
         """Fire SILENT_TIMEOUT if no output or file activity past the LLM-declared limit."""
         if self.metadata.max_silent_s is None:
             return
-        effective_limit = self.metadata.max_silent_s * 1.10
+        effective_limit = self.metadata.max_silent_s * 1.25
         silent_for = time.time() - self._last_new_output_time
         if silent_for <= effective_limit:
             return
@@ -430,7 +430,7 @@ class SupervisedJob:
                 pass
 
         self._emit("SILENT_TIMEOUT",
-                    f"No stdout or file activity for {silent_for:.0f}s (limit: {self.metadata.max_silent_s:.0f}s + 10% margin)",
+                    f"No stdout or file activity for {silent_for:.0f}s (limit: {self.metadata.max_silent_s:.0f}s + 25% margin)",
                     {"silent_for_s": round(silent_for, 1), "max_silent_s": self.metadata.max_silent_s})
         self._last_new_output_time = time.time()  # debounce
 
