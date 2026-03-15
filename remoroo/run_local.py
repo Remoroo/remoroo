@@ -22,6 +22,7 @@ def run_local_worker(
     engine: str = "docker",
     verbose: bool = False,
     cache_env: bool = False,
+    in_place: bool = False,
     agentic: bool = False,
     engine_version: str = "v2",
 ) -> LocalRunResult:
@@ -261,11 +262,10 @@ def run_local_worker(
         original_repo_root=original_repo_path, 
         run_id=remote_run_id,
         engine=engine,
-        # v16: Persistence Dir (CLI Cache) for real-time mirroring
         persistence_dir=str(artifact_dir),
-        # Early instance might not have Live console yet, but we'll set it in the loop
         output_callback=console.print,
-        cache_env=cache_env  # Enable environment caching
+        cache_env=cache_env,
+        in_place=in_place,
     )
     
     final_result = None
@@ -578,8 +578,8 @@ def run_local_worker(
                 # 5. Handle Context Switching (Working Copy)
                 if step.type == "create_working_copy" and result.success:
                      new_root = result.data.get("working_path")
-                     if new_root:
-                         # CLEANUP PREVIOUS EPHEMERAL WORKSPACE (if any)
+                     is_in_place = result.data.get("in_place", False)
+                     if new_root and not is_in_place:
                          try:
                              worker_service.handle_request(ExecutionRequest(type="cleanup_working_copy", payload={}))
                          except Exception:
@@ -587,13 +587,13 @@ def run_local_worker(
 
                          worker_service = WorkerService(
                              repo_root=new_root, 
-                             artifact_dir=None, # v12: Use Ephemeral Artifacts (default) so 'ls' works
+                             artifact_dir=None,
                              original_repo_root=original_repo_path, 
                              run_id=remote_run_id,
                              engine=engine, output_callback=live.console.print,
-                             # v16: Persistence Dir (CLI Cache)
                              persistence_dir=str(artifact_dir),
-                             cache_env=cache_env  # Enable environment caching
+                             cache_env=cache_env,
+                             in_place=in_place,
                          )
                          live.console.print(f"[bold yellow]🔄 Switched execution context to:[/bold yellow] [dim]{new_root}[/dim]")
 

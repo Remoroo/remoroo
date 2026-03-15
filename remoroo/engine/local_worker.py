@@ -37,16 +37,14 @@ class LocalWorker:
     Handles ExecutionRequests and returns ExecutionResults.
     """
     
-    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None, system: Optional[SystemInterface] = None, persistence_dir: Optional[str] = None, cache_env: bool = False, sandbox_override: Optional[Any] = None):
+    def __init__(self, repo_root: str, artifact_dir: str, original_repo_root: Optional[str] = None, run_id: Optional[str] = None, engine: str = "docker", output_callback: Optional[Callable] = None, system: Optional[SystemInterface] = None, persistence_dir: Optional[str] = None, cache_env: bool = False, sandbox_override: Optional[Any] = None, in_place: bool = False):
         self.system = system or RealSystem()
         self.output_callback = output_callback
-        # self._log("🔧 LocalWorker (v4-Airtight) Loaded")
         
         self.repo_root = repo_root
-        self.original_repo_root = original_repo_root or repo_root # Keep reference to original
-        # Infer is_ephemeral if repo_root is different from original_repo_root
-        self.is_ephemeral = (self.repo_root != self.original_repo_root) 
-        self.is_ephemeral = (self.repo_root != self.original_repo_root) 
+        self.original_repo_root = original_repo_root or repo_root
+        self.in_place = in_place
+        self.is_ephemeral = (not in_place) and (self.repo_root != self.original_repo_root)
         
         # UNIVERSAL PATH LOGIC (v9)
         # If no artifact_dir provided, default to repo_root/artifacts
@@ -64,7 +62,7 @@ class LocalWorker:
         self.cache_env = cache_env  # Enable environment caching (skip already-installed packages)
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
         
-        # Initialize Sandbox
+        # Initialize Sandbox — always have one (Docker or Venv).
         # sandbox_override takes priority — used by harbor/test adapters to inject a custom sandbox.
         self.sandbox = None
         if sandbox_override is not None:
@@ -74,7 +72,8 @@ class LocalWorker:
             from .sandbox import DockerSandbox
             self.sandbox = DockerSandbox(repo_root, artifact_dir, cache_env=cache_env)
         else:
-            self._log(f"ℹ️  Execution Engine: {self.engine.upper()} (Sandbox Disabled)")
+            self.sandbox = VenvSandbox(repo_root, system=self.system)
+            self._log(f"ℹ️  Execution Engine: VENV (local sandbox)")
 
         
         # Async Execution Tracking
@@ -183,6 +182,16 @@ class LocalWorker:
         return metrics
 
         
+    def _recreate_sandbox(self, repo_root: str):
+        """Stop the current sandbox and create a fresh one for the given repo_root."""
+        if self.sandbox:
+            self.sandbox.stop()
+        if self.engine == "docker":
+            from .sandbox import DockerSandbox
+            self.sandbox = DockerSandbox(repo_root, self.artifact_dir, cache_env=self.cache_env)
+        else:
+            self.sandbox = VenvSandbox(repo_root, system=self.system)
+
     def _reclaim_ownership(self, path: str):
         """Helper to reclaim host ownership of files created by Docker root."""
         if self.engine == "docker" and self.sandbox and self.sandbox.available:
@@ -358,23 +367,17 @@ class LocalWorker:
         """
         env = os.environ.copy()
         
-        # 1. Inject Venv PATH
-        # We check for 'venv' or '.venv' in repo_root
-        for venv_name in ["venv", ".venv"]:
+        # 1. Inject Venv PATH — check .venv first (modern default), then venv
+        for venv_name in [".venv", "venv"]:
             venv_path = os.path.join(self.repo_root, venv_name)
             if os.path.isdir(venv_path):
-                # Determine bin dir (bin on Linux/Mac, Scripts on Windows)
-                import sys
                 bin_name = "Scripts" if sys.platform == "win32" else "bin"
                 bin_path = os.path.join(venv_path, bin_name)
                 
                 if os.path.isdir(bin_path):
-                    # Prepend to PATH
                     current_path = env.get("PATH", "")
                     env["PATH"] = f"{bin_path}{os.pathsep}{current_path}"
-                    # Also set VIRTUAL_ENV
                     env["VIRTUAL_ENV"] = venv_path
-                    # Remove PYTHONHOME if set (interference)
                     if "PYTHONHOME" in env:
                         del env["PYTHONHOME"]
                     break
@@ -382,11 +385,10 @@ class LocalWorker:
         # 2. Inject Remoroo defaults
         env["PYTHONUNBUFFERED"] = "1"
         
-        # 3. Headless Operation (Phase 1 Resilience)
-        # Prevent GUI apps (like Pygame or Qt) from hanging or crashing in cloud workers
+        # 3. Headless Operation
         env["SDL_VIDEODRIVER"] = "dummy"
         env["QT_QPA_PLATFORM"] = "offscreen"
-        env["DISPLAY"] = ":99" # Virtual display placeholder
+        env["DISPLAY"] = ":99"
         
         # 4. Apply extra env from request
         if extra_env:
@@ -394,15 +396,46 @@ class LocalWorker:
                 if k:
                     env[str(k)] = str(v)
         
-        # 5. Final Enforced Defaults (Override requested path if it's a Docker path in a local worker)
-        # We enforce the host-path artifacts dir for the local worker.
-        # CRITICAL: Use the absolute host path here to ensure robustness even if symlinks fail.
+        # 5. Enforce artifacts dir
         if self.artifact_dir:
             env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
         else:
             env["REMOROO_ARTIFACTS_DIR"] = os.path.join(self.repo_root, "artifacts")
                     
         return env
+
+    def _build_exec_env(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """
+        Single source of truth for building execution environment.
+        Works for both Docker and Venv modes.
+
+        Docker: starts from a minimal env (the container already has its own).
+        Venv:   starts from host env with venv PATH injected.
+        """
+        if self.engine == "docker":
+            env = (extra_env or {}).copy()
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            env.setdefault("REMOROO_ARTIFACTS_DIR", self.artifact_dir)
+            env.setdefault("SDL_VIDEODRIVER", "dummy")
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env.setdefault("DISPLAY", ":99")
+            return env
+        else:
+            return self._get_worker_env(extra_env)
+
+    def _make_runner(self, workdir: Optional[str] = None):
+        """Return a runner_factory callable compatible with executor/harness."""
+        wd = workdir or self.repo_root
+        if self.engine == "docker":
+            return lambda c, env=None: self.sandbox.exec_popen(c, env=env or {}, workdir=wd)
+        else:
+            return lambda c, env=None: self.sandbox.exec_popen(
+                c, env=env or {}, workdir=wd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
 
     def _handle_request_internal(self, request: ExecutionRequest) -> ExecutionResult:
         """Dispatch request to appropriate Worker method."""
@@ -497,14 +530,10 @@ class LocalWorker:
                 p = request.payload
                 timeout = p.get("timeout", 300)  # Default 5 minutes for installs
                 
-                # P0 Safer Sandbox: Always use Sandbox if available
                 if self.sandbox and self.sandbox.available:
-                    # Simplified Sandbox Install
-                    # We just run install commands inside container
                     install_commands = p.get("install_commands", [])
                     cmds_to_run = []
                     
-                    # Basic auto-detect logic for sandbox
                     if not install_commands and not p.get("skip_auto_install", False):
                         if os.path.exists(os.path.join(self.repo_root, "requirements.txt")):
                             cmds_to_run.append("pip install -r requirements.txt")
@@ -521,18 +550,12 @@ class LocalWorker:
                     last_error = None
                     start_t = os.times().elapsed
                     
-                    # Ensure container running
                     self.sandbox.start()
-                    
-                    # Use streaming execution with progress output
-                    def sandbox_runner(cmd, env=None):
-                        return self.sandbox.exec_popen(cmd, env=env or {})
-                    
-                    exec_env = self._get_worker_env()
+                    exec_env = self._build_exec_env()
+                    runner = self._make_runner()
                     
                     for cmd in cmds_to_run:
                         self._log(f"📦 Sandbox Install: {cmd}")
-                        # Use executor with streaming output
                         outcome = executor.run_command_with_timeout(
                             cmd=cmd,
                             cwd=self.repo_root,
@@ -540,7 +563,7 @@ class LocalWorker:
                             show_progress=True,
                             output_callback=self.output_callback,
                             env=exec_env,
-                            runner_factory=sandbox_runner
+                            runner_factory=runner
                         )
                         setup_log.append(f"> {cmd}\n{outcome.get('stdout', '')}\n{outcome.get('stderr', '')}")
                         outcomes.append({
@@ -593,20 +616,14 @@ class LocalWorker:
                 cmd = p.get("smoke_test_cmd", "")
                 timeout = p.get("timeout_s", 30)
                 
-                runner = None
-                if self.sandbox and self.sandbox.available:
-                    def sandbox_runner(cmd, env=None):
-                        return self.sandbox.exec_popen(cmd, env=env or {})
-                    runner = sandbox_runner
-                
                 outcome = executor.run_command_with_timeout(
                     cmd=cmd,
                     cwd=self.repo_root,
                     timeout_s=timeout,
                     show_progress=True,
                     output_callback=self.output_callback,
-                    env=self._get_worker_env(),
-                    runner_factory=runner
+                    env=self._build_exec_env(),
+                    runner_factory=self._make_runner()
                 )
                 
                 return ExecutionResult(success=True, data={
@@ -620,13 +637,8 @@ class LocalWorker:
                 commands = p.get("commands", [])
                 timeout = p.get("timeout_s", 120)
                 
-                runner = None
-                if self.sandbox and self.sandbox.available:
-                    def sandbox_runner(cmd, env=None):
-                        return self.sandbox.exec_popen(cmd, env=env or {})
-                    runner = sandbox_runner
-                
-                exec_env = self._get_worker_env()
+                runner = self._make_runner()
+                exec_env = self._build_exec_env()
                 
                 outcomes = []
                 success = True
@@ -861,30 +873,8 @@ class LocalWorker:
                 
                 # Setup Sandbox/Runner
                 runner_factory = None
-                if self.engine == "docker" and self.sandbox and self.sandbox.available:
-                    # Inside Docker: use mirrored host path (Zero-Mapping)
-                    env_vars["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
-                    env_vars["PYTHONUNBUFFERED"] = "1"
-                    # Add headless variables to Docker too
-                    env_vars["SDL_VIDEODRIVER"] = "dummy"
-                    env_vars["QT_QPA_PLATFORM"] = "offscreen"
-                    env_vars["DISPLAY"] = ":99"
-                    runner_factory = lambda c, env=None: self.sandbox.exec_popen(c, env=env or {}, workdir=self.repo_root)
-                else:
-                    # Local/Venv Mode
-                    env_vars = self._get_worker_env(env_vars)
-                    # UNIVERSAL ENFORCEMENT: Always overwrite REMOROO_ARTIFACTS_DIR
-                    env_vars["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
-                    
-                    venv_sandbox = VenvSandbox(self.repo_root, system=self.system)
-                    runner_factory = lambda c, env=None, sp=subprocess: venv_sandbox.exec_popen(
-                        c, 
-                        env=env or {}, 
-                        shell=True,
-                        stdout=sp.PIPE,
-                        stderr=sp.PIPE,
-                        text=True
-                    )
+                env_vars = self._build_exec_env(env_vars)
+                runner_factory = self._make_runner()
                 
                 harness = RemorooHarness(system=self.system)
                 outcomes = []
@@ -1424,10 +1414,13 @@ class LocalWorker:
                 return ExecutionResult(success=True, data=dataclasses.asdict(res))
 
             elif request.type == "create_working_copy":
+                if self.in_place:
+                    self._log("ℹ️  In-place mode: editing original repo directly (no working copy)")
+                    return ExecutionResult(success=True, data={"working_path": self.repo_root, "in_place": True})
+
                 run_id = request.payload.get("run_id") or f"run-{uuid.uuid4().hex[:8]}"
                 source_path = request.payload.get("source_path") or self.original_repo_root
                 
-                # Create ephemeral path
                 temp_dir = os.path.join(tempfile.gettempdir(), f"remoroo_worktree_{run_id}")
                 
                 # Cleanup if exists (unlikely but safe)
@@ -1534,12 +1527,8 @@ class LocalWorker:
                     self.repo_root = temp_dir
                     self.is_ephemeral = True
                     
-                    # Also need to update sub-components that hold repo_root refs
                     self.worker.repo_root = temp_dir
-                    if self.sandbox:
-                        self.sandbox.stop()
-                        from .sandbox import DockerSandbox
-                        self.sandbox = DockerSandbox(self.repo_root, self.artifact_dir, cache_env=self.cache_env)
+                    self._recreate_sandbox(self.repo_root)
                     
                     return ExecutionResult(success=True, data={"working_path": self.repo_root})
                 except Exception as e:
@@ -1585,9 +1574,7 @@ class LocalWorker:
                         if self.sandbox:
                             self._log("   🛑 Stopping Sandbox...")
                             self.sandbox.stop()
-                            # Replace with fresh one for future use (if needed)
-                            from .sandbox import DockerSandbox
-                            self.sandbox = DockerSandbox(self.original_repo_root, self.artifact_dir, cache_env=self.cache_env)
+                            self._recreate_sandbox(self.original_repo_root)
 
                         # 3. DELETE DIRECTORY
                         shutil.rmtree(self.repo_root)
@@ -1900,16 +1887,6 @@ class LocalWorker:
                 
                 execution_id = f"exec-{uuid.uuid4().hex[:8]}"
                 
-                # Build execution environment
-                # CRITICAL: Separate Host vs Docker env logic
-                
-                # Default to safe empty env for Docker, overlay payload
-                docker_env = request.payload.get("env", {}).copy()
-                docker_env["PYTHONUNBUFFERED"] = "1"
-                
-                # For Local, we need full host env + venv
-                local_env = self._get_worker_env(request.payload.get("env", {}))
-                
                 try:
                     # Log files for async output
                     stdout_buffer = []
@@ -1930,39 +1907,8 @@ class LocalWorker:
                     # self._log(f"   📂 Repo Root: {self.repo_root}")
                     # self._log(f"   📂 Artifact Dir: {self.artifact_dir} (Exists: {os.path.exists(self.artifact_dir)})")
 
-                    # Select Sandbox Factory
-                    sandbox_factory = None
-                    final_env = {}
-                    
-                    if self.engine == "docker" and self.sandbox and self.sandbox.available:
-                        # Docker Mode
-                        # v13: Mirrored Host Path (Zero-Mapping)
-                        docker_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
-                        docker_env["SDL_VIDEODRIVER"] = "dummy"
-                        docker_env["QT_QPA_PLATFORM"] = "offscreen"
-                        docker_env["DISPLAY"] = ":99"
-                        
-                        final_env = docker_env
-                        # self._log(f"   🐳 Docker Mode. Env artifact dir: {docker_env['REMOROO_ARTIFACTS_DIR']}")
-                        
-                        sandbox_factory = lambda c, env=None: self.sandbox.exec_popen(c, env=final_env, workdir=self.repo_root)
-                    else:
-                        # Local/Venv Mode
-                        # CRITICAL: Must point to absolute path on host so code writes where Harness looks
-                        local_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
-                        final_env = local_env
-                        
-                        venv_sandbox = VenvSandbox(self.repo_root, system=self.system)
-                        # VenvSandbox calls proc.spawn.
-                        # CRITICAL: Harness needs stdout/stderr PIPEs to capture output!
-                        sandbox_factory = lambda c, env=None: venv_sandbox.exec_popen(
-                            c, 
-                            env=env or {}, 
-                            shell=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True
-                        )
+                    final_env = self._build_exec_env(request.payload.get("env", {}))
+                    sandbox_factory = self._make_runner()
 
                     # Thread-safe kill bridge: Brain sets this event via kill_command RPC,
                     # Harness checks it in its 0.1s supervision loop and executes _terminate_ladder.
@@ -2650,26 +2596,9 @@ class LocalWorker:
 
                 job_id = f"job-{uuid.uuid4().hex[:8]}"
 
-                # Use the same sandbox/env infrastructure as run_command_async
-                if self.engine == "docker" and self.sandbox and self.sandbox.available:
-                    docker_env = env_vars.copy()
-                    docker_env["PYTHONUNBUFFERED"] = "1"
-                    docker_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
-                    docker_env["SDL_VIDEODRIVER"] = "dummy"
-                    docker_env["QT_QPA_PLATFORM"] = "offscreen"
-                    docker_env["DISPLAY"] = ":99"
-                    proc = self.sandbox.exec_popen(cmd, env=docker_env, workdir=cwd)
-                else:
-                    local_env = self._get_worker_env(env_vars)
-                    local_env["PYTHONUNBUFFERED"] = "1"
-                    local_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
-                    local_env["SDL_VIDEODRIVER"] = "dummy"
-                    local_env["QT_QPA_PLATFORM"] = "offscreen"
-                    venv_sandbox = VenvSandbox(self.repo_root, system=self.system)
-                    proc = venv_sandbox.exec_popen(
-                        cmd, env=local_env, shell=True,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    )
+                run_env = self._build_exec_env(env_vars)
+                runner = self._make_runner(cwd)
+                proc = runner(cmd, env=run_env)
 
                 buffer = collections.deque(maxlen=10000)
 
@@ -2845,25 +2774,9 @@ class LocalWorker:
                 stdout_buf = collections.deque(maxlen=50000)
                 stderr_buf = collections.deque(maxlen=10000)
 
-                if self.engine == "docker" and self.sandbox and self.sandbox.available:
-                    run_env = env_vars.copy()
-                    run_env["PYTHONUNBUFFERED"] = "1"
-                    run_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
-                    run_env["SDL_VIDEODRIVER"] = "dummy"
-                    run_env["QT_QPA_PLATFORM"] = "offscreen"
-                    run_env["DISPLAY"] = ":99"
-                    proc = self.sandbox.exec_popen(cmd, env=run_env, workdir=cwd)
-                else:
-                    run_env = self._get_worker_env(env_vars)
-                    run_env["PYTHONUNBUFFERED"] = "1"
-                    run_env["REMOROO_ARTIFACTS_DIR"] = self.artifact_dir
-                    run_env["SDL_VIDEODRIVER"] = "dummy"
-                    run_env["QT_QPA_PLATFORM"] = "offscreen"
-                    venv_sandbox = VenvSandbox(self.repo_root, system=self.system)
-                    proc = venv_sandbox.exec_popen(
-                        cmd, env=run_env, shell=True,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    )
+                run_env = self._build_exec_env(env_vars)
+                runner = self._make_runner(cwd)
+                proc = runner(cmd, env=run_env)
 
                 log_cb = self.output_callback
 
