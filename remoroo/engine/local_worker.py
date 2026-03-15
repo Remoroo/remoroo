@@ -2575,47 +2575,13 @@ class LocalWorker:
                     repo_root = request.payload.get("repo_root", self.repo_root)
                     max_results = request.payload.get("max_results", 20)
 
-                    query_tokens = set(query.lower().replace("_", " ").replace("-", " ").split())
-
-                    ext_affinity = {
-                        ".py": {"python", "train", "model", "test", "api", "server", "script"},
-                        ".ts": {"typescript", "component", "frontend", "ui", "react", "api"},
-                        ".tsx": {"typescript", "component", "frontend", "ui", "react"},
-                        ".js": {"javascript", "frontend", "ui", "script", "api"},
-                        ".go": {"go", "server", "handler", "api", "middleware"},
-                        ".rs": {"rust", "server", "handler", "parser"},
-                        ".java": {"java", "service", "controller", "handler"},
-                    }
-
-                    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".remoroo",
-                                 ".tox", ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs"}
-
-                    scored = []
-                    for root, dirs, files in os.walk(repo_root):
-                        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
-                        for fname in files:
-                            rel = os.path.relpath(os.path.join(root, fname), repo_root)
-                            _, ext = os.path.splitext(fname)
-                            path_tokens = set(rel.lower().replace("/", " ").replace("_", " ").replace("-", " ").replace(".", " ").split())
-                            jaccard = len(query_tokens & path_tokens) / max(len(query_tokens | path_tokens), 1)
-                            ext_bonus = 0.1 if ext in ext_affinity and query_tokens & ext_affinity[ext] else 0
-                            score = jaccard + ext_bonus
-                            if score > 0:
-                                scored.append({"path": rel, "score": round(score, 3), "skeleton": ""})
-
-                    scored.sort(key=lambda x: -x["score"])
-                    top = scored[:max_results]
-
-                    for entry in top[:10]:
-                        try:
-                            if hasattr(self, "_repo_indexer") and self._repo_indexer:
-                                skel = self._repo_indexer.get_snippet(entry["path"], "module_level")
-                                if skel:
-                                    entry["skeleton"] = skel[:500]
-                        except Exception:
-                            pass
-
-                    return ExecutionResult(success=True, data={"files": top})
+                    from .core.code_search import get_or_build_index
+                    idx = get_or_build_index(repo_root)
+                    results = idx.search(query, max_results=max_results)
+                    return ExecutionResult(success=True, data={
+                        "files": results,
+                        "index_stats": idx.stats,
+                    })
                 except Exception as e:
                     return ExecutionResult(success=False, error=f"scan_repo failed: {e}")
 
