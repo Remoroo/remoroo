@@ -1707,7 +1707,7 @@ class LocalWorker:
                          with open(persist_path, 'w', encoding='utf-8') as f:
                              f.write(content)
 
-                     log_skip_files = {"checkpoint.json", "run_manifest.json", "trace.jsonl"}
+                     log_skip_files = {"checkpoint.json", "run_manifest.json", "trace.jsonl", "run_state.json"}
 
                      if Path(target_path).name not in log_skip_files:
                          self._log("   ✅ File written successfully")
