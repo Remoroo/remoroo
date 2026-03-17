@@ -229,6 +229,11 @@ class SupervisedJob:
                 self._last_file_sizes[path] = os.stat(path).st_size
             except OSError:
                 self._last_file_sizes[path] = 0
+        if self.metadata.redirect_output_file and self.metadata.redirect_output_file not in self._last_file_sizes:
+            try:
+                self._last_file_sizes[self.metadata.redirect_output_file] = os.stat(self.metadata.redirect_output_file).st_size
+            except OSError:
+                self._last_file_sizes[self.metadata.redirect_output_file] = 0
 
         self._log_config()
 
@@ -254,6 +259,8 @@ class SupervisedJob:
             print(f"  [watch] job={self.job_id} readiness_regex={self.metadata.readiness_regex}", flush=True)
         if self.metadata.readiness_port:
             print(f"  [watch] job={self.job_id} readiness_port={self.metadata.readiness_port}", flush=True)
+        if self._output_deferred_until_exit():
+            print(f"  [watch] job={self.job_id} output_deferred_until_exit (pipe to tail) — SILENT_TIMEOUT disabled", flush=True)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -396,9 +403,16 @@ class SupervisedJob:
                         self._emit("ERROR_SIGNATURE", f"Detected {sig_id} in stderr",
                                    {"signature_id": sig_id, "line": stripped[:200]})
 
+    def _paths_to_watch(self) -> List[str]:
+        """All paths that count as 'activity' for silence detection (file_watch_paths + redirect_output_file)."""
+        paths = list(self.metadata.file_watch_paths)
+        if self.metadata.redirect_output_file and self.metadata.redirect_output_file not in paths:
+            paths.append(self.metadata.redirect_output_file)
+        return paths
+
     def _check_files(self) -> None:
         """Check watched files for growth — resets silence timer."""
-        for path in self.metadata.file_watch_paths:
+        for path in self._paths_to_watch():
             try:
                 size = os.stat(path).st_size
                 prev = self._last_file_sizes.get(path, 0)
@@ -408,17 +422,25 @@ class SupervisedJob:
             except OSError:
                 pass
 
+    def _output_deferred_until_exit(self) -> bool:
+        """True if stdout only appears when the pipeline exits (e.g. cmd | tail -30)."""
+        return "| tail" in self.command
+
     def _check_silent(self) -> None:
         """Fire SILENT_TIMEOUT if no output or file activity past the LLM-declared limit."""
         if self.metadata.max_silent_s is None:
+            return
+        # Pipelines like "python train.py | tail -30" produce no stdout until the pipeline
+        # closes; do not treat expected silence as a hang.
+        if self._output_deferred_until_exit():
             return
         effective_limit = self.metadata.max_silent_s * 1.25
         silent_for = time.time() - self._last_new_output_time
         if silent_for <= effective_limit:
             return
 
-        # Double-check file watches right now before firing
-        for path in self.metadata.file_watch_paths:
+        # Double-check all watched paths (file_watch_paths + redirect_output_file)
+        for path in self._paths_to_watch():
             try:
                 size = os.stat(path).st_size
                 prev = self._last_file_sizes.get(path, 0)
@@ -428,6 +450,24 @@ class SupervisedJob:
                     return
             except OSError:
                 pass
+
+        # When stdout is redirected to a file, the process may be line-buffered or block-buffered;
+        # the file might not have grown at our last poll. Give it one short delay then re-check
+        # to avoid false SILENT_TIMEOUT while the process is actively appending.
+        if self.metadata.redirect_output_file:
+            self._stop_event.wait(timeout=2.0)
+            if self._stop_event.is_set():
+                return
+            for path in self._paths_to_watch():
+                try:
+                    size = os.stat(path).st_size
+                    prev = self._last_file_sizes.get(path, 0)
+                    if size > prev:
+                        self._last_new_output_time = time.time()
+                        self._last_file_sizes[path] = size
+                        return
+                except OSError:
+                    pass
 
         self._emit("SILENT_TIMEOUT",
                     f"No stdout or file activity for {silent_for:.0f}s (limit: {self.metadata.max_silent_s:.0f}s + 25% margin)",

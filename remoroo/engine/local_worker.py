@@ -31,6 +31,21 @@ from .venv_sandbox import VenvSandbox
 from .harness import RemorooHarness
 from .utils.system_interface import SystemInterface, RealSystem
 
+# Used by interrupt handler to kill background jobs when CLI receives SIGINT/SIGTERM
+_current_worker: Optional["LocalWorker"] = None
+
+
+def _interrupt_handler(signum: int, frame: Any) -> None:
+    """On SIGINT/SIGTERM: kill all worker child processes then exit."""
+    global _current_worker
+    if _current_worker:
+        try:
+            _current_worker.kill_all_background_jobs()
+        except Exception:
+            pass
+    raise KeyboardInterrupt()
+
+
 class LocalWorker:
     """
     Service entrypoint for Validated Execution.
@@ -85,6 +100,20 @@ class LocalWorker:
         self._interactive_sessions: Dict[str, Any] = {} # Store pexpect sessions
         self._supervised_jobs: Dict[str, Any] = {}  # job_id → SupervisedJob
         self._signature_tracker: Dict[str, List[float]] = {}  # cmd_signature -> list of crash timestamps
+
+        # So that Ctrl+C kills training (and other) child processes instead of orphaning them
+        global _current_worker
+        _current_worker = self
+        try:
+            signal.signal(signal.SIGINT, _interrupt_handler)
+        except (ValueError, OSError):
+            pass  # e.g. not main thread or Windows
+        if getattr(signal, "SIGTERM", None) is not None:
+            try:
+                signal.signal(signal.SIGTERM, _interrupt_handler)
+            except (ValueError, OSError):
+                pass
+
     def _log(self, message: str):
         """Internal logger that redirects to output_callback or standard print."""
         if self.output_callback:
@@ -436,6 +465,57 @@ class LocalWorker:
                 stderr=subprocess.PIPE,
                 text=True,
             )
+
+    def kill_all_background_jobs(self) -> None:
+        """Terminate all running background jobs (e.g. training). Call on SIGINT/SIGTERM so children don't outlive the CLI."""
+        if not self._running_processes:
+            return
+        self._log("🛑 Interrupt: killing background jobs...")
+        for job_id in list(self._running_processes.keys()):
+            proc = self._running_processes.get(job_id)
+            supervised = self._supervised_jobs.get(job_id)
+            if proc is None:
+                continue
+            if proc.poll() is not None:
+                self._running_processes.pop(job_id, None)
+                self._supervised_jobs.pop(job_id, None)
+                self._execution_buffers.pop(job_id, None)
+                continue
+            try:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (OSError, AttributeError):
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (OSError, AttributeError):
+                        proc.kill()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+            except Exception:
+                pass
+            if supervised:
+                try:
+                    supervised.mark_killed()
+                    supervised.stop_monitoring()
+                except Exception:
+                    pass
+            if self.engine == "docker" and self.sandbox and self.sandbox.available and supervised:
+                try:
+                    cmd_str = getattr(supervised, "command", "") or ""
+                    if cmd_str:
+                        self.sandbox.kill_process_by_command(cmd_str)
+                except Exception:
+                    pass
+            self._running_processes.pop(job_id, None)
+            self._execution_buffers.pop(job_id, None)
+            self._supervised_jobs.pop(job_id, None)
+        self._log("   Background jobs terminated.")
 
     def _handle_request_internal(self, request: ExecutionRequest) -> ExecutionResult:
         """Dispatch request to appropriate Worker method."""
@@ -1284,16 +1364,14 @@ class LocalWorker:
                 })
 
             elif request.type == "execute_command":
-                # Direct command execution
+                # Direct command execution (grep, list_dir, etc.)
                 cmd = request.payload.get("command", "")
                 timeout = request.payload.get("timeout_s")
                 env_vars = request.payload.get("env", {})
-                
-                runner = None
-                if self.sandbox and self.sandbox.available:
-                    def sandbox_runner(cmd, env=None):
-                        return self.sandbox.exec_popen(cmd, env=env or {})
-                    runner = sandbox_runner
+                # Use same runner as harness: workdir=repo_root (worktree when in a run) and shell=True
+                # so shell commands like "rg ... || grep ..." run correctly; ad-hoc runner without
+                # shell=True caused Errno 2 (whole string treated as executable name).
+                runner = self._make_runner(self.repo_root) if (self.sandbox and self.sandbox.available) else None
 
                 # Ensure artifacts directory exists for the script to use
                 artifacts_path = os.path.join(self.repo_root, "artifacts")
@@ -2814,6 +2892,8 @@ class LocalWorker:
                     abs_redirect = os.path.join(cwd, redirect_file) if not os.path.isabs(redirect_file) else redirect_file
                     if abs_redirect not in file_watches:
                         file_watches.append(abs_redirect)
+                    # Unbuffered Python so redirect file grows on each print (avoids false SILENT_TIMEOUT)
+                    run_env["PYTHONUNBUFFERED"] = "1"
 
                 metadata = JobMetadata(
                     expected_kind=raw_meta.get("expected_kind", "unknown"),
