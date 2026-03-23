@@ -16,14 +16,74 @@ from __future__ import annotations
 import collections
 import dataclasses
 import os
+import signal
 import re
 import socket
 import threading
 import time
 import traceback
+import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Child process enumeration (portable)
+# ---------------------------------------------------------------------------
+
+
+def _get_child_pids(parent_pid: int) -> Set[int]:
+    """Return direct child PIDs of parent_pid. Works on Linux and macOS."""
+    try:
+        # ps ax -o pid=,ppid= is widely portable; we filter for ppid==parent
+        result = subprocess.run(
+            ["ps", "ax", "-o", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return set()
+        children: Set[int] = set()
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(None, 1)
+            if len(parts) >= 2:
+                try:
+                    pid, ppid = int(parts[0]), int(parts[1])
+                    if ppid == parent_pid:
+                        children.add(pid)
+                except ValueError:
+                    pass
+        return children
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+
+
+def _count_processes_in_group(pgid: int) -> int:
+    """Count processes in the given process group. Returns 0 when group is gone (all exited).
+    Uses ps -o pid=,pgid= and filters; portable on Linux and macOS (BSD ps -g behaves differently)."""
+    try:
+        result = subprocess.run(
+            ["ps", "ax", "-o", "pid=,pgid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return 0
+        count = 0
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(None, 1)
+            if len(parts) >= 2:
+                try:
+                    if int(parts[1]) == pgid:
+                        count += 1
+                except ValueError:
+                    pass
+        return count
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +93,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 class JobState(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
+    BACKGROUND_FOLLOW = "background_follow"  # shell exited but background children still running
     FINISHED = "finished"
     FAILED = "failed"
     KILLED = "killed"
@@ -105,6 +166,26 @@ PRIMARY_EVENT_TYPES = set(EVENT_CONFIDENCE_THRESHOLDS.keys())
 _METRIC_KV_RE = re.compile(
     r"(\w[\w_]*)\s*[=:]\s*(-?[\d]+\.[\d]+|-?[\d]+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
 )
+
+
+def _redirect_target_from_command(command: str) -> Optional[str]:
+    """Infer stdout redirect filepath from shell command (aligned with bash tool auto-detect).
+
+    Matches `> file`, `>>file`, `&> file`, `| tee file`. Skips /dev/null.
+    Uses `\\s*` after the operator so `>run.log` works, not only `> run.log`.
+    """
+    if not command or not command.strip():
+        return None
+    matches = re.findall(
+        r"(?:^|\s)(?:>|>>|&>|\|\s*tee(?:\s+-a)?)\s*([^\s>&|;]+)",
+        command,
+    )
+    if not matches:
+        return None
+    last = matches[-1]
+    if last in ("/dev/null", "NUL"):
+        return None
+    return last
 
 
 def extract_metric_values(line: str) -> Dict[str, float]:
@@ -223,6 +304,8 @@ class SupervisedJob:
         self._readiness_re = re.compile(self.metadata.readiness_regex) if self.metadata.readiness_regex else None
         self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
+        self._background_pids: Set[int] = set()  # child PIDs when shell uses &; fallback when no PGID
+        self._shell_pgid: Optional[int] = None   # process group of shell; used to wait for whole tree
 
         for path in self.metadata.file_watch_paths:
             try:
@@ -235,7 +318,7 @@ class SupervisedJob:
             except OSError:
                 self._last_file_sizes[self.metadata.redirect_output_file] = 0
 
-        self._log_config()
+        # self._log_config()
 
     # ------------------------------------------------------------------
     # Transparent config logging
@@ -261,6 +344,8 @@ class SupervisedJob:
             print(f"  [watch] job={self.job_id} readiness_port={self.metadata.readiness_port}", flush=True)
         if self._output_deferred_until_exit():
             print(f"  [watch] job={self.job_id} output_deferred_until_exit (pipe to tail) — SILENT_TIMEOUT disabled", flush=True)
+        if self._has_background_ampersand():
+            print(f"  [watch] job={self.job_id} background_jobs=true — will track children after shell exits", flush=True)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -276,10 +361,18 @@ class SupervisedJob:
         self._stop_event.set()
 
     def mark_finished(self, exit_code: int, signal_num: Optional[int] = None) -> None:
-        if self.state in (JobState.KILLED, JobState.FINISHED, JobState.FAILED):
+        if self.state in (JobState.KILLED, JobState.FINISHED, JobState.FAILED, JobState.BACKGROUND_FOLLOW):
             return
         self.exit_code = exit_code
         self.exit_signal = signal_num
+
+        # If command used & and we have background children, don't emit yet — keep monitoring them
+        if self._has_background_ampersand() and (self._shell_pgid is not None or self._background_pids):
+            self.state = JobState.BACKGROUND_FOLLOW
+            track_msg = f"pgid={self._shell_pgid}" if self._shell_pgid else f"{len(self._background_pids)} PIDs"
+            print(f"  [watch] job={self.job_id} shell exited (code={exit_code}) — tracking {track_msg}", flush=True)
+            return  # Don't set _stop_event or emit; monitor loop continues
+
         self.state = JobState.FINISHED if exit_code == 0 else JobState.FAILED
         self._stop_event.set()
         etype = "COMPLETED" if exit_code == 0 else "FAILED"
@@ -287,9 +380,37 @@ class SupervisedJob:
                    {"exit_code": exit_code, "signal": signal_num,
                     "elapsed_s": round(time.time() - self.start_time, 1)})
 
+    def kill_background_children(self) -> None:
+        """Send SIGTERM then SIGKILL to background process group. Used when user kills during BACKGROUND_FOLLOW."""
+        if self._shell_pgid is not None:
+            try:
+                os.killpg(self._shell_pgid, signal.SIGTERM)
+            except OSError:
+                pass
+            time.sleep(2)
+            try:
+                os.killpg(self._shell_pgid, signal.SIGKILL)
+            except OSError:
+                pass
+            self._shell_pgid = None
+        for pid in list(self._background_pids):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(1)
+        for pid in list(self._background_pids):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        self._background_pids.clear()
+
     def mark_killed(self) -> None:
         if self.state in (JobState.KILLED, JobState.FINISHED, JobState.FAILED):
             return
+        if self.state == JobState.BACKGROUND_FOLLOW:
+            self.kill_background_children()
         self.state = JobState.KILLED
         self._stop_event.set()
 
@@ -317,9 +438,19 @@ class SupervisedJob:
             try:
                 if self.state == JobState.STARTING:
                     self._check_readiness()
-                self._check_output()
-                self._check_files()
-                self._check_silent()
+                elif self.state == JobState.BACKGROUND_FOLLOW:
+                    self._check_background_follow()
+                else:
+                    # RUNNING: capture PGID and children for background-follow (in case shell exits)
+                    if self._has_background_ampersand() and self.pid and self.pid > 0:
+                        self._background_pids = _get_child_pids(self.pid)
+                        try:
+                            self._shell_pgid = os.getpgid(self.pid)
+                        except (OSError, AttributeError):
+                            self._shell_pgid = None
+                    self._check_output()
+                    self._check_files()
+                    self._check_silent()
             except Exception:
                 print(f"  [watch] ERROR job={self.job_id}:\n{traceback.format_exc()}", flush=True)
             self._stop_event.wait(timeout=self.POLL_INTERVAL_S)
@@ -334,7 +465,7 @@ class SupervisedJob:
                 pass
         if not ready and self._readiness_re:
             try:
-                for line in list(self.stdout_buf)[-50:]:
+                for line in list(self.stdout_buf)[-500:]:  # transport cap only; no policy
                     if self._readiness_re.search(line):
                         ready = True
                         break
@@ -367,7 +498,7 @@ class SupervisedJob:
                     sig_id, confidence = err
                     if confidence >= EVENT_CONFIDENCE_THRESHOLDS.get("ERROR_SIGNATURE", 0.7):
                         self._emit("ERROR_SIGNATURE", f"Detected {sig_id} in stdout",
-                                   {"signature_id": sig_id, "line": stripped[:200]})
+                                   {"signature_id": sig_id, "line": stripped})  # full line; brain truncates with notice
 
                 if self.metadata.target_metrics:
                     metrics = extract_metric_values(stripped)
@@ -401,7 +532,7 @@ class SupervisedJob:
                     sig_id, confidence = err
                     if confidence >= EVENT_CONFIDENCE_THRESHOLDS.get("ERROR_SIGNATURE", 0.7):
                         self._emit("ERROR_SIGNATURE", f"Detected {sig_id} in stderr",
-                                   {"signature_id": sig_id, "line": stripped[:200]})
+                                   {"signature_id": sig_id, "line": stripped})  # full line; brain truncates with notice
 
     def _paths_to_watch(self) -> List[str]:
         """All paths that count as 'activity' for silence detection (file_watch_paths + redirect_output_file)."""
@@ -425,6 +556,11 @@ class SupervisedJob:
     def _output_deferred_until_exit(self) -> bool:
         """True if stdout only appears when the pipeline exits (e.g. cmd | tail -30)."""
         return "| tail" in self.command
+
+    def _has_background_ampersand(self) -> bool:
+        """True if the command backgrounds work with & (e.g. cmd1 & sleep 5). Excludes && (logical AND)."""
+        # Match " &" not followed by &, or "& " not preceded by &
+        return bool(re.search(r" &(?!&)|(?<![&])& ", self.command))
 
     def _check_silent(self) -> None:
         """Fire SILENT_TIMEOUT if no output or file activity past the LLM-declared limit."""
@@ -474,6 +610,36 @@ class SupervisedJob:
                     {"silent_for_s": round(silent_for, 1), "max_silent_s": self.metadata.max_silent_s})
         self._last_new_output_time = time.time()  # debounce
 
+    def _check_background_follow(self) -> None:
+        """While in BACKGROUND_FOLLOW: wait for process group (or fallback PIDs) to empty, then COMPLETED."""
+        self._check_files()
+
+        if self.metadata.max_silent_s is not None and not self._output_deferred_until_exit():
+            self._check_silent()
+
+        all_done = False
+        if self._shell_pgid is not None:
+            # Primary: process group — wait until no processes in shell's group remain
+            n = _count_processes_in_group(self._shell_pgid)
+            if n == 0:
+                all_done = True
+        else:
+            # Fallback: direct children (when PGID unavailable, e.g. Windows)
+            for pid in list(self._background_pids):
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    self._background_pids.discard(pid)
+            if not self._background_pids:
+                all_done = True
+
+        if all_done:
+            self.state = JobState.FINISHED
+            self._stop_event.set()
+            self._emit("COMPLETED", "All background processes exited",
+                       {"elapsed_s": round(time.time() - self.start_time, 1)})
+            print(f"  [watch] job={self.job_id} BACKGROUND_FOLLOW -> COMPLETED", flush=True)
+
     # ------------------------------------------------------------------
     # Event emission — always printed
     # ------------------------------------------------------------------
@@ -494,7 +660,9 @@ class SupervisedJob:
         self._last_event_times[event_type] = now
 
         try:
-            log_tail = "".join(list(self.stdout_buf)[-20:])
+            # Generous slice only; no truncation notice (brain applies via output_interceptor)
+            _event_log_cap = 500
+            log_tail = "".join(list(self.stdout_buf)[-_event_log_cap:])
         except RuntimeError:
             log_tail = ""
 
@@ -515,6 +683,51 @@ class SupervisedJob:
     # Poll response
     # ------------------------------------------------------------------
 
+    # Chunk size for reading redirect file from the end (I/O only; no policy cap).
+    # Size policy is in output_interceptor; we return last tail_lines lines and let it trim.
+    _REDIRECT_TAIL_CHUNK_BYTES = 64 * 1024
+
+    def _read_redirect_tail(self, tail_lines: int, redirect_path: Optional[str] = None) -> str:
+        """When stdout was redirected to a file, read last tail_lines lines (same semantics as pipe stdout_tail).
+        No byte cap here — output_interceptor trims large results.
+        redirect_path: if set, read this file (absolute or relative to cwd); else use metadata.redirect_output_file.
+        """
+        path = (redirect_path or self.metadata.redirect_output_file or "").strip()
+        if not path:
+            return ""
+        if not os.path.isabs(path):
+            path = os.path.join(self.cwd, path)
+        try:
+            if not os.path.exists(path):
+                return ""
+            size = os.path.getsize(path)
+            if size == 0:
+                return ""
+            collected: List[str] = []
+            with open(path, "rb") as f:
+                chunk_size = min(size, self._REDIRECT_TAIL_CHUNK_BYTES)
+                offset = max(0, size - chunk_size)
+                while offset < size and len(collected) < tail_lines:
+                    f.seek(offset)
+                    raw = f.read(chunk_size)
+                    try:
+                        text = raw.decode("utf-8", errors="replace")
+                    except Exception:
+                        text = raw.decode("latin-1", errors="replace")
+                    parts = text.splitlines()
+                    # If this chunk doesn't end with newline, its last part continues in collected[0]
+                    if collected and parts and not raw.endswith(b"\n"):
+                        collected = parts[:-1] + [parts[-1] + collected[0]] + collected[1:]
+                    else:
+                        collected = parts + collected
+                    if offset == 0:
+                        break
+                    offset = max(0, offset - chunk_size)
+            last = collected[-tail_lines:] if len(collected) > tail_lines else collected
+            return "\n".join(last) + ("\n" if last else "")
+        except (OSError, IOError):
+            return ""
+
     def build_poll_response(self, tail_lines: int = 80, drain: bool = True) -> Dict[str, Any]:
         try:
             stdout_lines = list(self.stdout_buf)
@@ -522,13 +735,30 @@ class SupervisedJob:
         except RuntimeError:
             stdout_lines, stderr_lines = [], []
 
+        stdout_tail = "".join(stdout_lines[-tail_lines:])
+        # When command redirected to file, always include redirect tail so the agent gets the log
+        # (even if the pipe has wrapper output like echo "Exit code: $?" — then we send both).
+        # If metadata omitted redirect_output_file, infer from command (same patterns as bash tool).
+        redir = (self.metadata.redirect_output_file or "").strip()
+        if not redir:
+            inferred = _redirect_target_from_command(self.command)
+            if inferred:
+                redir = inferred
+        if redir:
+            redirect_tail = self._read_redirect_tail(tail_lines, redirect_path=redir)
+            if redirect_tail:
+                if stdout_tail.strip():
+                    stdout_tail = stdout_tail.rstrip() + "\n\n" + redirect_tail
+                else:
+                    stdout_tail = redirect_tail
+
         events = self.drain_events() if drain else self.peek_events()
         return {
             "status": self.state.value,
             "exit_code": self.exit_code,
             "elapsed_s": round(time.time() - self.start_time, 1),
-            "stdout_tail": "".join(stdout_lines[-tail_lines:]),
-            "stderr_tail": "".join(stderr_lines[-min(20, tail_lines):]),
+            "stdout_tail": stdout_tail,
+            "stderr_tail": "".join(stderr_lines[-tail_lines:]),
             "output_lines": len(stdout_lines),
             "events": [e.to_dict() for e in events],
         }

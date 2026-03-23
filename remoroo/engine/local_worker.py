@@ -1785,7 +1785,7 @@ class LocalWorker:
                          with open(persist_path, 'w', encoding='utf-8') as f:
                              f.write(content)
 
-                     log_skip_files = {"checkpoint.json", "run_manifest.json", "trace.jsonl", "run_state.json"}
+                     log_skip_files = {"checkpoint.json", "run_manifest.json", "trace.jsonl", "run_state.json", "context_view.json", "context_view_sent.json"}
 
                      if Path(target_path).name not in log_skip_files:
                          self._log("   ✅ File written successfully")
@@ -2421,6 +2421,7 @@ class LocalWorker:
                     "memory_gb": memory_gb,
                     "gpu_info": gpu_info
                 }
+                print(f"Worker info: {info}")
                 return ExecutionResult(success=True, data=info)
 
             elif request.type == "interact":
@@ -2973,14 +2974,14 @@ class LocalWorker:
                             supervised.metadata.max_silent_s = float(new_val)
                         else:
                             supervised.metadata.max_silent_s = None
-                        print(f"  [watch] job={job_id} max_silent_s updated: {old_val} -> {supervised.metadata.max_silent_s}", flush=True)
+                        # print(f"  [watch] job={job_id} max_silent_s updated: {old_val} -> {supervised.metadata.max_silent_s}", flush=True)
 
                 # Wait loop: block up to wait_s for exit or new events
                 proc = self._running_processes.get(job_id)
                 deadline = time.time() + wait_s
 
                 while time.time() < deadline:
-                    if supervised.state.value not in ("starting", "running"):
+                    if supervised.state.value not in ("starting", "running", "background_follow"):
                         break
                     if supervised.event_queue:
                         break
@@ -3009,6 +3010,15 @@ class LocalWorker:
                         "killed": True, "exit_code": None,
                         "note": f"Job {job_id} already finished or was already killed.",
                     })
+
+                # Kill background children when in BACKGROUND_FOLLOW (shell already exited)
+                if supervised and supervised.state.value == "background_follow":
+                    supervised.mark_killed()
+                    self._running_processes.pop(job_id, None)
+                    self._execution_buffers.pop(job_id, None)
+                    self._supervised_jobs.pop(job_id, None)
+                    self._log(f"  [v2] Killed: {job_id} (background children)")
+                    return ExecutionResult(success=True, data={"killed": True, "exit_code": None})
 
                 if proc.poll() is None:
                     try:

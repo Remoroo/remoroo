@@ -1,38 +1,19 @@
-# Remoroo CLI
+# Remoroo CLI (developer note)
 
-The `remoroo` CLI allows you to run the Remoroo offline engine interactively.
+End-user documentation lives in **[README.md](./README.md)** (installation, v2 behavior, artifact layout, flags, troubleshooting).
 
-## Installation
+## Install from this repo
 
 ```bash
 pip install .
 ```
 
-## Usage
-
-### Run Local
-
-To start a new run on the repository in the current directory:
+## Quick usage
 
 ```bash
-remoroo run --local
+remoroo run --local --goal "..." --metrics "..."
 ```
 
-### Options
+**v2** is the only supported agent loop; legacy v1 is not available. Local runs use the default hosted Brain out of the box; auth via `remoroo login` or `REMOROO_API_KEY`. Override the Brain URL only for self-hosted setups (`REMOROO_API_URL`).
 
-- `--repo PATH`: Specify a different repository path (default: `.`)
-- `--out PATH`: Specify output directory (default: `repo/runs`)
-- `--yes`: Skip confirmation prompt
-- `--verbose`: Show extended output
-
-### Authentication
-
-On the first run, `remoroo` will attempt to open your browser to sign in.
-You will need to paste the API key back into the terminal.
-Credentials are stored securely in `~/.config/remoroo/credentials`.
-
-### Interactive Mode
-
-The CLI will prompt you for:
-1. **Goal**: What you want to achieve with this run.
-2. **Metrics**: Key metrics to track (enter one per line).
+Run outputs: **`<repo>/.remoroo/runs/<run-id>/`** (reports, patches, trace, checkpoints). See the main README for the full flag list and architecture.
