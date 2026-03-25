@@ -12,6 +12,22 @@ class LocalRunResult:
     outcome: str
     partial_success: bool = False
 
+
+def _teardown_local_worker_processes(worker) -> None:
+    """Stop bash/training children and docker/venv sandbox (best-effort)."""
+    if worker is None:
+        return
+    try:
+        worker.kill_all_background_jobs()
+    except Exception:
+        pass
+    try:
+        if getattr(worker, "sandbox", None):
+            worker.sandbox.stop()
+    except Exception:
+        pass
+
+
 def run_local_worker(
     run_id: str,
     repo_path: Path,
@@ -25,6 +41,8 @@ def run_local_worker(
     in_place: bool = False,
     agentic: bool = False,
     engine_version: str = "v2",
+    model: Optional[str] = None,
+    resume_run_id: Optional[str] = None,
 ) -> LocalRunResult:
     from .configs import get_api_url
     if brain_url is None:
@@ -43,18 +61,15 @@ def run_local_worker(
     
     # Use local engine components
     from .engine.local_worker import WorkerService
-    from .engine.protocol import ExecutionResult
+    from .engine.protocol import ExecutionRequest, ExecutionResult
 
     # STAGE 2 Retrofit: Pure Client
     import time
     import requests
     import threading
-    import sseclient
     from .http_transport import HttpTransport
 
     API_URL = brain_url
-    
-    typer.echo(f"🔌 Connecting to Brain Server at {API_URL}...")
     
     # Check Server Health
     import requests
@@ -63,7 +78,6 @@ def run_local_worker(
         if resp.status_code != 200:
              typer.secho(f"❌ Server at {API_URL} returned status code {resp.status_code}", fg=typer.colors.RED)
              raise typer.Exit(code=1)
-        typer.echo("✅ Server is reachable.")
     except Exception as e:
          typer.secho(f"❌ Could not connect to Brain Server at {API_URL}.", fg=typer.colors.RED)
          typer.echo(f"   Check connectivity by running 'curl {API_URL}/health' in a terminal.")
@@ -81,7 +95,6 @@ def run_local_worker(
         from .auth import _client
         if _client.is_authenticated():
             session_key = _client.get_token()
-            typer.echo("🔐 Using saved credentials from 'remoroo login'")
     
     if not session_key:
          typer.echo("⚠️  No authentication found. Set REMOROO_API_KEY or run 'remoroo login'.")
@@ -101,69 +114,73 @@ def run_local_worker(
     except:
          pass
             
-    # 3. Start Run (Create Run on Server)
+    # 3. Create run on server, or attach to an existing run (--resume)
+    headers = {"Authorization": f"Bearer {session_key}"}
     try:
-        headers = {}
-        headers["Authorization"] = f"Bearer {session_key}"
-        
-        resp = requests.post(f"{API_URL}/runs", data={
-            "repo_path": str(repo_path),
-            "goal": goal,
-            "metrics": metrics_str,
-            "artifact_dir": str(artifact_dir),
-            "agentic": "true" if agentic else "false",
-            "engine_version": engine_version,
-        }, headers=headers)
-        
-        if resp.status_code == 402:
-             typer.secho("\n❌ Quota Exceeded. Please upgrade your plan at https://remoroo.com/pricing", fg=typer.colors.RED)
-             raise typer.Exit(code=1)
-             
-        if resp.status_code in [401, 403]:
-             typer.secho("\n❌ Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.", fg=typer.colors.RED)
-             raise typer.Exit(code=1)
-             
-        resp.raise_for_status()
+        if resume_run_id:
+            resp = requests.get(
+                f"{API_URL}/runs/{resume_run_id}",
+                headers=headers,
+                timeout=20.0,
+            )
+            if resp.status_code == 404:
+                typer.secho(f"❌ Run not found: {resume_run_id}", fg=typer.colors.RED)
+                raise typer.Exit(code=1)
+            if resp.status_code in (401, 403):
+                typer.secho(
+                    "\n❌ Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.",
+                    fg=typer.colors.RED,
+                )
+                raise typer.Exit(code=1)
+            resp.raise_for_status()
+            body = resp.json()
+            run_info = body.get("run") or {}
+            st = str(run_info.get("status") or "")
+            if st in ("SUCCESS", "FAILED", "PARTIAL_SUCCESS", "COMPLETED"):
+                typer.secho(
+                    f"❌ Run {resume_run_id} is already finished (status={st}).",
+                    fg=typer.colors.RED,
+                )
+                raise typer.Exit(code=1)
+            remote_run_id = resume_run_id
+        else:
+            form: dict = {
+                "repo_path": str(repo_path),
+                "goal": goal,
+                "metrics": metrics_str,
+                "artifact_dir": str(artifact_dir),
+                "agentic": "true" if agentic else "false",
+                "engine_version": engine_version,
+                "in_place": "true" if in_place else "false",
+            }
+            if model:
+                form["model"] = model
+            resp = requests.post(f"{API_URL}/runs", data=form, headers=headers)
+
+            if resp.status_code == 402:
+                typer.secho(
+                    "\n❌ Quota Exceeded. Please upgrade your plan at https://remoroo.com/pricing",
+                    fg=typer.colors.RED,
+                )
+                raise typer.Exit(code=1)
+
+            if resp.status_code in (401, 403):
+                typer.secho(
+                    "\n❌ Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.",
+                    fg=typer.colors.RED,
+                )
+                raise typer.Exit(code=1)
+
+            resp.raise_for_status()
+            run_data = resp.json()
+            remote_run_id = run_data["run_id"]
+    except typer.Exit:
+        raise
     except Exception as e:
-        typer.secho(f"❌ Failed to create run on server: {e}", fg=typer.colors.RED)
+        typer.secho(f"❌ Failed to start or attach run on server: {e}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
-
-    run_data = resp.json()
-    remote_run_id = run_data["run_id"]
-    typer.echo(f"   Remote Run ID: {remote_run_id}")
     
-    # 4. Start Log Streamer (Background)
-    # Mutable holder so the thread can write to Live console once it exists.
-    # _token_sink removed: streaming now displayed via dashboard activity indicator
-
-    _llm_activity = {"active": False, "tokens": 0, "start": 0.0}
-    def stream_logs():
-        try:
-            import requests as _req
-            resp = _req.get(f"{API_URL}/runs/{remote_run_id}/stream", stream=True)
-            client = sseclient.SSEClient(resp)
-            for msg in client.events():
-                if msg.event == "finish":
-                    _llm_activity["active"] = False
-                    break
-                if msg.event == "llm_token":
-                    try:
-                        data = json.loads(msg.data)
-                        chunks = data.get("tokens", [])
-                        n = sum(len(c) for c in chunks)
-                        if n:
-                            if not _llm_activity["active"]:
-                                _llm_activity["active"] = True
-                                _llm_activity["tokens"] = 0
-                                _llm_activity["start"] = time.time()
-                            _llm_activity["tokens"] += n
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    log_thread = threading.Thread(target=stream_logs, daemon=True)
-    log_thread.start()
+    # 4. Start Log Streamer (Background) — started after display is created (see below)
 
     # 5. Initialize Proxy
     
@@ -179,8 +196,6 @@ def run_local_worker(
         client_id = f"worker-{uuid.uuid4()}"
         client_id_file.write_text(client_id)
         
-    typer.echo(f"🆔 Worker ID: {client_id}")
-
     server = HttpTransport(API_URL, client_id=client_id)
     server.session.headers.update({"Authorization": f"Bearer {session_key}"}) # Authenticate Transport
     
@@ -192,7 +207,7 @@ def run_local_worker(
         while not stop_heartbeat.is_set():
             try:
                 import time
-                requests.post(
+                r = requests.post(
                     f"{API_URL}/workers/heartbeat",
                     json={
                         "run_id": remote_run_id,
@@ -202,9 +217,12 @@ def run_local_worker(
                     headers={"Authorization": f"Bearer {session_key}"},
                     timeout=5.0
                 )
+                # Do not raise: transient 4xx/5xx should not tighten heartbeat spacing vs success.
+                if r.status_code >= 400 and verbose:
+                    typer.secho(f"[dim]heartbeat HTTP {r.status_code}[/]", fg=typer.colors.YELLOW)
+                time.sleep(5)
             except Exception:
-                pass # Silent fail
-            time.sleep(5)
+                time.sleep(5)
             
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat_thread.start()
@@ -243,388 +261,57 @@ def run_local_worker(
         except Exception:
             pass
 
-    from rich.console import Console, Group
-    from rich.live import Live
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.layout import Layout
-    from rich.text import Text
-    from rich.spinner import Spinner
-    
-    console = Console()
+    from rich.console import Console
+    from .engine.local_worker import current_local_worker
+    from .tui_run import run_remoroo_tui_session
 
-    # Initialize Execution Service (Does the work)
-    # True original repo root preserved across context switches
     original_repo_path = str(repo_path.absolute())
-    worker_service = WorkerService(
-        repo_root=original_repo_path, 
-        artifact_dir=str(artifact_dir), 
-        original_repo_root=original_repo_path, 
-        run_id=remote_run_id,
-        engine=engine,
-        persistence_dir=str(artifact_dir),
-        output_callback=console.print,
-        cache_env=cache_env,
-        in_place=in_place,
-    )
-    
+
     final_result = None
     outcome = "UNKNOWN"
     success = False
     partial_success = False
+    rb: dict = {}
 
-    
-
-    # --- Dashboard Components ---
-    # Normalize metric keys: strip operator+target suffix so "val_accuracy>0.97"
-    # becomes "val_accuracy", matching what metric_gate extracts.
-    import re as _re_norm
-    _METRIC_OP_RE = _re_norm.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*(?:==|>=|<=|!=|>|<)')
-
-    def _normalize_metric_key(raw: str) -> str:
-        m = _METRIC_OP_RE.match(raw.strip())
-        if m:
-            return m.group(1)
-        return raw.split(",")[0].strip()
-
-    _metric_targets = {}
-    _normalized_metrics = []
-    for m in metrics:
-        base = _normalize_metric_key(m)
-        _normalized_metrics.append(base)
-        if any(op in m for op in ("==", ">=", "<=", "!=", ">", "<")):
-            _metric_targets[base] = m
-
-    scoreboard_data = {
-        "baseline": {m: None for m in _normalized_metrics}, 
-        "current": {m: None for m in _normalized_metrics}, 
-        "status": "Initializing..."
-    }
-
-    # Create Persistent Layout to prevent flickering
-    dashboard_layout = Layout()
-    dashboard_layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="metrics", size=8),
-        Layout(name="llm_activity", size=3),
-        Layout(name="footer", size=3),
-    )
-
-    def update_dashboard(layout, data):
-        # Header
-        layout["header"].update(Panel(Text(f"🚀 Remoroo Run: {remote_run_id}", justify="center", style="bold magenta"), border_style="magenta"))
-        
-        # Metrics Table
-        table = Table(box=None, expand=True)
-        table.add_column("Metric", style="cyan")
-        table.add_column("Baseline", justify="right", style="dim")
-        table.add_column("Current", justify="right", style="bold green")
-        table.add_column("Delta", justify="right")
-        
-        baseline = data.get("baseline") or {}
-        current = data.get("current") or {}
-        
-        all_keys = sorted(set(list(baseline.keys()) + list(current.keys())))
-        
-        if not all_keys:
-            table.add_row("[italic yellow]No metrics captured yet...[/italic yellow]", "", "", "")
-        else:
-            for k in all_keys:
-                b_val = baseline.get(k)
-                c_val = current.get(k)
-                
-                delta_str = ""
-                if isinstance(b_val, (int, float)) and isinstance(c_val, (int, float)):
-                    delta = c_val - b_val
-                    color = "green" if delta >= 0 else "red"
-                    # Some metrics are better if lower (like runtime)
-                    if "time" in k.lower() or "runtime" in k.lower() or "cost" in k.lower():
-                        color = "green" if delta <= 0 else "red"
-                    delta_str = f"[{color}]{delta:+.2f}[/{color}]"
-                
-                table.add_row(
-                    k, 
-                    str(b_val) if b_val is not None else "-", 
-                    str(c_val) if c_val is not None else "-",
-                    delta_str
-                )
-            
-        layout["metrics"].update(Panel(table, title="[bold]Scoreboard[/bold]", border_style="blue"))
-        
-        # LLM Activity indicator
-        if _llm_activity["active"]:
-            elapsed = time.time() - _llm_activity["start"]
-            chars = _llm_activity["tokens"]
-            bar_ticks = int(elapsed) % 4
-            bar = "●" * (bar_ticks + 1) + "○" * (3 - bar_ticks)
-            activity_text = Text.assemble(
-                ("  🤖 AI Thinking  ", "bold cyan"),
-                (bar, "cyan"),
-                (f"  {elapsed:.0f}s  ", "dim"),
-                (f"~{chars:,} chars generated", "dim italic"),
-            )
-            layout["llm_activity"].update(Panel(activity_text, border_style="cyan"))
-        else:
-            layout["llm_activity"].update(Panel(Text("", justify="center"), border_style="dim"))
-
-        # Footer / Status
-        status_msg = data.get("status", "")
-        layout["footer"].update(Panel(Text(f" {status_msg}", justify="center", style="italic yellow"), border_style="dim"))
-        
-        return layout
-
-    # Initialize layout content
-    update_dashboard(dashboard_layout, scoreboard_data)
-
-    typer.echo("")
-    console.print(f"[bold blue]🧠 Brain connected to run [white]{remote_run_id}[/white]. Ready to solve![/bold blue]")
-    typer.echo("")
-
-    # Main Execution Loop (Pull Model)
-    last_processed_id = None
-    last_result = None
-    
     try:
-        with Live(dashboard_layout, console=console, refresh_per_second=10, vertical_overflow="visible") as live:
-            worker_service.output_callback = live.console.print
-            # Streaming tokens are tracked in _llm_activity and shown in dashboard
-            
-            while True:
-                # 1. Get next step
-                step, current_metrics, baseline_metrics = server.get_next_step(timeout=10.0, run_id=remote_run_id)
-                
-                if baseline_metrics:
-                    # Merge instead of overwrite
-                    for k, v in baseline_metrics.items():
-                         if k not in scoreboard_data["baseline"] or v is not None:
-                             scoreboard_data["baseline"][k] = v
-                
-                # Sync with server metrics if available
-                if current_metrics:
-                    for k, v in current_metrics.items():
-                         # PRIORITY: If we have a local value, only overwrite if server value is DIFFERENT 
-                         # and not None. This prevents flickering back to "N/A" during sync delays.
-                         if v is not None:
-                             # If we have a local value, we only update if it's "new" info 
-                             # (e.g. Brain calculated something the CLI didn't)
-                             scoreboard_data["current"][k] = v
-                
-                # Debug info in status
-                debug_info = f"B:{len(scoreboard_data['baseline'])} C:{len(scoreboard_data['current'])}"
-                if not step:
-                    if "Brain" not in scoreboard_data["status"]:
-                         scoreboard_data["status"] = "🧠 Brain is analyzing results..."
-                else:
-                    if step.type != "metrics_update":
-                        scoreboard_data["status"] = f"🛠️ Executing {step.type}"
-                    _llm_activity["active"] = False
-                
-                # 2. Check for completion or timeout
-                if step is None:
-                    # Provide grounded status if possible
-                    if "Running" in scoreboard_data["status"]:
-                        pass # Keep current running status
-                    elif "Applying" in scoreboard_data["status"]:
-                        pass
-                    else:
-                        #scoreboard_data["status"] = "🧠 Brain is analyzing results & planning next step..."
-                        pass
-                    
-                    update_dashboard(dashboard_layout, scoreboard_data)
-                    time.sleep(0.5)
-                    continue
-                    
-                # IDEMPOTENCY CHECK
-                if step.request_id and step.request_id == last_processed_id:
-                     if last_result:
-                         live.console.print(f"[yellow]🔄 Resending cached result for {step.request_id}[/yellow]")
-                         server.submit_result(last_result)
-                         continue
-                    
-                # 3. Handle Special Control Steps
-                if step.type == "workflow_complete":
-                    final_result = step.payload or {}
-                    # v19: Debug – log what we actually received so we can diagnose UNKNOWN issues
-                    live.console.print(f"[dim]📡 workflow_complete payload: {final_result}[/dim]")
-                    
-                    # v18: Prioritize explicit outcome and success from Brain
-                    outcome = final_result.get("outcome") or final_result.get("decision", "UNKNOWN")
-                    
-                    # v19: Deep Debug - Why is outcome UNKNOWN?
-                    if outcome == "UNKNOWN":
-                        live.console.print(f"[bold red]❌ CRITICAL: Outcome remains UNKNOWN! Payload: {json.dumps(final_result)}[/bold red]")
-                    else:
-                        live.console.print(f"[green]✅ Outcome confirmed: {outcome}[/green]")
-                    
-                    # Normalization: Ensure success and partial_success are booleans even if strings arrive
-                    # We accept "SUCCESS" or True as success.
-                    success = final_result.get("success") == True or outcome == "SUCCESS"
-                    partial_success = final_result.get("partial_success") == True or outcome == "PARTIAL_SUCCESS"
-                    
-                    # v2: Extract metrics from workflow_complete payload
-                    if final_result.get("metrics") and isinstance(final_result["metrics"], dict):
-                        for k, v in final_result["metrics"].items():
-                            if isinstance(v, (int, float)):
-                                scoreboard_data["current"][k] = v
-                    if final_result.get("baseline_metrics") and isinstance(final_result["baseline_metrics"], dict):
-                        for k, v in final_result["baseline_metrics"].items():
-                            if isinstance(v, (int, float)):
-                                scoreboard_data["baseline"][k] = v
-
-                    scoreboard_data["status"] = "✅ Workflow Complete!"
-                    update_dashboard(dashboard_layout, scoreboard_data)
-                    break
-                    
-                if step.type == "metrics_update":
-                    mu_phase = step.payload.get("phase", "current")
-                    mu_metrics = step.payload.get("metrics", {})
-                    mu_target = scoreboard_data["baseline"] if mu_phase == "baseline" else scoreboard_data["current"]
-                    for k, v in mu_metrics.items():
-                        if isinstance(v, (int, float)):
-                            mu_target[k] = v
-                    update_dashboard(dashboard_layout, scoreboard_data)
-                    ack_result = ExecutionResult(success=True, data={})
-                    ack_result.request_id = step.request_id
-                    server.submit_result(ack_result)
-                    continue
-
-                if step.type == "workflow_error":
-                    outcome = f"ERROR: {step.payload.get('error')}"
-                    success = False
-                    scoreboard_data["status"] = "❌ Workflow Error"
-                    update_dashboard(dashboard_layout, scoreboard_data)
-                    break
-                
-                # 4. Execute Step
-                # Map active status to human readable
-                if step.type == "execute_command":
-                    cmd = step.payload.get("command_line", "command")
-                    # Truncate if too long
-                    if len(cmd) > 40: cmd = cmd[:37] + "..."
-                    scoreboard_data["status"] = f"🏃 Running: {cmd}"
-                elif step.type == "apply_patch":
-                    scoreboard_data["status"] = "📝 Applying Fix..."
-                elif step.type == "scan_repo":
-                    scoreboard_data["status"] = "🔍 Scanning Codebase..." 
-                else:
-                    scoreboard_data["status"] = f"🛠️ Executing: {step.type}"
-                
-                update_dashboard(dashboard_layout, scoreboard_data)
-                
-                try:
-                    # live.console.print(f"\n[bold cyan]🛠️  Executing: {step.type}[/bold cyan]")
-                    result = worker_service.handle_request(step)
-                    
-                    # --- INSTANT METRIC UPDATE (LOCAL) ---
-                    # Helper to filter dirty metrics
-                    def clean_metrics_dict(d):
-                        clean = {}
-                        blacklist = ["created_at", "source", "version", "phase"]
-                        # 1. Primary Flattening of "metrics"
-                        if "metrics" in d and isinstance(d["metrics"], dict):
-                            for k, v in d["metrics"].items():
-                                if isinstance(v, (int, float)): clean[k] = v
-                        
-                        # 2. Extract from "metrics_with_units"
-                        if "metrics_with_units" in d and isinstance(d["metrics_with_units"], dict):
-                            for k, v in d["metrics_with_units"].items():
-                                if isinstance(v, dict) and "value" in v:
-                                    val = v["value"]
-                                    if isinstance(val, (int, float)): clean[k] = val
-                        
-                        # 3. Direct Key fallback
-                        for k, v in d.items():
-                            if k in blacklist or k == "metrics" or k == "metrics_with_units": continue
-                            if isinstance(v, (int, float)):
-                                if k not in clean: clean[k] = v
-                        return clean
-
-                    # Update scoreboard immediately with local result metrics
-                    # Note: For run_command_async, the Brain polls get_output and those steps come through here too.
-                    # Each get_output result updates the scoreboard since result.metrics is populated.
-                    # Check phase to route metrics to correct column (baseline vs current)
-                    phase = result.data.get("phase", "current") if result.data else "current"
-                    
-                    # DEBUG: Log what we receive
-                    if step.type == "get_output":
-                        pass
-                        # live.console.print(f"[dim]📊 [DEBUG] get_output step - phase={phase}, metrics={result.metrics}[/dim]")
-                    
-                    if result.metrics:
-                        cleaned = clean_metrics_dict(result.metrics)
-                        if cleaned:
-                             # Route to correct column based on phase
-                             target = scoreboard_data["baseline"] if phase == "baseline" else scoreboard_data["current"]
-                             for k, v in cleaned.items():
-                                  target[k] = v
-                             # live.console.print(f"[dim]📊 [DEBUG] Updated {phase} scoreboard: {cleaned}[/dim]")
-                    
-                    # Check for baseline in specific artifact fields if available (legacy support)
-                    if result.data.get("baseline_metrics"):
-                        cleaned_base = clean_metrics_dict(result.data["baseline_metrics"])
-                        for k, v in cleaned_base.items():
-                             scoreboard_data["baseline"][k] = v
-                    
-                    update_dashboard(dashboard_layout, scoreboard_data)
-                    # -------------------------------------
-
-                    # Ensure request_id is preserved for the server
-                    if not result.request_id:
-                        result.request_id = step.request_id
-                except Exception as e:
-                    live.console.print_exception()
-                    result = ExecutionResult(success=False, error=str(e), request_id=step.request_id)
-                
-                # 5. Handle Context Switching (Working Copy)
-                if step.type == "create_working_copy" and result.success:
-                     new_root = result.data.get("working_path")
-                     is_in_place = result.data.get("in_place", False)
-                     if new_root and not is_in_place:
-                         try:
-                             worker_service.handle_request(ExecutionRequest(type="cleanup_working_copy", payload={}))
-                         except Exception:
-                             pass
-
-                         worker_service = WorkerService(
-                             repo_root=new_root, 
-                             artifact_dir=None,
-                             original_repo_root=original_repo_path, 
-                             run_id=remote_run_id,
-                             engine=engine, output_callback=live.console.print,
-                             persistence_dir=str(artifact_dir),
-                             cache_env=cache_env,
-                             in_place=in_place,
-                         )
-                         live.console.print(f"[bold yellow]🔄 Switched execution context to:[/bold yellow] [dim]{new_root}[/dim]")
-
-                # 6. Submit Result
-                server.submit_result(result)
-                
-                # Update Cache
-                last_processed_id = step.request_id
-                last_result = result
-                
-                # Restart status for next poll
-                scoreboard_data["status"] = "🧠 Brain: Analyzing results..."
-                update_dashboard(dashboard_layout, scoreboard_data)
-
+        rb = run_remoroo_tui_session(
+            server=server,
+            api_url=API_URL,
+            session_key=session_key,
+            remote_run_id=remote_run_id,
+            repo_path=original_repo_path,
+            engine=engine,
+            artifact_dir=str(artifact_dir),
+            original_repo_path=original_repo_path,
+            cache_env=cache_env,
+            in_place=in_place,
+        )
+        final_result = rb.get("final_result")
+        outcome = rb.get("outcome", "UNKNOWN")
+        success = bool(rb.get("success", False))
+        partial_success = bool(rb.get("partial_success", False))
+        if outcome == "UNKNOWN" and final_result:
+            typer.secho(f"Outcome UNKNOWN. Payload: {json.dumps(final_result)}", fg=typer.colors.RED)
     except KeyboardInterrupt:
         typer.echo("")
-        typer.secho("🛑 Experiment Paused by User.", fg=typer.colors.YELLOW, bold=True)
+        typer.secho(
+            "🛑 Interrupted — killing local jobs, stopping sandbox, aborting run…",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
         outcome = "INTERRUPTED"
         success = False
-        
-        # Notify Server of Abort (Infrastructure failure)
+        stop_heartbeat.set()
+        _teardown_local_worker_processes(rb.get("_cleanup_worker"))
+        _teardown_local_worker_processes(current_local_worker())
         try:
             requests.post(
                 f"{API_URL}/runs/{remote_run_id}/abort",
                 headers={"Authorization": f"Bearer {session_key}"},
-                timeout=2.0
-            ) 
+                timeout=12.0,
+            )
         except Exception:
-            pass # Best effort
-        
-        # Fall through to cleanup
+            pass
     except Exception as e:
         typer.secho(f"❌ Execution loop crashed: {e}", fg=typer.colors.RED)
         outcome = f"CRASH: {e}"
@@ -632,6 +319,21 @@ def run_local_worker(
         if verbose:
             import traceback
             traceback.print_exc()
+
+    console = Console()
+    worker_service = rb.get("_cleanup_worker")
+    if worker_service is None:
+        worker_service = WorkerService(
+            repo_root=original_repo_path,
+            artifact_dir=str(artifact_dir),
+            original_repo_root=original_repo_path,
+            run_id=remote_run_id,
+            engine=engine,
+            persistence_dir=str(artifact_dir),
+            output_callback=console.print,
+            cache_env=cache_env,
+            in_place=in_place,
+        )
 
     # v19: Fallback outcome detection from final_report.md
     # Removed as requested (root cause fixed in Brain).
@@ -659,7 +361,11 @@ def run_local_worker(
     try:
         # 1. Stop heartbeat
         stop_heartbeat.set()
-        
+
+        if outcome == "INTERRUPTED":
+            _teardown_local_worker_processes(rb.get("_cleanup_worker"))
+            _teardown_local_worker_processes(current_local_worker())
+
         # 2. Commit Docker environment if run was successful
         if success and hasattr(worker_service, 'sandbox') and worker_service.sandbox:
             try:
@@ -720,17 +426,23 @@ def run_local_worker(
     except Exception as e:
         console.print(f"   [yellow]⚠️  Cleanup warning: {e}[/yellow]")
     
-    # 8. Save Metrics for CLI Summary
+    # 8. Save Metrics for CLI Summary (extract from workflow_complete payload)
     try:
-        if scoreboard_data["current"]:
-            # SAVE TO RUN-SPECIFIC DIR (Where CLI expects them if we return run_output_dir)
+        _final_metrics = {}
+        _baseline_metrics = {}
+        if final_result:
+            if isinstance(final_result.get("metrics"), dict):
+                _final_metrics = {k: v for k, v in final_result["metrics"].items() if isinstance(v, (int, float))}
+            if isinstance(final_result.get("baseline_metrics"), dict):
+                _baseline_metrics = {k: v for k, v in final_result["baseline_metrics"].items() if isinstance(v, (int, float))}
+        if _final_metrics:
             with open(run_output_dir / "metrics.json", 'w') as f:
-                json.dump(scoreboard_data["current"], f, indent=2)
-        if scoreboard_data["baseline"]:
+                json.dump(_final_metrics, f, indent=2)
+        if _baseline_metrics:
             with open(run_output_dir / "baseline_metrics.json", 'w') as f:
-                json.dump(scoreboard_data["baseline"], f, indent=2)
+                json.dump(_baseline_metrics, f, indent=2)
     except Exception as e:
-        console.print(f"   [yellow]⚠️  Could not save metrics to cache: {e}[/yellow]")
+        console.print(f"   [yellow]Could not save metrics to cache: {e}[/yellow]")
 
     return LocalRunResult(
         run_root=run_output_dir,

@@ -47,13 +47,13 @@ v2 is built for longer, tool-driven sessions: structured traces, run checkpoints
 
 Before you begin:
 
-- **Python 3.9+** ([python.org](https://python.org)) — for the `remoroo` CLI itself
+- **Python 3.10+** ([python.org](https://python.org)) — for the `remoroo` CLI itself
 - **Git** — required; the CLI can prompt to help install it on some platforms
 - **Docker** — if you use the default execution engine (`docker`); not required if you use `--engine venv`
 - **Internet** — for the default hosted Brain and authentication (same as a normal `remoroo login` flow)
 
 ```bash
-python --version   # 3.9+
+python --version   # 3.10+
 git --version
 docker --version   # if using --engine docker (default)
 ```

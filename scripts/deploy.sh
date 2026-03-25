@@ -2,8 +2,8 @@
 set -e
 
 # Remoroo CLI Deployment Script
-# Purpose: Deploy changes to GitHub main branch and trigger CI workflows
-# Note: This script does NOT create or modify tags
+# Purpose: Push main + tag v{version} to GitHub. Pushing the tag triggers Actions → Publish to PyPI automatically.
+# Before tagging: runs scripts/sync_and_build.sh (uv lock --check, uv build) — same checks as the publish workflow.
 
 echo "🚀 Remoroo CLI Deployment Script"
 echo "=================================="
@@ -132,6 +132,15 @@ if [ -n "$LATEST_TAG" ]; then
 fi
 echo ""
 
+# Ensure uv.lock matches pyproject.toml and the package builds before tagging
+echo "🔒 Verifying lockfile and building release artifacts (same as CI publish)..."
+DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! bash "$DEPLOY_SCRIPT_DIR/sync_and_build.sh"; then
+    echo "❌ Lock check or build failed. Run: cd \"$(dirname "$DEPLOY_SCRIPT_DIR")\" && uv lock && commit uv.lock, then retry."
+    exit 1
+fi
+echo ""
+
 # Check if tag already exists locally
 if git rev-parse "$TAG" >/dev/null 2>&1; then
     echo "⚠️  Warning: Tag $TAG already exists locally"
@@ -180,8 +189,8 @@ echo "🔄 Pushing tag $TAG..."
 if git push origin "$TAG"; then
     echo "✅ Successfully pushed tag $TAG!"
     echo ""
-    echo "🎯 GitHub Actions CI workflow will be triggered automatically"
-    echo "   View status at: https://github.com/$(git config --get remote.origin.url | sed 's/.*github.com[:/]\(.*\)\.git/\1/')/actions"
+    echo "🎯 \"Publish to PyPI\" will run automatically on this tag (uv build + pip build check + PyPI upload)."
+    echo "   Watch: https://github.com/$(git config --get remote.origin.url | sed 's/.*github.com[:/]\(.*\)\.git/\1/')/actions"
     echo ""
     echo "✨ Deployment complete!"
 else

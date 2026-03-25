@@ -35,6 +35,11 @@ from .utils.system_interface import SystemInterface, RealSystem
 _current_worker: Optional["LocalWorker"] = None
 
 
+def current_local_worker() -> Optional["LocalWorker"]:
+    """Process-global active LocalWorker (last constructed), for Ctrl+C / cleanup outside the TUI."""
+    return _current_worker
+
+
 def _interrupt_handler(signum: int, frame: Any) -> None:
     """On SIGINT/SIGTERM: kill all worker child processes then exit."""
     global _current_worker
@@ -115,14 +120,46 @@ class LocalWorker:
                 pass
 
     def _log(self, message: str):
-        """Internal logger that redirects to output_callback or standard print."""
+        """Internal logger that redirects to output_callback or standard print.
+
+        Applies lightweight Rich markup when output_callback is a Rich Console.
+        Messages styled to empty string are suppressed.
+        """
+        styled = self._style_log_message(message)
+        if not styled:
+            return
         if self.output_callback:
             try:
-                self.output_callback(message)
-            except:
+                self.output_callback(styled)
+            except Exception:
                 print(message)
         else:
             print(message)
+
+    @staticmethod
+    def _style_log_message(message: str) -> str:
+        """Style worker log messages for Rich console output.
+
+        Returns empty string to suppress a message entirely.
+        Only suppresses truly noisy internal messages (Worker info).
+        """
+        stripped = message.strip()
+        if not stripped:
+            return ""
+
+        if "Worker info:" in stripped:
+            return ""
+
+        if "Execution Engine:" in stripped or "In-place mode:" in stripped:
+            return f"  [dim]{stripped}[/dim]"
+        if "File written successfully" in stripped or "\u2705" in stripped:
+            return f"  [green]{stripped}[/green]"
+        if stripped.startswith("[watch]") or "EVENT: COMPLETED" in stripped:
+            return f"  [dim]{stripped}[/dim]"
+        if stripped.startswith("Started:"):
+            return f"  [dim]{stripped}[/dim]"
+
+        return f"  [dim]{stripped}[/dim]"
         
     def _robust_extract_metrics(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -2421,7 +2458,7 @@ class LocalWorker:
                     "memory_gb": memory_gb,
                     "gpu_info": gpu_info
                 }
-                print(f"Worker info: {info}")
+                self._log(f"Worker info: {info}")
                 return ExecutionResult(success=True, data=info)
 
             elif request.type == "interact":
@@ -2867,14 +2904,12 @@ class LocalWorker:
                                 if log_cb:
                                     stripped = line.strip()
                                     if stripped:
-                                        try:
-                                            tag = "dim red" if is_stderr else "dim"
-                                            log_cb(f"[{tag}]   {stripped}[/{tag}]")
-                                        except Exception:
-                                            pass
+                                        tag = "dim red" if is_stderr else "dim"
+                                        log_cb(f"[{tag}]   {stripped}[/{tag}]")
                             stream.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if log_cb:
+                            log_cb(f"[dim red]  (output reader error: {e})[/dim red]")
 
                 threading.Thread(target=_reader, args=(proc.stdout, stdout_buf, False), daemon=True).start()
                 threading.Thread(target=_reader, args=(proc.stderr, stderr_buf, True), daemon=True).start()

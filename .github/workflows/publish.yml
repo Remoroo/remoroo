@@ -1,27 +1,35 @@
+# Tag push (e.g. after ./scripts/deploy.sh):
+# - sync_and_build.sh: uv lock --check, uv build, then python -m build (both paths)
+# - Upload dist/ via pypa/gh-action-pypi-publish (pip/twine ecosystem; not uv publish)
+# Repository secret: PYPI_API_TOKEN
 name: Publish to PyPI
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   build-n-publish:
     name: Build and publish to PyPI
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    - name: Install build dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install build
-    - name: Build binary wheel and source tarball
-      run: python -m build
-    - name: Publish to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        password: ${{ secrets.PYPI_API_TOKEN }}
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Set up Python (for pip build step in sync_and_build.sh)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify lockfile + uv build + pip build
+        run: bash scripts/sync_and_build.sh
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

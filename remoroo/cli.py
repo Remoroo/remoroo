@@ -1,5 +1,6 @@
 import typer
 from pathlib import Path
+from typing import Optional
 
 from .auth import ensure_logged_in
 from .prompts import prompt_goal, prompt_metrics, confirm_run
@@ -70,6 +71,77 @@ def whoami():
     _client.whoami()
 
 
+@app.command("list")
+def list_runs_cmd(
+    limit: int = typer.Option(50, "--limit", "-n", help="Max runs to fetch (server caps at 100)."),
+    attachable: bool = typer.Option(
+        False,
+        "--attachable",
+        "-a",
+        help="Only PENDING / RUNNING / PAUSED (typical attach targets).",
+    ),
+    status: Optional[str] = typer.Option(
+        None,
+        "--status",
+        "-s",
+        help="Filter by one status (e.g. RUNNING). Ignored if --attachable is set.",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON."),
+    brain_url: Optional[str] = typer.Option(None, "--brain-url", help="Override API base URL."),
+):
+    """List your runs and statuses (attach with `remoroo attach --id <run_id>` or `remoroo run --local --resume`)."""
+    from .list_sessions import list_sessions
+
+    list_sessions(
+        limit=limit,
+        attachable=attachable,
+        status=status,
+        json_out=json_out,
+        brain_url=brain_url,
+    )
+
+
+@app.command()
+def attach(
+    run_id: str = typer.Option(..., "--id", "-i", metavar="RUN_ID", help="Run id from `remoroo list`."),
+    repo: Optional[Path] = typer.Option(
+        None,
+        "--repo",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Local checkout; if omitted, uses server repo_path when it exists on disk.",
+    ),
+    out: Optional[Path] = typer.Option(None, "--out", help="Output base directory."),
+    brain_url: Optional[str] = typer.Option(None, "--brain-url", help="API base URL."),
+    engine: Optional[str] = typer.Option(None, "--engine", help="docker or venv (default: config)."),
+    cache_env: bool = typer.Option(True, "--cache-env/--no-cache-env"),
+    in_place: bool = typer.Option(True, "--in-place/--no-in-place"),
+    agentic: bool = typer.Option(True, "--agentic/--no-agentic"),
+    v2: bool = typer.Option(True, "--v2/--v1"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip attach and patch confirmation prompts."),
+    no_patch: bool = typer.Option(False, "--no-patch", help="Never apply patch after run."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Attach local worker to an existing run (goal/metrics loaded from server; no model picker)."""
+    from .attach_session import attach_to_run
+
+    attach_to_run(
+        run_id=run_id.strip(),
+        repo=repo,
+        out=out,
+        engine=engine,
+        in_place=in_place,
+        cache_env=cache_env,
+        agentic=agentic,
+        v2=v2,
+        yes=yes,
+        no_patch=no_patch,
+        verbose=verbose,
+        brain_url=brain_url,
+    )
+
+
 @app.callback()
 def main():
     """
@@ -91,9 +163,17 @@ def run(
     no_patch: bool = typer.Option(False, "--no-patch", help="Do not ask to apply patch (auto-deny)."),
     engine: str = typer.Option(None, "--engine", help="Execution engine (docker or venv). Defaults to 'docker'."),
     cache_env: bool = typer.Option(True, "--cache-env", help="Cache Docker environment (skip already-installed packages, commit changes)."),
-    in_place: bool = typer.Option(False, "--in-place", help="Edit the repo directly instead of creating a temporary working copy."),
+    in_place: bool = typer.Option(True, "--in-place", help="Edit the repo directly instead of creating a temporary working copy."),
     agentic: bool = typer.Option(True, "--agentic", help="Use Conductor-driven agentic loop instead of the legacy pipeline."),
     v2: bool = typer.Option(True, "--v2/--v1", help="Use v2 agent loop (default) or legacy v1."),
+    model: Optional[str] = typer.Option(None, "--model", help="v2 LLM model id (e.g. anthropic/claude-sonnet-4.5)."),
+    pick_model: bool = typer.Option(True, "--pick-model", help="Full-screen picker: Haiku / Sonnet / Opus before the run TUI."),
+    resume: Optional[str] = typer.Option(
+        None,
+        "--resume",
+        metavar="RUN_ID",
+        help="Attach worker to an existing run instead of creating a new one.",
+    ),
 ):
     from .configs import get_api_url, get_default_engine
     from .engine.utils.doctor import ensure_ready
@@ -150,24 +230,41 @@ def run(
     repo_path = resolve_repo_path(repo)
     out_dir = resolve_out_dir(out, repo_path)
 
-    if not goal:
-        goal = prompt_goal()
-    
-    metrics_list = []
-    if metrics:
-        metrics_list = [m.strip() for m in metrics.split(",") if m.strip()]
-    
-    if not metrics_list:
-        metrics_list = prompt_metrics()
+    if pick_model and not resume:
+        from .model_picker import pick_model_interactive
 
-    run_id = new_run_id()
+        picked = pick_model_interactive()
+        if picked:
+            model = picked
+
+    if resume:
+        if not goal:
+            goal = ""
+        metrics_list = []
+        if metrics:
+            metrics_list = [m.strip() for m in metrics.split(",") if m.strip()]
+    else:
+        if not goal:
+            goal = prompt_goal()
+
+        metrics_list = []
+        if metrics:
+            metrics_list = [m.strip() for m in metrics.split(",") if m.strip()]
+
+        if not metrics_list:
+            metrics_list = prompt_metrics()
+
+    run_id = resume if resume else new_run_id()
 
     if not yes:
-        if not confirm_run(repo_path, goal, metrics_list, mode="local"):
+        if resume:
+            if not robust_confirm(f"Attach local worker to existing run {resume}?", default=True):
+                raise typer.Exit(code=0)
+        elif not confirm_run(repo_path, goal, metrics_list, mode="local"):
             raise typer.Exit(code=0)
 
     typer.secho(f"\nStarting run {run_id}...", fg=typer.colors.BLUE)
-    
+
     try:
         result = run_local_worker(
             run_id=run_id,
@@ -182,155 +279,19 @@ def run(
             in_place=in_place,
             agentic=agentic,
             engine_version="v2" if v2 else "v1",
+            model=model,
+            resume_run_id=resume,
         )
 
-        from rich.console import Console
-        from rich.table import Table
-        from rich.panel import Panel
-        from rich.style import Style
-        console = Console()
+        from .run_summary import display_local_run_result
 
-        if result.success:
-            outcome_color = "bright_green"
-        elif getattr(result, 'partial_success', False):
-            outcome_color = "bright_yellow"
-        elif result.outcome == "INTERRUPTED":
-            outcome_color = "bright_black"
-        elif "ERROR" in result.outcome or "CRASH" in result.outcome or result.outcome == "FAIL" or result.outcome == "FAILED" or result.outcome == "ABORT":
-            outcome_color = "red"
-        else:
-            outcome_color = "bright_yellow"
-
-        console.print("")
-        console.print(Panel(
-            f"[bold {outcome_color}]{result.outcome}[/bold {outcome_color}]\n"
-            f"Run ID: [white]{result.run_id}[/white]\n"
-            f"Artifacts: [cyan]{result.run_root}[/cyan]",
-            title="[bold]Run Summary[/bold]",
-            border_style=outcome_color
-        ))
-
-        # Show Metrics if available
-        metrics_file = result.run_root / "metrics.json"
-        baseline_file = result.run_root / "baseline_metrics.json"
-        
-        if metrics_file.exists():
-            import json
-            def clean_metrics_dict(d):
-                clean = {}
-                blacklist = ["created_at", "source", "version", "phase"]
-                if "metrics" in d and isinstance(d["metrics"], dict):
-                    for k, v in d["metrics"].items():
-                        if isinstance(v, (int, float)): clean[k] = v
-                if "metrics_with_units" in d and isinstance(d["metrics_with_units"], dict):
-                    for k, v in d["metrics_with_units"].items():
-                        if isinstance(v, dict) and "value" in v:
-                            val = v["value"]
-                            if isinstance(val, (int, float)): clean[k] = val
-                for k, v in d.items():
-                    if k in blacklist or k in ["metrics", "metrics_with_units", "baseline_metrics", "target_files"]: continue
-                    if isinstance(v, (int, float)):
-                        if k not in clean: clean[k] = v
-                return clean
-
-            try:
-                with open(metrics_file, 'r') as f:
-                    final_metrics_raw = json.load(f)
-                with open(baseline_file, 'r') if baseline_file.exists() else None as bf:
-                    baseline_metrics_raw = json.load(bf) if bf else {}
-                
-                final_metrics = clean_metrics_dict(final_metrics_raw)
-                baseline_metrics = clean_metrics_dict(baseline_metrics_raw)
-                '''
-
-                if final_metrics:
-                    #console.print("\n📊 [bold]Metric Comparison:[/bold]")
-                    for m_name, final_val in final_metrics.items():
-                        base_val = baseline_metrics.get(m_name, "N/A")
-                        try:
-                            f_v = float(final_val)
-                            b_v = float(base_val)
-                            diff = f_v - b_v
-                            color = "green" if diff < 0 else "red" # Assuming lower is better for optimization
-                            console.print(f"   {m_name}: [magenta]{base_val}[/magenta] (baseline) [bold]--->[/bold] [{color}]{final_val}[/{color}] (current)")
-                        except:
-                            console.print(f"   {m_name}: {base_val} (baseline) ---> {final_val} (current)")
-                '''
-                table = Table(title="\n📈 Detailed Performance", box=None)
-                table.add_column("Metric", style="cyan")
-                table.add_column("Baseline", justify="right", style="magenta")
-                table.add_column("Final", justify="right", style="green")
-                table.add_column("Progress", justify="right")
-
-                for m_name, final_val in final_metrics.items():
-                    base_val = baseline_metrics.get(m_name, "N/A")
-                    progress = ""
-                    try:
-                        f_v = float(final_val)
-                        b_v = float(base_val)
-                        diff = f_v - b_v
-                        color = "green" if diff < 0 else "red"
-                        progress = f"[{color}]{diff:+.4f}[/{color}]"
-                    except:
-                        pass
-                    table.add_row(m_name, str(base_val), str(final_val), progress)
-                
-                console.print(table)
-            except Exception as e:
-                if verbose:
-                    console.print(f"[dim]Note: Could not parse metrics: {e}[/dim]")
-
-        # Clickable Links
-        report_path = result.run_root / "final_report.md"
-        patch_path = result.run_root / "final_patch.diff"
-        
-        if report_path.exists():
-            console.print(f"📄 [bold]Report:[/bold] [link=file://{report_path.absolute()}]{report_path.name}[/link]")
-        
-        # v18: Lead Architect Diagram
-        diagram_path = result.run_root / "system_diagram.md"
-        if diagram_path.exists():
-            console.print(f"🗺️  [bold]System Diagram:[/bold] [link=file://{diagram_path.absolute()}]{diagram_path.name}[/link]")
-
-        if patch_path.exists():
-            console.print(f"🩹 [bold]Clean Patch:[/bold] [link=file://{patch_path.absolute()}]{patch_path.name}[/link]")
-        
-        if (result.success or getattr(result, 'partial_success', False)) and patch_path.exists():
-            console.print("")
-            should_apply = False
-            
-            if no_patch:
-                # Auto-deny
-                should_apply = False
-            elif yes:
-                # Auto-accept
-                should_apply = True
-            else:
-                # Ask
-                should_apply = typer.confirm("Would you like to apply the generated patch to your local repository?", default=True)
-            
-            if should_apply:
-                try:
-                    import subprocess
-                    # Use 'git apply' if in git repo, or 'patch'
-                    is_git = (repo_path / ".git").exists()
-                    if is_git:
-                         subprocess.run(["git", "apply", str(patch_path)], cwd=repo_path, check=True)
-                    else:
-                         subprocess.run(["patch", "-p1", "-i", str(patch_path)], cwd=repo_path, check=True)
-                    
-                    console.print("[bold green]✅ Patch applied successfully![/bold green]")
-                except Exception as e:
-                    console.print(f"[bold red]❌ Failed to apply patch:[/bold red] {e}")
-
-
-        # Exit Codes
-        if result.success:
-            raise typer.Exit(code=0)
-        elif getattr(result, 'partial_success', False):
-            raise typer.Exit(code=2)
-        else:
-            raise typer.Exit(code=1)
+        display_local_run_result(
+            result,
+            repo_path,
+            verbose=verbose,
+            no_patch=no_patch,
+            yes=yes,
+        )
             
     except typer.Exit:
         raise
