@@ -121,7 +121,7 @@ class RunDisplay:
             return
         self.console.print(Panel(
             text,
-            title="[bold blue]Autonomous Engineer[/bold blue]",
+            title="[bold blue]Autonomous Engineering[/bold blue]",
             border_style="blue",
             padding=(0, 1),
         ))

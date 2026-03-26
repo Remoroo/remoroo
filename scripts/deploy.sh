@@ -3,7 +3,7 @@ set -e
 
 # Remoroo CLI Deployment Script
 # Purpose: Push main + tag v{version} to GitHub. Pushing the tag triggers Actions → Publish to PyPI automatically.
-# Before tagging: runs scripts/sync_and_build.sh (uv lock --check, uv build) — same checks as the publish workflow.
+# Before tagging: uv lock (refresh + commit if needed), then scripts/sync_and_build.sh — same checks as the publish workflow.
 
 echo "🚀 Remoroo CLI Deployment Script"
 echo "=================================="
@@ -132,11 +132,25 @@ if [ -n "$LATEST_TAG" ]; then
 fi
 echo ""
 
-# Ensure uv.lock matches pyproject.toml and the package builds before tagging
-echo "🔒 Verifying lockfile and building release artifacts (same as CI publish)..."
 DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLI_ROOT="$(cd "$DEPLOY_SCRIPT_DIR/.." && pwd)"
+
+# Refresh lockfile so deploy does not fail on stale uv.lock (CI still enforces via uv lock --check on a clean checkout)
+if ! command -v uv >/dev/null 2>&1; then
+    echo "❌ uv is required: https://docs.astral.sh/uv/"
+    exit 1
+fi
+echo "🔒 Refreshing uv.lock (if pyproject.toml changed, lock updates here)..."
+(cd "$CLI_ROOT" && uv lock)
+if [ -n "$(git -C "$CLI_ROOT" status --porcelain uv.lock)" ]; then
+    echo "💾 Committing updated uv.lock..."
+    git -C "$CLI_ROOT" add uv.lock
+    git -C "$CLI_ROOT" commit -m "chore: sync uv.lock for release"
+fi
+
+echo "🔒 Verifying lockfile and building release artifacts (same as CI publish)..."
 if ! bash "$DEPLOY_SCRIPT_DIR/sync_and_build.sh"; then
-    echo "❌ Lock check or build failed. Run: cd \"$(dirname "$DEPLOY_SCRIPT_DIR")\" && uv lock && commit uv.lock, then retry."
+    echo "❌ Lock check or build failed."
     exit 1
 fi
 echo ""

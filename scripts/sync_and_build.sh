@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 1) uv: lockfile check + uv build → dist/ (primary artifacts for PyPI upload in CI)
+# 1) uv: lockfile check (frozen) + uv build → dist/ (primary artifacts for PyPI upload in CI)
 # 2) pip: python -m build → dist_pip_build/ (same PEP 517 project; fails if pip path breaks)
 # Upload is done in GitHub Actions with pypa/gh-action-pypi-publish (not uv publish).
 set -euo pipefail

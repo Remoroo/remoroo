@@ -85,7 +85,7 @@ class RunTuiModel:
 
 class RemorooRunApp(App[None]):
     TITLE = "Remoroo"
-    SUB_TITLE = "autonomous engineer"
+    SUB_TITLE = "Autonomous Engineering"
 
     CSS = """
     Screen {
