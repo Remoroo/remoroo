@@ -101,6 +101,63 @@ def list_runs_cmd(
     )
 
 
+@app.command("abort")
+def abort_run_cmd(
+    run_id: str = typer.Argument(..., metavar="RUN_ID", help="Run id to stop on the control plane."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+    brain_url: Optional[str] = typer.Option(None, "--brain-url", help="API base URL."),
+):
+    """Abort a run on the server (sets status FAILED). Frees attach/resume and monthly quota counting for infra aborts.
+
+    Note: A cloud ``brain_runner`` process may keep working until that process exits or is restarted;
+    this endpoint updates the database and clears pause/detach flags—it does not SIGKILL the worker VM process.
+    """
+    import requests
+
+    from .list_sessions import _api_and_headers
+
+    ensure_logged_in()
+    rid = run_id.strip()
+    if not rid:
+        typer.secho("Run id is empty.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    if not yes:
+        if not typer.confirm(f"Abort run {rid} on the server?", default=True):
+            raise typer.Exit(code=0)
+
+    api, headers = _api_and_headers(brain_url)
+    try:
+        r = requests.post(f"{api}/runs/{rid}/abort", headers=headers, timeout=30.0)
+        if r.status_code == 404:
+            typer.secho(f"Run not found: {rid}", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        if r.status_code in (401, 403):
+            typer.secho("Authentication failed.", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        if r.status_code == 400:
+            detail = ""
+            try:
+                detail = r.json().get("detail", "")
+            except Exception:
+                detail = r.text or ""
+            typer.secho(
+                f"Cannot abort (run may already be finished): {detail or r.status_code}",
+                fg=typer.colors.YELLOW,
+            )
+            raise typer.Exit(code=1)
+        r.raise_for_status()
+    except typer.Exit:
+        raise
+    except requests.RequestException as e:
+        typer.secho(f"Abort request failed: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    typer.secho(f"Aborted run {rid} on the server.", fg=typer.colors.GREEN)
+    typer.echo(
+        "If a brain worker is still busy on AWS, restart that worker or wait for the current handle_run to finish."
+    )
+
+
 @app.command()
 def attach(
     run_id: str = typer.Option(..., "--id", "-i", metavar="RUN_ID", help="Run id from `remoroo list`."),

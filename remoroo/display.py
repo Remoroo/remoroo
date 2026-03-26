@@ -277,6 +277,7 @@ _TOOL_ICONS = {
     "scan_repo": "?",
     "think": "T",
     "metric_gate": "M",
+    "iterate": "↻",
     "done": "D",
     "plan": "P",
     "note": "N",

@@ -2917,10 +2917,20 @@ class LocalWorker:
                 raw_targets = raw_meta.get("target_metrics", [])
                 parsed_targets = []
                 for t in raw_targets:
-                    if isinstance(t, dict) and "name" in t and "operator" in t and "value" in t:
-                        parsed_targets.append(TargetMetric(
-                            name=t["name"], operator=t["operator"], value=float(t["value"]),
-                        ))
+                    if not isinstance(t, dict) or "name" not in t or "value" not in t:
+                        continue
+                    op = t.get("operator") or t.get("op")
+                    if not op:
+                        continue
+                    try:
+                        v = t["value"]
+                        if isinstance(v, bool):
+                            v = 1.0 if v else 0.0
+                        else:
+                            v = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    parsed_targets.append(TargetMetric(name=t["name"], operator=op, value=v))
 
                 file_watches = raw_meta.get("file_watch_paths", [])
                 redirect_file = raw_meta.get("redirect_output_file")
@@ -2930,6 +2940,10 @@ class LocalWorker:
                         file_watches.append(abs_redirect)
                     # Unbuffered Python so redirect file grows on each print (avoids false SILENT_TIMEOUT)
                     run_env["PYTHONUNBUFFERED"] = "1"
+
+                raw_probes = raw_meta.get("metric_probes")
+                if not isinstance(raw_probes, list):
+                    raw_probes = []
 
                 metadata = JobMetadata(
                     expected_kind=raw_meta.get("expected_kind", "unknown"),
@@ -2943,6 +2957,7 @@ class LocalWorker:
                     readiness_regex=raw_meta.get("readiness_regex"),
                     readiness_port=int(raw_meta["readiness_port"]) if raw_meta.get("readiness_port") is not None else None,
                     redirect_output_file=abs_redirect if redirect_file else None,
+                    metric_probes=[p for p in raw_probes if isinstance(p, dict)],
                 )
 
                 supervised = SupervisedJob(

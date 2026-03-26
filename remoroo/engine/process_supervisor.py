@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
+from .metric_probes_executor import execute_metric_probes
+
 
 # ---------------------------------------------------------------------------
 # Child process enumeration (portable)
@@ -128,6 +130,7 @@ class JobMetadata:
     readiness_regex: Optional[str] = None
     readiness_port: Optional[int] = None
     redirect_output_file: Optional[str] = None
+    metric_probes: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -753,7 +756,7 @@ class SupervisedJob:
                     stdout_tail = redirect_tail
 
         events = self.drain_events() if drain else self.peek_events()
-        return {
+        out: Dict[str, Any] = {
             "status": self.state.value,
             "exit_code": self.exit_code,
             "elapsed_s": round(time.time() - self.start_time, 1),
@@ -762,3 +765,25 @@ class SupervisedJob:
             "output_lines": len(stdout_lines),
             "events": [e.to_dict() for e in events],
         }
+        if self.state.value in ("finished", "failed", "killed", "backoff") and self.metadata.metric_probes:
+            full_out = "".join(stdout_lines)
+            full_err = "".join(stderr_lines)
+            if redir:
+                redir_path = redir if os.path.isabs(redir) else os.path.join(self.cwd, redir)
+                try:
+                    with open(redir_path, "r", encoding="utf-8", errors="replace") as _rf:
+                        redirect_full = _rf.read(4 * 1024 * 1024)
+                except (OSError, IOError):
+                    redirect_full = ""
+                if redirect_full:
+                    full_out = (full_out + "\n" + redirect_full) if full_out.strip() else redirect_full
+            snap, perr = execute_metric_probes(
+                self.metadata.metric_probes,
+                stdout_text=full_out,
+                stderr_text=full_err,
+                cwd=self.cwd,
+            )
+            out["metrics_snapshot"] = snap
+            if perr:
+                out["metrics_probe_errors"] = perr
+        return out

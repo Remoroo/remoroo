@@ -79,6 +79,8 @@ class RunTuiModel:
     last_tool_short: str = "—"
     current_sink: Optional[List[str]] = None
     orphan_worker: List[str] = field(default_factory=list)
+    last_metrics_snapshot: Dict[str, Any] = field(default_factory=dict)
+    episode_index: int = 0
     # Assistant text that arrived before turn_started (brain emits assistant_message first)
     pending_assistant_buffer: str = ""
 
@@ -112,7 +114,8 @@ class RemorooRunApp(App[None]):
     }
     #goal-strip {
         dock: top;
-        height: 2;
+        height: auto;
+        max-height: 4;
         background: #21262d;
         color: #8b949e;
         border-bottom: solid #30363d;
@@ -412,7 +415,23 @@ class RemorooRunApp(App[None]):
             g = g[:117] + "…"
         if len(met) > 100:
             met = met[:97] + "…"
-        text = f"[bold]{g}[/]\n[dim]Metric:[/] [italic]{met}[/]" if met else f"[bold]{g}[/]"
+        ep = ""
+        if getattr(m, "episode_index", 0) > 0:
+            ep = f"[dim]Ep {m.episode_index}[/]  "
+        snap = getattr(m, "last_metrics_snapshot", None) or {}
+        snap_s = ""
+        if snap:
+            parts = [f"{k}={v}" for k, v in list(snap.items())[:10]]
+            snap_s = "  [dim]│[/]  " + " ".join(parts)
+            if len(snap_s) > 200:
+                snap_s = snap_s[:197] + "…"
+        line1 = f"{ep}[bold]{g}[/]"
+        line2 = (
+            f"[dim]Metric:[/] [italic]{met}[/]{snap_s}"
+            if met
+            else f"[dim]Metric:[/] —{snap_s}" if snap_s else ""
+        )
+        text = line1 + ("\n" + line2 if line2 else "")
         self.query_one("#goal-strip", Static).update(text)
 
     def _refresh_footer(self) -> None:
@@ -642,6 +661,20 @@ class RemorooRunApp(App[None]):
                 self._refresh_detail_logs()
         elif kind == "tool_call_completed":
             name = d.get("tool_name", "")
+            data = d.get("data") or {}
+            snap_updated = False
+            if isinstance(data, dict):
+                ms = data.get("metrics_snapshot")
+                if isinstance(ms, dict) and ms:
+                    self.model.last_metrics_snapshot = dict(ms)
+                    snap_updated = True
+                elif name == "metric_gate":
+                    mg = data.get("metrics")
+                    if isinstance(mg, dict) and mg:
+                        self.model.last_metrics_snapshot = dict(mg)
+                        snap_updated = True
+            if snap_updated:
+                self._refresh_goal()
             if _is_plumbing(name, d.get("output_preview", "")):
                 return
             turn = self._current_turn()
@@ -665,6 +698,22 @@ class RemorooRunApp(App[None]):
                             self.model.current_sink = None
                         break
             self._update_timeline_prompt(turn)
+            if self.model.follow_live:
+                self._refresh_detail_logs()
+        elif kind == "metrics_snapshot":
+            mets = d.get("metrics") or {}
+            if isinstance(mets, dict):
+                self.model.last_metrics_snapshot = dict(mets)
+            self._refresh_goal()
+        elif kind == "iterate_episode":
+            self.model.episode_index = int(d.get("episode_index", 0))
+            sp = (d.get("summary_preview") or "").strip()
+            turn = self._current_turn()
+            if turn is not None and sp:
+                turn.worker_notes.append(
+                    f"[iterate · episode {self.model.episode_index}] {sp[:300]}"
+                )
+            self._refresh_goal()
             if self.model.follow_live:
                 self._refresh_detail_logs()
 
@@ -914,6 +963,13 @@ class RemorooRunApp(App[None]):
                 ack = ExecutionResult(success=True, data={})
                 ack.request_id = step.request_id
                 server.submit_result(ack)
+                pl = step.payload or {}
+                mets = pl.get("metrics")
+                if isinstance(mets, dict):
+                    self._ui_q.put((
+                        "agent_event",
+                        {"kind": "metrics_snapshot", "metrics": mets},
+                    ))
                 continue
 
             if step.type == "workflow_error":
