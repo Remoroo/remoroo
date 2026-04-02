@@ -63,6 +63,82 @@ class TurnModel:
 
 
 @dataclass
+class BudgetTuiState:
+    """Billing/budget snapshot from POST /runs for the sticky budget strip."""
+
+    requested_wall_time_s: float
+    effective_wall_time_s: float
+    model_tier: str = "haiku"
+    multiplier: int = 1
+    clamped: bool = False
+    overage: bool = False
+    projected_overage_credits: Optional[int] = None
+    projected_overage_usd: Optional[float] = None
+    credits_available: Optional[int] = None
+    credits_reserved: Optional[int] = None
+    affordable_h: Optional[Dict[str, float]] = None
+
+
+def _budget_timeline_badge(b: Optional[BudgetTuiState]) -> str:
+    """Short always-visible status for the timeline pane (left column)."""
+    if b is None:
+        return "[dim]│[/]  [dim]budget n/a[/]"
+    eff_h = b.effective_wall_time_s / 3600.0
+    if b.overage:
+        return f"[dim]│[/]  [bold #f0883e]OVERAGE {eff_h:.1f}h[/]"
+    if b.clamped:
+        return f"[dim]│[/]  [bold yellow]CLAMPED {eff_h:.1f}h[/]"
+    return f"[dim]│[/]  [bold green]WITHIN BALANCE {eff_h:.1f}h[/]"
+
+
+def _budget_footer_lines(b: Optional[BudgetTuiState]) -> str:
+    """Two-line max budget strip above Textual Footer (no LIVE/help duplication)."""
+    def _cr_inline(bb: BudgetTuiState) -> str:
+        if bb.credits_available is None or bb.credits_reserved is None:
+            return ""
+        return (
+            f"  [dim]·[/]  [bold green]{bb.credits_available}[/][dim]/[/][cyan]{bb.credits_reserved}[/] [dim]cr[/]"
+        )
+
+    if b is None:
+        return "[bold yellow]▶ BUDGET[/]  [dim]n/a[/]  [dim](--resume)[/]"
+    req_h = b.requested_wall_time_s / 3600.0
+    eff_h = b.effective_wall_time_s / 3600.0
+    tier = (b.model_tier or "haiku").capitalize()
+    mul = b.multiplier
+    cr = _cr_inline(b)
+    if b.overage:
+        oc = b.projected_overage_credits
+        ou = float(b.projected_overage_usd or 0.0)
+        oc_s = str(oc) if oc is not None else "?"
+        line1 = (
+            f"[bold #f0883e]▶ OVERAGE[/]  [bold #ffa657]+{oc_s} cr[/] ~[bold #ffa657]${ou:.2f}[/]  "
+            f"[dim]·[/]  full ask [bold]{req_h:.1f}h[/]{cr}"
+        )
+    elif b.clamped:
+        line1 = (
+            f"[bold yellow]▶ CLAMPED[/]  [dim]{req_h:.1f}h[/][dim]→[/][bold #58a6ff]{eff_h:.1f}h[/]  "
+            f"[dim]·[/]  {tier} [dim]{mul}×[/]{cr}"
+        )
+    else:
+        line1 = (
+            f"[bold green]▶ OK[/]  [bold #58a6ff]{eff_h:.1f}h[/] cap  [dim]·[/]  {tier} [dim]{mul}×[/]{cr}"
+        )
+    aff = b.affordable_h or {}
+    line2 = ""
+    if b.clamped and aff:
+        h, s, o = aff.get("haiku"), aff.get("sonnet"), aff.get("opus")
+        if h is not None and s is not None and o is not None:
+            line2 = (
+                f"[dim]Afford @ balance:[/]  [cyan]{h:g}[/]h H  [dim]/[/]  [cyan]{s:g}[/]h S  [dim]/[/]  "
+                f"[cyan]{o:g}[/]h O"
+            )
+    if line2:
+        return line1 + "\n" + line2
+    return line1
+
+
+@dataclass
 class RunTuiModel:
     run_id: str
     repo_short: str
@@ -83,6 +159,7 @@ class RunTuiModel:
     episode_index: int = 0
     # Assistant text that arrived before turn_started (brain emits assistant_message first)
     pending_assistant_buffer: str = ""
+    budget: Optional[BudgetTuiState] = None
 
 
 class RemorooRunApp(App[None]):
@@ -93,9 +170,18 @@ class RemorooRunApp(App[None]):
     Screen {
         background: #0d1117;
         color: #e6edf3;
+        layers: body chrome;
+    }
+    Header {
+        layer: chrome;
+    }
+    Footer {
+        layer: chrome;
+        background: #161b22;
     }
     #brand-strip {
         dock: top;
+        layer: chrome;
         height: 1;
         background: #010409;
         color: #79c0ff;
@@ -105,6 +191,7 @@ class RemorooRunApp(App[None]):
     }
     #title-strip {
         dock: top;
+        layer: chrome;
         height: 1;
         background: #161b22;
         color: #58a6ff;
@@ -114,6 +201,7 @@ class RemorooRunApp(App[None]):
     }
     #goal-strip {
         dock: top;
+        layer: chrome;
         height: auto;
         max-height: 4;
         background: #21262d;
@@ -122,6 +210,7 @@ class RemorooRunApp(App[None]):
         padding: 0 1;
     }
     #main-split {
+        layer: body;
         height: 1fr;
         min-height: 12;
     }
@@ -132,7 +221,9 @@ class RemorooRunApp(App[None]):
         border-right: wide #388bfd;
     }
     #timeline-header {
-        height: 1;
+        height: auto;
+        min-height: 1;
+        max-height: 3;
         background: #161b22;
         color: #58a6ff;
         text-style: bold;
@@ -191,6 +282,7 @@ class RemorooRunApp(App[None]):
     #raw-pane {
         height: 8;
         dock: bottom;
+        layer: chrome;
         background: #161b22;
         border-top: solid #6e7681;
         display: none;
@@ -209,16 +301,25 @@ class RemorooRunApp(App[None]):
         background: #0d1117;
         border: tall #6e7681;
     }
-    #footer-strip {
+    /* One dock-bottom stack: budget strip above Footer (no z-order fight). */
+    #bottom-bar {
         dock: bottom;
-        height: 2;
-        background: #161b22;
-        color: #7ee787;
-        padding: 0 1;
-        border-top: solid #30363d;
+        layer: chrome;
+        width: 100%;
+        height: auto;
     }
-    Footer {
-        background: #161b22;
+    #footer-strip {
+        height: auto;
+        min-height: 1;
+        max-height: 4;
+        width: 100%;
+        background: #21262d;
+        color: #c9d1d9;
+        padding: 0 1;
+        border-top: solid #388bfd;
+    }
+    #bottom-bar Footer {
+        width: 100%;
     }
     """
 
@@ -276,11 +377,7 @@ class RemorooRunApp(App[None]):
         yield Static("", id="goal-strip")
         with Horizontal(id="main-split"):
             with Vertical(id="timeline-pane"):
-                yield Static(
-                    "[bold #58a6ff]REMOROO[/] [dim]│[/] [bold]Turns[/]",
-                    id="timeline-header",
-                    markup=True,
-                )
+                yield Static("", id="timeline-header", markup=True)
                 yield OptionList(id="timeline")
             with Vertical(id="detail-pane"):
                 yield Static(
@@ -302,8 +399,9 @@ class RemorooRunApp(App[None]):
                 markup=True,
             )
             yield RichLog(id="raw-log", wrap=True, highlight=True, markup=False)
-        yield Static("", id="footer-strip")
-        yield Footer()
+        with Vertical(id="bottom-bar"):
+            yield Static("", id="footer-strip", markup=True)
+            yield Footer()
 
     def on_mount(self) -> None:
         self._refresh_brand()
@@ -407,6 +505,12 @@ class RemorooRunApp(App[None]):
         )
         self.query_one("#title-strip", Static).update(line)
 
+    def _refresh_timeline_header(self) -> None:
+        m = self.model
+        badge = _budget_timeline_badge(m.budget)
+        line = f"[bold #58a6ff]REMOROO[/] [dim]│[/] [bold]Turns[/]  {badge}"
+        self.query_one("#timeline-header", Static).update(line)
+
     def _refresh_goal(self) -> None:
         m = self.model
         g = (m.goal or "—").replace("\n", " ")
@@ -436,18 +540,8 @@ class RemorooRunApp(App[None]):
 
     def _refresh_footer(self) -> None:
         m = self.model
-        live = "[green]LIVE[/]" if m.follow_live else "[yellow]SEL[/]"
-        pause_tag = " [magenta]PAUSED[/]" if m.ui_paused else ""
-        row1 = (
-            f"{live}{pause_tag}  [dim]│[/]  [bold]{m.now_text}[/]  [dim]│[/]  last: [cyan]{m.last_tool_short}[/]  "
-            f"[dim]│[/]  [bold]?[/] help  [bold]p[/] pause  [bold]^d[/] detach  [bold]g[/] live  [bold]^r[/] raw  [bold]q[/] quit"
-        )
-        row2 = (
-            "[dim]remoroo.com  ·  [bold]q[/] stop run + kill local jobs  ·  [bold]^d[/] tmux-detach (stays RUNNING)  ·  "
-            "[bold]p[/] pause  ·  reattach:[/] "
-            f"[italic cyan]remoroo run --local --resume {m.run_id}[/]"
-        )
-        self.query_one("#footer-strip", Static).update(row1 + "\n" + row2)
+        self.query_one("#footer-strip", Static).update(_budget_footer_lines(m.budget))
+        self._refresh_timeline_header()
 
     def _current_turn(self) -> Optional[TurnModel]:
         return self.model.turns[-1] if self.model.turns else None
@@ -1079,11 +1173,17 @@ def run_remoroo_tui_session(
     original_repo_path: str,
     cache_env: bool,
     in_place: bool,
+    budget_ui: Optional[BudgetTuiState] = None,
 ) -> Dict[str, Any]:
     result_box: Dict[str, Any] = {}
     stop_flag = threading.Event()
     repo_short = str(repo_path).rstrip("/").split("/")[-1] or str(repo_path)
-    model = RunTuiModel(run_id=remote_run_id, repo_short=repo_short, engine=engine)
+    model = RunTuiModel(
+        run_id=remote_run_id,
+        repo_short=repo_short,
+        engine=engine,
+        budget=budget_ui,
+    )
 
     app = RemorooRunApp(
         model=model,

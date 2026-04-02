@@ -13,6 +13,35 @@ class LocalRunResult:
     partial_success: bool = False
 
 
+def _budget_tui_from_run_json(requested_max_wall_time_s: int, run_data: dict):
+    """Build TUI budget strip state from POST /runs JSON."""
+    from .tui_run import BudgetTuiState
+
+    warnings = list(run_data.get("warnings") or [])
+    raw_eff = run_data.get("max_wall_time_s_effective")
+    eff = int(raw_eff) if raw_eff is not None else int(requested_max_wall_time_s)
+    tier = str(run_data.get("model_tier") or "haiku")
+    mul = int(run_data.get("model_multiplier") or 1)
+    ca = run_data.get("credits_available")
+    cr = run_data.get("credits_reserved")
+    aff = run_data.get("max_affordable_hours")
+    oc = run_data.get("projected_overage_credits")
+    ou = run_data.get("projected_overage_usd")
+    return BudgetTuiState(
+        requested_wall_time_s=float(requested_max_wall_time_s),
+        effective_wall_time_s=float(eff),
+        model_tier=tier,
+        multiplier=mul,
+        clamped="budget_clamped_to_balance" in warnings,
+        overage="overage_projected" in warnings,
+        projected_overage_credits=int(oc) if oc is not None else None,
+        projected_overage_usd=float(ou) if ou is not None else None,
+        credits_available=int(ca) if ca is not None else None,
+        credits_reserved=int(cr) if cr is not None else None,
+        affordable_h=aff if isinstance(aff, dict) else None,
+    )
+
+
 def _teardown_local_worker_processes(worker) -> None:
     """Stop bash/training children and docker/venv sandbox (best-effort)."""
     if worker is None:
@@ -43,6 +72,8 @@ def run_local_worker(
     engine_version: str = "v2",
     model: Optional[str] = None,
     resume_run_id: Optional[str] = None,
+    max_wall_time_s: int = 36000,
+    allow_overage: bool = False,
 ) -> LocalRunResult:
     from .configs import get_api_url
     if brain_url is None:
@@ -116,6 +147,7 @@ def run_local_worker(
             
     # 3. Create run on server, or attach to an existing run (--resume)
     headers = {"Authorization": f"Bearer {session_key}"}
+    budget_ui = None
     try:
         if resume_run_id:
             resp = requests.get(
@@ -152,6 +184,8 @@ def run_local_worker(
                 "agentic": "true" if agentic else "false",
                 "engine_version": engine_version,
                 "in_place": "true" if in_place else "false",
+                "max_wall_time_s": str(max_wall_time_s),
+                "allow_overage": "true" if allow_overage else "false",
             }
             if model:
                 form["model"] = model
@@ -174,6 +208,7 @@ def run_local_worker(
             resp.raise_for_status()
             run_data = resp.json()
             remote_run_id = run_data["run_id"]
+            budget_ui = _budget_tui_from_run_json(max_wall_time_s, run_data)
     except typer.Exit:
         raise
     except Exception as e:
@@ -285,6 +320,7 @@ def run_local_worker(
             original_repo_path=original_repo_path,
             cache_env=cache_env,
             in_place=in_place,
+            budget_ui=budget_ui,
         )
         final_result = rb.get("final_result")
         outcome = rb.get("outcome", "UNKNOWN")

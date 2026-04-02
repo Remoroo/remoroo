@@ -20,6 +20,9 @@ def run_remote_experiment(
     goal: str,
     metrics: list[str],
     verbose: bool = False,
+    model: str | None = None,
+    max_wall_time_s: int = 36000,
+    allow_overage: bool = False,
 ) -> RemoteRunResult:
     """
     Connects to Remoroo Brain (Cloud/Local) as a VIEWER.
@@ -51,8 +54,12 @@ def run_remote_experiment(
         data = {
             "goal": goal,
             "metrics": metrics_str,
-            "artifact_dir": str(out_dir / run_id)
+            "artifact_dir": str(out_dir / run_id),
+            "max_wall_time_s": str(max_wall_time_s),
+            "allow_overage": "true" if allow_overage else "false",
         }
+        if model:
+            data["model"] = model
         
         # Read API Key
         import os
@@ -113,6 +120,21 @@ def run_remote_experiment(
     run_data = resp.json()
     remote_run_id = run_data["run_id"]
     typer.echo(f"   Run ID: {remote_run_id}")
+
+    # Surface budget warnings from CP
+    for w in run_data.get("warnings") or []:
+        if w == "budget_clamped_to_balance":
+            affordable = run_data.get("max_affordable_hours", {})
+            eff = run_data.get("max_wall_time_s_effective", "?")
+            typer.secho(f"   ⚠️  Insufficient credits — budget clamped to {eff}s.", fg=typer.colors.YELLOW)
+            if affordable:
+                typer.echo(f"   You can afford: Haiku {affordable.get('haiku','?')}h / Sonnet {affordable.get('sonnet','?')}h / Opus {affordable.get('opus','?')}h")
+            typer.echo("   Re-run with --allow-overage to use the full budget (overage charges apply).")
+        elif w == "overage_projected":
+            oc = run_data.get("projected_overage_credits", "?")
+            ou = run_data.get("projected_overage_usd", "?")
+            typer.secho(f"   ⚠️  Overage: ~{oc} credits (~${ou}) will be billed beyond your balance.", fg=typer.colors.YELLOW)
+
     typer.echo("   (Viewer Mode: Waiting for remote worker to execute...)")
 
     outcome = "UNKNOWN"

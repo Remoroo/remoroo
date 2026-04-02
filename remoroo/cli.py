@@ -225,6 +225,8 @@ def run(
     v2: bool = typer.Option(True, "--v2/--v1", help="Use v2 agent loop (default) or legacy v1."),
     model: Optional[str] = typer.Option(None, "--model", help="v2 LLM model id (e.g. anthropic/claude-sonnet-4.5)."),
     pick_model: bool = typer.Option(True, "--pick-model", help="Full-screen picker: Haiku / Sonnet / Opus before the run TUI."),
+    budget_hours: float = typer.Option(10.0, "--budget", help="Time budget in hours (default 10). Sets wall-clock and cost caps."),
+    allow_overage: bool = typer.Option(False, "--allow-overage", help="Allow run to exceed credit balance (billed as overage)."),
     resume: Optional[str] = typer.Option(
         None,
         "--resume",
@@ -268,6 +270,7 @@ def run(
         if not metrics_list:
             metrics_list = prompt_metrics()
 
+        max_wall_time_s = int(budget_hours * 3600)
         try:
              res = run_remote_experiment(
                 run_id=new_run_id(),
@@ -275,6 +278,9 @@ def run(
                 out_dir=resolve_out_dir(out, resolve_repo_path(repo)),
                 goal=goal,
                 metrics=metrics_list,
+                model=model,
+                max_wall_time_s=max_wall_time_s,
+                allow_overage=allow_overage,
              )
              typer.echo(f"Run outcome: {res.outcome}")
              raise typer.Exit(code=0)
@@ -320,6 +326,7 @@ def run(
         elif not confirm_run(repo_path, goal, metrics_list, mode="local"):
             raise typer.Exit(code=0)
 
+    max_wall_time_s = int(budget_hours * 3600)
     typer.secho(f"\nStarting run {run_id}...", fg=typer.colors.BLUE)
 
     try:
@@ -338,6 +345,8 @@ def run(
             engine_version="v2" if v2 else "v1",
             model=model,
             resume_run_id=resume,
+            max_wall_time_s=max_wall_time_s,
+            allow_overage=allow_overage,
         )
 
         from .run_summary import display_local_run_result
