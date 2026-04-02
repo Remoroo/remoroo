@@ -54,7 +54,6 @@ def run_remote_experiment(
         data = {
             "goal": goal,
             "metrics": metrics_str,
-            "artifact_dir": str(out_dir / run_id),
             "max_wall_time_s": str(max_wall_time_s),
             "allow_overage": "true" if allow_overage else "false",
         }

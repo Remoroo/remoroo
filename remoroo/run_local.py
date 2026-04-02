@@ -85,11 +85,7 @@ def run_local_worker(
     
     # Map input list[str] to string for Orchestrator if needed.
     metrics_str = ", ".join(metrics)
-    
-    # We need to construct artifact_dir based on out_dir and run_id
-    artifact_dir = out_dir / run_id
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Use local engine components
     from .engine.local_worker import WorkerService
     from .engine.protocol import ExecutionRequest, ExecutionResult
@@ -103,7 +99,6 @@ def run_local_worker(
     API_URL = brain_url
     
     # Check Server Health
-    import requests
     try:
         resp = requests.get(f"{API_URL}/health", timeout=2.0)
         if resp.status_code != 200:
@@ -180,7 +175,6 @@ def run_local_worker(
                 "repo_path": str(repo_path),
                 "goal": goal,
                 "metrics": metrics_str,
-                "artifact_dir": str(artifact_dir),
                 "agentic": "true" if agentic else "false",
                 "engine_version": engine_version,
                 "in_place": "true" if in_place else "false",
@@ -214,11 +208,43 @@ def run_local_worker(
     except Exception as e:
         typer.secho(f"❌ Failed to start or attach run on server: {e}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
-    
+
+    remoroo_dir = repo_path / ".remoroo"
+    run_output_dir = remoroo_dir / "runs" / remote_run_id
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    run_root_str = str(run_output_dir.resolve())
+
+    gitignore_path = repo_path / ".gitignore"
+    try:
+        if gitignore_path.exists():
+            content = gitignore_path.read_text()
+            if ".remoroo/" not in content:
+                with open(gitignore_path, "a") as f:
+                    f.write("\n# Remoroo Metadata\n.remoroo/\n")
+        else:
+            gitignore_path.write_text("# Remoroo Metadata\n.remoroo/\n")
+    except Exception:
+        pass
+
+    memory_path = remoroo_dir / "memory.json"
+    old_memory_path = remoroo_dir / "local_memory.json"
+    if not memory_path.exists() and old_memory_path.exists():
+        try:
+            old_memory_path.rename(memory_path)
+        except Exception:
+            pass
+    if not memory_path.exists():
+        try:
+            memory_path.write_text(
+                '{"repo_url": "", "last_updated": "", "world_facts": [], "entity_summaries": {}, "experiences": [], "beliefs": []}'
+            )
+        except Exception:
+            pass
+
     # 4. Start Log Streamer (Background) — started after display is created (see below)
 
     # 5. Initialize Proxy
-    
+
     # Phase 3: Persistent Client ID
     config_dir = Path.home() / ".config" / "remoroo"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -261,40 +287,6 @@ def run_local_worker(
             
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat_thread.start()
-    
-    # Phase 2.5: Bulletproof Isolation & Persistence
-    # Create unique run output directory in the original repo
-    remoroo_dir = repo_path / ".remoroo"
-    run_output_base = remoroo_dir / "runs"
-    run_output_dir = run_output_base / remote_run_id
-    run_output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Git Hygiene: Ensure .remoroo is ignored to prevent "patch soup"
-    gitignore_path = repo_path / ".gitignore"
-    try:
-        if gitignore_path.exists():
-            content = gitignore_path.read_text()
-            if ".remoroo/" not in content:
-                with open(gitignore_path, 'a') as f:
-                    f.write("\n# Remoroo Metadata\n.remoroo/\n")
-        else:
-            gitignore_path.write_text("# Remoroo Metadata\n.remoroo/\n")
-    except Exception:
-        pass # Ignore gitignore failures
-
-    # Initialize workspace memory file if it doesn't exist; migrate old name
-    memory_path = remoroo_dir / "memory.json"
-    old_memory_path = remoroo_dir / "local_memory.json"
-    if not memory_path.exists() and old_memory_path.exists():
-        try:
-            old_memory_path.rename(memory_path)
-        except Exception:
-            pass
-    if not memory_path.exists():
-        try:
-            memory_path.write_text('{"repo_url": "", "last_updated": "", "world_facts": [], "entity_summaries": {}, "experiences": [], "beliefs": []}')
-        except Exception:
-            pass
 
     from rich.console import Console
     from .engine.local_worker import current_local_worker
@@ -316,7 +308,7 @@ def run_local_worker(
             remote_run_id=remote_run_id,
             repo_path=original_repo_path,
             engine=engine,
-            artifact_dir=str(artifact_dir),
+            artifact_dir=run_root_str,
             original_repo_path=original_repo_path,
             cache_env=cache_env,
             in_place=in_place,
@@ -361,11 +353,11 @@ def run_local_worker(
     if worker_service is None:
         worker_service = WorkerService(
             repo_root=original_repo_path,
-            artifact_dir=str(artifact_dir),
+            artifact_dir=run_root_str,
             original_repo_root=original_repo_path,
             run_id=remote_run_id,
             engine=engine,
-            persistence_dir=str(artifact_dir),
+            persistence_dir=run_root_str,
             output_callback=console.print,
             cache_env=cache_env,
             in_place=in_place,
@@ -409,37 +401,7 @@ def run_local_worker(
             except Exception as e:
                 console.print(f"   [yellow]⚠️  Docker commit failed: {e}[/yellow]")
         
-        # 3. v14.1: HARDENED ARTIFACT SYNCHRONIZATION
-        # Ensure we sync artifacts from the worker's active directory to the permanent CLI cache.
-        if worker_service.artifact_dir:
-             src_artifacts = Path(worker_service.artifact_dir)
-             dst_artifacts = artifact_dir # This is the permanent path from line 36
-             
-             if src_artifacts.exists() and src_artifacts.resolve() != dst_artifacts.resolve():
-                 console.print(f"   [green]💾 Synchronizing artifacts...[/green]")
-                 try:
-                     # Reclaim ownership first (important for Docker)
-                     if hasattr(worker_service, '_reclaim_ownership'):
-                         worker_service._reclaim_ownership(str(src_artifacts))
-                     
-                     # Sync files
-                     import shutil
-                     count = 0
-                     for item in src_artifacts.iterdir():
-                         s = item
-                         d = dst_artifacts / item.name
-                         if s.is_dir():
-                             if d.exists(): shutil.rmtree(d)
-                             shutil.copytree(s, d)
-                         else:
-                             shutil.copy2(s, d)
-                         count += 1
-                     if count > 0:
-                         console.print(f"   [green]✅ Synchronized {count} artifacts to {dst_artifacts}[/green]")
-                 except Exception as e:
-                      console.print(f"   [red]❌ Failed to synchronize artifacts: {e}[/red]")
-        
-        # 4. Request cleanup of working copy via RPC (Handles both Mac and Linux)
+        # 3. Request cleanup of working copy via RPC (Handles both Mac and Linux)
         from .engine.protocol import ExecutionRequest
         cleanup_request = ExecutionRequest(
             type="cleanup_working_copy",
