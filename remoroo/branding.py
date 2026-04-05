@@ -10,3 +10,23 @@ BRAND_MARKUP_MODEL_PICKER = (
     "[bold #58a6ff]REMOROO[/]  [dim]model[/]  [dim]·[/]  "
     "[dim italic]Ship faster with agents[/]  [dim]·[/]  [#8b949e]remoroo.com[/]"
 )
+
+BRAND_MARKUP_WIZARD = (
+    "[bold #58a6ff]REMOROO[/]  [dim]wizard[/]  [dim]·[/]  "
+    "[dim italic]Ship faster with agents[/]  [dim]·[/]  [#8b949e]remoroo.com[/]"
+)
+
+BRAND_MARKUP_RESULTS = (
+    "[bold #58a6ff]REMOROO[/]  [dim]results[/]  [dim]·[/]  "
+    "[dim italic]Ship faster with agents[/]  [dim]·[/]  [#8b949e]remoroo.com[/]"
+)
+
+BRAND_MARKUP_CONNECTING = (
+    "[bold #58a6ff]REMOROO[/]  [dim]connecting[/]  [dim]·[/]  "
+    "[dim italic]Ship faster with agents[/]  [dim]·[/]  [#8b949e]remoroo.com[/]"
+)
+
+BRAND_MARKUP_CONFIRM = (
+    "[bold #58a6ff]REMOROO[/]  [dim]confirm[/]  [dim]·[/]  "
+    "[dim italic]Ship faster with agents[/]  [dim]·[/]  [#8b949e]remoroo.com[/]"
+)

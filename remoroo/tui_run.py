@@ -29,8 +29,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
+from textual.screen import Screen
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header, OptionList, RichLog, Static
@@ -162,26 +163,27 @@ class RunTuiModel:
     budget: Optional[BudgetTuiState] = None
 
 
-class RemorooRunApp(App[None]):
-    TITLE = "Remoroo"
-    SUB_TITLE = "Autonomous Engineering"
+class RemorooRunScreen(Screen[Dict[str, Any]]):
+    """Live run timeline + logs; dismisses with ``result_box`` when the run ends."""
 
     CSS = """
     Screen {
         background: #0d1117;
         color: #e6edf3;
-        layers: body chrome;
+        layout: vertical;
+        overflow-y: hidden;
     }
+    /* Single vertical flow: separate body/chrome layers each fill the screen, so top
+       strips were painting over #main-split; a taller goal/metrics bar hid assistant text. */
     Header {
-        layer: chrome;
+        dock: none;
+        height: 1;
     }
     Footer {
-        layer: chrome;
+        dock: none;
         background: #161b22;
     }
     #brand-strip {
-        dock: top;
-        layer: chrome;
         height: 1;
         background: #010409;
         color: #79c0ff;
@@ -190,8 +192,6 @@ class RemorooRunApp(App[None]):
         padding: 0 1;
     }
     #title-strip {
-        dock: top;
-        layer: chrome;
         height: 1;
         background: #161b22;
         color: #58a6ff;
@@ -200,8 +200,6 @@ class RemorooRunApp(App[None]):
         padding: 0 1;
     }
     #goal-strip {
-        dock: top;
-        layer: chrome;
         height: auto;
         max-height: 4;
         background: #21262d;
@@ -210,7 +208,6 @@ class RemorooRunApp(App[None]):
         padding: 0 1;
     }
     #main-split {
-        layer: body;
         height: 1fr;
         min-height: 12;
     }
@@ -281,8 +278,6 @@ class RemorooRunApp(App[None]):
     }
     #raw-pane {
         height: 8;
-        dock: bottom;
-        layer: chrome;
         background: #161b22;
         border-top: solid #6e7681;
         display: none;
@@ -301,10 +296,8 @@ class RemorooRunApp(App[None]):
         background: #0d1117;
         border: tall #6e7681;
     }
-    /* One dock-bottom stack: budget strip above Footer (no z-order fight). */
     #bottom-bar {
-        dock: bottom;
-        layer: chrome;
+        layout: vertical;
         width: 100%;
         height: auto;
     }
@@ -320,6 +313,7 @@ class RemorooRunApp(App[None]):
     }
     #bottom-bar Footer {
         width: 100%;
+        dock: none;
     }
     """
 
@@ -658,10 +652,17 @@ class RemorooRunApp(App[None]):
         partial_success: bool,
         final_result: Optional[Dict[str, Any]],
     ) -> None:
-        self.call_from_thread(self._finish, outcome, success, partial_success, final_result)
+        # Must use App.call_from_thread — Screen has no such API.
+        app = self.app
+        if app is not None:
+            app.call_from_thread(
+                self._finish, outcome, success, partial_success, final_result
+            )
 
     def finish_error(self, message: str) -> None:
-        self.call_from_thread(self._finish_err, message)
+        app = self.app
+        if app is not None:
+            app.call_from_thread(self._finish_err, message)
 
     def _set_sse(self, ok: bool) -> None:
         self.model.sse_ok = ok
@@ -842,7 +843,8 @@ class RemorooRunApp(App[None]):
         self.model.now_text = f"Done: {outcome}"
         self._refresh_footer()
         self.notify(f"Run finished: {outcome}", severity="information" if success else "warning")
-        self.exit()
+        # Return AwaitComplete so App.call_from_thread → invoke() awaits pop_screen (unblocks push_screen_wait).
+        return self.dismiss(self.result_box)
 
     def _finish_err(self, message: str) -> None:
         self.stop_flag.set()
@@ -854,7 +856,7 @@ class RemorooRunApp(App[None]):
             final_result=None,
         )
         self.notify(message, severity="error")
-        self.exit()
+        return self.dismiss(self.result_box)
 
     def action_quit(self) -> None:
         import requests as _req
@@ -886,7 +888,7 @@ class RemorooRunApp(App[None]):
             partial_success=False,
             final_result=None,
         )
-        self.exit()
+        self.dismiss(self.result_box)
 
     def _sync_pause_from_server(self) -> None:
         import requests as _req
@@ -958,7 +960,7 @@ class RemorooRunApp(App[None]):
             severity="information",
             timeout=7,
         )
-        self.exit()
+        self.dismiss(self.result_box)
 
     def action_go_live(self) -> None:
         self.model.follow_live = True
@@ -1161,6 +1163,28 @@ class RemorooRunApp(App[None]):
                 backoff = min(max_backoff, backoff * 1.5)
 
 
+class _LegacyRunTuiApp(App[Dict[str, Any]]):
+    """Single-screen host so ``RemorooRunScreen.dismiss`` returns the result dict."""
+
+    TITLE = "Remoroo"
+    SUB_TITLE = "Autonomous Engineering"
+    CSS = RemorooRunScreen.CSS
+
+    def __init__(self, run_screen: RemorooRunScreen) -> None:
+        super().__init__()
+        self._run_screen = run_screen
+
+    async def on_mount(self) -> None:
+        self._await_run_screen()
+
+    @work(exclusive=True)
+    async def _await_run_screen(self) -> None:
+        rb = await self.push_screen_wait(self._run_screen)
+        if not isinstance(rb, dict) or not rb:
+            rb = getattr(self._run_screen, "result_box", {}) or {}
+        self.exit(rb)
+
+
 def run_remoroo_tui_session(
     *,
     server: Any,
@@ -1185,7 +1209,7 @@ def run_remoroo_tui_session(
         budget=budget_ui,
     )
 
-    app = RemorooRunApp(
+    screen = RemorooRunScreen(
         model=model,
         result_box=result_box,
         stop_flag=stop_flag,
@@ -1199,7 +1223,13 @@ def run_remoroo_tui_session(
         in_place=in_place,
         server=server,
     )
-    app.run()
-    if not result_box:
-        result_box.update(outcome="UNKNOWN", success=False, partial_success=False, final_result=None)
-    return result_box
+    out = _LegacyRunTuiApp(screen).run()
+    if not out:
+        out = dict(result_box)
+    if not out:
+        out.update(outcome="UNKNOWN", success=False, partial_success=False, final_result=None)
+    return out
+
+
+# Backward-compatible name
+RemorooRunApp = RemorooRunScreen

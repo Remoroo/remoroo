@@ -47,8 +47,8 @@ def attach_to_run(
     from .configs import get_default_engine
     from .engine.utils.doctor import ensure_ready
     from .auth import ensure_logged_in
-    from .run_local import run_local_worker
-    from .run_summary import display_local_run_result
+    from .tui_launch_config import LaunchConfig
+    from .tui_unified_app import echo_session_finished_line, run_unified_local_session
 
     ensure_ready()
     ensure_logged_in()
@@ -115,21 +115,11 @@ def attach_to_run(
         typer.secho(f"Invalid engine '{eng}'.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
-    if not yes:
-        if not typer.confirm(f"Attach to run {run_id} ({st}) at {repo_path}?", default=True):
-            raise typer.Exit(0)
-
-    typer.secho(f"\nAttaching to {run_id}…", fg=typer.colors.BLUE)
-    if goal:
-        typer.secho(f"  Goal: {goal[:120]}{'…' if len(goal) > 120 else ''}", fg=typer.colors.CYAN)
-
     try:
-        result = run_local_worker(
-            run_id=run_id,
+        cfg = LaunchConfig(
+            mode="attach",
             repo_path=repo_path,
             out_dir=out_dir,
-            goal=goal,
-            metrics=metrics_list,
             brain_url=api,
             engine=eng,
             verbose=verbose,
@@ -137,16 +127,23 @@ def attach_to_run(
             in_place=in_place,
             agentic=agentic,
             engine_version="v2" if v2 else "v1",
+            max_wall_time_s=36000,
+            allow_overage=False,
+            yes=yes,
+            no_patch=no_patch,
+            pick_model=False,
+            goal=goal.strip(),
+            metrics_list=metrics_list,
             model=None,
             resume_run_id=run_id,
+            run_id_display=run_id,
+            attach_status=st,
+            attach_goal_preview=goal[:400] if goal else "",
+            metrics_option_provided=True,
         )
-        display_local_run_result(
-            result,
-            repo_path,
-            verbose=verbose,
-            no_patch=no_patch,
-            yes=yes,
-        )
+        lr, code = run_unified_local_session(cfg)
+        echo_session_finished_line(lr, code)
+        raise typer.Exit(code=code)
     except typer.Exit:
         raise
     except Exception as e:

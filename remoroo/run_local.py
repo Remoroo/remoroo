@@ -1,16 +1,62 @@
+from __future__ import annotations
+
+import json
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+
 import typer
-import json
+
+from .paths import resolve_canonical_repo_root
+
+if TYPE_CHECKING:
+    from .http_transport import HttpTransport
+
 
 @dataclass
 class LocalRunResult:
-    run_root: Path
+    """Result of a local CLI session.
+
+    ``run_root`` is the per-run directory ``<repo>/.remoroo/runs/<run_id>`` and is only
+    set after the worker context was prepared (POST/GET run succeeded). It must not be
+    filled with ``LaunchConfig.out_dir`` or other fallbacks — those are not artifact roots.
+    """
+
+    run_root: Optional[Path]
     run_id: str
     success: bool
     outcome: str
     partial_success: bool = False
+
+
+class RunPrepareError(Exception):
+    """User-visible prepare failure (auth, health, quota, etc.)."""
+
+    def __init__(self, message: str, code: int = 1) -> None:
+        self.message = message
+        self.code = code
+        super().__init__(message)
+
+
+@dataclass
+class LocalWorkerContext:
+    api_url: str
+    session_key: str
+    remote_run_id: str
+    run_output_dir: Path
+    repo_path: Path
+    original_repo_path: str
+    server: Any
+    stop_heartbeat: threading.Event
+    heartbeat_thread: threading.Thread
+    client_id: str
+    budget_ui: Any
+    engine: str
+    cache_env: bool
+    in_place: bool
+    verbose: bool
 
 
 def _budget_tui_from_run_json(requested_max_wall_time_s: int, run_data: dict):
@@ -57,90 +103,58 @@ def _teardown_local_worker_processes(worker) -> None:
         pass
 
 
-def run_local_worker(
-    run_id: str,
+def prepare_local_worker_context(
+    *,
     repo_path: Path,
-    out_dir: Path,
     goal: str,
-    metrics: list[str],
-    brain_url: str = None,
-    engine: str = "docker",
-    verbose: bool = False,
-    cache_env: bool = False,
-    in_place: bool = False,
-    agentic: bool = False,
-    engine_version: str = "v2",
-    model: Optional[str] = None,
-    resume_run_id: Optional[str] = None,
-    max_wall_time_s: int = 36000,
-    allow_overage: bool = False,
-) -> LocalRunResult:
-    from .configs import get_api_url
-    if brain_url is None:
-        brain_url = get_api_url()
-    """
-    Adapter that connects to the Remoroo Brain Server as a Worker.
-    The Server must be running separately (remoroo server).
-    """
-    
-    # Map input list[str] to string for Orchestrator if needed.
-    metrics_str = ", ".join(metrics)
+    metrics: List[str],
+    brain_url: str,
+    engine: str,
+    verbose: bool,
+    cache_env: bool,
+    in_place: bool,
+    agentic: bool,
+    engine_version: str,
+    model: Optional[str],
+    resume_run_id: Optional[str],
+    max_wall_time_s: int,
+    allow_overage: bool,
+) -> LocalWorkerContext:
+    """Health check, auth, POST /runs or GET resume, dirs, transport, heartbeat."""
+    import os
 
-    # Use local engine components
-    from .engine.local_worker import WorkerService
-    from .engine.protocol import ExecutionRequest, ExecutionResult
+    repo_path = resolve_canonical_repo_root(Path(repo_path))
 
-    # STAGE 2 Retrofit: Pure Client
-    import time
     import requests
-    import threading
     from .http_transport import HttpTransport
 
+    metrics_str = ", ".join(metrics)
     API_URL = brain_url
-    
-    # Check Server Health
+
     try:
         resp = requests.get(f"{API_URL}/health", timeout=2.0)
         if resp.status_code != 200:
-             typer.secho(f"❌ Server at {API_URL} returned status code {resp.status_code}", fg=typer.colors.RED)
-             raise typer.Exit(code=1)
+            raise RunPrepareError(
+                f"Server at {API_URL} returned status code {resp.status_code}",
+                code=1,
+            )
+    except RunPrepareError:
+        raise
     except Exception as e:
-         typer.secho(f"❌ Could not connect to Brain Server at {API_URL}.", fg=typer.colors.RED)
-         typer.echo(f"   Check connectivity by running 'curl {API_URL}/health' in a terminal.")
-         if verbose:
-             typer.echo(f"   Error: {e}")
-         raise typer.Exit(code=1)
-    
-    
-    # Auth Key
-    import os
+        msg = f"Could not connect to Brain Server at {API_URL}."
+        if verbose:
+            msg += f" Error: {e}"
+        raise RunPrepareError(msg, code=1) from e
+
     session_key = os.getenv("REMOROO_API_KEY")
-    
-    # Fallback to saved credentials from remoroo login
     if not session_key:
         from .auth import _client
+
         if _client.is_authenticated():
             session_key = _client.get_token()
-    
     if not session_key:
-         typer.echo("⚠️  No authentication found. Set REMOROO_API_KEY or run 'remoroo login'.")
-         typer.echo("   Assuming server accepts unauthenticated requests or allow-list.")
-         # Generate a dummy key just in case protocol requires non-empty string
-         session_key = "remote-worker-key"
+        session_key = "remote-worker-key"
 
-    # Verify Auth (Optional but good UX)
-    try:
-         auth_resp = requests.get(
-             f"{API_URL}/user/me", 
-             headers={"Authorization": f"Bearer {session_key}"},
-             timeout=2.0
-         )
-         if auth_resp.status_code != 200:
-            typer.secho(f"⚠️  Authentication failed (Status {auth_resp.status_code}). Check your credentials.", fg=typer.colors.YELLOW)
-    except:
-         pass
-            
-    # 3. Create run on server, or attach to an existing run (--resume)
     headers = {"Authorization": f"Bearer {session_key}"}
     budget_ui = None
     try:
@@ -151,24 +165,21 @@ def run_local_worker(
                 timeout=20.0,
             )
             if resp.status_code == 404:
-                typer.secho(f"❌ Run not found: {resume_run_id}", fg=typer.colors.RED)
-                raise typer.Exit(code=1)
+                raise RunPrepareError(f"Run not found: {resume_run_id}", code=1)
             if resp.status_code in (401, 403):
-                typer.secho(
-                    "\n❌ Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.",
-                    fg=typer.colors.RED,
+                raise RunPrepareError(
+                    "Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.",
+                    code=1,
                 )
-                raise typer.Exit(code=1)
             resp.raise_for_status()
             body = resp.json()
             run_info = body.get("run") or {}
             st = str(run_info.get("status") or "")
             if st in ("SUCCESS", "FAILED", "PARTIAL_SUCCESS", "COMPLETED"):
-                typer.secho(
-                    f"❌ Run {resume_run_id} is already finished (status={st}).",
-                    fg=typer.colors.RED,
+                raise RunPrepareError(
+                    f"Run {resume_run_id} is already finished (status={st}).",
+                    code=1,
                 )
-                raise typer.Exit(code=1)
             remote_run_id = resume_run_id
         else:
             form: dict = {
@@ -184,35 +195,28 @@ def run_local_worker(
             if model:
                 form["model"] = model
             resp = requests.post(f"{API_URL}/runs", data=form, headers=headers)
-
             if resp.status_code == 402:
-                typer.secho(
-                    "\n❌ Quota Exceeded. Please upgrade your plan at https://remoroo.com/pricing",
-                    fg=typer.colors.RED,
+                raise RunPrepareError(
+                    "Quota exceeded. Please upgrade your plan at https://remoroo.com/pricing",
+                    code=1,
                 )
-                raise typer.Exit(code=1)
-
             if resp.status_code in (401, 403):
-                typer.secho(
-                    "\n❌ Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.",
-                    fg=typer.colors.RED,
+                raise RunPrepareError(
+                    "Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.",
+                    code=1,
                 )
-                raise typer.Exit(code=1)
-
             resp.raise_for_status()
             run_data = resp.json()
             remote_run_id = run_data["run_id"]
             budget_ui = _budget_tui_from_run_json(max_wall_time_s, run_data)
-    except typer.Exit:
+    except RunPrepareError:
         raise
     except Exception as e:
-        typer.secho(f"❌ Failed to start or attach run on server: {e}", fg=typer.colors.RED)
-        raise typer.Exit(code=1)
+        raise RunPrepareError(f"Failed to start or attach run on server: {e}", code=1) from e
 
     remoroo_dir = repo_path / ".remoroo"
     run_output_dir = remoroo_dir / "runs" / remote_run_id
     run_output_dir.mkdir(parents=True, exist_ok=True)
-    run_root_str = str(run_output_dir.resolve())
 
     gitignore_path = repo_path / ".gitignore"
     try:
@@ -241,112 +245,91 @@ def run_local_worker(
         except Exception:
             pass
 
-    # 4. Start Log Streamer (Background) — started after display is created (see below)
-
-    # 5. Initialize Proxy
-
-    # Phase 3: Persistent Client ID
     config_dir = Path.home() / ".config" / "remoroo"
     config_dir.mkdir(parents=True, exist_ok=True)
     client_id_file = config_dir / "client_id"
-    
     if client_id_file.exists():
         client_id = client_id_file.read_text().strip()
     else:
-        import uuid
         client_id = f"worker-{uuid.uuid4()}"
         client_id_file.write_text(client_id)
-        
+
     server = HttpTransport(API_URL, client_id=client_id)
-    server.session.headers.update({"Authorization": f"Bearer {session_key}"}) # Authenticate Transport
-    
-    # Phase 2: Heartbeat Thread
+    server.session.headers.update({"Authorization": f"Bearer {session_key}"})
+
     stop_heartbeat = threading.Event()
-    def heartbeat_loop():
-        # Wait for Initial Run creation before starting? 
-        # We have remote_run_id from line 114.
+
+    def heartbeat_loop() -> None:
+        import time as _time
+
         while not stop_heartbeat.is_set():
             try:
-                import time
                 r = requests.post(
                     f"{API_URL}/workers/heartbeat",
                     json={
                         "run_id": remote_run_id,
                         "client_id": client_id,
-                        "timestamp": time.time()
+                        "timestamp": _time.time(),
                     },
                     headers={"Authorization": f"Bearer {session_key}"},
-                    timeout=5.0
+                    timeout=5.0,
                 )
-                # Do not raise: transient 4xx/5xx should not tighten heartbeat spacing vs success.
                 if r.status_code >= 400 and verbose:
-                    typer.secho(f"[dim]heartbeat HTTP {r.status_code}[/]", fg=typer.colors.YELLOW)
-                time.sleep(5)
+                    typer.secho(
+                        f"[dim]heartbeat HTTP {r.status_code}[/]",
+                        fg=typer.colors.YELLOW,
+                    )
+                _time.sleep(5)
             except Exception:
-                time.sleep(5)
-            
+                _time.sleep(5)
+
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat_thread.start()
 
+    return LocalWorkerContext(
+        api_url=API_URL,
+        session_key=session_key,
+        remote_run_id=remote_run_id,
+        run_output_dir=run_output_dir,
+        repo_path=repo_path,
+        original_repo_path=str(repo_path.absolute()),
+        server=server,
+        stop_heartbeat=stop_heartbeat,
+        heartbeat_thread=heartbeat_thread,
+        client_id=client_id,
+        budget_ui=budget_ui,
+        engine=engine,
+        cache_env=cache_env,
+        in_place=in_place,
+        verbose=verbose,
+    )
+
+
+def finalize_local_worker_session(ctx: LocalWorkerContext, rb: dict) -> LocalRunResult:
+    """Post-TUI finalize artifacts, cleanup, metrics files; returns LocalRunResult."""
     from rich.console import Console
-    from .engine.local_worker import current_local_worker
-    from .tui_run import run_remoroo_tui_session
 
-    original_repo_path = str(repo_path.absolute())
+    from .engine.local_worker import WorkerService, current_local_worker
+    from .engine.protocol import ExecutionRequest
 
-    final_result = None
-    outcome = "UNKNOWN"
-    success = False
-    partial_success = False
-    rb: dict = {}
+    run_output_dir = ctx.run_output_dir
+    remote_run_id = ctx.remote_run_id
+    original_repo_path = ctx.original_repo_path
+    run_root_str = str(run_output_dir.resolve())
+    engine = ctx.engine
+    cache_env = ctx.cache_env
+    in_place = ctx.in_place
+    stop_heartbeat = ctx.stop_heartbeat
 
-    try:
-        rb = run_remoroo_tui_session(
-            server=server,
-            api_url=API_URL,
-            session_key=session_key,
-            remote_run_id=remote_run_id,
-            repo_path=original_repo_path,
-            engine=engine,
-            artifact_dir=run_root_str,
-            original_repo_path=original_repo_path,
-            cache_env=cache_env,
-            in_place=in_place,
-            budget_ui=budget_ui,
-        )
-        final_result = rb.get("final_result")
-        outcome = rb.get("outcome", "UNKNOWN")
-        success = bool(rb.get("success", False))
-        partial_success = bool(rb.get("partial_success", False))
-        if outcome == "UNKNOWN" and final_result:
-            typer.secho(f"Outcome UNKNOWN. Payload: {json.dumps(final_result)}", fg=typer.colors.RED)
-    except KeyboardInterrupt:
-        typer.echo("")
+    final_result = rb.get("final_result")
+    outcome = rb.get("outcome", "UNKNOWN")
+    success = bool(rb.get("success", False))
+    partial_success = bool(rb.get("partial_success", False))
+    if outcome == "UNKNOWN" and final_result:
         typer.secho(
-            "🛑 Interrupted — killing local jobs, stopping sandbox, aborting run…",
-            fg=typer.colors.YELLOW,
-            bold=True,
+            f"Outcome UNKNOWN. Payload: {json.dumps(final_result)}",
+            fg=typer.colors.RED,
         )
-        outcome = "INTERRUPTED"
-        success = False
-        stop_heartbeat.set()
-        _teardown_local_worker_processes(rb.get("_cleanup_worker"))
-        _teardown_local_worker_processes(current_local_worker())
-        try:
-            requests.post(
-                f"{API_URL}/runs/{remote_run_id}/abort",
-                headers={"Authorization": f"Bearer {session_key}"},
-                timeout=12.0,
-            )
-        except Exception:
-            pass
-    except Exception as e:
-        typer.secho(f"❌ Execution loop crashed: {e}", fg=typer.colors.RED)
-        outcome = f"CRASH: {e}"
-        success = False
-        if verbose:
-            import traceback
-            traceback.print_exc()
 
     console = Console()
     worker_service = rb.get("_cleanup_worker")
@@ -363,81 +346,73 @@ def run_local_worker(
             in_place=in_place,
         )
 
-    # v19: Fallback outcome detection from final_report.md
-    # Removed as requested (root cause fixed in Brain).
-    pass
-
-    # 7. Finalize Artifacts (Worker generates local diff and delivers it)
-    # v15: Only call manually if the Brain hasn't already triggered a cleanup
     if worker_service.is_ephemeral:
         console.print("\n[bold blue]📦 Finalizing artifacts...[/bold blue]")
         try:
-            from .engine.protocol import ExecutionRequest
             finalize_request = ExecutionRequest(
                 type="finalize_artifacts",
                 payload={},
-                request_id=f"finalize-{remote_run_id}"
+                request_id=f"finalize-{remote_run_id}",
             )
             worker_service.handle_request(finalize_request)
         except Exception as e:
             console.print(f"   [yellow]⚠️  Could not finalize artifacts: {e}[/yellow]")
     else:
         console.print("\n[dim]ℹ️  Artifacts already finalized by Brain.[/dim]")
-    
-    # Cleanup Phase: Ensure temporary resources are cleaned up
+
     console.print("[bold blue]🧹 Cleaning up temporary resources...[/bold blue]")
     try:
-        # 1. Stop heartbeat
         stop_heartbeat.set()
-
         if outcome == "INTERRUPTED":
             _teardown_local_worker_processes(rb.get("_cleanup_worker"))
             _teardown_local_worker_processes(current_local_worker())
 
-        # 2. Commit Docker environment if run was successful
-        if success and hasattr(worker_service, 'sandbox') and worker_service.sandbox:
+        if success and hasattr(worker_service, "sandbox") and worker_service.sandbox:
             try:
                 worker_service.sandbox.commit(success=True)
             except Exception as e:
                 console.print(f"   [yellow]⚠️  Docker commit failed: {e}[/yellow]")
-        
-        # 3. Request cleanup of working copy via RPC (Handles both Mac and Linux)
-        from .engine.protocol import ExecutionRequest
+
         cleanup_request = ExecutionRequest(
             type="cleanup_working_copy",
             payload={},
-            request_id=f"cleanup-{remote_run_id}"
+            request_id=f"cleanup-{remote_run_id}",
         )
         cleanup_res = worker_service.handle_request(cleanup_request)
         if cleanup_res.success and cleanup_res.data.get("cleaned"):
             console.print("   [green]✅ Temporary working copy cleaned up[/green]")
         elif not cleanup_res.success:
             console.print(f"   [yellow]⚠️ Cleanup failed: {cleanup_res.error}[/yellow]")
-        
-        # 4. Stop Docker sandbox (stopped by cleanup RPC above, but defensive here)
-        if hasattr(worker_service, 'sandbox') and worker_service.sandbox:
+
+        if hasattr(worker_service, "sandbox") and worker_service.sandbox:
             try:
                 worker_service.sandbox.stop()
             except Exception:
                 pass
-    
     except Exception as e:
         console.print(f"   [yellow]⚠️  Cleanup warning: {e}[/yellow]")
-    
-    # 8. Save Metrics for CLI Summary (extract from workflow_complete payload)
+
     try:
         _final_metrics = {}
         _baseline_metrics = {}
         if final_result:
             if isinstance(final_result.get("metrics"), dict):
-                _final_metrics = {k: v for k, v in final_result["metrics"].items() if isinstance(v, (int, float))}
+                _final_metrics = {
+                    k: v
+                    for k, v in final_result["metrics"].items()
+                    if isinstance(v, (int, float))
+                }
             if isinstance(final_result.get("baseline_metrics"), dict):
-                _baseline_metrics = {k: v for k, v in final_result["baseline_metrics"].items() if isinstance(v, (int, float))}
+                _baseline_metrics = {
+                    k: v
+                    for k, v in final_result["baseline_metrics"].items()
+                    if isinstance(v, (int, float))
+                }
         if _final_metrics:
-            with open(run_output_dir / "metrics.json", 'w') as f:
+            with open(run_output_dir / "metrics.json", "w") as f:
                 json.dump(_final_metrics, f, indent=2)
         if _baseline_metrics:
-            with open(run_output_dir / "baseline_metrics.json", 'w') as f:
+            with open(run_output_dir / "baseline_metrics.json", "w") as f:
                 json.dump(_baseline_metrics, f, indent=2)
     except Exception as e:
         console.print(f"   [yellow]Could not save metrics to cache: {e}[/yellow]")
@@ -447,7 +422,73 @@ def run_local_worker(
         run_id=remote_run_id,
         success=success,
         outcome=outcome,
-        partial_success=partial_success
+        partial_success=partial_success,
     )
-    
 
+
+
+def run_local_worker(
+    run_id: str,
+    repo_path: Path,
+    out_dir: Path,
+    goal: str,
+    metrics: list,
+    brain_url: str = None,
+    engine: str = "docker",
+    verbose: bool = False,
+    cache_env: bool = False,
+    in_place: bool = False,
+    agentic: bool = False,
+    engine_version: str = "v2",
+    model: Optional[str] = None,
+    resume_run_id: Optional[str] = None,
+    max_wall_time_s: int = 36000,
+    allow_overage: bool = False,
+    *,
+    metrics_option_provided: bool = True,
+    yes: bool = False,
+    no_patch: bool = False,
+    pick_model: bool = True,
+    attach_status: str = "",
+    attach_goal_preview: str = "",
+) -> LocalRunResult:
+    """Run unified TUI; raises ``typer.Exit`` with process exit code (does not return)."""
+    from .configs import get_api_url
+    from .tui_launch_config import LaunchConfig, unified_tui_requires_tty
+    from .tui_unified_app import run_unified_local_session
+
+    if brain_url is None:
+        brain_url = get_api_url()
+    if not unified_tui_requires_tty():
+        typer.secho(
+            "Remoroo local run requires an interactive terminal (TTY).",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+    cfg = LaunchConfig(
+        mode="attach" if resume_run_id else "new",
+        repo_path=repo_path,
+        out_dir=out_dir,
+        brain_url=brain_url,
+        engine=engine,
+        verbose=verbose,
+        cache_env=cache_env,
+        in_place=in_place,
+        agentic=agentic,
+        engine_version=engine_version,
+        max_wall_time_s=max_wall_time_s,
+        allow_overage=allow_overage,
+        yes=yes,
+        no_patch=no_patch,
+        pick_model=False if resume_run_id else pick_model,
+        goal=(goal or "").strip(),
+        metrics_list=list(metrics),
+        model=None if resume_run_id else model,
+        resume_run_id=resume_run_id,
+        run_id_display=run_id,
+        attach_status=attach_status,
+        attach_goal_preview=attach_goal_preview,
+        metrics_option_provided=metrics_option_provided,
+    )
+    _result, code = run_unified_local_session(cfg)
+    raise typer.Exit(code=code)
