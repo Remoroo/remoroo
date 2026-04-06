@@ -511,6 +511,7 @@ class RemorooUnifiedApp(App[Tuple[LocalRunResult, int]]):
                         cfg.resume_run_id or "",
                         False,
                         "PREPARE_FAILED",
+                        detail=prep,
                     ),
                     1,
                 )
@@ -550,28 +551,45 @@ class RemorooUnifiedApp(App[Tuple[LocalRunResult, int]]):
 
 
 def echo_session_finished_line(lr: LocalRunResult, code: int) -> None:
-    """After the TUI exits, print a single clear line on the real terminal (TTY only)."""
-    if not sys.stdout.isatty():
-        return
+    """After the TUI exits, print summary (and ``detail`` e.g. prepare errors) on the terminal."""
+    detail = (lr.detail or "").strip()
+    rid = lr.run_id or "(no id)"
     try:
         import typer
 
-        if code == 0:
-            fg = typer.colors.GREEN
-        elif code == 2:
-            fg = typer.colors.YELLOW
+        if sys.stdout.isatty():
+            if code == 0:
+                fg = typer.colors.GREEN
+            elif code == 2:
+                fg = typer.colors.YELLOW
+            else:
+                fg = typer.colors.RED
+            typer.secho(
+                f"Remoroo session ended · {lr.outcome} · exit {code} · run {rid}",
+                fg=fg,
+            )
+            if detail:
+                typer.secho(f"Reason: {detail}", fg=typer.colors.RED)
+            if lr.run_root is not None:
+                typer.secho(f"Artifacts: {lr.run_root}", fg=typer.colors.BRIGHT_BLACK)
         else:
-            fg = typer.colors.RED
-        rid = lr.run_id or "(no id)"
-        typer.secho(
-            f"Remoroo session ended · {lr.outcome} · exit {code} · run {rid}",
-            fg=fg,
-        )
-        if lr.run_root is not None:
-            typer.secho(f"Artifacts: {lr.run_root}", fg=typer.colors.BRIGHT_BLACK)
+            print(
+                f"Remoroo session ended · {lr.outcome} · exit {code} · run {rid}",
+                file=sys.stderr,
+            )
+            if detail:
+                print(f"Reason: {detail}", file=sys.stderr)
+            if lr.run_root is not None:
+                print(f"Artifacts: {lr.run_root}", file=sys.stderr)
     except Exception:
-        extra = f" · {lr.run_root}" if lr.run_root is not None else ""
-        print(f"Remoroo session ended · exit {code}{extra}", file=sys.stdout)
+        print(
+            f"Remoroo session ended · {lr.outcome} · exit {code} · run {rid}",
+            file=sys.stderr,
+        )
+        if detail:
+            print(f"Reason: {detail}", file=sys.stderr)
+        if lr.run_root is not None:
+            print(f"Artifacts: {lr.run_root}", file=sys.stderr)
 
 
 def run_unified_local_session(cfg: LaunchConfig) -> Tuple[LocalRunResult, int]:

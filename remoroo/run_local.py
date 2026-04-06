@@ -22,6 +22,8 @@ class LocalRunResult:
     ``run_root`` is the per-run directory ``<repo>/.remoroo/runs/<run_id>`` and is only
     set after the worker context was prepared (POST/GET run succeeded). It must not be
     filled with ``LaunchConfig.out_dir`` or other fallbacks — those are not artifact roots.
+
+    ``detail`` is an optional human-readable reason (e.g. prepare/health/auth errors).
     """
 
     run_root: Optional[Path]
@@ -29,6 +31,7 @@ class LocalRunResult:
     success: bool
     outcome: str
     partial_success: bool = False
+    detail: Optional[str] = None
 
 
 class RunPrepareError(Exception):
@@ -196,10 +199,36 @@ def prepare_local_worker_context(
                 form["model"] = model
             resp = requests.post(f"{API_URL}/runs", data=form, headers=headers)
             if resp.status_code == 402:
-                raise RunPrepareError(
-                    "Quota exceeded. Please upgrade your plan at https://remoroo.com/pricing",
-                    code=1,
-                )
+                detail = "Quota exceeded"
+                try:
+                    detail = resp.json().get("detail", detail)
+                except Exception:
+                    pass
+                if "concurrent" in detail.lower() or "limit" in detail.lower():
+                    try:
+                        fix = requests.post(
+                            f"{API_URL}/billing/release-stale",
+                            headers=headers,
+                            timeout=10.0,
+                        )
+                        if fix.status_code == 200 and fix.json().get("released", 0) > 0:
+                            resp = requests.post(f"{API_URL}/runs", data=form, headers=headers)
+                            if resp.status_code != 402:
+                                pass  # fall through to normal handling below
+                            else:
+                                raise RunPrepareError(
+                                    f"{detail}. Upgrade or manage your plan at https://remoroo.com/pricing",
+                                    code=1,
+                                )
+                    except RunPrepareError:
+                        raise
+                    except Exception:
+                        pass
+                if resp.status_code == 402:
+                    raise RunPrepareError(
+                        f"{detail}. Upgrade or manage your plan at https://remoroo.com/pricing",
+                        code=1,
+                    )
             if resp.status_code in (401, 403):
                 raise RunPrepareError(
                     "Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.",
@@ -214,95 +243,113 @@ def prepare_local_worker_context(
     except Exception as e:
         raise RunPrepareError(f"Failed to start or attach run on server: {e}", code=1) from e
 
-    remoroo_dir = repo_path / ".remoroo"
-    run_output_dir = remoroo_dir / "runs" / remote_run_id
-    run_output_dir.mkdir(parents=True, exist_ok=True)
-
-    gitignore_path = repo_path / ".gitignore"
-    try:
-        if gitignore_path.exists():
-            content = gitignore_path.read_text()
-            if ".remoroo/" not in content:
-                with open(gitignore_path, "a") as f:
-                    f.write("\n# Remoroo Metadata\n.remoroo/\n")
-        else:
-            gitignore_path.write_text("# Remoroo Metadata\n.remoroo/\n")
-    except Exception:
-        pass
-
-    memory_path = remoroo_dir / "memory.json"
-    old_memory_path = remoroo_dir / "local_memory.json"
-    if not memory_path.exists() and old_memory_path.exists():
+    def _abort_run_on_failure(reason: str):
+        """Best-effort abort so the server releases the reservation."""
         try:
-            old_memory_path.rename(memory_path)
-        except Exception:
-            pass
-    if not memory_path.exists():
-        try:
-            memory_path.write_text(
-                '{"repo_url": "", "last_updated": "", "world_facts": [], "entity_summaries": {}, "experiences": [], "beliefs": []}'
+            requests.post(
+                f"{API_URL}/runs/{remote_run_id}/abort",
+                headers=headers,
+                timeout=10.0,
             )
         except Exception:
             pass
 
-    config_dir = Path.home() / ".config" / "remoroo"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    client_id_file = config_dir / "client_id"
-    if client_id_file.exists():
-        client_id = client_id_file.read_text().strip()
-    else:
-        client_id = f"worker-{uuid.uuid4()}"
-        client_id_file.write_text(client_id)
+    try:
+        remoroo_dir = repo_path / ".remoroo"
+        run_output_dir = remoroo_dir / "runs" / remote_run_id
+        run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    server = HttpTransport(API_URL, client_id=client_id)
-    server.session.headers.update({"Authorization": f"Bearer {session_key}"})
+        gitignore_path = repo_path / ".gitignore"
+        try:
+            if gitignore_path.exists():
+                content = gitignore_path.read_text()
+                if ".remoroo/" not in content:
+                    with open(gitignore_path, "a") as f:
+                        f.write("\n# Remoroo Metadata\n.remoroo/\n")
+            else:
+                gitignore_path.write_text("# Remoroo Metadata\n.remoroo/\n")
+        except Exception:
+            pass
 
-    stop_heartbeat = threading.Event()
-
-    def heartbeat_loop() -> None:
-        import time as _time
-
-        while not stop_heartbeat.is_set():
+        memory_path = remoroo_dir / "memory.json"
+        old_memory_path = remoroo_dir / "local_memory.json"
+        if not memory_path.exists() and old_memory_path.exists():
             try:
-                r = requests.post(
-                    f"{API_URL}/workers/heartbeat",
-                    json={
-                        "run_id": remote_run_id,
-                        "client_id": client_id,
-                        "timestamp": _time.time(),
-                    },
-                    headers={"Authorization": f"Bearer {session_key}"},
-                    timeout=5.0,
-                )
-                if r.status_code >= 400 and verbose:
-                    typer.secho(
-                        f"[dim]heartbeat HTTP {r.status_code}[/]",
-                        fg=typer.colors.YELLOW,
-                    )
-                _time.sleep(5)
+                old_memory_path.rename(memory_path)
             except Exception:
-                _time.sleep(5)
+                pass
+        if not memory_path.exists():
+            try:
+                memory_path.write_text(
+                    '{"repo_url": "", "last_updated": "", "world_facts": [], "entity_summaries": {}, "experiences": [], "beliefs": []}'
+                )
+            except Exception:
+                pass
 
-    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-    heartbeat_thread.start()
+        config_dir = Path.home() / ".config" / "remoroo"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        client_id_file = config_dir / "client_id"
+        if client_id_file.exists():
+            client_id = client_id_file.read_text().strip()
+        else:
+            client_id = f"worker-{uuid.uuid4()}"
+            client_id_file.write_text(client_id)
 
-    return LocalWorkerContext(
-        api_url=API_URL,
-        session_key=session_key,
-        remote_run_id=remote_run_id,
-        run_output_dir=run_output_dir,
-        repo_path=repo_path,
-        original_repo_path=str(repo_path.absolute()),
-        server=server,
-        stop_heartbeat=stop_heartbeat,
-        heartbeat_thread=heartbeat_thread,
-        client_id=client_id,
-        budget_ui=budget_ui,
-        engine=engine,
-        cache_env=cache_env,
-        in_place=in_place,
-        verbose=verbose,
-    )
+        server = HttpTransport(API_URL, client_id=client_id)
+        server.session.headers.update({"Authorization": f"Bearer {session_key}"})
+
+        stop_heartbeat = threading.Event()
+
+        def heartbeat_loop() -> None:
+            import time as _time
+
+            while not stop_heartbeat.is_set():
+                try:
+                    r = requests.post(
+                        f"{API_URL}/workers/heartbeat",
+                        json={
+                            "run_id": remote_run_id,
+                            "client_id": client_id,
+                            "timestamp": _time.time(),
+                        },
+                        headers={"Authorization": f"Bearer {session_key}"},
+                        timeout=5.0,
+                    )
+                    if r.status_code >= 400 and verbose:
+                        typer.secho(
+                            f"[dim]heartbeat HTTP {r.status_code}[/]",
+                            fg=typer.colors.YELLOW,
+                        )
+                    _time.sleep(5)
+                except Exception:
+                    _time.sleep(5)
+
+        heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+
+        return LocalWorkerContext(
+            api_url=API_URL,
+            session_key=session_key,
+            remote_run_id=remote_run_id,
+            run_output_dir=run_output_dir,
+            repo_path=repo_path,
+            original_repo_path=str(repo_path.absolute()),
+            server=server,
+            stop_heartbeat=stop_heartbeat,
+            heartbeat_thread=heartbeat_thread,
+            client_id=client_id,
+            budget_ui=budget_ui,
+            engine=engine,
+            cache_env=cache_env,
+            in_place=in_place,
+            verbose=verbose,
+        )
+    except RunPrepareError:
+        _abort_run_on_failure("prepare_failed")
+        raise
+    except Exception as e:
+        _abort_run_on_failure("prepare_failed")
+        raise RunPrepareError(f"Local setup failed after run created: {e}", code=1) from e
 
 
 def finalize_local_worker_session(ctx: LocalWorkerContext, rb: dict) -> LocalRunResult:

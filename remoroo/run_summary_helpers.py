@@ -148,6 +148,8 @@ def outcome_style_category(result: "LocalRunResult") -> str:
         return "interrupted"
     if result.outcome == "DETACHED":
         return "detached"
+    if result.outcome == "PREPARE_FAILED":
+        return "error"
     if (
         "ERROR" in result.outcome
         or "CRASH" in result.outcome

@@ -107,6 +107,43 @@ def list_sessions(
     console = Console()
     if not runs:
         console.print("[dim]No runs match the filter.[/dim]")
+        if attachable:
+            try:
+                bs = requests.get(f"{api}/billing/summary", headers=headers, timeout=10.0)
+                if bs.status_code == 200:
+                    summary = bs.json()
+                    active_res = summary.get("active_reservations", 0)
+                    if active_res > 0:
+                        console.print(
+                            f"[bold yellow]Warning:[/bold yellow] {active_res} active reservation(s) found "
+                            "with no attachable runs. Releasing stale reservations..."
+                        )
+                        try:
+                            fix = requests.post(
+                                f"{api}/billing/release-stale",
+                                headers=headers,
+                                timeout=10.0,
+                            )
+                            if fix.status_code == 200:
+                                data = fix.json()
+                                released = data.get("released", 0)
+                                remaining = data.get("active_reservations", 0)
+                                if released > 0:
+                                    console.print(
+                                        f"[bold green]Fixed:[/bold green] released {released} stale reservation(s). "
+                                        "You can start a new run now."
+                                    )
+                                elif remaining > 0:
+                                    console.print(
+                                        f"[bold yellow]Note:[/bold yellow] {remaining} reservation(s) still active "
+                                        "(runs may still be in progress on another worker)."
+                                    )
+                        except Exception:
+                            console.print(
+                                "[dim]Could not auto-release. Contact support if the issue persists.[/dim]"
+                            )
+            except Exception:
+                pass
         console.print(
             "[dim]Start one: [bold]remoroo run --local --goal \"…\"[/bold]  ·  "
             "Attach: [bold]remoroo run --local --resume RUN_ID[/bold][/dim]"
