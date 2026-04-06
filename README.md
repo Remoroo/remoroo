@@ -250,7 +250,7 @@ git diff  # Review changes
 | `remoroo worker --repo PATH` | Standalone worker polling for jobs; optional `--server URL` for a non-default control plane / Brain. |
 | `remoroo login` / `logout` / `whoami` | Authentication. |
 
-**Exit codes (local run):** `0` success, `1` failure / error, `2` partial success (e.g. some goals met).
+**Exit codes (`remoroo run`):** `0` success; `1` failure or error; `2` **either** partial success from the session **or** you used `--remote` while hosted execution is unavailable (check the message printed to the terminal).
 
 ---
 
@@ -429,9 +429,9 @@ tail -f ./.remoroo/runs/<run-id>/trace.jsonl
 
 ## Next Steps
 
-- [Why Remoroo?](/docs/1-getting-started/why-remoroo) — Use cases and philosophy
-- [CLI Reference](/docs/4-cli-reference/reference) — Full command documentation
-- [Architecture](/docs/2-architecture) — How the engine works
+- [Why Remoroo?](https://www.remoroo.com/docs/1-getting-started/why-remoroo) — Use cases and philosophy
+- [CLI Reference](https://www.remoroo.com/docs/4-cli-reference/reference) — Full command documentation
+- [Architecture](https://www.remoroo.com/docs/2-architecture/overview) — How the engine works
 
 Ready? Run your first experiment:
 

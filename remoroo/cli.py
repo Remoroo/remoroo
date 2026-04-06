@@ -168,8 +168,12 @@ def main():
 
 @app.command()
 def run(
-    local: bool = typer.Option(False, "--local", help="Run execution on this machine (Free/Offline)."),
-    remote: bool = typer.Option(True, "--remote", help="Run execution on hosted Cloud Engine (Commercial)."),
+    local: bool = typer.Option(False, "--local", help="Run execution on this machine (default)."),
+    remote: bool = typer.Option(
+        False,
+        "--remote",
+        help="Hosted Cloud execution (Enterprise). Not available in this CLI release; shows how to contact sales.",
+    ),
     repo: Path = typer.Option(Path("."), "--repo", exists=True, file_okay=False, dir_okay=True),
     out: Path = typer.Option(None, "--out", help="Base directory for run outputs."),
     yes: bool = typer.Option(False, "--yes", help="Skip confirmation."),
@@ -210,43 +214,26 @@ def run(
     if engine not in ["docker", "venv"]:
         typer.secho(f"❌ Invalid engine '{engine}'. Choose 'docker' or 'venv'.", fg=typer.colors.RED)
         raise typer.Exit(code=1)
-    # Logic: Default is Remote. 
-    # If user explicitly says --local, then remote=False. 
-    # Because 'remote' defaults to True, we check if local is True.
+    # --local wins if both flags are passed.
     if local:
         remote = False
 
     if remote:
-        from .run_remote import run_remote_experiment
-        # typer.secho("Remote execution is not available yet.", fg=typer.colors.YELLOW)
-        # raise typer.Exit(code=2)
-        # Prepare arguments
-        if not goal:
-            goal = prompt_goal()
-        
-        metrics_list = []
-        if metrics:
-            metrics_list = [m.strip() for m in metrics.split(",") if m.strip()]
-        if not metrics_list:
-            metrics_list = prompt_metrics()
-
-        max_wall_time_s = int(budget_hours * 3600)
-        try:
-             res = run_remote_experiment(
-                run_id=new_run_id(),
-                repo_path=resolve_repo_path(repo),
-                out_dir=resolve_out_dir(out, resolve_repo_path(repo)),
-                goal=goal,
-                metrics=metrics_list,
-                model=model,
-                max_wall_time_s=max_wall_time_s,
-                allow_overage=allow_overage,
-             )
-             typer.echo(f"Run outcome: {res.outcome}")
-             raise typer.Exit(code=0)
-        except Exception as e:
-             typer.echo(f"Error: {e}")
-             raise typer.Exit(code=1)
+        typer.secho(
+            "☁️  Hosted remote runs are not available in this CLI release.",
+            fg=typer.colors.YELLOW,
+        )
+        typer.echo("")
+        typer.echo(
+            "Remoroo Cloud execution is available to Enterprise customers. "
+            "Visit https://remoroo.com to contact us and learn about hosted runs."
+        )
+        typer.echo("")
+        typer.echo("Run on your machine (default):")
+        typer.echo("  remoroo run")
+        typer.echo("Or explicitly:")
+        typer.echo("  remoroo run --local")
+        raise typer.Exit(code=2)
 
     ensure_logged_in()
 
