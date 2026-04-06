@@ -28,6 +28,7 @@ except ImportError:
     requests = None
 
 from .venv_sandbox import VenvSandbox
+from .sandbox import DockerSandboxUnavailableError
 from .harness import RemorooHarness
 from .utils.system_interface import SystemInterface, RealSystem
 
@@ -3109,6 +3110,8 @@ class LocalWorker:
                 return ExecutionResult(success=False, error=f"Unknown request type: {request.type}")
 
 
+        except DockerSandboxUnavailableError as e:
+            return ExecutionResult(success=False, error=str(e))
         except Exception as e:
             traceback.print_exc()
             return ExecutionResult(success=False, error=str(e))

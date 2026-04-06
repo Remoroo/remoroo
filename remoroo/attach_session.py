@@ -45,7 +45,7 @@ def attach_to_run(
     brain_url: Optional[str],
 ) -> None:
     from .configs import get_default_engine
-    from .engine.utils.doctor import ensure_ready
+    from .engine.utils.doctor import ensure_ready, resolve_execution_engine
     from .auth import ensure_logged_in
     from .tui_launch_config import LaunchConfig
     from .tui_unified_app import echo_session_finished_line, run_unified_local_session
@@ -110,10 +110,15 @@ def attach_to_run(
         repo_path = cand
 
     out_dir = resolve_out_dir(out, repo_path)
-    eng = engine or get_default_engine()
+    eng_opt = engine
+    eng = (engine or get_default_engine()).lower()
     if eng not in ("docker", "venv"):
         typer.secho(f"Invalid engine '{eng}'.", fg=typer.colors.RED)
         raise typer.Exit(1)
+    eng = resolve_execution_engine(
+        eng,
+        explicit_docker=(eng_opt is not None and eng == "docker"),
+    )
 
     try:
         cfg = LaunchConfig(

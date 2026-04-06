@@ -16,9 +16,9 @@ def worker(
     server_url: str = typer.Option(None, "--server", help="URL of the Brain Server."),
     poll_interval: float = typer.Option(1.0, "--interval", help="Polling interval in seconds."),
 ):
-    from .configs import get_api_url
-    from .engine.utils.doctor import ensure_ready
-    
+    from .configs import get_api_url, get_default_engine
+    from .engine.utils.doctor import ensure_ready, resolve_execution_engine
+
     # Pre-flight checks
     ensure_ready()
 
@@ -40,7 +40,8 @@ def worker(
     # Initialize Worker Service
     # We use a temp artifact dir for the worker
     artifact_dir = repo_path / "artifacts"
-    worker_service = WorkerService(str(repo_path), str(artifact_dir))
+    worker_engine = resolve_execution_engine(get_default_engine(), explicit_docker=False)
+    worker_service = WorkerService(str(repo_path), str(artifact_dir), engine=worker_engine)
 
     import socket
     import uuid

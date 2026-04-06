@@ -9,6 +9,32 @@ from pathlib import Path
 from .utils import configs
 
 
+def check_docker_daemon() -> bool:
+    """True if the ``docker`` CLI exists and the daemon responds (``docker info``)."""
+    try:
+        subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+DOCKER_SANDBOX_UNAVAILABLE_MSG = (
+    "Docker sandbox is not available: the `docker` command was not found on PATH, "
+    "or `docker info` failed (daemon not running). "
+    "Install and start Docker, or run with `--engine venv` to use a local Python venv instead."
+)
+
+
+class DockerSandboxUnavailableError(RuntimeError):
+    """Raised when Docker engine is selected but the CLI/daemon cannot run commands."""
+
+
 class DockerSandbox:
     def __init__(self, repo_path: str, artifact_dir: str, image_name: str = "remoroo-cli",
                  cache_env: bool = False, memory_limit: str = "8g", cpu_limit: str = "4"):
@@ -21,8 +47,6 @@ class DockerSandbox:
         self.container_name = f"remoroo-sandbox-{uuid.uuid4().hex[:8]}"
         self.is_running = False
         self.available = self.check_docker()
-        if not self.available:
-            print("⚠️  Docker not available. Sandbox disabled.")
 
     def host_to_container(self, host_path: str) -> str:
         """Map a host path to its container equivalent. Identity mapping for DockerSandbox."""
@@ -30,15 +54,7 @@ class DockerSandbox:
 
     def check_docker(self) -> bool:
         """Check if docker daemon is accessible."""
-        try:
-            subprocess.check_call(
-                ["docker", "info"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
+        return check_docker_daemon()
 
     def check_image(self) -> bool:
         """Check if image exists."""
@@ -109,6 +125,9 @@ class DockerSandbox:
         """Start the persistent sandbox container."""
         if self.is_running:
             return
+
+        if not self.available:
+            raise DockerSandboxUnavailableError(DOCKER_SANDBOX_UNAVAILABLE_MSG)
 
         self.build_image_if_missing(os.path.dirname(self.repo_path) if os.path.isfile(self.repo_path) else self.repo_path)
 
@@ -303,6 +322,8 @@ class DockerSandbox:
     def exec_popen(self, cmd: Union[str, List[str]], env: Dict[str, str] = {},
                    workdir: Optional[str] = None) -> subprocess.Popen:
         """Run a command via docker exec, returning a Popen object for streaming."""
+        if not self.available:
+            raise DockerSandboxUnavailableError(DOCKER_SANDBOX_UNAVAILABLE_MSG)
         if not self.is_running:
             self.start()
 
@@ -332,6 +353,8 @@ class DockerSandbox:
     def exec_run(self, cmd: Union[str, List[str]], env: Dict[str, str] = {},
                  workdir: Optional[str] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Run a command via docker exec (blocking). Returns a dict with exit_code, stdout, stderr."""
+        if not self.available:
+            raise DockerSandboxUnavailableError(DOCKER_SANDBOX_UNAVAILABLE_MSG)
         if not self.is_running:
             self.start()
 

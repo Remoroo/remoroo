@@ -199,21 +199,26 @@ def run(
     ),
 ):
     from .configs import get_api_url, get_default_engine
-    from .engine.utils.doctor import ensure_ready
-    
-    # Pre-flight checks
+    from .engine.utils.doctor import ensure_ready, resolve_execution_engine
+
+    # Pre-flight checks (git, etc.)
     ensure_ready()
 
     if brain_url is None:
         brain_url = get_api_url()
-    
-    if engine is None:
-        engine = get_default_engine()
-    
+
+    engine_opt = engine
+    engine = (engine or get_default_engine()).lower()
+
     # Validation
     if engine not in ["docker", "venv"]:
         typer.secho(f"❌ Invalid engine '{engine}'. Choose 'docker' or 'venv'.", fg=typer.colors.RED)
         raise typer.Exit(code=1)
+
+    engine = resolve_execution_engine(
+        engine,
+        explicit_docker=(engine_opt is not None and engine == "docker"),
+    )
     # --local wins if both flags are passed.
     if local:
         remote = False

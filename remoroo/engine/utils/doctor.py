@@ -118,6 +118,37 @@ def ensure_git():
     typer.secho("🛑 Git is required to continue. Please install it and try again.", fg=typer.colors.RED)
     raise typer.Exit(code=1)
 
+def resolve_execution_engine(engine: str, *, explicit_docker: bool) -> str:
+    """Pick a runnable engine before any worker or remote agent starts.
+
+    If Docker is requested only implicitly (config/default) and the daemon is not
+    usable, fall back to ``venv`` so local runs work without Docker.
+
+    If the user explicitly passed ``--engine docker``, we exit with a clear error
+    instead of wasting a run on failing bash tools.
+    """
+    from ..sandbox import check_docker_daemon
+
+    eng = (engine or "docker").lower()
+    if eng != "docker":
+        return eng
+    if check_docker_daemon():
+        return "docker"
+    if explicit_docker:
+        typer.secho(
+            "Docker is not available: `docker` is missing or `docker info` failed "
+            "(daemon not running). Install and start Docker, or run with --engine venv.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+    typer.secho(
+        "Docker is not available — using the venv engine (host Python / project .venv). "
+        "Use --engine docker to require Docker, or set REMOROO_DEFAULT_ENGINE=venv to silence this.",
+        fg=typer.colors.YELLOW,
+    )
+    return "venv"
+
+
 def ensure_ready():
     """Run all pre-flight checks (updates, dependencies)."""
     # 1. Check for CLI updates (non-blocking)
