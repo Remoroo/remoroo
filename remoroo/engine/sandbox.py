@@ -1,13 +1,31 @@
 import subprocess
 import os
+import re
 import shlex
 import sys
 import time
 import uuid
 from typing import List, Dict, Any, Optional, Tuple, Union
 from pathlib import Path
-from .utils import configs
 
+
+# ---------------------------------------------------------------------------
+# PyTorch CUDA wheel variants — ordered highest-first.
+# Each entry: (min_cuda_major, min_cuda_minor, tag, torch_index_url)
+# Only needs to track versions that PyTorch actually ships wheels for.
+# ---------------------------------------------------------------------------
+_PYTORCH_CUDA_VARIANTS: List[Tuple[int, int, str, str]] = [
+    (12, 4, "cu124", "https://download.pytorch.org/whl/cu124"),
+    (12, 1, "cu121", "https://download.pytorch.org/whl/cu121"),
+    (11, 8, "cu118", "https://download.pytorch.org/whl/cu118"),
+]
+
+_CPU_TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
+
+
+# ---------------------------------------------------------------------------
+# Docker daemon check (unchanged from before)
+# ---------------------------------------------------------------------------
 
 def check_docker_daemon() -> bool:
     """True if the ``docker`` CLI exists and the daemon responds (``docker info``)."""
@@ -24,6 +42,150 @@ def check_docker_daemon() -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# GPU detection  (standalone — no brain imports, no transport)
+# ---------------------------------------------------------------------------
+
+def detect_host_gpu() -> Dict[str, Any]:
+    """Probe the HOST for NVIDIA GPU hardware.
+
+    Returns a dict with at least ``{"type": "none"}`` or
+    ``{"type": "nvidia", "driver": str, "cuda_version": str, "devices": [...]}``.
+
+    Respects:
+      REMOROO_FORCE_CPU=1       → always returns ``{"type": "none"}``
+      REMOROO_CUDA_VERSION=cuXX → skips detection, uses the given variant
+    """
+    if os.environ.get("REMOROO_FORCE_CPU", "").strip() == "1":
+        return {"type": "none"}
+
+    # macOS: Docker runs a Linux VM — no GPU passthrough regardless of host HW.
+    if sys.platform == "darwin":
+        return {"type": "none"}
+
+    # Manual override — trust the user.
+    override = os.environ.get("REMOROO_CUDA_VERSION", "").strip().lower()
+    if override:
+        for _, _, tag, index_url in _PYTORCH_CUDA_VARIANTS:
+            if tag == override:
+                return {
+                    "type": "nvidia",
+                    "driver": "unknown (override)",
+                    "cuda_version": override,
+                    "devices": [],
+                    "_tag_override": tag,
+                    "_torch_index_override": index_url,
+                }
+        print(f"  ⚠️  REMOROO_CUDA_VERSION={override} not recognized, auto-detecting...")
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return {"type": "none"}
+
+        cuda_version: Optional[str] = None
+        driver_version: Optional[str] = None
+        for line in result.stdout.split("\n"):
+            if "CUDA Version" in line:
+                m = re.search(r"CUDA Version:\s*(\d+\.\d+)", line)
+                if m:
+                    cuda_version = m.group(1)
+            if "Driver Version" in line:
+                m = re.search(r"Driver Version:\s*([\d.]+)", line)
+                if m:
+                    driver_version = m.group(1)
+
+        if not cuda_version:
+            return {"type": "none"}
+
+        devices: List[Dict[str, Any]] = []
+        try:
+            dev_result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if dev_result.returncode == 0:
+                for line in dev_result.stdout.strip().split("\n"):
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 2:
+                        devices.append({"name": parts[0], "memory_mb": float(parts[1])})
+        except Exception:
+            pass
+
+        return {
+            "type": "nvidia",
+            "driver": driver_version or "unknown",
+            "cuda_version": cuda_version,
+            "devices": devices,
+        }
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {"type": "none"}
+    except Exception:
+        return {"type": "none"}
+
+
+def check_nvidia_docker_runtime() -> bool:
+    """Return True if Docker has the NVIDIA runtime (nvidia-container-toolkit).
+
+    Fast path: parse ``docker info`` for an ``nvidia`` runtime entry.
+    This avoids pulling images and completes in <1 s.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{json .Runtimes}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and "nvidia" in result.stdout.lower():
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    except Exception:
+        pass
+
+    # Fallback: scan full ``docker info`` text for nvidia runtime lines.
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.split("\n"):
+                low = line.lower()
+                if "nvidia" in low and "runtime" in low:
+                    return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _resolve_cuda_variant(cuda_version_str: str) -> Tuple[str, str]:
+    """Map a CUDA version string (e.g. ``'12.3'``) to ``(tag, torch_index_url)``.
+
+    Falls back to ``("cpu", cpu_index)`` if the version is too old or unparseable.
+    """
+    try:
+        parts = cuda_version_str.split(".")
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, IndexError):
+        return "cpu", _CPU_TORCH_INDEX
+
+    for min_major, min_minor, tag, index_url in _PYTORCH_CUDA_VARIANTS:
+        if (major, minor) >= (min_major, min_minor):
+            return tag, index_url
+
+    return "cpu", _CPU_TORCH_INDEX
+
+
+# ---------------------------------------------------------------------------
+# Error helpers
+# ---------------------------------------------------------------------------
+
 DOCKER_SANDBOX_UNAVAILABLE_MSG = (
     "Docker sandbox is not available: the `docker` command was not found on PATH, "
     "or `docker info` failed (daemon not running). "
@@ -35,18 +197,56 @@ class DockerSandboxUnavailableError(RuntimeError):
     """Raised when Docker engine is selected but the CLI/daemon cannot run commands."""
 
 
+# ---------------------------------------------------------------------------
+# DockerSandbox
+# ---------------------------------------------------------------------------
+
 class DockerSandbox:
     def __init__(self, repo_path: str, artifact_dir: str, image_name: str = "remoroo-cli",
-                 cache_env: bool = False, memory_limit: str = "8g", cpu_limit: str = "4"):
+                 cache_env: bool = False):
         self.repo_path = os.path.abspath(repo_path)
         self.artifact_dir = os.path.abspath(artifact_dir)
-        self.image_name = image_name
+        self._base_image_name = image_name
         self.cache_env = cache_env
-        self.memory_limit = memory_limit
-        self.cpu_limit = cpu_limit
         self.container_name = f"remoroo-sandbox-{uuid.uuid4().hex[:8]}"
         self.is_running = False
         self.available = self.check_docker()
+
+        # --- GPU detection & image tag resolution ---
+        self._gpu_info = detect_host_gpu()
+        self._use_gpu = False
+        self._resolved_tag = "cpu"
+        self._build_args: Dict[str, str] = {}
+
+        if self.available and self._gpu_info["type"] == "nvidia":
+            # Check override first
+            if "_tag_override" in self._gpu_info:
+                tag = self._gpu_info["_tag_override"]
+                torch_index = self._gpu_info["_torch_index_override"]
+            else:
+                tag, torch_index = _resolve_cuda_variant(self._gpu_info["cuda_version"])
+
+            if tag != "cpu" and check_nvidia_docker_runtime():
+                self._use_gpu = True
+                self._resolved_tag = tag
+                self._build_args = {"TORCH_INDEX": torch_index}
+                devs = self._gpu_info.get("devices", [])
+                dev_str = devs[0]["name"] if devs else "NVIDIA GPU"
+                print(f"  🖥️  GPU detected: {dev_str} — using CUDA image (remoroo-cli:{tag})")
+            elif tag != "cpu":
+                devs = self._gpu_info.get("devices", [])
+                dev_str = devs[0]["name"] if devs else "NVIDIA GPU"
+                raise DockerSandboxUnavailableError(
+                    f"NVIDIA GPU detected ({dev_str}) but nvidia-container-toolkit is not "
+                    f"installed, so Docker cannot access the GPU.\n\n"
+                    f"Either:\n"
+                    f"  1. Install nvidia-container-toolkit:\n"
+                    f"     https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html\n"
+                    f"  2. Run with --engine venv to use the GPU directly (no Docker isolation)\n"
+                    f"  3. Set REMOROO_FORCE_CPU=1 to run on CPU inside Docker"
+                )
+
+        self.image_name = f"{self._base_image_name}:{self._resolved_tag}"
 
     def host_to_container(self, host_path: str) -> str:
         """Map a host path to its container equivalent. Identity mapping for DockerSandbox."""
@@ -81,8 +281,17 @@ class DockerSandbox:
                  return
 
             build_context = dockerfile_path.parent
+            cmd = [
+                "docker", "build",
+                "-t", self.image_name,
+                "-f", str(dockerfile_path),
+            ]
+            for key, value in self._build_args.items():
+                cmd.extend(["--build-arg", f"{key}={value}"])
+            cmd.append(".")
+
             subprocess.check_call(
-                ["docker", "build", "-t", self.image_name, "-f", str(dockerfile_path), "."],
+                cmd,
                 cwd=str(build_context),
                 stdout=sys.stdout,
                 stderr=sys.stderr
@@ -104,11 +313,9 @@ class DockerSandbox:
                 return False
 
             cfg = result.stdout
-            # If home points to a macOS path, it's cross-platform
             if "/Library/Frameworks/" in cfg or "/usr/local/Cellar/" in cfg:
                 return True
 
-            # Check the python binary — if it's a Mach-O binary in a Linux container it won't run
             python_path = f"{venv_dir}/bin/python"
             file_result = subprocess.run(
                 ["docker", "exec", self.container_name, "file", python_path],
@@ -136,21 +343,33 @@ class DockerSandbox:
         host_home = os.path.expanduser("~")
         host_cache = os.path.join(host_home, ".cache")
 
-        cmd = [
-            "docker", "run", "-d",
+        # No --memory/--cpus: use Docker / host defaults so the same command works
+        # on laptops, CI, Codespaces, rootless, etc.
+        cmd: List[str] = ["docker", "run", "-d"]
+        if self._use_gpu:
+            cmd.extend(["--gpus", "all"])
+        cmd.extend([
             "--name", self.container_name,
-            "--memory", self.memory_limit,
-            "--cpus", self.cpu_limit,
             "-v", f"{self.repo_path}:{self.repo_path}",
             "-v", f"{self.artifact_dir}:{self.artifact_dir}",
             "-v", f"{host_cache}:/root/.cache",
             "--workdir", self.repo_path,
             "--entrypoint", "sleep",
             self.image_name,
-            "infinity"
-        ]
+            "infinity",
+        ])
 
-        subprocess.check_call(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            err_txt = (result.stderr or result.stdout or "").strip()
+            hint = (
+                "You can run without a container using `remoroo run --engine venv` "
+                "(host Python / project .venv)."
+            )
+            detail = f"{hint}\n\n{err_txt}" if err_txt else hint
+            raise DockerSandboxUnavailableError(
+                f"{DOCKER_SANDBOX_UNAVAILABLE_MSG}\n\n{detail}"
+            )
         self.is_running = True
 
         # Only purge venvs that have wrong-platform binaries (e.g. macOS venv in Linux).
@@ -164,7 +383,6 @@ class DockerSandbox:
                         ["docker", "exec", self.container_name, "rm", "-rf", venv_dir],
                         timeout=10, capture_output=True,
                     )
-                # Always safe to remove __pycache__
             subprocess.run(
                 ["docker", "exec", self.container_name, "/bin/sh", "-c",
                  "find . -maxdepth 3 -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true"],
@@ -172,6 +390,28 @@ class DockerSandbox:
             )
         except Exception as e:
             print(f"  ⚠️ venv cleanup check failed (non-fatal): {e}")
+
+        # Post-start GPU verification
+        if self._use_gpu:
+            self._verify_gpu_in_container()
+
+    def _verify_gpu_in_container(self):
+        """Quick probe: confirm torch sees CUDA inside the running container."""
+        try:
+            result = self.exec_run(
+                ["python3", "-c", "import torch; print('cuda' if torch.cuda.is_available() else 'cpu')"],
+                timeout=30,
+            )
+            detected = (result.get("stdout") or "").strip()
+            if detected == "cuda":
+                print("  ✅ GPU verified inside container (torch.cuda.is_available() == True)")
+            else:
+                print(
+                    "  ⚠️  GPU expected but torch.cuda.is_available() returned False inside container.\n"
+                    "     The run will proceed on CPU. Check nvidia-container-toolkit installation."
+                )
+        except Exception as e:
+            print(f"  ⚠️  GPU verification probe failed (non-fatal): {e}")
 
     def commit_state(self, success: bool = True):
         """
@@ -190,11 +430,10 @@ class DockerSandbox:
             return
 
         try:
-            commit_tag = f"{self.image_name}:latest"
-            print(f"💾 Committing Docker container state to {commit_tag}...")
+            print(f"💾 Committing Docker container state to {self.image_name}...")
 
             subprocess.check_call(
-                ["docker", "commit", self.container_name, commit_tag],
+                ["docker", "commit", self.container_name, self.image_name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )

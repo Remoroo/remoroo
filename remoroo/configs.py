@@ -10,4 +10,5 @@ def get_default_engine() -> str:
     """
     Get the default execution engine (docker or venv).
     """
-    return os.getenv("REMOROO_DEFAULT_ENGINE", "docker").lower()
+    raw = os.getenv("REMOROO_DEFAULT_ENGINE", "docker")
+    return (raw or "docker").lower()

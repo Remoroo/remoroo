@@ -1,8 +1,13 @@
 # Dockerfile.cli
 # Purpose: A sandbox container for Remoroo experiment execution.
 # Includes build tools for packages with C extensions.
+#
+# Build args:
+#   BASE_IMAGE   — override the base (default: python:3.11-slim)
+#   TORCH_INDEX  — PyTorch wheel index: CPU or CUDA variant
 
-FROM python:3.11-slim
+ARG BASE_IMAGE=python:3.11-slim
+FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
@@ -20,18 +25,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Enable pip cache for faster subsequent installs
-# (removed --no-cache-dir)
 RUN pip install --upgrade pip
 
-# PyTorch CPU for autoresearch (and similar ML workloads) inside Docker
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+# PyTorch — the index URL selects CPU or CUDA wheels at build time.
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+RUN pip install torch --index-url ${TORCH_INDEX}
 
 # Common ML/data deps used by autoresearch and similar workloads
 RUN pip install tiktoken pyarrow requests matplotlib numpy pandas
 
 # uv package manager — required by autoresearch for `uv run` execution
 RUN pip install uv
-
-# Note: The CLI is not pre-installed. The sandbox mounts the repo and runs commands directly.
 
 ENTRYPOINT ["/bin/bash"]

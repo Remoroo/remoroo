@@ -149,6 +149,32 @@ def resolve_execution_engine(engine: str, *, explicit_docker: bool) -> str:
     return "venv"
 
 
+def print_gpu_status():
+    """Print a one-line GPU summary during preflight (non-fatal)."""
+    from ..sandbox import detect_host_gpu
+
+    try:
+        info = detect_host_gpu()
+        if info["type"] == "nvidia":
+            devs = info.get("devices", [])
+            name = devs[0]["name"] if devs else "NVIDIA GPU"
+            mem = f" ({devs[0]['memory_mb']:.0f} MB)" if devs and devs[0].get("memory_mb") else ""
+            typer.secho(
+                f"  GPU: {name}{mem} — CUDA {info.get('cuda_version', '?')} "
+                f"(driver {info.get('driver', '?')})",
+                fg=typer.colors.CYAN,
+            )
+        else:
+            if os.environ.get("REMOROO_FORCE_CPU", "").strip() == "1":
+                typer.secho("  GPU: forced CPU mode (REMOROO_FORCE_CPU=1)", fg=typer.colors.YELLOW)
+            elif sys.platform == "darwin":
+                typer.secho("  GPU: none in Docker (macOS — use --engine venv for MPS)", fg=typer.colors.YELLOW)
+            else:
+                typer.secho("  GPU: none detected", fg=typer.colors.YELLOW)
+    except Exception:
+        pass
+
+
 def ensure_ready():
     """Run all pre-flight checks (updates, dependencies)."""
     # 1. Check for CLI updates (non-blocking)
@@ -156,3 +182,6 @@ def ensure_ready():
     
     # 2. Ensure Git is present
     ensure_git()
+
+    # 3. Surface GPU detection (informational only)
+    print_gpu_status()
