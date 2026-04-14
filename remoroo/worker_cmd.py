@@ -60,17 +60,21 @@ def worker(
     
     # --- Background Heartbeat Thread ---
     active_run_id = None
+    active_run_token = None
     heartbeat_stop_event = threading.Event()
 
     def heartbeat_loop():
         while not heartbeat_stop_event.is_set():
             if active_run_id:
                 try:
-                    session.post(f"{server_url}/workers/heartbeat", json={
+                    hb = {
                         "run_id": active_run_id,
                         "client_id": client_id,
-                        "timestamp": time.time()
-                    }, timeout=5)
+                        "timestamp": time.time(),
+                    }
+                    if active_run_token:
+                        hb["run_token"] = active_run_token
+                    session.post(f"{server_url}/workers/heartbeat", json=hb, timeout=5)
                 except Exception:
                     pass
             time.sleep(5)
@@ -82,11 +86,14 @@ def worker(
         while True:
             try:
                 # 1. Poll for work
-                resp = session.post(f"{server_url}/workers/poll", json={
+                poll_body = {
                     "capabilities": {"python": True, "bash": True},
                     "client_id": client_id,
-                    "run_id": active_run_id
-                }, timeout=5)
+                    "run_id": active_run_id,
+                }
+                if active_run_token:
+                    poll_body["run_token"] = active_run_token
+                resp = session.post(f"{server_url}/workers/poll", json=poll_body, timeout=5)
                 
                 if resp.status_code != 200:
                     time.sleep(poll_interval)
@@ -107,6 +114,7 @@ def worker(
                 
                 # Update background heartbeat target
                 active_run_id = request.run_id
+                active_run_token = data.get("run_token") or active_run_token
                 
                 # 2. Execute Request
                 typer.secho(f"\n📨 Received Job: {request.type}", fg=typer.colors.GREEN)
@@ -115,16 +123,19 @@ def worker(
                 result = worker_service.handle_request(request)
                 
                 # 3. Submit Result
-                submit_resp = session.post(f"{server_url}/jobs/result", json={
+                result_body = {
                     "client_id": client_id,
                     "result": {
                         "request_id": request.request_id,
                         "success": result.success,
                         "data": result.data,
                         "error": result.error,
-                        "metrics": result.metrics
-                    }
-                })
+                        "metrics": result.metrics,
+                    },
+                }
+                if active_run_token:
+                    result_body["run_token"] = active_run_token
+                submit_resp = session.post(f"{server_url}/jobs/result", json=result_body)
                 submit_resp.raise_for_status()
                 
                 typer.echo("   ✅ Result submitted.")

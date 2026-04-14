@@ -2859,6 +2859,8 @@ class LocalWorker:
                 cmd = request.payload.get("command", "")
                 env_vars = request.payload.get("env", {})
                 cwd = request.payload.get("cwd") or self.repo_root
+                if not os.path.isabs(cwd):
+                    cwd = os.path.join(self.repo_root, cwd)
                 raw_meta = request.payload.get("metadata", {})
 
                 if not cmd:

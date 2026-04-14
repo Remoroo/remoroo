@@ -363,6 +363,9 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
         self._replay_seen: set[str] = set()
         # Unbounded cross-thread UI queue — never block worker on Textual main thread
         self._ui_q: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
+        # Coalesce detail-pane rebuilds: _worker_line used to call _refresh_detail_logs per
+        # stdout line; the pump can drain 250 items per tick → hundreds of full RichLog clears/s.
+        self._pending_detail_refresh: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -379,13 +382,14 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                     id="assistant-label",
                     markup=True,
                 )
-                yield RichLog(id="assistant-log", wrap=True, highlight=True, markup=True)
+                # highlight=False: Pygments on every write is very slow for large assistant/tool text
+                yield RichLog(id="assistant-log", wrap=True, highlight=False, markup=True)
                 yield Static(
                     "[bold #58a6ff]Remoroo[/] [dim]·[/] Tool output",
                     id="tool-label",
                     markup=True,
                 )
-                yield RichLog(id="tool-log", wrap=True, highlight=True, markup=False)
+                yield RichLog(id="tool-log", wrap=True, highlight=False, markup=False)
         with Vertical(id="raw-pane"):
             yield Static(
                 "[bold #58a6ff]Remoroo[/] [dim]·[/] Raw worker / debug",
@@ -438,8 +442,6 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                             ol = self.query_one("#timeline", OptionList)
                             if ol.option_count and self.model.follow_live:
                                 ol.highlighted = ol.option_count - 1
-                            if self.model.follow_live:
-                                self._refresh_detail_logs()
                         except Exception:
                             pass
                 elif kind == "sse":
@@ -448,6 +450,10 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                     self._set_now(payload)
             except Exception as e:
                 _log.exception("TUI pump failed (kind=%s): %s", kind, e)
+        if self._pending_detail_refresh:
+            self._pending_detail_refresh = False
+            if self.model.follow_live:
+                self._refresh_detail_logs()
 
     def _focus_timeline(self) -> None:
         try:
@@ -694,7 +700,7 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                     if len(turn.worker_notes) > 200:
                         turn.worker_notes = turn.worker_notes[-150:]
         if m.follow_live:
-            self._refresh_detail_logs()
+            self._pending_detail_refresh = True
 
     def _apply_agent_event(self, d: Dict[str, Any]) -> None:
         kind = d.get("kind", "")
@@ -720,7 +726,7 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                 self.model.pending_assistant_buffer = ""
             self._refresh_footer()
             if self.model.follow_live:
-                self._refresh_detail_logs()
+                self._pending_detail_refresh = True
         elif kind == "assistant_message":
             text = (d.get("text") or "").strip()
             if not text:
@@ -732,7 +738,7 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                 return
             turn.assistant = (turn.assistant + "\n\n" + text) if turn.assistant else text
             if self.model.follow_live:
-                self._refresh_detail_logs()
+                self._pending_detail_refresh = True
         elif kind == "tool_call_started":
             name = d.get("tool_name", "")
             summary = d.get("args_summary", "") or ""
@@ -753,7 +759,7 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
             self._update_timeline_prompt(turn)
             self._refresh_footer()
             if self.model.follow_live:
-                self._refresh_detail_logs()
+                self._pending_detail_refresh = True
         elif kind == "tool_call_completed":
             name = d.get("tool_name", "")
             data = d.get("data") or {}
@@ -794,7 +800,7 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                         break
             self._update_timeline_prompt(turn)
             if self.model.follow_live:
-                self._refresh_detail_logs()
+                self._pending_detail_refresh = True
         elif kind == "metrics_snapshot":
             mets = d.get("metrics") or {}
             if isinstance(mets, dict):
@@ -810,7 +816,7 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                 )
             self._refresh_goal()
             if self.model.follow_live:
-                self._refresh_detail_logs()
+                self._pending_detail_refresh = True
 
     def _planned_from_turn(self, d: Dict[str, Any]) -> str:
         names = d.get("tool_names") or []

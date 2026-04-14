@@ -33,9 +33,10 @@ class HttpTransport(Transport):
     Transport that communicates with the BrainServer via HTTP.
     """
     
-    def __init__(self, base_url: str, client_id: Optional[str] = None):
+    def __init__(self, base_url: str, client_id: Optional[str] = None, run_token: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
         self.client_id = client_id or f"cli-worker-{time.time()}"
+        self.run_token = run_token
         self.session = requests.Session()
         
     def send(self, request: ExecutionRequest) -> ExecutionResult:
@@ -76,9 +77,12 @@ class HttpTransport(Transport):
     def get_next_step(self, timeout: float = 0.5, run_id: Optional[str] = None):
         """Poll the HTTP server for the next step. Returns (step, latest_metrics, baseline_metrics)."""
         try:
+            body = {"client_id": self.client_id, "run_id": run_id}
+            if self.run_token:
+                body["run_token"] = self.run_token
             resp = self.session.post(
                 f"{self.base_url}/workers/poll",
-                json={"client_id": self.client_id, "run_id": run_id},
+                json=body,
                 timeout=timeout + 1.0
             )
             if resp.status_code != 200:
@@ -139,10 +143,13 @@ class HttpTransport(Transport):
         
         for attempt in range(max_retries):
             try:
+                body = {"client_id": self.client_id, "result": payload}
+                if self.run_token:
+                    body["run_token"] = self.run_token
                 resp = self.session.post(
                     f"{self.base_url}/jobs/result",
-                    json={"client_id": self.client_id, "result": payload},
-                    timeout=60.0 # Increase timeout
+                    json=body,
+                    timeout=60.0
                 )
                 if resp.status_code == 200:
                     return

@@ -295,7 +295,8 @@ def prepare_local_worker_context(
             client_id = f"worker-{uuid.uuid4()}"
             client_id_file.write_text(client_id)
 
-        server = HttpTransport(API_URL, client_id=client_id)
+        run_token = run_data.get("run_token") if run_data else None
+        server = HttpTransport(API_URL, client_id=client_id, run_token=run_token)
         server.session.headers.update({"Authorization": f"Bearer {session_key}"})
 
         stop_heartbeat = threading.Event()
@@ -305,13 +306,16 @@ def prepare_local_worker_context(
 
             while not stop_heartbeat.is_set():
                 try:
+                    hb_body = {
+                        "run_id": remote_run_id,
+                        "client_id": client_id,
+                        "timestamp": _time.time(),
+                    }
+                    if run_token:
+                        hb_body["run_token"] = run_token
                     r = requests.post(
                         f"{API_URL}/workers/heartbeat",
-                        json={
-                            "run_id": remote_run_id,
-                            "client_id": client_id,
-                            "timestamp": _time.time(),
-                        },
+                        json=hb_body,
                         headers={"Authorization": f"Bearer {session_key}"},
                         timeout=5.0,
                     )

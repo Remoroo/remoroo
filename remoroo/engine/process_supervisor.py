@@ -303,6 +303,7 @@ class SupervisedJob:
         self._last_file_sizes: Dict[str, int] = {}
         self._satisfied_targets: Dict[str, float] = {}
         self._last_event_times: Dict[str, float] = {}
+        self._redirect_scan_offset: int = 0
 
         self._readiness_re = re.compile(self.metadata.readiness_regex) if self.metadata.readiness_regex else None
         self._stop_event = threading.Event()
@@ -315,13 +316,14 @@ class SupervisedJob:
                 self._last_file_sizes[path] = os.stat(path).st_size
             except OSError:
                 self._last_file_sizes[path] = 0
-        if self.metadata.redirect_output_file and self.metadata.redirect_output_file not in self._last_file_sizes:
+        resolved_redirect = self._resolve_redirect_path()
+        if resolved_redirect and resolved_redirect not in self._last_file_sizes:
             try:
-                self._last_file_sizes[self.metadata.redirect_output_file] = os.stat(self.metadata.redirect_output_file).st_size
+                self._last_file_sizes[resolved_redirect] = os.stat(resolved_redirect).st_size
             except OSError:
-                self._last_file_sizes[self.metadata.redirect_output_file] = 0
+                self._last_file_sizes[resolved_redirect] = 0
 
-        # self._log_config()
+        self._log_config()
 
     # ------------------------------------------------------------------
     # Transparent config logging
@@ -333,12 +335,15 @@ class SupervisedJob:
             print(f"  [watch] job={self.job_id} max_silent_s={self.metadata.max_silent_s}", flush=True)
         else:
             print(f"  [watch] job={self.job_id} WARNING: max_silent_s not set — no hang detection", flush=True)
-        if self.metadata.redirect_output_file:
-            exists = os.path.exists(self.metadata.redirect_output_file)
-            print(f"  [watch] job={self.job_id} redirect_file={self.metadata.redirect_output_file} exists={exists}", flush=True)
-        for path in self.metadata.file_watch_paths:
+        resolved = self._resolve_redirect_path()
+        if resolved:
+            exists = os.path.exists(resolved)
+            print(f"  [watch] job={self.job_id} redirect_resolved={resolved} exists={exists}", flush=True)
+        if self.metadata.redirect_output_file and self.metadata.redirect_output_file != resolved:
+            print(f"  [watch] job={self.job_id} redirect_metadata={self.metadata.redirect_output_file} (differs from resolved!)", flush=True)
+        for path in self._paths_to_watch():
             exists = os.path.exists(path)
-            print(f"  [watch] job={self.job_id} file_watch={path} exists={exists}", flush=True)
+            print(f"  [watch] job={self.job_id} watching={path} exists={exists}", flush=True)
         for t in self.metadata.target_metrics:
             print(f"  [watch] job={self.job_id} target: {t.name} {t.operator} {t.value}", flush=True)
         if self.metadata.readiness_regex:
@@ -520,6 +525,7 @@ class SupervisedJob:
                                        {"satisfied_targets": dict(self._satisfied_targets)})
 
         if current_stderr > self._last_stderr_len:
+            self._last_new_output_time = time.time()
             try:
                 new_lines = list(self.stderr_buf)[-max(1, current_stderr - self._last_stderr_len):]
             except RuntimeError:
@@ -537,20 +543,94 @@ class SupervisedJob:
                         self._emit("ERROR_SIGNATURE", f"Detected {sig_id} in stderr",
                                    {"signature_id": sig_id, "line": stripped})  # full line; brain truncates with notice
 
+        self._scan_redirect_file()
+
+    def _resolve_redirect_path(self) -> Optional[str]:
+        """Absolute path to the redirect file (from metadata or inferred from command)."""
+        path = (self.metadata.redirect_output_file or "").strip()
+        if not path:
+            path = (_redirect_target_from_command(self.command) or "").strip()
+        if not path:
+            return None
+        if not os.path.isabs(path):
+            path = os.path.join(self.cwd, path)
+        return path
+
+    def _scan_redirect_file(self) -> None:
+        """Read new bytes from the redirect file and scan for error signatures + metric targets.
+
+        Pipes are empty when stdout/stderr are redirected to a file, so this is
+        the only way to detect OOM, metric targets, etc. during the run.
+        """
+        path = self._resolve_redirect_path()
+        if not path:
+            return
+        try:
+            size = os.stat(path).st_size
+        except OSError:
+            return
+        if size <= self._redirect_scan_offset:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._redirect_scan_offset)
+                chunk = f.read()
+        except OSError:
+            return
+        self._redirect_scan_offset = size
+
+        if not chunk:
+            return
+
+        lines = chunk.split("\n")
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            err = detect_error_signature(stripped)
+            if err:
+                sig_id, confidence = err
+                if confidence >= EVENT_CONFIDENCE_THRESHOLDS.get("ERROR_SIGNATURE", 0.7):
+                    self._emit("ERROR_SIGNATURE", f"Detected {sig_id} in redirect log",
+                               {"signature_id": sig_id, "line": stripped})
+
+            if self.metadata.target_metrics:
+                metrics = extract_metric_values(stripped)
+                if metrics:
+                    hits = check_targets(metrics, self.metadata.target_metrics)
+                    for target, observed in hits:
+                        self._satisfied_targets[target.name.lower()] = observed
+
+                    all_names = {t.name.lower() for t in self.metadata.target_metrics}
+                    if all_names and all_names <= set(self._satisfied_targets.keys()):
+                        summary = ", ".join(
+                            f"{t.name} {t.operator} {t.value} (observed: {self._satisfied_targets.get(t.name.lower(), '?')})"
+                            for t in self.metadata.target_metrics
+                        )
+                        self._emit("METRIC_TARGET_REACHED", f"All targets met: {summary}",
+                                   {"satisfied_targets": dict(self._satisfied_targets)})
+
     def _paths_to_watch(self) -> List[str]:
-        """All paths that count as 'activity' for silence detection (file_watch_paths + redirect_output_file)."""
+        """All paths that count as 'activity' for silence detection (file_watch_paths + redirect)."""
         paths = list(self.metadata.file_watch_paths)
-        if self.metadata.redirect_output_file and self.metadata.redirect_output_file not in paths:
-            paths.append(self.metadata.redirect_output_file)
+        resolved = self._resolve_redirect_path()
+        if resolved and resolved not in paths:
+            paths.append(resolved)
         return paths
 
     def _check_files(self) -> None:
-        """Check watched files for growth — resets silence timer."""
+        """Check watched files for size change — resets silence timer.
+
+        Uses != instead of > to handle file recreation (rm + redirect).
+        """
         for path in self._paths_to_watch():
             try:
                 size = os.stat(path).st_size
                 prev = self._last_file_sizes.get(path, 0)
-                if size > prev:
+                if size != prev:
                     self._last_new_output_time = time.time()
                     self._last_file_sizes[path] = size
             except OSError:
@@ -569,49 +649,106 @@ class SupervisedJob:
         """Fire SILENT_TIMEOUT if no output or file activity past the LLM-declared limit."""
         if self.metadata.max_silent_s is None:
             return
-        # Pipelines like "python train.py | tail -30" produce no stdout until the pipeline
-        # closes; do not treat expected silence as a hang.
         if self._output_deferred_until_exit():
             return
         effective_limit = self.metadata.max_silent_s * 1.25
-        silent_for = time.time() - self._last_new_output_time
+        now = time.time()
+        silent_for = now - self._last_new_output_time
         if silent_for <= effective_limit:
             return
 
-        # Double-check all watched paths (file_watch_paths + redirect_output_file)
+        diag: Dict[str, Any] = {
+            "job_id": self.job_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "command": self.command[:200],
+            "cwd": self.cwd,
+            "max_silent_s": self.metadata.max_silent_s,
+            "effective_limit": effective_limit,
+            "silent_for": round(silent_for, 1),
+            "stdout_buf_len": len(self.stdout_buf),
+            "stderr_buf_len": len(self.stderr_buf),
+            "last_stdout_len": self._last_stdout_len,
+            "last_stderr_len": self._last_stderr_len,
+            "metadata_redirect": self.metadata.redirect_output_file,
+            "metadata_file_watch_paths": self.metadata.file_watch_paths,
+            "resolved_redirect": self._resolve_redirect_path(),
+            "paths_to_watch": self._paths_to_watch(),
+            "file_checks": [],
+        }
+
+        # Double-check all watched paths (!= catches recreation/truncation)
+        saved_by_file = False
         for path in self._paths_to_watch():
+            entry: Dict[str, Any] = {"path": path}
             try:
                 size = os.stat(path).st_size
                 prev = self._last_file_sizes.get(path, 0)
-                if size > prev:
-                    self._last_new_output_time = time.time()
+                entry["exists"] = True
+                entry["size"] = size
+                entry["prev_size"] = prev
+                entry["changed"] = size != prev
+                if size != prev:
+                    self._last_new_output_time = now
                     self._last_file_sizes[path] = size
-                    return
-            except OSError:
-                pass
+                    saved_by_file = True
+            except OSError as e:
+                entry["exists"] = False
+                entry["error"] = str(e)
+            diag["file_checks"].append(entry)
 
-        # When stdout is redirected to a file, the process may be line-buffered or block-buffered;
-        # the file might not have grown at our last poll. Give it one short delay then re-check
-        # to avoid false SILENT_TIMEOUT while the process is actively appending.
-        if self.metadata.redirect_output_file:
+        if saved_by_file:
+            diag["outcome"] = "saved_by_file_doublecheck"
+            self._write_silent_diag(diag)
+            return
+
+        # Retry once after short delay for block-buffered output
+        resolved = self._resolve_redirect_path()
+        if resolved:
             self._stop_event.wait(timeout=2.0)
             if self._stop_event.is_set():
                 return
+            retry_checks = []
             for path in self._paths_to_watch():
+                entry = {"path": path, "retry": True}
                 try:
                     size = os.stat(path).st_size
                     prev = self._last_file_sizes.get(path, 0)
-                    if size > prev:
+                    entry["exists"] = True
+                    entry["size"] = size
+                    entry["prev_size"] = prev
+                    entry["changed"] = size != prev
+                    if size != prev:
                         self._last_new_output_time = time.time()
                         self._last_file_sizes[path] = size
-                        return
-                except OSError:
-                    pass
+                        saved_by_file = True
+                except OSError as e:
+                    entry["exists"] = False
+                    entry["error"] = str(e)
+                retry_checks.append(entry)
+            diag["retry_checks"] = retry_checks
+
+        if saved_by_file:
+            diag["outcome"] = "saved_by_retry"
+            self._write_silent_diag(diag)
+            return
+
+        diag["outcome"] = "FIRED"
+        self._write_silent_diag(diag)
 
         self._emit("SILENT_TIMEOUT",
                     f"No stdout or file activity for {silent_for:.0f}s (limit: {self.metadata.max_silent_s:.0f}s + 25% margin)",
                     {"silent_for_s": round(silent_for, 1), "max_silent_s": self.metadata.max_silent_s})
         self._last_new_output_time = time.time()  # debounce
+
+    @staticmethod
+    def _write_silent_diag(diag: Dict[str, Any]) -> None:
+        import json
+        diag_path = "/tmp/remoroo_silent_timeout_diag.jsonl"
+        try:
+            with open(diag_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(diag, default=str) + "\n")
+        except OSError:
+            pass
 
     def _check_background_follow(self) -> None:
         """While in BACKGROUND_FOLLOW: wait for process group (or fallback PIDs) to empty, then COMPLETED."""
