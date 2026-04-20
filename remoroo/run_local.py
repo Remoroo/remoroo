@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,6 +93,21 @@ def _budget_tui_from_run_json(requested_max_wall_time_s: int, run_data: dict):
     )
 
 
+_PREPARE_DEBUG_LOG = Path(tempfile.gettempdir()) / "remoroo_cli_prepare_debug.log"
+
+
+def _prepare_cli_debug(event: str, **fields: Any) -> None:
+    """Append one JSON line to the system temp dir (best-effort; never raises)."""
+    try:
+        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event}
+        record.update(fields)
+        line = json.dumps(record, sort_keys=True, default=str) + "\n"
+        with open(_PREPARE_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
 def _teardown_local_worker_processes(worker) -> None:
     """Stop bash/training children and docker/venv sandbox (best-effort)."""
     if worker is None:
@@ -127,6 +144,11 @@ def prepare_local_worker_context(
     import os
 
     repo_path = resolve_canonical_repo_root(Path(repo_path))
+    _prepare_cli_debug(
+        "repo_path_resolved",
+        log_file=str(_PREPARE_DEBUG_LOG),
+        repo_path=str(repo_path.resolve()),
+    )
 
     import requests
     from .http_transport import HttpTransport
@@ -243,6 +265,13 @@ def prepare_local_worker_context(
     except Exception as e:
         raise RunPrepareError(f"Failed to start or attach run on server: {e}", code=1) from e
 
+    _prepare_cli_debug(
+        "run_registered",
+        log_file=str(_PREPARE_DEBUG_LOG),
+        remote_run_id=remote_run_id,
+        resume_run_id=resume_run_id or "",
+    )
+
     def _abort_run_on_failure(reason: str):
         """Best-effort abort so the server releases the reservation."""
         try:
@@ -260,16 +289,51 @@ def prepare_local_worker_context(
         run_output_dir.mkdir(parents=True, exist_ok=True)
 
         gitignore_path = repo_path / ".gitignore"
+        _prepare_cli_debug(
+            "gitignore_phase_start",
+            log_file=str(_PREPARE_DEBUG_LOG),
+            gitignore_path=str(gitignore_path),
+            gitignore_exists=gitignore_path.exists(),
+            remote_run_id=remote_run_id,
+            repo_path=str(repo_path.resolve()),
+        )
         try:
             if gitignore_path.exists():
-                content = gitignore_path.read_text()
-                if ".remoroo/" not in content:
-                    with open(gitignore_path, "a") as f:
+                content = gitignore_path.read_text(encoding="utf-8", errors="replace")
+                has_marker = ".remoroo/" in content
+                if not has_marker:
+                    with open(gitignore_path, "a", encoding="utf-8") as f:
                         f.write("\n# Remoroo Metadata\n.remoroo/\n")
+                    _prepare_cli_debug(
+                        "gitignore_appended_remoroo",
+                        log_file=str(_PREPARE_DEBUG_LOG),
+                        gitignore_path=str(gitignore_path),
+                        prior_bytes=len(content.encode("utf-8")),
+                    )
+                else:
+                    _prepare_cli_debug(
+                        "gitignore_skip_already_has_marker",
+                        log_file=str(_PREPARE_DEBUG_LOG),
+                        gitignore_path=str(gitignore_path),
+                        prior_bytes=len(content.encode("utf-8")),
+                    )
             else:
-                gitignore_path.write_text("# Remoroo Metadata\n.remoroo/\n")
-        except Exception:
-            pass
+                gitignore_path.write_text(
+                    "# Remoroo Metadata\n.remoroo/\n", encoding="utf-8"
+                )
+                _prepare_cli_debug(
+                    "gitignore_created",
+                    log_file=str(_PREPARE_DEBUG_LOG),
+                    gitignore_path=str(gitignore_path),
+                )
+        except Exception as ex:
+            _prepare_cli_debug(
+                "gitignore_error",
+                log_file=str(_PREPARE_DEBUG_LOG),
+                gitignore_path=str(gitignore_path),
+                error_type=type(ex).__name__,
+                error=str(ex),
+            )
 
         memory_path = remoroo_dir / "memory.json"
         old_memory_path = remoroo_dir / "local_memory.json"
