@@ -11,6 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 from .executor import run_command_with_timeout
+from .workspace import managed_venv_path
 
 @dataclass
 class EnvSetupResult:
@@ -166,18 +167,23 @@ def execute_env_setup(
     """
     start_time = time.time()
     commands_run = []
-    
-    venv_path = os.path.join(repo_root, "venv")
+
+    # Managed venvs live OUTSIDE the user's repo (see
+    # `workspace.managed_venv_path` for the rationale). This keeps
+    # `ls` / `grep` / ripgrep walks of the repo from ever seeing
+    # hundreds of MB of site-packages.
+    venv_path = managed_venv_path(repo_root)
     is_win = sys.platform == "win32"
     venv_python = os.path.join(venv_path, "Scripts", "python.exe") if is_win else os.path.join(venv_path, "bin", "python")
     venv_pip = os.path.join(venv_path, "Scripts", "pip.exe") if is_win else os.path.join(venv_path, "bin", "pip")
-    
+
     if use_venv:
         if not os.path.exists(venv_path) or always_create_venv:
+            os.makedirs(os.path.dirname(venv_path), exist_ok=True)
             print(f"Creating venv at {venv_path}")
             try:
                 subprocess.check_call([sys.executable, "-m", "venv", venv_path])
-                commands_run.append(f"{sys.executable} -m venv venv")
+                commands_run.append(f"{sys.executable} -m venv {venv_path}")
             except subprocess.CalledProcessError as e:
                 return EnvSetupResult(
                     success=False,

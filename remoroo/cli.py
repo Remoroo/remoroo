@@ -159,6 +159,117 @@ def attach(
     )
 
 
+@app.command("continue")
+def continue_cmd(
+    url: str = typer.Argument(
+        ...,
+        metavar="URL",
+        help="Receipt URL (https://remoroo.com/r/<rid>) or a bare receipt id.",
+    ),
+    dest: Optional[Path] = typer.Option(
+        None,
+        "--dest",
+        help="Destination directory for the cloned template. "
+             "Defaults to ./remoroo_<env>_<rid>/.",
+    ),
+    with_checkpoint: bool = typer.Option(
+        False,
+        "--with-checkpoint",
+        help="Also download the session's final checkpoint.pt into the clone.",
+    ),
+    template_url_template: Optional[str] = typer.Option(
+        None,
+        "--template-url-template",
+        help="Override the git URL used to clone the per-env template. "
+             "Use `{env}` as the placeholder.",
+    ),
+    receipt_url_template: Optional[str] = typer.Option(
+        None,
+        "--receipt-url-template",
+        help="Override the URL used to fetch the receipt JSON. "
+             "Use `{rid}` as the placeholder.",
+    ),
+):
+    """Land a Try-Now session locally (prepare the repo; does not run)."""
+    from .continue_cmd import (
+        DEFAULT_RECEIPT_URL_TEMPLATE,
+        DEFAULT_TEMPLATE_URL_TEMPLATE,
+        ContinueConfig,
+        ContinueError,
+        resolve_receipt_url,
+        run_continue,
+    )
+    import os as _os
+
+    # Resolve the rid up-front so we can derive a default dest directory
+    # from it. `run_continue` would do this anyway, but we need the rid
+    # and env before the clone to compute `./remoroo_<env>_<rid>/`; env
+    # only lands after the receipt fetch, so we defer dest resolution
+    # until right before clone in that case.
+    receipt_tpl = (
+        receipt_url_template
+        or _os.getenv("REMOROO_TRY_NOW_RECEIPT_URL_TEMPLATE")
+        or DEFAULT_RECEIPT_URL_TEMPLATE
+    )
+    template_tpl = (
+        template_url_template
+        or _os.getenv("REMOROO_TRY_NOW_TEMPLATE_URL")
+        or DEFAULT_TEMPLATE_URL_TEMPLATE
+    )
+    try:
+        rid, _receipt_url = resolve_receipt_url(
+            url, receipt_url_template=receipt_tpl
+        )
+    except ContinueError as exc:
+        typer.secho(exc.message, fg=typer.colors.RED)
+        raise typer.Exit(code=exc.code)
+
+    # Defer the env-dependent part of the default dest: pass a
+    # placeholder-resolved path up front, and let `run_continue` trust
+    # the caller on collisions. If the user did not pass --dest, we do
+    # a lightweight pre-fetch to learn the env so the default path is
+    # a real readable name. That's one extra network call but keeps
+    # CLI ergonomics honest.
+    if dest is None:
+        try:
+            from .continue_cmd import default_fetch_bytes
+            raw = default_fetch_bytes(_receipt_url)
+            import json as _json
+            payload = _json.loads(raw.decode("utf-8"))
+            env = str(payload.get("env") or "unknown").lower()
+        except Exception:
+            env = "unknown"
+        dest = Path.cwd() / f"remoroo_{env}_{rid}"
+
+    cfg = ContinueConfig(
+        input_url=url,
+        dest_dir=dest,
+        with_checkpoint=with_checkpoint,
+        template_url_template=template_tpl,
+        receipt_url_template=receipt_tpl,
+    )
+    try:
+        result = run_continue(cfg)
+    except ContinueError as exc:
+        typer.secho(exc.message, fg=typer.colors.RED)
+        raise typer.Exit(code=exc.code)
+
+    typer.secho(
+        f"Prepared Try-Now continuation at {result.clone_dir}",
+        fg=typer.colors.GREEN,
+    )
+    typer.echo(f"  env:         {result.env}")
+    typer.echo(f"  receipt id:  {result.rid}")
+    if result.wrote_checkpoint:
+        typer.echo("  checkpoint:  ./checkpoint.pt")
+    for w in result.warnings:
+        typer.secho(f"  warning:     {w}", fg=typer.colors.YELLOW)
+    typer.echo("")
+    typer.echo("Next:")
+    typer.echo(f"  cd {result.clone_dir}")
+    typer.echo("  remoroo run --local")
+
+
 @app.callback()
 def main():
     """
@@ -196,6 +307,15 @@ def run(
         "--resume",
         metavar="RUN_ID",
         help="Attach worker to an existing run instead of creating a new one.",
+    ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help=(
+            "Run without the Rich TUI — for Try-Now Spot workers or CI. "
+            "Reuses the same polling loop but emits JSON log lines to stderr "
+            "instead of rendering a terminal UI; exits 0/1/2 by final outcome."
+        ),
     ),
 ):
     from .configs import get_api_url, get_default_engine
@@ -251,7 +371,7 @@ def run(
     ml = [m.strip() for m in metrics.split(",") if m.strip()] if metrics else []
     metrics_option_provided = metrics is not None
 
-    from .tui_launch_config import LaunchConfig
+    from .tui_launch_config import LaunchConfig, exit_code_for_result
     from .tui_unified_app import echo_session_finished_line, run_unified_local_session
 
     try:
@@ -280,6 +400,15 @@ def run(
             attach_goal_preview="",
             metrics_option_provided=metrics_option_provided,
         )
+        if headless:
+            # Headless bypasses the TUI and the TTY check. It still uses the
+            # same prepare/finalize path; only the renderer is stripped.
+            from .run_local import run_local_worker_headless
+
+            lr = run_local_worker_headless(cfg)
+            code = exit_code_for_result(lr.success, lr.partial_success)
+            echo_session_finished_line(lr, code)
+            raise typer.Exit(code=code)
         lr, code = run_unified_local_session(cfg)
         echo_session_finished_line(lr, code)
         raise typer.Exit(code=code)

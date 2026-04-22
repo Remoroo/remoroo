@@ -1897,18 +1897,22 @@ class LocalWorker:
 
             elif request.type == "diagnosis_import_error":
                 from ..execution import import_diagnostics
+                from .core.workspace import managed_venv_python
                 # Use explicit repo_root from payload if provided (stateless protocol)
                 target_root = request.payload.get("repo_root") or self.repo_root
-                # Use absolute venv python if available
+                # Use absolute venv python if available. Precedence:
+                #   caller-supplied > CLI-managed cache > user's .venv
+                # A bare in-repo `venv/` is intentionally NOT consulted;
+                # see venv_sandbox._detect_venv for the rationale.
                 venv_python = request.payload.get("venv_python")
                 if not venv_python or venv_python == "python":
-                    potential_venv = os.path.join(target_root, "venv", "bin", "python")
-                    if os.path.exists(potential_venv):
-                        venv_python = potential_venv
+                    managed_py = managed_venv_python(target_root)
+                    if os.path.exists(managed_py):
+                        venv_python = managed_py
                     else:
-                        potential_venv = os.path.join(target_root, ".venv", "bin", "python")
-                        if os.path.exists(potential_venv):
-                            venv_python = potential_venv
+                        dotvenv_py = os.path.join(target_root, ".venv", "bin", "python")
+                        if os.path.exists(dotvenv_py):
+                            venv_python = dotvenv_py
 
                 d = import_diagnostics.diagnose_import_error(
                     error_message=request.payload.get("error_message", ""),

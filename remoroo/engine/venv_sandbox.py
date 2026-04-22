@@ -4,6 +4,7 @@ import subprocess
 from typing import List, Dict, Union, Optional, Any
 from pathlib import Path
 from .utils.system_interface import SystemInterface, RealSystem
+from .core.workspace import managed_venv_path
 
 
 class VenvSandbox:
@@ -31,16 +32,48 @@ class VenvSandbox:
         return True
 
     def _detect_venv(self):
-        """Find the venv directory, checking .venv first (modern default), then venv."""
-        for name in [".venv", "venv"]:
-            candidate = os.path.join(self.repo_root, name)
-            if os.path.isdir(candidate):
-                self.venv_path = candidate
-                break
+        """Locate the venv to activate for this repo.
 
-        if self.venv_path is None:
-            self.venv_path = os.path.join(self.repo_root, ".venv")
+        Precedence (high → low):
+          1. CLI-managed venv at ``workspace.managed_venv_path(repo_root)``
+             — out-of-tree, keyed by the repo's absolute path.
+          2. ``.venv/`` at repo root — a user-blessed convention; fine
+             to activate because the user put it there deliberately.
+          3. Nothing. Caller's environment wins; on Try-Now that's
+             the shared ``/opt/try_now/.venv`` via ``PATH``.
 
+        NOTE: A bare ``venv/`` (no dot) inside the repo is NOT picked
+        up. Historically the CLI wrote its managed venv there, but
+        that leaked megabytes of site-packages into users' repos and
+        shadowed their real interpreter with a stale one. We now
+        ignore such directories entirely and emit a one-line warning
+        so operators know to delete the leftover.
+        """
+        managed = managed_venv_path(self.repo_root)
+        if os.path.isdir(managed):
+            self.venv_path = managed
+            self._resolve_paths()
+            return
+
+        dotvenv = os.path.join(self.repo_root, ".venv")
+        if os.path.isdir(dotvenv):
+            self.venv_path = dotvenv
+            self._resolve_paths()
+            return
+
+        bare = os.path.join(self.repo_root, "venv")
+        if os.path.isdir(bare):
+            print(
+                f"⚠️  Found an in-repo 'venv/' at {bare} — ignoring it. "
+                f"The CLI no longer creates venvs inside your repo. "
+                f"If this was left by an older Remoroo version, delete "
+                f"it: rm -rf {bare}"
+            )
+
+        # No usable venv. Point venv_path at the managed location so
+        # a later env_setup call creates it there; has_venv() stays
+        # False until that happens.
+        self.venv_path = managed
         self._resolve_paths()
 
     def _resolve_paths(self):

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Tuple
 
 import typer
 
@@ -182,6 +183,12 @@ def prepare_local_worker_context(
 
     headers = {"Authorization": f"Bearer {session_key}"}
     budget_ui = None
+    # Initialised up-front because the resume-run branch below doesn't
+    # populate it — only the fresh-run path assigns `run_data = resp.json()`.
+    # Without this, the `run_data.get("run_token")` read at the bottom of
+    # this function raises `UnboundLocalError` on every `--resume` path
+    # (e.g. the Try-Now executor on the GPU host).
+    run_data = None
     try:
         if resume_run_id:
             resp = requests.get(
@@ -298,34 +305,63 @@ def prepare_local_worker_context(
             repo_path=str(repo_path.resolve()),
         )
         try:
+            # Append a block of recommended ignores (``.remoroo/`` plus
+            # universal Python/Node/OS bloat). Fully idempotent: only
+            # entries not already present in the file are written, so
+            # re-runs never duplicate lines, and users who have already
+            # ignored some of them keep their version. Rationale and
+            # the canonical list live in engine.core.workspace.
+            from .engine.core.workspace import (
+                GITIGNORE_BLOCK_HEADER,
+                missing_gitignore_entries,
+            )
+
+            existing = ""
             if gitignore_path.exists():
-                content = gitignore_path.read_text(encoding="utf-8", errors="replace")
-                has_marker = ".remoroo/" in content
-                if not has_marker:
-                    with open(gitignore_path, "a", encoding="utf-8") as f:
-                        f.write("\n# Remoroo Metadata\n.remoroo/\n")
-                    _prepare_cli_debug(
-                        "gitignore_appended_remoroo",
-                        log_file=str(_PREPARE_DEBUG_LOG),
-                        gitignore_path=str(gitignore_path),
-                        prior_bytes=len(content.encode("utf-8")),
-                    )
-                else:
-                    _prepare_cli_debug(
-                        "gitignore_skip_already_has_marker",
-                        log_file=str(_PREPARE_DEBUG_LOG),
-                        gitignore_path=str(gitignore_path),
-                        prior_bytes=len(content.encode("utf-8")),
-                    )
-            else:
-                gitignore_path.write_text(
-                    "# Remoroo Metadata\n.remoroo/\n", encoding="utf-8"
-                )
+                existing = gitignore_path.read_text(encoding="utf-8", errors="replace")
+
+            to_add = missing_gitignore_entries(existing)
+
+            if not to_add:
                 _prepare_cli_debug(
-                    "gitignore_created",
+                    "gitignore_skip_already_has_all",
                     log_file=str(_PREPARE_DEBUG_LOG),
                     gitignore_path=str(gitignore_path),
+                    prior_bytes=len(existing.encode("utf-8")),
                 )
+            else:
+                # Ensure we start on a fresh line so we don't merge
+                # with the user's last (possibly newline-less) entry.
+                sep = ""
+                if existing and not existing.endswith("\n"):
+                    sep = "\n"
+
+                block = (
+                    f"{sep}\n{GITIGNORE_BLOCK_HEADER}\n"
+                    + "\n".join(to_add)
+                    + "\n"
+                )
+
+                if existing:
+                    with open(gitignore_path, "a", encoding="utf-8") as f:
+                        f.write(block)
+                    _prepare_cli_debug(
+                        "gitignore_appended",
+                        log_file=str(_PREPARE_DEBUG_LOG),
+                        gitignore_path=str(gitignore_path),
+                        prior_bytes=len(existing.encode("utf-8")),
+                        entries_added=list(to_add),
+                    )
+                else:
+                    gitignore_path.write_text(
+                        block.lstrip("\n"), encoding="utf-8"
+                    )
+                    _prepare_cli_debug(
+                        "gitignore_created",
+                        log_file=str(_PREPARE_DEBUG_LOG),
+                        gitignore_path=str(gitignore_path),
+                        entries_added=list(to_add),
+                    )
         except Exception as ex:
             _prepare_cli_debug(
                 "gitignore_error",
@@ -607,3 +643,320 @@ def run_local_worker(
     )
     _result, code = run_unified_local_session(cfg)
     raise typer.Exit(code=code)
+
+
+# ── Headless executor (Try-Now Spot / CI) ───────────────────────────
+#
+# The TUI path above is battle-tested but assumes a real terminal. On a
+# GPU Spot worker running Try Now there is no TTY, only systemd; we need
+# the same polling loop without the Rich rendering. `run_local_worker_headless`
+# below reuses `prepare_local_worker_context` and
+# `finalize_local_worker_session` verbatim — the only new code is a silent
+# poll/handle/submit loop and structured JSON-line logging to stderr so
+# `journalctl -u remoroo-executor.service` gives operators a readable trace.
+#
+# The loop is factored into a pure, DI-tested helper (`_headless_step_loop`)
+# so we can unit-test exit conditions and logging without needing a live
+# control plane or WorkerService.
+
+
+class _PollFn(Protocol):
+    def __call__(self, timeout: float, run_id: str) -> Tuple[Any, Any, Any]: ...
+
+
+class _HandleFn(Protocol):
+    def __call__(self, step: Any) -> Any: ...
+
+
+class _SubmitFn(Protocol):
+    def __call__(self, result: Any) -> None: ...
+
+
+# Exit strings the control plane can return (surfaced via
+# `ExecutionRequest.type` on the synthetic `workflow_complete` step). We
+# treat all three as terminal — the worker has no more work to do and
+# must tear down.
+_HEADLESS_TERMINAL_STEP_TYPES = frozenset(
+    {"workflow_complete", "workflow_error", "run_complete"}
+)
+
+
+@dataclass
+class HeadlessLoopStats:
+    """Counters the headless loop exposes for tests + observability."""
+
+    polls: int = 0
+    steps_handled: int = 0
+    submit_failures: int = 0
+    poll_errors: int = 0
+    last_step_type: str = ""
+
+
+@dataclass
+class HeadlessLoopOutcome:
+    """Terminal payload extracted from the `workflow_complete`-class step
+    that ended the loop. Translated to `finalize_local_worker_session`'s
+    `rb` dict by the caller.
+    """
+
+    outcome: str
+    success: bool
+    partial_success: bool
+    final_result: Any
+    step_type: str
+
+
+def _emit_headless_log(
+    event: str,
+    *,
+    stream: Any = None,
+    **fields: Any,
+) -> None:
+    """One JSON line on stderr per handled step (or error).
+
+    Schema is deliberately tiny: operators grep with `journalctl | jq`
+    and the event name is the filter key. We never raise from the logger.
+    """
+    try:
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "component": "remoroo.headless",
+            "event": event,
+        }
+        record.update(fields)
+        line = json.dumps(record, sort_keys=True, default=str)
+    except Exception:
+        line = f'{{"ts": "?", "event": "{event}", "log_error": true}}'
+    out = stream if stream is not None else sys.stderr
+    try:
+        out.write(line + "\n")
+        out.flush()
+    except Exception:
+        pass
+
+
+def _headless_step_loop(
+    *,
+    run_id: str,
+    poll_fn: _PollFn,
+    handle_fn: _HandleFn,
+    submit_fn: _SubmitFn,
+    poll_timeout: float = 1.0,
+    max_iterations: Optional[int] = None,
+    log_stream: Any = None,
+    stats: Optional[HeadlessLoopStats] = None,
+) -> Tuple[HeadlessLoopOutcome, HeadlessLoopStats]:
+    """Poll → handle → submit until a terminal step appears.
+
+    Pure w.r.t. the network and the `WorkerService`; callers inject real
+    implementations (see `run_local_worker_headless`), tests inject
+    fakes. `max_iterations` is a safety net for tests / stalled loops
+    (None means "loop forever").
+
+    Exits on:
+      - a terminal `workflow_*` step (returns the outcome),
+      - or `max_iterations` polls if provided without seeing one.
+
+    Never raises; any exception inside `handle_fn` / `submit_fn` is
+    counted and logged, and the loop continues. A failure in
+    `poll_fn` yields `(None, None, None)` by contract of `HttpTransport`.
+    """
+    if stats is None:
+        stats = HeadlessLoopStats()
+
+    loop_iters = 0
+    while True:
+        if max_iterations is not None and loop_iters >= max_iterations:
+            _emit_headless_log(
+                "headless.loop_exceeded_max_iterations",
+                stream=log_stream,
+                run_id=run_id,
+                max_iterations=max_iterations,
+            )
+            outcome = HeadlessLoopOutcome(
+                outcome="UNKNOWN",
+                success=False,
+                partial_success=False,
+                final_result=None,
+                step_type="",
+            )
+            return outcome, stats
+        loop_iters += 1
+
+        try:
+            step, _metrics, _baseline = poll_fn(poll_timeout, run_id)
+        except Exception as exc:  # noqa: BLE001 — logger decides fate
+            stats.poll_errors += 1
+            _emit_headless_log(
+                "headless.poll_error",
+                stream=log_stream,
+                run_id=run_id,
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+            continue
+        stats.polls += 1
+
+        if step is None:
+            continue
+
+        step_type = getattr(step, "type", "") or ""
+        stats.last_step_type = step_type
+
+        try:
+            result = handle_fn(step)
+        except Exception as exc:  # noqa: BLE001
+            _emit_headless_log(
+                "headless.handle_error",
+                stream=log_stream,
+                run_id=run_id,
+                step_type=step_type,
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+            # handle_fn failing before emitting a result is a worker
+            # fault — bail with UNKNOWN so the CP can release the
+            # reservation. Operators see the journalctl error.
+            outcome = HeadlessLoopOutcome(
+                outcome="UNKNOWN",
+                success=False,
+                partial_success=False,
+                final_result=None,
+                step_type=step_type,
+            )
+            return outcome, stats
+
+        stats.steps_handled += 1
+
+        try:
+            submit_fn(result)
+        except Exception as exc:  # noqa: BLE001
+            stats.submit_failures += 1
+            _emit_headless_log(
+                "headless.submit_error",
+                stream=log_stream,
+                run_id=run_id,
+                step_type=step_type,
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+            # HttpTransport.submit_result already retries; if the caller
+            # raised, the result truly failed to land — the CP will
+            # time us out and mark the run FAILED. Continue looping so
+            # the next poll surfaces the terminal step.
+            continue
+
+        _emit_headless_log(
+            "headless.step_handled",
+            stream=log_stream,
+            run_id=run_id,
+            step_type=step_type,
+        )
+
+        if step_type in _HEADLESS_TERMINAL_STEP_TYPES:
+            payload = getattr(step, "payload", None) or {}
+            outcome = HeadlessLoopOutcome(
+                outcome=str(payload.get("outcome", "UNKNOWN") or "UNKNOWN"),
+                success=bool(payload.get("success", False)),
+                partial_success=bool(payload.get("partial_success", False)),
+                final_result=getattr(result, "data", None),
+                step_type=step_type,
+            )
+            return outcome, stats
+
+
+def run_local_worker_headless(cfg: "Any") -> LocalRunResult:
+    """No-TUI `remoroo run --local` entry point for Try Now spot workers.
+
+    Reuses the battle-tested `prepare_local_worker_context` and
+    `finalize_local_worker_session` — the only new behaviour is:
+      * no `unified_tui_requires_tty()` check (caller in cli.py handles it),
+      * silent polling loop over the HTTP transport,
+      * one JSON log line per handled step on stderr (journald-friendly).
+
+    Exit code convention (interpreted by cli.py via
+    `exit_code_for_result`): 0 on SUCCESS, 1 on FAILED/UNKNOWN/prepare
+    errors, 2 on PARTIAL_SUCCESS.
+
+    Signature mirrors `run_local_worker` so `cli.py` can dispatch to
+    either by flag with no other changes.
+    """
+    from .engine.local_worker import WorkerService
+
+    try:
+        ctx = prepare_local_worker_context(
+            repo_path=cfg.repo_path,
+            goal=cfg.goal,
+            metrics=cfg.metrics_list,
+            brain_url=cfg.brain_url,
+            engine=cfg.engine,
+            verbose=cfg.verbose,
+            cache_env=cfg.cache_env,
+            in_place=cfg.in_place,
+            agentic=cfg.agentic,
+            engine_version=cfg.engine_version,
+            model=cfg.model,
+            resume_run_id=cfg.resume_run_id,
+            max_wall_time_s=cfg.max_wall_time_s,
+            allow_overage=cfg.allow_overage,
+        )
+    except RunPrepareError as exc:
+        _emit_headless_log(
+            "headless.prepare_failed",
+            error=exc.message,
+            exit_code=exc.code,
+        )
+        return LocalRunResult(
+            run_root=None,
+            run_id=cfg.resume_run_id or "",
+            success=False,
+            outcome="PREPARE_FAILED",
+            partial_success=False,
+            detail=exc.message,
+        )
+
+    _emit_headless_log(
+        "headless.prepare_ok",
+        run_id=ctx.remote_run_id,
+        repo=str(ctx.repo_path),
+    )
+
+    worker = WorkerService(
+        repo_root=str(ctx.repo_path),
+        artifact_dir=str(ctx.run_output_dir),
+        original_repo_root=ctx.original_repo_path,
+        run_id=ctx.remote_run_id,
+        engine=ctx.engine,
+        persistence_dir=str(ctx.run_output_dir),
+        cache_env=ctx.cache_env,
+        in_place=ctx.in_place,
+    )
+
+    try:
+        outcome, _stats = _headless_step_loop(
+            run_id=ctx.remote_run_id,
+            poll_fn=lambda timeout, run_id: ctx.server.get_next_step(
+                timeout=timeout, run_id=run_id
+            ),
+            handle_fn=worker.handle_request,
+            submit_fn=ctx.server.submit_result,
+        )
+    finally:
+        ctx.stop_heartbeat.set()
+
+    rb = {
+        "final_result": outcome.final_result,
+        "outcome": outcome.outcome,
+        "success": outcome.success,
+        "partial_success": outcome.partial_success,
+        "_cleanup_worker": worker,
+    }
+    lr = finalize_local_worker_session(ctx, rb)
+    _emit_headless_log(
+        "headless.finalized",
+        run_id=lr.run_id,
+        outcome=lr.outcome,
+        success=lr.success,
+        partial_success=lr.partial_success,
+    )
+    return lr
