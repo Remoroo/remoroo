@@ -74,13 +74,41 @@ def execute_metric_probes(
                 flags = re.MULTILINE
                 if str(probe.get("flags", "")).lower() == "i":
                     flags |= re.IGNORECASE
-                m = re.search(pattern, combined, flags)
-                if not m:
+                # Reduction strategy over all matches in the combined log.
+                # Default "last" because training logs append rows over time;
+                # the most recent value is the one that reflects the current
+                # state of the run (a `re.search`-style first-match gives
+                # whatever the first logged step was, which for RL training
+                # is typically the initial, near-random policy — useless for
+                # a dashboard metric).
+                reduce = str(probe.get("reduce", "last")).lower()
+                matches = list(re.finditer(pattern, combined, flags))
+                if not matches:
                     snapshot[name] = None
                     errors[name] = "regex no match"
                 else:
-                    g = m.group(1) if m.lastindex else m.group(0)
-                    snapshot[name] = _coerce_value(g) if g is not None else None
+                    def _extract(mm: "re.Match[str]") -> Any:
+                        g = mm.group(1) if mm.lastindex else mm.group(0)
+                        return _coerce_value(g) if g is not None else None
+
+                    vals = [_extract(mm) for mm in matches]
+                    numeric = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+                    if reduce == "first":
+                        snapshot[name] = vals[0]
+                    elif reduce == "max":
+                        if not numeric:
+                            snapshot[name] = vals[-1]
+                            errors[name] = "reduce=max: no numeric values; used last"
+                        else:
+                            snapshot[name] = max(numeric)
+                    elif reduce == "min":
+                        if not numeric:
+                            snapshot[name] = vals[-1]
+                            errors[name] = "reduce=min: no numeric values; used last"
+                        else:
+                            snapshot[name] = min(numeric)
+                    else:
+                        snapshot[name] = vals[-1]
 
             elif ptype == "read_json_path":
                 path = probe.get("path") or ""

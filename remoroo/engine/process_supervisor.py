@@ -905,6 +905,7 @@ class SupervisedJob:
         if self.state.value in ("finished", "failed", "killed", "backoff") and self.metadata.metric_probes:
             full_out = "".join(stdout_lines)
             full_err = "".join(stderr_lines)
+            redirect_bytes = 0
             if redir:
                 redir_path = redir if os.path.isabs(redir) else os.path.join(self.cwd, redir)
                 try:
@@ -912,6 +913,7 @@ class SupervisedJob:
                         redirect_full = _rf.read(4 * 1024 * 1024)
                 except (OSError, IOError):
                     redirect_full = ""
+                redirect_bytes = len(redirect_full)
                 if redirect_full:
                     full_out = (full_out + "\n" + redirect_full) if full_out.strip() else redirect_full
             snap, perr = execute_metric_probes(
@@ -923,4 +925,12 @@ class SupervisedJob:
             out["metrics_snapshot"] = snap
             if perr:
                 out["metrics_probe_errors"] = perr
+            print(
+                f"[METRIC_TRACE] supervisor.probes job_id={self.job_id!r} "
+                f"state={self.state.value} probes={len(self.metadata.metric_probes)} "
+                f"stdout_bytes={len(''.join(stdout_lines))} redirect_path={redir!r} "
+                f"redirect_bytes={redirect_bytes} snap_keys={list((snap or {}).keys())} "
+                f"errors={len(perr or [])}",
+                flush=True,
+            )
         return out
