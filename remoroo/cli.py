@@ -298,7 +298,7 @@ def run(
     in_place: bool = typer.Option(True, "--in-place", help="Edit the repo directly instead of creating a temporary working copy."),
     agentic: bool = typer.Option(True, "--agentic", help="Use Conductor-driven agentic loop instead of the legacy pipeline."),
     v2: bool = typer.Option(True, "--v2/--v1", help="Use v2 agent loop (default) or legacy v1."),
-    model: Optional[str] = typer.Option(None, "--model", help="v2 LLM model id (e.g. anthropic/claude-sonnet-4.5)."),
+    model: Optional[str] = typer.Option(None, "--model", help="v2 LLM model id (e.g. anthropic/claude-opus-4.7)."),
     pick_model: bool = typer.Option(True, "--pick-model", help="Full-screen picker: Haiku / Sonnet / Opus before the run TUI."),
     budget_hours: float = typer.Option(10.0, "--budget", help="Time budget in hours (default 10). Sets wall-clock and cost caps."),
     allow_overage: bool = typer.Option(False, "--allow-overage", help="Allow run to exceed credit balance (billed as overage)."),
