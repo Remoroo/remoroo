@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, Callable, List
+from typing import Dict, Any, Optional, Callable, List, Tuple
 from .protocol import ExecutionRequest, ExecutionResult
 from .core.worker import Worker
 from .utils import fs_utils, syntax_validator, configs
@@ -31,9 +31,68 @@ from .venv_sandbox import VenvSandbox
 from .sandbox import DockerSandboxUnavailableError
 from .harness import RemorooHarness
 from .utils.system_interface import SystemInterface, RealSystem
+from .access_policy import AccessPolicy, seed_default_ignore_if_missing
 
 # Used by interrupt handler to kill background jobs when CLI receives SIGINT/SIGTERM
 _current_worker: Optional["LocalWorker"] = None
+
+
+def _entry_references_blocked(entry: Any, is_blocked: Callable[[str], bool]) -> bool:
+    """Best-effort check whether a memory.json entry mentions a blocked path."""
+    if isinstance(entry, str):
+        return is_blocked(entry)
+    if isinstance(entry, dict):
+        for key in ("path", "file", "filename", "rel_path", "target"):
+            v = entry.get(key)
+            if isinstance(v, str) and is_blocked(v):
+                return True
+    return False
+
+
+def _patch_blocked_paths(patch: Any, is_blocked: Callable[[str], bool]) -> List[str]:
+    """Return paths in a patch proposal that match the blocklist.
+
+    Tolerates both the typical ``{"edits": [{"path": ...}, ...]}`` shape and
+    a flat ``{"path": ...}`` legacy shape. Returns an empty list if nothing
+    is blocked, allowing the caller to fast-path through.
+    """
+    blocked: List[str] = []
+    if not isinstance(patch, dict):
+        return blocked
+    edits = patch.get("edits")
+    if isinstance(edits, list):
+        for e in edits:
+            if isinstance(e, dict):
+                p = e.get("path") or e.get("file") or e.get("target")
+                if isinstance(p, str) and is_blocked(p):
+                    blocked.append(p)
+    flat = patch.get("path")
+    if isinstance(flat, str) and is_blocked(flat):
+        blocked.append(flat)
+    return blocked
+
+
+def _filter_scaffolding(scaffolding: Any, is_blocked: Callable[[str], bool]) -> Any:
+    """Drop blocked-path entries from the scaffolding dict returned by RepoIndexer.
+
+    The shape varies (RepoIndexer returns nested dicts with file/dir keys).
+    We walk dicts/lists and prune any string values that look like paths and
+    match the blocklist. Non-path-like values are preserved.
+    """
+    if isinstance(scaffolding, dict):
+        out: Dict[str, Any] = {}
+        for k, v in scaffolding.items():
+            if isinstance(k, str) and ("/" in k or "." in k) and is_blocked(k):
+                continue
+            out[k] = _filter_scaffolding(v, is_blocked)
+        return out
+    if isinstance(scaffolding, list):
+        return [
+            _filter_scaffolding(item, is_blocked)
+            for item in scaffolding
+            if not (isinstance(item, str) and is_blocked(item))
+        ]
+    return scaffolding
 
 
 def current_local_worker() -> Optional["LocalWorker"]:
@@ -82,6 +141,26 @@ class LocalWorker:
         self.engine = engine.lower()
         self.cache_env = cache_env  # Enable environment caching (skip already-installed packages)
         self.worker = Worker(repo_root=repo_root, artifact_dir=artifact_dir)
+
+        # Access policy: customer-declared blocklist (.remorooignore at repo root).
+        # Auto-seeded on first run with sensible secret-hiding defaults so customers
+        # get protection on day one. To opt out, the customer truncates the file
+        # to empty. See docs/access_policy_plan.md.
+        if seed_default_ignore_if_missing(self.original_repo_root):
+            self._log(
+                "🔒 Created .remorooignore with recommended defaults "
+                "(.env, *.pem, secrets/, …). Edit or empty it to customise."
+            )
+        self.access_policy = AccessPolicy.load(self.original_repo_root)
+        self._bash_wrapper: Optional[Callable[[str], str]] = (
+            self.access_policy.host_bash_wrapper() if self.engine != "docker" else None
+        )
+        if self.access_policy.has_patterns():
+            self._log(
+                f"🔒 Access policy active: {len(self.access_policy.patterns)} pattern(s), "
+                f"sandbox = {self.access_policy.describe_engine()}"
+            )
+            self._scrub_memory_cache()
         
         # Initialize Sandbox — always have one (Docker or Venv).
         # sandbox_override takes priority — used by harbor/test adapters to inject a custom sandbox.
@@ -504,6 +583,103 @@ class LocalWorker:
                 text=True,
             )
 
+    # ── Access policy helpers (see docs/access_policy_plan.md) ──────────────
+
+    def _is_blocked(self, path: str) -> bool:
+        """Wrapper around ``AccessPolicy.is_blocked`` for use in handle_request branches."""
+        if not path:
+            return False
+        return self.access_policy.is_blocked(path)
+
+    def _filter_blocked_paths(self, paths: List[str]) -> List[str]:
+        return self.access_policy.filter_paths(paths)
+
+    @staticmethod
+    def _blocked_not_found_response() -> "ExecutionResult":
+        """Standard read-family response for blocked paths.
+
+        Mirrors the ``{"exists": False}`` shape used elsewhere in the worker
+        so the brain sees a natural "file not found" outcome rather than a
+        bespoke error type — keeps the rule invisible to the agent loop.
+        """
+        return ExecutionResult(success=True, data={"exists": False})
+
+    @staticmethod
+    def _blocked_write_response(path: str) -> "ExecutionResult":
+        """Standard write-family response for blocked paths."""
+        return ExecutionResult(
+            success=False,
+            error=f"path '{path}' is not writable (blocked by .remorooignore)",
+            data={"blocked": True, "reason": "remorooignore", "path": path},
+        )
+
+    def _wrap_bash_command(self, cmd: str) -> Tuple[str, Optional["ExecutionResult"]]:
+        """Apply access-policy enforcement to a shell command.
+
+        Returns ``(cmd_to_run, refusal)``:
+          - ``refusal`` is non-None if the command should be refused outright
+            (literal pre-flight matched a blocked pattern). Caller should
+            return that ExecutionResult immediately.
+          - Otherwise, ``cmd_to_run`` is either the original command (no
+            blocklist active, or no kernel sandbox available) or a wrapped
+            command that runs the original under sandbox-exec / bwrap /
+            firejail.
+        """
+        if not cmd or not self.access_policy.has_patterns():
+            return cmd, None
+        match = self.access_policy.literal_match_in_command(cmd)
+        if match:
+            refusal = ExecutionResult(
+                success=False,
+                error=f"command references blocked path '{match}' (.remorooignore)",
+                data={"blocked": True, "reason": "remorooignore", "pattern": match},
+            )
+            return cmd, refusal
+        if self._bash_wrapper is None:
+            # No kernel sandbox available (Windows, docker engine, or no patterns
+            # currently expand to existing files). Pre-flight is the only guard.
+            return cmd, None
+        try:
+            return self._bash_wrapper(cmd), None
+        except Exception as e:
+            self._log(f"⚠️  Bash sandbox wrap failed; falling back to pre-flight only: {e}")
+            return cmd, None
+
+    def _scrub_memory_cache(self) -> None:
+        """Drop entries referencing currently-blocked paths from .remoroo/memory.json.
+
+        A previous run that pre-dated the customer's .remorooignore may have
+        cached file contents or entity summaries. We pre-emptively scrub them
+        so blocked content can't reach the brain via the memory layer.
+        Best-effort; never raises.
+        """
+        try:
+            mem_path = os.path.join(self.original_repo_root, ".remoroo", "memory.json")
+            if not os.path.isfile(mem_path):
+                return
+            with open(mem_path, "r", encoding="utf-8") as fh:
+                mem = json.load(fh)
+            changed = False
+            ent = mem.get("entity_summaries")
+            if isinstance(ent, dict):
+                for key in list(ent.keys()):
+                    if self._is_blocked(key):
+                        del ent[key]
+                        changed = True
+            for list_key in ("world_facts", "experiences", "beliefs"):
+                items = mem.get(list_key)
+                if isinstance(items, list):
+                    pruned = [it for it in items if not _entry_references_blocked(it, self._is_blocked)]
+                    if len(pruned) != len(items):
+                        mem[list_key] = pruned
+                        changed = True
+            if changed:
+                with open(mem_path, "w", encoding="utf-8") as fh:
+                    json.dump(mem, fh, indent=2, default=str)
+                self._log("🔒 Memory cache scrubbed of blocked paths.")
+        except Exception:
+            return
+
     def kill_all_background_jobs(self) -> None:
         """Terminate all running background jobs (e.g. training). Call on SIGINT/SIGTERM so children don't outlive the CLI."""
         if not self._running_processes:
@@ -590,23 +766,29 @@ class LocalWorker:
                 
             elif request.type == "file_exists":
                 return self._handle_file_exists(request)
-            
+
             elif request.type == "is_data_file":
                 path = request.payload.get("path", "")
+                if self._is_blocked(path):
+                    return ExecutionResult(success=True, data={"is_data_file": False})
                 is_data = fs_utils.is_data_file(path, self.repo_root)
                 return ExecutionResult(success=True, data={"is_data_file": is_data})
-                
+
             elif request.type == "get_scaffolding":
                 self._log(f"Executing: get_scaffolding")
                 from .core.repo_indexer import RepoIndexer
                 indexer = RepoIndexer(target_root)
                 scaffolding = indexer.get_scaffolding()
+                if self.access_policy.has_patterns() and isinstance(scaffolding, dict):
+                    scaffolding = _filter_scaffolding(scaffolding, self._is_blocked)
                 return ExecutionResult(success=True, data={"scaffolding": scaffolding})
 
             elif request.type == "get_snippet":
                 self._log(f"Executing: get_snippet")
                 file_path = request.payload.get("file_path", "")
                 symbol_name = request.payload.get("symbol_name", "")
+                if self._is_blocked(file_path):
+                    return ExecutionResult(success=True, data={"code": ""})
                 from .core.repo_indexer import RepoIndexer
                 indexer = RepoIndexer(target_root)
                 code = indexer.get_snippet(file_path, symbol_name)
@@ -615,15 +797,27 @@ class LocalWorker:
             elif request.type == "build_context":
                 # Extract args
                 p = request.payload
+                # Merge access-policy patterns into deny_paths so the legacy
+                # context packer also respects .remorooignore.
+                deny_paths = list(p.get("deny_paths", []) or [])
+                if self.access_policy.has_patterns():
+                    for pat in self.access_policy.patterns:
+                        if pat not in deny_paths:
+                            deny_paths.append(pat)
+                # Drop any focus_files that resolve to blocked paths.
+                focus_files = [
+                    f for f in (p.get("focus_files", []) or [])
+                    if not self._is_blocked(f)
+                ]
                 context = context_packer.build_context_pack(
                     repo_root=self.repo_root,
                     turn_index=p.get("turn_index", -1),
-                    focus_files=p.get("focus_files", []),
+                    focus_files=focus_files,
                     previous_turn_outcomes=p.get("previous_turn_outcomes"),
                     max_files=p.get("max_files", 50),
                     max_total_bytes=p.get("max_total_bytes", 200000),
                     max_total_chars=p.get("max_total_chars", 200000),
-                    deny_paths=p.get("deny_paths", []),
+                    deny_paths=deny_paths,
                     deny_writing_data_folders=p.get("deny_writing_data_folders", True),
                     allowed_data_folders=p.get("allowed_data_folders", []),
                     goal=p.get("goal"),
@@ -1145,6 +1339,30 @@ class LocalWorker:
                 
             elif request.type == "execute_plan":
                 p = request.payload
+                # Pre-flight: scan all command strings in the plan for blocked
+                # paths. The legacy command_plan can hold many shell commands
+                # under arbitrary stage keys; if any one references a blocked
+                # path we refuse the whole plan rather than silently editing it.
+                if self.access_policy.has_patterns():
+                    plan_dict = p.get("command_plan", {}) or {}
+                    for stage_cmds in plan_dict.values():
+                        if not isinstance(stage_cmds, list):
+                            continue
+                        for entry in stage_cmds:
+                            if isinstance(entry, str):
+                                m = self.access_policy.literal_match_in_command(entry)
+                            elif isinstance(entry, dict):
+                                m = self.access_policy.literal_match_in_command(
+                                    str(entry.get("cmd") or entry.get("command") or "")
+                                )
+                            else:
+                                m = None
+                            if m:
+                                return ExecutionResult(
+                                    success=False,
+                                    error=f"plan refused: command references blocked path '{m}' (.remorooignore)",
+                                    data={"blocked": True, "reason": "remorooignore", "pattern": m},
+                                )
                 # Build execution environment with required vars
                 exec_env = os.environ.copy()
                 
@@ -1229,7 +1447,22 @@ class LocalWorker:
                 patch_proposal = request.payload.get("patch_proposal") or request.payload.get("patch", {})
                 if not patch_proposal:
                     return ExecutionResult(success=False, error="No patch provided")
-                
+
+                blocked_targets = _patch_blocked_paths(patch_proposal, self._is_blocked)
+                if blocked_targets:
+                    return ExecutionResult(
+                        success=False,
+                        error=(
+                            f"patch refused: targets blocked path(s) {blocked_targets[:3]} "
+                            f"(.remorooignore)"
+                        ),
+                        data={
+                            "blocked": True,
+                            "reason": "remorooignore",
+                            "blocked_paths": blocked_targets,
+                        },
+                    )
+
                 try:
                     applied, skipped = applier.apply_patchproposal(
                         repo_root=self.repo_root,
@@ -1260,6 +1493,8 @@ class LocalWorker:
                 path = request.payload.get("path", "")
                 max_chars = request.payload.get("max_chars")
                 target_scope = request.payload.get("target_scope", "current")
+                if self._is_blocked(path):
+                    return self._blocked_not_found_response()
                 try:
                     # Determine root
                     root = self.repo_root
@@ -1319,6 +1554,9 @@ class LocalWorker:
                      items = []
                      for item in os.listdir(abs_path):
                          item_path = os.path.join(abs_path, item)
+                         rel_for_check = os.path.join(path, item) if path not in (".", "") else item
+                         if self._is_blocked(rel_for_check):
+                             continue
                          items.append({
                              "name": item,
                              "is_dir": os.path.isdir(item_path),
@@ -1352,6 +1590,7 @@ class LocalWorker:
                             if d not in SNAPSHOT_EXCLUDED_DIRS
                             and "venv" not in d.lower()
                             and "site-packages" not in d.lower()
+                            and not self._is_blocked(os.path.relpath(os.path.join(dirpath, d), scan_root))
                         ]
                         for fname in filenames:
                             ext = os.path.splitext(fname)[1].lower()
@@ -1360,9 +1599,11 @@ class LocalWorker:
                             if fname in configs.DEFAULT_EXCLUDED_FILES or fname == ".DS_Store":
                                 continue
                             fpath = os.path.join(dirpath, fname)
+                            relpath = os.path.relpath(fpath, scan_root)
+                            if self._is_blocked(relpath):
+                                continue
                             try:
                                 stat = os.stat(fpath)
-                                relpath = os.path.relpath(fpath, scan_root)
                                 snapshot.append({
                                     "path": relpath,
                                     "size_bytes": stat.st_size,
@@ -1406,6 +1647,9 @@ class LocalWorker:
                 cmd = request.payload.get("command", "")
                 timeout = request.payload.get("timeout_s")
                 env_vars = request.payload.get("env", {})
+                cmd, refusal = self._wrap_bash_command(cmd)
+                if refusal is not None:
+                    return refusal
                 # Use same runner as harness: workdir=repo_root (worktree when in a run) and shell=True
                 # so shell commands like "rg ... || grep ..." run correctly; ad-hoc runner without
                 # shell=True caused Errno 2 (whole string treated as executable name).
@@ -1709,7 +1953,14 @@ class LocalWorker:
                  # Git diff support
                  files = request.payload.get("files", [])
                  staged = request.payload.get("staged", False)
-                 
+
+                 if files and self.access_policy.has_patterns():
+                     filtered = self._filter_blocked_paths(files)
+                     if not filtered:
+                         # All requested files were blocked.
+                         return ExecutionResult(success=True, data={"diff": ""})
+                     files = filtered
+
                  # Stage files first if requested
                  if files:
                      files_str = " ".join(f'"{f}"' for f in files)
@@ -1741,6 +1992,8 @@ class LocalWorker:
                  
                  if not path:
                      return ExecutionResult(success=False, error="path required")
+                 if self._is_blocked(path):
+                     return self._blocked_write_response(path)
                  
                  try:
                      # Determine root
@@ -2001,9 +2254,12 @@ class LocalWorker:
                 # Get expected metrics from ExperimentContract for filtered extraction
                 expected_metrics = request.payload.get("expected_metrics", [])
                 is_baseline = request.payload.get("is_baseline", False)
-                
+
                 if not cmd:
                     return ExecutionResult(success=False, error="No command provided")
+                cmd, refusal = self._wrap_bash_command(cmd)
+                if refusal is not None:
+                    return refusal
                 
                 execution_id = f"exec-{uuid.uuid4().hex[:8]}"
                 
@@ -2472,6 +2728,18 @@ class LocalWorker:
                 is_init = request.payload.get("init", False)
                 timeout = request.payload.get("timeout", 5.0)
 
+                # Literal pre-flight: refuse any stdin that names a blocked path.
+                # Interactive PTY sessions can't easily be wrapped with sandbox-exec,
+                # so this is the only enforcement layer available here.
+                if stdin and self.access_policy.has_patterns():
+                    match = self.access_policy.literal_match_in_command(stdin)
+                    if match:
+                        return ExecutionResult(
+                            success=False,
+                            error=f"input references blocked path '{match}' (.remorooignore)",
+                            data={"blocked": True, "reason": "remorooignore", "pattern": match},
+                        )
+
                 if is_init or session_id not in self._interactive_sessions:
                     try:
                         import pexpect
@@ -2604,14 +2872,22 @@ class LocalWorker:
                     total_files = 0
                     for root, dirs, files in os.walk(base):
                         depth = root[len(base):].count(os.sep)
-                        dirs[:] = [d for d in sorted(dirs) if d not in skip_dirs and not d.startswith(".")]
+                        dirs[:] = [
+                            d for d in sorted(dirs)
+                            if d not in skip_dirs
+                            and not d.startswith(".")
+                            and not self._is_blocked(os.path.join(root, d))
+                        ]
 
                         if depth > max_depth:
                             dirs.clear()
                             continue
 
-                        visible_files = [f for f in sorted(files)
-                                         if os.path.splitext(f)[1] not in skip_exts]
+                        visible_files = [
+                            f for f in sorted(files)
+                            if os.path.splitext(f)[1] not in skip_exts
+                            and not self._is_blocked(os.path.join(root, f))
+                        ]
                         total_files += len(visible_files)
 
                         indent = "  " * depth
@@ -2645,6 +2921,14 @@ class LocalWorker:
                     from .core.code_search import get_or_build_index
                     idx = get_or_build_index(repo_root)
                     results = idx.search(query, max_results=max_results)
+                    if self.access_policy.has_patterns() and isinstance(results, list):
+                        def _result_path(r: Any) -> str:
+                            if isinstance(r, str):
+                                return r
+                            if isinstance(r, dict):
+                                return r.get("path") or r.get("file") or ""
+                            return ""
+                        results = [r for r in results if not self._is_blocked(_result_path(r))]
                     return ExecutionResult(success=True, data={
                         "files": results,
                         "index_stats": idx.stats,
@@ -2657,6 +2941,8 @@ class LocalWorker:
                     path = request.payload.get("path", "")
                     symbol_name = request.payload.get("symbol_name", "")
                     repo_root = request.payload.get("repo_root", self.repo_root)
+                    if self._is_blocked(path):
+                        return ExecutionResult(success=False, error=f"File not found: {path}")
                     full_path = os.path.normpath(os.path.join(repo_root, path))
 
                     if not os.path.isfile(full_path):
@@ -2714,6 +3000,9 @@ class LocalWorker:
                 env_vars = request.payload.get("env", {})
                 if not cmd:
                     return ExecutionResult(success=False, error="Missing 'command' parameter")
+                cmd, refusal = self._wrap_bash_command(cmd)
+                if refusal is not None:
+                    return refusal
 
                 job_id = f"job-{uuid.uuid4().hex[:8]}"
 
@@ -2869,6 +3158,9 @@ class LocalWorker:
 
                 if not cmd:
                     return ExecutionResult(success=False, error="Missing 'command' parameter")
+                cmd, refusal = self._wrap_bash_command(cmd)
+                if refusal is not None:
+                    return refusal
 
                 job_id = f"v2-{uuid.uuid4().hex[:8]}"
                 
@@ -3130,6 +3422,8 @@ class LocalWorker:
 
     def _handle_file_exists(self, request: ExecutionRequest) -> ExecutionResult:
         path = request.payload.get("path", "")
+        if self._is_blocked(path):
+            return ExecutionResult(success=True, data={"exists": False})
         exists = os.path.exists(os.path.join(self.repo_root, path))
         return ExecutionResult(success=True, data={"exists": exists})
 

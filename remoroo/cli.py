@@ -9,8 +9,12 @@ from .paths import resolve_repo_path, resolve_out_dir
 
 
 from .worker_cmd import worker
+from .block_cmd import block, unblock, blocked
 app = typer.Typer(no_args_is_help=True)
 app.command(name="worker")(worker)
+app.command(name="block")(block)
+app.command(name="unblock")(unblock)
+app.command(name="blocked")(blocked)
 
 @app.command()
 def login():
