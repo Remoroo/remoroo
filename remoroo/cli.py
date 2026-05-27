@@ -10,11 +10,17 @@ from .paths import resolve_repo_path, resolve_out_dir
 
 from .worker_cmd import worker
 from .block_cmd import block, unblock, blocked
+from .answer_cmd import answer
+from .aliases_cmd import aliases
+from .init_cmd import init
 app = typer.Typer(no_args_is_help=True)
 app.command(name="worker")(worker)
 app.command(name="block")(block)
 app.command(name="unblock")(unblock)
 app.command(name="blocked")(blocked)
+app.command(name="answer")(answer)
+app.command(name="aliases")(aliases)
+app.command(name="init")(init)
 
 @app.command()
 def login():
@@ -321,6 +327,15 @@ def run(
             "instead of rendering a terminal UI; exits 0/1/2 by final outcome."
         ),
     ),
+    interactive: bool = typer.Option(
+        False,
+        "--interactive",
+        help=(
+            "Enable agent-initiated Q&A (the ask_human tool). For setup/"
+            "configuration runs only — do NOT use for autoresearch loops. "
+            "Goal aliases like `@bootstrap_program_md` enable this automatically."
+        ),
+    ),
 ):
     from .configs import get_api_url, get_default_engine
     from .engine.utils.doctor import ensure_ready, resolve_execution_engine
@@ -375,6 +390,20 @@ def run(
     ml = [m.strip() for m in metrics.split(",") if m.strip()] if metrics else []
     metrics_option_provided = metrics is not None
 
+    # Goal aliases (``--goal @<name>``) are resolved by the control plane
+    # using the brain-owned registry at remoroo_brain/prompts/goal_aliases.py.
+    # The CLI stays dumb: it passes the literal ``@<name>`` through. We only
+    # surface a friendly banner if the goal is alias-shaped.
+    from .goal_aliases import is_alias, alias_name as _alias_name_of
+
+    if is_alias(gl):
+        typer.secho(
+            f"🎛  Goal alias @{_alias_name_of(gl)} will be resolved by the "
+            "control plane (interactive flag, default metrics, and seed "
+            "files come from the brain).",
+            fg=typer.colors.CYAN,
+        )
+
     from .tui_launch_config import LaunchConfig, exit_code_for_result
     from .tui_unified_app import echo_session_finished_line, run_unified_local_session
 
@@ -403,6 +432,7 @@ def run(
             attach_status="",
             attach_goal_preview="",
             metrics_option_provided=metrics_option_provided,
+            interactive=interactive,
         )
         if headless:
             # Headless bypasses the TUI and the TTY check. It still uses the

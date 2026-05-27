@@ -264,6 +264,7 @@ class PrepareWorkerScreen(Screen[PrepareOutcome]):
                     resume_run_id=c.resume_run_id,
                     max_wall_time_s=c.max_wall_time_s,
                     allow_overage=c.allow_overage,
+                    interactive=getattr(c, "interactive", False),
                 )
                 self.app.call_from_thread(self.dismiss, ctx)
             except RunPrepareError as e:

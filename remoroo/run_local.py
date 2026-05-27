@@ -140,6 +140,7 @@ def prepare_local_worker_context(
     resume_run_id: Optional[str],
     max_wall_time_s: int,
     allow_overage: bool,
+    interactive: bool = False,
 ) -> LocalWorkerContext:
     """Health check, auth, POST /runs or GET resume, dirs, transport, heartbeat."""
     import os
@@ -223,6 +224,7 @@ def prepare_local_worker_context(
                 "in_place": "true" if in_place else "false",
                 "max_wall_time_s": str(max_wall_time_s),
                 "allow_overage": "true" if allow_overage else "false",
+                "interactive": "true" if interactive else "false",
             }
             if model:
                 form["model"] = model
@@ -263,6 +265,17 @@ def prepare_local_worker_context(
                     "Authentication failed. If connecting to a remote server, set REMOROO_API_KEY.",
                     code=1,
                 )
+            if resp.status_code == 422:
+                # Server-side validation, including unknown ``--goal @<name>``
+                # aliases, lands here. Surface the brain's message verbatim
+                # (e.g. "Unknown goal alias: @foo. Known aliases: ...").
+                detail = "Invalid run parameters"
+                try:
+                    body = resp.json()
+                    detail = body.get("detail", detail) or detail
+                except Exception:
+                    pass
+                raise RunPrepareError(str(detail), code=2)
             resp.raise_for_status()
             run_data = resp.json()
             remote_run_id = run_data["run_id"]
@@ -899,6 +912,7 @@ def run_local_worker_headless(cfg: "Any") -> LocalRunResult:
             resume_run_id=cfg.resume_run_id,
             max_wall_time_s=cfg.max_wall_time_s,
             allow_overage=cfg.allow_overage,
+            interactive=getattr(cfg, "interactive", False),
         )
     except RunPrepareError as exc:
         _emit_headless_log(

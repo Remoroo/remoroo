@@ -149,6 +149,9 @@ def is_in_repo_venv_dir(path: str) -> bool:
 
 RECOMMENDED_GITIGNORE_ENTRIES: Tuple[str, ...] = (
     ".remoroo/",
+    # Bootstrap / init artifacts (seed catalog staged by `remoroo init`).
+    # Kept separate from .remoroo/ which holds run state.
+    ".remoroo_init/",
     # Python venvs
     "venv/",
     ".venv/",

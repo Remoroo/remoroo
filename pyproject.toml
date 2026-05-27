@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remoroo"
-version = "0.5.00"
+version = "0.6.00"
 description = "Remoroo Offline Engine CLI"
 requires-python = ">=3.10"
 dependencies = [
@@ -32,4 +32,7 @@ remoroo = "remoroo.cli:app"
 include = ["remoroo*", "remoroo_offline*"]
 
 [tool.setuptools.package-data]
-remoroo = ["engine/Dockerfile"]
+remoroo = [
+    "engine/Dockerfile",
+    "seeds/**/*.md",
+]

@@ -43,6 +43,10 @@ class LaunchConfig:
     attach_goal_preview: str = ""
     # True if user passed --metrics on CLI (even empty); skips metrics wizard when list empty.
     metrics_option_provided: bool = False
+    # Interactive runs enable the agent-side ask_human tool. Set by `--interactive`
+    # on the CLI or auto-set by interactive goal aliases (e.g. @bootstrap_program_md).
+    # The brain only registers ask_human when this is true.
+    interactive: bool = False
 
     def is_resume(self) -> bool:
         return bool(self.resume_run_id)

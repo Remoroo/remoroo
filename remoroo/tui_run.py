@@ -817,6 +817,51 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
             self._refresh_goal()
             if self.model.follow_live:
                 self._pending_detail_refresh = True
+        elif kind == "awaiting_human_input":
+            # Agent called ask_human and is blocking until POST /runs/{id}/answer
+            # arrives. Surface the question prominently in the timeline so the
+            # operator notices and can answer from another shell:
+            #   remoroo answer <run_id> "<text>"
+            q = (d.get("question") or "").strip()
+            ctx_text = (d.get("context") or "").strip()
+            default = (d.get("default") or "").strip()
+            try:
+                tmin = int(round(float(d.get("timeout_s") or 0) / 60.0))
+            except Exception:
+                tmin = 30
+            rid = self.model.run_id or d.get("run_id", "")
+            note = (
+                f"❓ AWAITING ANSWER (timeout {tmin}m): {q}"
+                + (f"\n   why: {ctx_text}" if ctx_text else "")
+                + (f"\n   default: {default}" if default else "")
+                + f"\n   answer with:  remoroo answer {rid} \"<your reply>\""
+            )
+            turn = self._current_turn()
+            if turn is not None:
+                turn.worker_notes.append(note)
+            self.model.last_tool_short = f"awaiting answer (Q{int(d.get('call_index', 0)) + 1})"
+            self._refresh_footer()
+            if self.model.follow_live:
+                self._pending_detail_refresh = True
+        elif kind == "human_input_received":
+            timed_out = bool(d.get("timed_out"))
+            aborted = bool(d.get("aborted"))
+            ans = (d.get("answer") or "").strip()
+            wait_s = float(d.get("wait_s") or 0)
+            if aborted:
+                note = "🛑 ask_human aborted (run was aborted by operator)."
+            elif timed_out:
+                note = f"⏱  ask_human timed out after {wait_s:.0f}s — using default: {ans or '(none)'}"
+            else:
+                preview = ans if len(ans) <= 200 else (ans[:200] + "…")
+                note = f"✅ Operator answered ({wait_s:.0f}s): {preview}"
+            turn = self._current_turn()
+            if turn is not None:
+                turn.worker_notes.append(note)
+            self.model.last_tool_short = "answered"
+            self._refresh_footer()
+            if self.model.follow_live:
+                self._pending_detail_refresh = True
 
     def _planned_from_turn(self, d: Dict[str, Any]) -> str:
         names = d.get("tool_names") or []
