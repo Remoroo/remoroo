@@ -31,10 +31,10 @@ from typing import Any, Dict, List, Optional
 
 from textual import on, work
 from textual.app import App, ComposeResult
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, OptionList, RichLog, Static
+from textual.widgets import Footer, Header, Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
 from .branding import BRAND_MARKUP_LINE
@@ -161,6 +161,84 @@ class RunTuiModel:
     # Assistant text that arrived before turn_started (brain emits assistant_message first)
     pending_assistant_buffer: str = ""
     budget: Optional[BudgetTuiState] = None
+
+
+class AskHumanModal(ModalScreen[Optional[str]]):
+    """In-TUI prompt shown when the agent calls ``ask_human``.
+
+    Enter submits the typed answer (POSTed by the caller); Esc defers — it
+    closes the overlay WITHOUT answering so the operator can read the timeline
+    and reopen with the ``a`` key. Returns the answer string on submit, or
+    ``None`` on defer / external close. The default (if any) is pre-filled so
+    accepting it is a single Enter.
+    """
+
+    DEFAULT_CSS = """
+    AskHumanModal { align: center middle; }
+    AskHumanModal > #askhuman-box {
+        width: 80%;
+        max-width: 100;
+        height: auto;
+        padding: 1 2;
+        border: thick $accent;
+        background: $surface;
+    }
+    AskHumanModal #askhuman-title { text-style: bold; color: $warning; }
+    AskHumanModal #askhuman-question { padding: 1 0; }
+    AskHumanModal #askhuman-context { text-style: dim; }
+    AskHumanModal #askhuman-hint { text-style: dim; padding-top: 1; }
+    AskHumanModal #askhuman-input { margin-top: 1; }
+    """
+
+    BINDINGS = [Binding("escape", "defer", "Answer later", show=True)]
+
+    def __init__(
+        self,
+        *,
+        question: str,
+        context: str,
+        default: str,
+        timeout_min: int,
+        call_index: int,
+    ) -> None:
+        super().__init__()
+        self._question = question
+        self._context = context
+        self._default = default
+        self._timeout_min = timeout_min
+        self._call_index = call_index
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="askhuman-box"):
+            yield Static(
+                f"Operator question (Q{self._call_index + 1})",
+                id="askhuman-title",
+                markup=False,
+            )
+            yield Static(self._question, id="askhuman-question", markup=False)
+            if self._context:
+                yield Static(f"why: {self._context}", id="askhuman-context", markup=False)
+            yield Static(
+                f"Enter = submit  ·  Esc = answer later (press 'a' to reopen)  ·  "
+                f"times out in {self._timeout_min}m",
+                id="askhuman-hint",
+                markup=False,
+            )
+            yield Input(
+                value=self._default,
+                placeholder="type your answer…",
+                id="askhuman-input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#askhuman-input", Input).focus()
+
+    @on(Input.Submitted, "#askhuman-input")
+    def _submitted(self, event: Input.Submitted) -> None:
+        self.dismiss((event.value or "").strip())
+
+    def action_defer(self) -> None:
+        self.dismiss(None)
 
 
 class RemorooRunScreen(Screen[Dict[str, Any]]):
@@ -320,6 +398,7 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
         Binding("p", "pause_toggle", "Pause"),
+        Binding("a", "answer", "Answer"),
         Binding("ctrl+d", "detach", "Detach"),
         Binding("g", "go_live", "Live"),
         Binding("ctrl+r", "toggle_raw", "Raw"),
@@ -366,6 +445,12 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
         # Coalesce detail-pane rebuilds: _worker_line used to call _refresh_detail_logs per
         # stdout line; the pump can drain 250 items per tick → hundreds of full RichLog clears/s.
         self._pending_detail_refresh: bool = False
+        # In-TUI ask_human prompt state. `_pending_q` holds the latest unanswered
+        # question (so the `a` key can reopen a deferred prompt); `_askhuman_modal`
+        # is the live overlay instance (so an answer arriving via `remoroo answer`
+        # or a timeout can close it).
+        self._pending_q: Optional[Dict[str, Any]] = None
+        self._askhuman_modal: Optional["AskHumanModal"] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -834,16 +919,36 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                 f"❓ AWAITING ANSWER (timeout {tmin}m): {q}"
                 + (f"\n   why: {ctx_text}" if ctx_text else "")
                 + (f"\n   default: {default}" if default else "")
-                + f"\n   answer with:  remoroo answer {rid} \"<your reply>\""
+                + "\n   answer in the popup (Enter), or press 'a' to reopen it, "
+                + f"or:  remoroo answer {rid} \"<your reply>\""
             )
             turn = self._current_turn()
             if turn is not None:
                 turn.worker_notes.append(note)
             self.model.last_tool_short = f"awaiting answer (Q{int(d.get('call_index', 0)) + 1})"
+            # Remember the question so the `a` key can reopen a deferred prompt,
+            # then pop the input overlay so the operator can answer in the TUI.
+            self._pending_q = {
+                "question": q,
+                "context": ctx_text,
+                "default": default,
+                "timeout_min": tmin,
+                "call_index": int(d.get("call_index", 0)),
+            }
+            self._open_askhuman_modal()
             self._refresh_footer()
             if self.model.follow_live:
                 self._pending_detail_refresh = True
         elif kind == "human_input_received":
+            # An answer landed (via the TUI popup, `remoroo answer`, or timeout).
+            # Clear the pending question and close any still-open input overlay.
+            self._pending_q = None
+            if self._askhuman_modal is not None:
+                try:
+                    self._askhuman_modal.dismiss(None)
+                except Exception:
+                    pass
+                self._askhuman_modal = None
             timed_out = bool(d.get("timed_out"))
             aborted = bool(d.get("aborted"))
             ans = (d.get("answer") or "").strip()
@@ -940,6 +1045,66 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
             final_result=None,
         )
         self.dismiss(self.result_box)
+
+    # ------------------------------------------------------------------
+    # ask_human — in-TUI operator prompt
+    # ------------------------------------------------------------------
+
+    def _open_askhuman_modal(self) -> None:
+        """Pop the input overlay for the pending question (idempotent)."""
+        if self._pending_q is None or self._askhuman_modal is not None:
+            return
+        q = self._pending_q
+        modal = AskHumanModal(
+            question=q["question"],
+            context=q["context"],
+            default=q["default"],
+            timeout_min=q["timeout_min"],
+            call_index=q["call_index"],
+        )
+        self._askhuman_modal = modal
+        self.app.push_screen(modal, self._on_askhuman_answer)
+
+    def _on_askhuman_answer(self, result: Optional[str]) -> None:
+        """Callback when the overlay closes. None = deferred (keep pending so
+        the `a` key can reopen). A string = submit it to the brain."""
+        self._askhuman_modal = None
+        if result is None:
+            return
+        self._pending_q = None
+        self._post_answer(result)
+
+    def action_answer(self) -> None:
+        """`a` key: (re)open the prompt for the current pending question."""
+        if self._pending_q is None:
+            self.app.notify("No operator question is pending.", timeout=4)
+            return
+        self._open_askhuman_modal()
+
+    def _post_answer(self, text: str) -> None:
+        import requests as _req
+
+        ok = False
+        try:
+            r = _req.post(
+                f"{self.api_url}/runs/{self.remote_run_id}/answer",
+                json={"answer": text},
+                headers={"Authorization": f"Bearer {self.session_key}"},
+                timeout=10.0,
+            )
+            ok = r.status_code < 300
+        except Exception:
+            ok = False
+        turn = self._current_turn()
+        if turn is not None:
+            turn.worker_notes.append(
+                f"📨 Answer submitted: {text[:200]}"
+                if ok
+                else "⚠ Failed to submit answer — try: "
+                f"remoroo answer {self.remote_run_id} \"<your reply>\""
+            )
+        if self.model.follow_live:
+            self._pending_detail_refresh = True
 
     def _sync_pause_from_server(self) -> None:
         import requests as _req
