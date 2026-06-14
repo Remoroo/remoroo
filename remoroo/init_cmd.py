@@ -41,7 +41,7 @@ def init(
         None, "--engine", help="Execution engine ('docker' or 'venv')."
     ),
     model: Optional[str] = typer.Option(
-        None, "--model", help="LLM model id (e.g. anthropic/claude-opus-4.7)."
+        None, "--model", help="LLM model id (e.g. anthropic/claude-opus-4.8)."
     ),
     pick_model: bool = typer.Option(
         True,
