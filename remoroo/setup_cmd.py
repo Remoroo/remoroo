@@ -60,6 +60,26 @@ def setup(
         "--headless",
         help="Skip the Rich TUI (CI / non-tty environments).",
     ),
+    note: Optional[str] = typer.Option(
+        None,
+        "--note",
+        "-n",
+        help=(
+            "Free-text guidance for the agent at launch — use it to correct its "
+            "assumptions or steer decisions (e.g. 'wrist cam is a RealSense D435, "
+            "NOT a ZED; the left arm is the leader; keep speeds very slow'). "
+            "Injected into the agent's prompt as authoritative operator guidance. "
+            "Combine with --note-file."
+        ),
+    ),
+    note_file: Optional[Path] = typer.Option(
+        None,
+        "--note-file",
+        help=(
+            "Path to a text/Markdown file with operator guidance; its contents are "
+            "appended to --note. Handy for longer cell descriptions."
+        ),
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", help="Verbose logging."
     ),
@@ -123,6 +143,29 @@ def setup(
     out_dir = resolve_out_dir(out, repo_path)
     run_id = new_run_id()
     max_wall_time_s = int(budget_hours * 3600)
+
+    # Resolve operator guidance (--note text + --note-file contents). This is
+    # injected into the agent's prompt at launch as authoritative guidance, so
+    # the operator can correct assumptions and steer decisions before any motion.
+    note_parts = []
+    if note and note.strip():
+        note_parts.append(note.strip())
+    if note_file is not None:
+        try:
+            note_parts.append(note_file.read_text(encoding="utf-8").strip())
+        except OSError as exc:
+            typer.secho(
+                f"❌ Could not read --note-file {note_file}: {exc}",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(code=1)
+    operator_note = "\n\n".join(p for p in note_parts if p)
+    if operator_note:
+        typer.secho(
+            f"📝 Operator note attached ({len(operator_note)} chars) — the agent "
+            "will treat it as authoritative guidance.",
+            fg=typer.colors.GREEN,
+        )
 
     # Make sure ``.remoroo_init/`` is gitignored BEFORE we stage anything
     # there, so a stray ``git add .`` can't commit the staged catalog. The
@@ -213,6 +256,7 @@ def setup(
         # to type here.
         metrics_option_provided=True,
         interactive=True,
+        operator_note=operator_note,
     )
 
     try:

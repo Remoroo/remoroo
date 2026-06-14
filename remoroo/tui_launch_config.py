@@ -47,6 +47,10 @@ class LaunchConfig:
     # on the CLI or auto-set by interactive goal aliases (e.g. @bootstrap_program_md).
     # The brain only registers ask_human when this is true.
     interactive: bool = False
+    # Free-text guidance the operator supplied at launch (`remoroo setup --note`).
+    # Injected into the v2 system prompt as authoritative guidance so the operator
+    # can correct the agent's assumptions and steer decisions up front.
+    operator_note: str = ""
 
     def is_resume(self) -> bool:
         return bool(self.resume_run_id)

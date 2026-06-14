@@ -141,6 +141,7 @@ def prepare_local_worker_context(
     max_wall_time_s: int,
     allow_overage: bool,
     interactive: bool = False,
+    operator_note: str = "",
 ) -> LocalWorkerContext:
     """Health check, auth, POST /runs or GET resume, dirs, transport, heartbeat."""
     import os
@@ -226,6 +227,8 @@ def prepare_local_worker_context(
                 "allow_overage": "true" if allow_overage else "false",
                 "interactive": "true" if interactive else "false",
             }
+            if operator_note and operator_note.strip():
+                form["operator_note"] = operator_note.strip()
             if model:
                 form["model"] = model
             resp = requests.post(f"{API_URL}/runs", data=form, headers=headers)
@@ -913,6 +916,7 @@ def run_local_worker_headless(cfg: "Any") -> LocalRunResult:
             max_wall_time_s=cfg.max_wall_time_s,
             allow_overage=cfg.allow_overage,
             interactive=getattr(cfg, "interactive", False),
+            operator_note=getattr(cfg, "operator_note", ""),
         )
     except RunPrepareError as exc:
         _emit_headless_log(
