@@ -13,6 +13,7 @@ from .block_cmd import block, unblock, blocked
 from .answer_cmd import answer
 from .aliases_cmd import aliases
 from .init_cmd import init
+from .setup_cmd import setup
 app = typer.Typer(no_args_is_help=True)
 app.command(name="worker")(worker)
 app.command(name="block")(block)
@@ -21,6 +22,7 @@ app.command(name="blocked")(blocked)
 app.command(name="answer")(answer)
 app.command(name="aliases")(aliases)
 app.command(name="init")(init)
+app.command(name="setup")(setup)
 
 @app.command()
 def login():
