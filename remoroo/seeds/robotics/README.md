@@ -52,8 +52,8 @@ for real at G4/G8.
 | 1 | Toolchain incl. cuRoboV2 | **G1** cuRoboV2 imports + smoke plan on this GPU; SDKs import; deps pinned |
 | 2 | Author the Bridge `primitives.py` + capture recorder (no motion) | **G2** imports; no-motion smoke; operator confirms frame; E-stop reachable |
 | 3 | Motion enablement (operator-gated) | **G3** supervised micro-move + **live E-stop verified**; bounds recorded |
-| 4 | World scan → TSDF/ESDF + collision world + scene | **G4** world reliable for small autonomous moves; scene queryable |
-| 5 | Calibration + sysid | **G5** residuals under threshold; report produced |
+| 4 | World scan → TSDF/ESDF + collision world + scene (**env only — exclude arms**) | **G4** world reliable for small autonomous moves; scene queryable |
+| 5 | Calibration + sysid + **robot-model assembly** (base→base, combined URDF, cuRobo spheres) | **G5** residuals under threshold; cuRobo robot model built + visualized |
 | 6 | Data-capture validation | **G6** one sample episode valid (sync/schema/complete) |
 | 7 | Task & eval **spec** (read-and-approve, not code) | **G7** `task_spec.md` operator-approved |
 | 8 | Autonomous safe-motion demo (**THE bar**) | **G8** repeatable safe autonomous motion; interlocks verified; no task |
@@ -72,17 +72,23 @@ for real at G4/G8.
   extrinsics (RealSense / ZED / GenICam).
 - `data_capture.md` — Phases 2 & 6. The data-capture **recorder** + episode
   schema. Authored for THIS cell's modalities; not hardcoded to any camera.
-- `calibration.md` — Phase 5. Hand-eye, intrinsics, time-sync, payload sysid.
+- `calibration.md` — Phase 5. Hand-eye, intrinsics, time-sync, payload sysid,
+  and the shared-ArUco dual-arm base-to-base.
+- `robot_model.md` — Phase 5 (after calibration). Assemble the cuRobo-ready
+  model: combine per-arm URDFs (skip if a whole-robot URDF is provided),
+  generate collision spheres from meshes → cuRobo YAML, visualize on the desk
+  (NO Isaac Sim).
 - `world_scan.md` — Phase 4. Scan strategy: static-depth fusion, eye-in-hand
-  active sweep, and operator hand-guided scan; build TSDF/ESDF + scene.
+  active sweep, and operator hand-guided scan; build TSDF/ESDF + scene as the
+  **environment only** (ignore the arms — cuRobo handles the robot).
 - `task_spec_template.md` — Phase 7. The human-readable task + eval **spec**
   the operator approves (no code).
 
 ## What you author vs. what is shipped
 
 - **You author (in `remoroo_cell/`, editable):** `cell.yaml`, `primitives.py`
-  (Bridge), the capture recorder, `calibration/`, `world/`, `task_spec.md`,
-  `requirements.lock`, `setup_report.md`.
+  (Bridge), the capture recorder, `calibration/`, `robot_model/`, `world/`,
+  `task_spec.md`, `requirements.lock`, `setup_report.md`.
 - **You import, never author:** the deterministic safety supervisor, the
   brain↔worker transport, and the episode-writer base. These ship in the
   installed Remoroo package. (Import them from the shipped runtime spine; see
@@ -102,9 +108,14 @@ for real at G4/G8.
       sample_episode/
     calibration/
       hand_eye.yaml
+      base_to_base.yaml      # dual-arm only (shared-ArUco)
       report.md
+    robot_model/             # cuRobo-ready model (Phase 5; skip combine if URDF given)
+      robot.urdf             # single resolved URDF cuRobo loads
+      collision_spheres.yml  # cuRobo robot config (spheres + limits)
+      spheres_preview.png    # desk visualization (no Isaac Sim)
     world/
-      collision.*            # TSDF/ESDF / cuRobo collision world
+      collision.*            # TSDF/ESDF / cuRobo collision world (env only — no arms)
       scene.json
       scan_report.md
     task_spec.md             # task + eval SPEC (operator-approved; NOT code)

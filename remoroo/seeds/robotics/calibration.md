@@ -13,9 +13,16 @@ operator supervision (it involves slow moves), after G3/G4. Outputs are
    - *eye-to-hand* (static cam): solve camera↔base.
    - both, if the cell has both.
 3. **Dual-arm base-to-base** — if two arms, the transform between their bases.
+   Once BOTH arms' eye-in-hand is solved, recover it from a **shared ArUco**
+   both wrist cams observe — simple matrix transforms, no extra solver. Full
+   method + the combined-URDF build live in `robot_model.md` (it feeds the
+   model, so it's covered there).
 4. **Time-sync / latency** — camera↔arm offset; record it for the recorder.
 5. **Payload / tool sysid** — mass + COM of the mounted tool/gripper so the
    controller and limits are honest.
+
+Hand-eye + base-to-base are the *inputs* to the cuRobo-ready robot model
+(combined URDF + collision spheres). Build that next in `robot_model.md`.
 
 ## Hand-eye (eye-in-hand) pattern — OpenCV
 
@@ -76,4 +83,5 @@ calibration/
 
 `report.md` is the G5 evidence: pose count, residual numbers, what passed/
 failed, and the thresholds used. The hand-eye + base transforms feed the
-world scan (world_scan.md) and get embedded in every episode (data_capture.md).
+robot model (`robot_model.md`) and world scan (`world_scan.md`) and get
+embedded in every episode (`data_capture.md`).

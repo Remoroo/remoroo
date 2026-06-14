@@ -55,6 +55,13 @@ gripper:
   connection: { kind: "tcp", host: "192.168.1.213" }
   cad: "unknown"                      # path to gripper CAD if available
 
+robot_model:                          # the cuRobo-ready model (assembled in Phase 5)
+  provided_full_urdf: null            # path if the customer ships a WHOLE-robot URDF
+                                      #   (then base-to-base + URDF combine are SKIPPED)
+  combined_urdf: null                 # else built here: remoroo_cell/robot_model/robot.urdf
+  collision_spheres: null             # cuRobo YAML: remoroo_cell/robot_model/collision_spheres.yml
+  base_to_base: null                  # dual-arm: calibration/base_to_base.yaml (shared-ArUco)
+
 cameras:                              # one entry per camera
   - name: "wrist"
     make: "Intel"
@@ -117,11 +124,14 @@ gates:                                # the readiness card mirrors setup_report.
 
 ## Notes
 
-- **Dual-arm:** add a second `arms:` entry; calibration will add a
-  base-to-base transform (see `calibration.md`).
-- **URDF is fetched from the library, never reconstructed.** The final
-  planning model (arm + gripper + measured transforms) is composed locally
-  during calibration; record where the composed model lands.
+- **Dual-arm:** add a second `arms:` entry. If each arm has its own URDF, the
+  combined model is built from a shared-ArUco **base-to-base** transform (both
+  wrist cams view one marker, after each arm's eye-in-hand) — see
+  `robot_model.md`. Skip combining if the customer ships a whole-robot URDF
+  (set `robot_model.provided_full_urdf`).
+- **URDF is fetched from the library, never reconstructed.** The cuRobo-ready
+  planning model (one resolved URDF + collision spheres) is assembled locally
+  in Phase 5 (`robot_model.md`); record where it lands under `robot_model:`.
 - **`software_only` E-stop** is a red flag — prefer a hardware E-stop; if only
   software is available, raise it with the operator (`ask_human`) before any
   motion and record the decision.

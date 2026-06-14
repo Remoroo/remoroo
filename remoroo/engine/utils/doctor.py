@@ -129,7 +129,7 @@ def resolve_execution_engine(engine: str, *, explicit_docker: bool) -> str:
     """
     from ..sandbox import check_docker_daemon
 
-    eng = (engine or "docker").lower()
+    eng = (engine or "venv").lower()
     if eng != "docker":
         return eng
     if check_docker_daemon():
@@ -143,7 +143,7 @@ def resolve_execution_engine(engine: str, *, explicit_docker: bool) -> str:
         raise typer.Exit(code=1)
     typer.secho(
         "Docker is not available — using the venv engine (host Python / project .venv). "
-        "Use --engine docker to require Docker, or set REMOROO_DEFAULT_ENGINE=venv to silence this.",
+        "Use --engine docker to require Docker.",
         fg=typer.colors.YELLOW,
     )
     return "venv"

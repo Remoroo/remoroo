@@ -305,7 +305,7 @@ def run(
     metrics: str = typer.Option(None, "--metrics", help="Comma-separated metrics."),
     brain_url: str = typer.Option(None, "--brain-url", help="URL of the Brain Server."),
     no_patch: bool = typer.Option(False, "--no-patch", help="Do not ask to apply patch (auto-deny)."),
-    engine: str = typer.Option(None, "--engine", help="Execution engine (docker or venv). Defaults to 'docker'."),
+    engine: str = typer.Option(None, "--engine", help="Execution engine (docker or venv). Defaults to 'venv'."),
     cache_env: bool = typer.Option(True, "--cache-env", help="Cache Docker environment (skip already-installed packages, commit changes)."),
     in_place: bool = typer.Option(True, "--in-place", help="Edit the repo directly instead of creating a temporary working copy."),
     agentic: bool = typer.Option(True, "--agentic", help="Use Conductor-driven agentic loop instead of the legacy pipeline."),

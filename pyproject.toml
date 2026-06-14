@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0.0"]
+dev = ["pytest>=7.0.1"]
 
 [project.scripts]
 remoroo = "remoroo.cli:app"
