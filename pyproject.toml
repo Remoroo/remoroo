@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remoroo"
-version = "0.7.00"
+version = "0.7.1"
 description = "Remoroo Offline Engine CLI"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0.1"]
+dev = ["pytest>=7.0.0"]
 
 [project.scripts]
 remoroo = "remoroo.cli:app"
