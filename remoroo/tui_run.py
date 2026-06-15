@@ -34,8 +34,8 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.screen import ModalScreen, Screen
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Input, OptionList, RichLog, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import Button, Footer, Header, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 from .branding import BRAND_MARKUP_LINE
@@ -167,33 +167,58 @@ class RunTuiModel:
 class AskHumanModal(ModalScreen[Optional[str]]):
     """Operator input overlay shown when the agent calls ``ask_human``.
 
-    Returns the typed answer on submit (Enter), or ``None`` on defer (Esc) or
-    external close. It is shown with ``push_screen_wait`` from inside a worker
-    (see ``RemorooRunScreen._run_ask_human``) so the event loop never blocks,
-    and the answer is POSTed off the event loop — so the TUI stays responsive.
-    The default is pre-filled, so accepting it is a single Enter.
+    Customer-grade input surface:
+      * a near-full-screen panel, so it has room and does not truncate;
+      * the QUESTION sits in a ``VerticalScroll`` — arbitrarily long prompts
+        scroll instead of clipping;
+      * the ANSWER is a multi-line ``TextArea`` (soft-wrapped) — paste of large
+        / multi-line content works and scrolls;
+      * **Ctrl+E opens the answer in ``$EDITOR``** (via ``App.suspend``) for big
+        answers — the robust, git-style escape hatch from TUI input limits;
+      * Ctrl+S submits, Esc defers.
+
+    Plain ``TextArea`` (NOT ``TextArea.code_editor``) is used deliberately: the
+    tree-sitter code editor has a known resize/freeze class
+    (Textualize/textual #5151). Returns the answer on submit, or ``None`` on
+    defer / external close. Shown via ``push_screen_wait`` from a worker so the
+    event loop never blocks; the answer POST runs off-thread.
     """
 
     DEFAULT_CSS = """
     AskHumanModal {
         align: center middle;
     }
-    AskHumanModal > #askhuman-box {
-        width: 80%;
-        max-width: 100;
-        height: auto;
+    AskHumanModal > #ah-root {
+        width: 90%;
+        height: 90%;
+        max-width: 120;
         padding: 1 2;
         border: thick $accent;
         background: $surface;
     }
-    AskHumanModal #askhuman-title { text-style: bold; color: $warning; }
-    AskHumanModal #askhuman-question { padding: 1 0; }
-    AskHumanModal #askhuman-context { text-style: dim; }
-    AskHumanModal #askhuman-hint { text-style: dim; padding-top: 1; }
-    AskHumanModal #askhuman-input { margin-top: 1; }
+    AskHumanModal #ah-title { text-style: bold; color: $warning; }
+    AskHumanModal #ah-question {
+        height: 1fr;
+        border: round $panel;
+        padding: 0 1;
+        margin: 1 0;
+    }
+    AskHumanModal #ah-answer-label { text-style: bold; }
+    AskHumanModal #ah-answer {
+        height: 40%;
+        min-height: 5;
+        border: round $accent;
+    }
+    AskHumanModal #ah-buttons { height: auto; margin-top: 1; }
+    AskHumanModal #ah-buttons Button { margin-right: 2; }
+    AskHumanModal #ah-hint { text-style: dim; padding-top: 1; }
     """
 
-    BINDINGS = [Binding("escape", "defer", "Answer later", show=True)]
+    BINDINGS = [
+        Binding("ctrl+s", "submit", "Submit", show=True),
+        Binding("ctrl+e", "edit_in_editor", "Edit in $EDITOR", show=True),
+        Binding("escape", "defer", "Answer later", show=True),
+    ]
 
     def __init__(
         self,
@@ -215,36 +240,93 @@ class AskHumanModal(ModalScreen[Optional[str]]):
         self._ah_call_index = call_index
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="askhuman-box"):
+        with Vertical(id="ah-root"):
             yield Static(
-                f"Operator question (Q{self._ah_call_index + 1})",
-                id="askhuman-title",
+                f"Operator question (Q{self._ah_call_index + 1}) — times out in "
+                f"{self._ah_timeout_min}m",
+                id="ah-title",
                 markup=False,
             )
-            yield Static(self._ah_question, id="askhuman-question", markup=False)
-            if self._ah_context:
-                yield Static(f"why: {self._ah_context}", id="askhuman-context", markup=False)
+            with VerticalScroll(id="ah-question"):
+                yield Static(self._ah_question, id="ah-question-text", markup=False)
+                if self._ah_context:
+                    yield Static(f"\nwhy: {self._ah_context}", id="ah-question-why", markup=False)
+            yield Static("Your answer (multi-line; paste OK):", id="ah-answer-label", markup=False)
+            yield TextArea(self._ah_default, id="ah-answer", soft_wrap=True)
+            with Horizontal(id="ah-buttons"):
+                yield Button("Submit  (Ctrl+S)", id="ah-submit", variant="primary")
+                yield Button("Edit in $EDITOR  (Ctrl+E)", id="ah-editor")
+                yield Button("Answer later  (Esc)", id="ah-defer")
             yield Static(
-                f"Enter = submit    Esc = answer later ('a' reopens)    "
-                f"times out in {self._ah_timeout_min}m",
-                id="askhuman-hint",
+                "Ctrl+S submit  ·  Ctrl+E open your editor for big answers  ·  "
+                "Esc answer later ('a' reopens)  ·  Tab to move focus",
+                id="ah-hint",
                 markup=False,
-            )
-            yield Input(
-                value=self._ah_default,
-                placeholder="type your answer…",
-                id="askhuman-input",
             )
 
     def on_mount(self) -> None:
-        self.query_one("#askhuman-input", Input).focus()
+        self.query_one("#ah-answer", TextArea).focus()
 
-    @on(Input.Submitted, "#askhuman-input")
-    def _submitted(self, event: Input.Submitted) -> None:
-        self.dismiss((event.value or "").strip())
+    # --- actions (also reachable via the buttons below) ---
+
+    def action_submit(self) -> None:
+        self.dismiss(self.query_one("#ah-answer", TextArea).text.strip())
 
     def action_defer(self) -> None:
         self.dismiss(None)
+
+    def action_edit_in_editor(self) -> None:
+        """Drop to the operator's $EDITOR for a big/pasted answer, then load the
+        result back into the TextArea. Robust for content the TUI can't handle
+        inline; the app is suspended while the editor runs."""
+        ta = self.query_one("#ah-answer", TextArea)
+        try:
+            with self.app.suspend():
+                edited = self._edit_via_external_editor(ta.text)
+        except Exception as exc:  # suspend unsupported (e.g. textual-web) or editor failed
+            self.app.notify(f"Could not open $EDITOR: {exc}", severity="error", timeout=8)
+            return
+        if edited is not None:
+            ta.text = edited
+        ta.focus()
+
+    @staticmethod
+    def _edit_via_external_editor(initial_text: str) -> Optional[str]:
+        """Write ``initial_text`` to a temp file, open it in $EDITOR (blocking),
+        and return the edited contents. Pure mechanics (no UI), so it is unit
+        testable with EDITOR set to a script. Returns None on failure."""
+        import os
+        import shlex
+        import subprocess
+        import tempfile
+
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
+        fd, path = tempfile.mkstemp(suffix=".md", prefix="remoroo_answer_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(initial_text or "")
+            subprocess.run([*shlex.split(editor), path], check=False)
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        except Exception:
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    @on(Button.Pressed, "#ah-submit")
+    def _b_submit(self, _event: Button.Pressed) -> None:
+        self.action_submit()
+
+    @on(Button.Pressed, "#ah-editor")
+    def _b_editor(self, _event: Button.Pressed) -> None:
+        self.action_edit_in_editor()
+
+    @on(Button.Pressed, "#ah-defer")
+    def _b_defer(self, _event: Button.Pressed) -> None:
+        self.action_defer()
 
 
 class RemorooRunScreen(Screen[Dict[str, Any]]):
