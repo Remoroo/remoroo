@@ -20,6 +20,7 @@ line (avoids stdout pipe deadlock).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -164,17 +165,19 @@ class RunTuiModel:
 
 
 class AskHumanModal(ModalScreen[Optional[str]]):
-    """In-TUI prompt shown when the agent calls ``ask_human``.
+    """Operator input overlay shown when the agent calls ``ask_human``.
 
-    Enter submits the typed answer (POSTed by the caller); Esc defers — it
-    closes the overlay WITHOUT answering so the operator can read the timeline
-    and reopen with the ``a`` key. Returns the answer string on submit, or
-    ``None`` on defer / external close. The default (if any) is pre-filled so
-    accepting it is a single Enter.
+    Returns the typed answer on submit (Enter), or ``None`` on defer (Esc) or
+    external close. It is shown with ``push_screen_wait`` from inside a worker
+    (see ``RemorooRunScreen._run_ask_human``) so the event loop never blocks,
+    and the answer is POSTed off the event loop — so the TUI stays responsive.
+    The default is pre-filled, so accepting it is a single Enter.
     """
 
     DEFAULT_CSS = """
-    AskHumanModal { align: center middle; }
+    AskHumanModal {
+        align: center middle;
+    }
     AskHumanModal > #askhuman-box {
         width: 80%;
         max-width: 100;
@@ -202,30 +205,33 @@ class AskHumanModal(ModalScreen[Optional[str]]):
         call_index: int,
     ) -> None:
         super().__init__()
-        self._question = question
-        self._context = context
-        self._default = default
-        self._timeout_min = timeout_min
-        self._call_index = call_index
+        # NB: prefix every attr with `_ah_`. Plain names like `_context` collide
+        # with Textual MessagePump internals (`_context` is a method) — shadowing
+        # it with a string breaks message processing and FREEZES the widget.
+        self._ah_question = question
+        self._ah_context = context
+        self._ah_default = default
+        self._ah_timeout_min = timeout_min
+        self._ah_call_index = call_index
 
     def compose(self) -> ComposeResult:
         with Vertical(id="askhuman-box"):
             yield Static(
-                f"Operator question (Q{self._call_index + 1})",
+                f"Operator question (Q{self._ah_call_index + 1})",
                 id="askhuman-title",
                 markup=False,
             )
-            yield Static(self._question, id="askhuman-question", markup=False)
-            if self._context:
-                yield Static(f"why: {self._context}", id="askhuman-context", markup=False)
+            yield Static(self._ah_question, id="askhuman-question", markup=False)
+            if self._ah_context:
+                yield Static(f"why: {self._ah_context}", id="askhuman-context", markup=False)
             yield Static(
-                f"Enter = submit  ·  Esc = answer later (press 'a' to reopen)  ·  "
-                f"times out in {self._timeout_min}m",
+                f"Enter = submit    Esc = answer later ('a' reopens)    "
+                f"times out in {self._ah_timeout_min}m",
                 id="askhuman-hint",
                 markup=False,
             )
             yield Input(
-                value=self._default,
+                value=self._ah_default,
                 placeholder="type your answer…",
                 id="askhuman-input",
             )
@@ -445,12 +451,14 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
         # Coalesce detail-pane rebuilds: _worker_line used to call _refresh_detail_logs per
         # stdout line; the pump can drain 250 items per tick → hundreds of full RichLog clears/s.
         self._pending_detail_refresh: bool = False
-        # In-TUI ask_human prompt state. `_pending_q` holds the latest unanswered
-        # question (so the `a` key can reopen a deferred prompt); `_askhuman_modal`
-        # is the live overlay instance (so an answer arriving via `remoroo answer`
-        # or a timeout can close it).
+        # In-TUI ask_human prompt state (see _run_ask_human). `_pending_q` is the
+        # latest unanswered question (so `a` can reopen a deferred prompt);
+        # `_ask_modal` is the live overlay (so an answer arriving via
+        # `remoroo answer` or a timeout can close it); `_asking` guards against
+        # opening two overlays at once.
         self._pending_q: Optional[Dict[str, Any]] = None
-        self._askhuman_modal: Optional["AskHumanModal"] = None
+        self._ask_modal: Optional[AskHumanModal] = None
+        self._asking: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -919,15 +927,16 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                 f"❓ AWAITING ANSWER (timeout {tmin}m): {q}"
                 + (f"\n   why: {ctx_text}" if ctx_text else "")
                 + (f"\n   default: {default}" if default else "")
-                + "\n   answer in the popup (Enter), or press 'a' to reopen it, "
+                + "\n   answer in the popup (Enter); press 'a' to reopen it; "
                 + f"or:  remoroo answer {rid} \"<your reply>\""
             )
             turn = self._current_turn()
             if turn is not None:
                 turn.worker_notes.append(note)
             self.model.last_tool_short = f"awaiting answer (Q{int(d.get('call_index', 0)) + 1})"
-            # Remember the question so the `a` key can reopen a deferred prompt,
-            # then pop the input overlay so the operator can answer in the TUI.
+            # Stash the question and kick off the worker-driven input overlay.
+            # The worker (not this pump callback) does push_screen_wait + the
+            # network POST, so the event loop never blocks.
             self._pending_q = {
                 "question": q,
                 "context": ctx_text,
@@ -935,20 +944,22 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                 "timeout_min": tmin,
                 "call_index": int(d.get("call_index", 0)),
             }
-            self._open_askhuman_modal()
+            self._run_ask_human()
             self._refresh_footer()
             if self.model.follow_live:
                 self._pending_detail_refresh = True
         elif kind == "human_input_received":
-            # An answer landed (via the TUI popup, `remoroo answer`, or timeout).
-            # Clear the pending question and close any still-open input overlay.
+            # An answer landed (TUI popup, `remoroo answer`, or timeout). Clear the
+            # pending question and close any still-open overlay. Dismissing on the
+            # main thread resolves the worker's push_screen_wait with None (no
+            # double-post), since a real submit already cleared `_ask_modal`.
             self._pending_q = None
-            if self._askhuman_modal is not None:
+            if self._ask_modal is not None:
                 try:
-                    self._askhuman_modal.dismiss(None)
+                    self._ask_modal.dismiss(None)
                 except Exception:
                     pass
-                self._askhuman_modal = None
+                self._ask_modal = None
             timed_out = bool(d.get("timed_out"))
             aborted = bool(d.get("aborted"))
             ans = (d.get("answer") or "").strip()
@@ -1047,14 +1058,19 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
         self.dismiss(self.result_box)
 
     # ------------------------------------------------------------------
-    # ask_human — in-TUI operator prompt
+    # ask_human — in-TUI operator prompt (worker-driven, never blocks the loop)
     # ------------------------------------------------------------------
 
-    def _open_askhuman_modal(self) -> None:
-        """Pop the input overlay for the pending question (idempotent)."""
-        if self._pending_q is None or self._askhuman_modal is not None:
+    @work(group="ask_human")
+    async def _run_ask_human(self) -> None:
+        """Show the input overlay and submit the answer — all off the event-loop
+        critical path. ``push_screen_wait`` requires a worker (this is one), and
+        the blocking HTTP POST runs in a thread via ``asyncio.to_thread``, so the
+        TUI never freezes. Triggered from the event pump or the ``a`` key."""
+        if self._pending_q is None or self._asking:
             return
-        q = self._pending_q
+        self._asking = True
+        q = dict(self._pending_q)
         modal = AskHumanModal(
             question=q["question"],
             context=q["context"],
@@ -1062,29 +1078,34 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
             timeout_min=q["timeout_min"],
             call_index=q["call_index"],
         )
-        self._askhuman_modal = modal
-        self.app.push_screen(modal, self._on_askhuman_answer)
+        self._ask_modal = modal
+        try:
+            answer = await self.app.push_screen_wait(modal)
+        finally:
+            self._ask_modal = None
+            self._asking = False
 
-    def _on_askhuman_answer(self, result: Optional[str]) -> None:
-        """Callback when the overlay closes. None = deferred (keep pending so
-        the `a` key can reopen). A string = submit it to the brain."""
-        self._askhuman_modal = None
-        if result is None:
-            return
+        if answer is None:
+            return  # deferred (Esc) or closed externally — keep _pending_q for 'a'
+
         self._pending_q = None
-        self._post_answer(result)
+        ok = await asyncio.to_thread(self._post_answer_blocking, answer)
+        turn = self._current_turn()
+        if turn is not None:
+            turn.worker_notes.append(
+                f"📨 Answer submitted: {answer[:200]}"
+                if ok
+                else "⚠ Could not submit answer — try: "
+                f"remoroo answer {self.remote_run_id} \"<reply>\""
+            )
+        if self.model.follow_live:
+            self._pending_detail_refresh = True
 
-    def action_answer(self) -> None:
-        """`a` key: (re)open the prompt for the current pending question."""
-        if self._pending_q is None:
-            self.app.notify("No operator question is pending.", timeout=4)
-            return
-        self._open_askhuman_modal()
-
-    def _post_answer(self, text: str) -> None:
+    def _post_answer_blocking(self, text: str) -> bool:
+        """Blocking HTTP POST of the answer. MUST run off the event loop (called
+        via asyncio.to_thread)."""
         import requests as _req
 
-        ok = False
         try:
             r = _req.post(
                 f"{self.api_url}/runs/{self.remote_run_id}/answer",
@@ -1092,19 +1113,17 @@ class RemorooRunScreen(Screen[Dict[str, Any]]):
                 headers={"Authorization": f"Bearer {self.session_key}"},
                 timeout=10.0,
             )
-            ok = r.status_code < 300
+            return r.status_code < 300
         except Exception:
-            ok = False
-        turn = self._current_turn()
-        if turn is not None:
-            turn.worker_notes.append(
-                f"📨 Answer submitted: {text[:200]}"
-                if ok
-                else "⚠ Failed to submit answer — try: "
-                f"remoroo answer {self.remote_run_id} \"<your reply>\""
-            )
-        if self.model.follow_live:
-            self._pending_detail_refresh = True
+            return False
+
+    def action_answer(self) -> None:
+        """`a` key: (re)open the prompt for the current pending question."""
+        if self._pending_q is None:
+            self.app.notify("No operator question is pending.", timeout=4)
+            return
+        if not self._asking:
+            self._run_ask_human()
 
     def _sync_pause_from_server(self) -> None:
         import requests as _req
