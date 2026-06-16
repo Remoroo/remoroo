@@ -7,6 +7,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Guard: the wheel MUST ship the prebuilt studio (remoroo/_studio/), which is a
+# vendored, committed artifact (this CLI repo can't build it — no studio source).
+# Fail loudly here rather than publish a studio-less wheel that breaks `remoroo setup`.
+STUDIO_INDEX="remoroo/_studio/dist/index.html"
+if [ ! -f "$STUDIO_INDEX" ]; then
+  echo "❌ Missing prebuilt studio ($STUDIO_INDEX) — the wheel would ship without Remoroo Studio."
+  echo "   From the monorepo (where remoroo_studio/ lives):"
+  echo "     python remoroo_studio/scripts/bundle_studio.py"
+  echo "   then commit remoroo/_studio/ in THIS repo and re-run."
+  exit 1
+fi
+echo "✅ studio bundle present ($(find remoroo/_studio/dist -type f | wc -l | xargs) files)"
+
 if ! command -v uv >/dev/null 2>&1; then
   echo "❌ uv is required: https://docs.astral.sh/uv/"
   exit 1

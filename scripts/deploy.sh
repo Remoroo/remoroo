@@ -31,6 +31,30 @@ if [ "$CURRENT_BRANCH" != "main" ]; then
     fi
 fi
 
+# --- Refresh the vendored Remoroo Studio bundle BEFORE the commit step ---------
+# This CLI repo ships the prebuilt studio in remoroo/_studio/ but can't build it
+# (no studio source here). Build it from the monorepo sibling (or $REMOROO_STUDIO_DIR)
+# so a plain `deploy.sh` always ships the latest studio; the refreshed bundle is
+# then picked up by the "uncommitted changes" commit step below — no extra commands.
+CLI_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STUDIO_DIR="${REMOROO_STUDIO_DIR:-$CLI_ROOT/../remoroo_studio}"
+if [ -f "$STUDIO_DIR/scripts/bundle_studio.py" ]; then
+    echo "🎨 Building + bundling Remoroo Studio from $STUDIO_DIR ..."
+    if ! python3 "$STUDIO_DIR/scripts/bundle_studio.py"; then
+        echo "❌ Studio bundle failed (need Node 22+ and npm to build it). Fix and re-run."
+        exit 1
+    fi
+    echo ""
+elif [ -f "$CLI_ROOT/remoroo/_studio/dist/index.html" ]; then
+    echo "⚠️  Studio source not found at $STUDIO_DIR — shipping the already-committed bundle."
+    echo "    (set REMOROO_STUDIO_DIR to rebuild it.)"
+    echo ""
+else
+    echo "❌ No studio source ($STUDIO_DIR) and no committed bundle (remoroo/_studio/)."
+    echo "    Set REMOROO_STUDIO_DIR to the studio checkout, then re-run."
+    exit 1
+fi
+
 # Check for uncommitted changes
 if ! git diff-index --quiet HEAD --; then
     echo "📝 Uncommitted changes detected"

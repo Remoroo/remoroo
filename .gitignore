@@ -97,3 +97,12 @@ credentials
 # Local config
 .env.local
 .env.*.local
+
+# Vendored prebuilt studio (minified dist/ + Python servers) is DELIBERATELY
+# COMMITTED: this CLI repo publishes to PyPI on its own and has no access to the
+# studio source, so the wheel must ship the prebuilt bundle. These negations
+# override the generic `dist/` ignore above (re-include dirs first, then files).
+# Refresh before a release:  python remoroo_studio/scripts/bundle_studio.py
+!remoroo/_studio/
+!remoroo/_studio/**/
+!remoroo/_studio/**

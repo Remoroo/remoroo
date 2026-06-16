@@ -2,12 +2,13 @@
 
 `remoroo setup` serves the Studio from the robot computer over the LAN and prints
 the URL/QR the operator opens on their laptop/tablet (the robot computer usually
-has no display). This module only does what the brain can't: locate the studio,
-ensure it's built, spawn the Node server, and report the address.
+has no display). The Studio ships **prebuilt** (minified ``dist/``) as CLI package
+data under ``remoroo/_studio/`` and is served by a **Python** server, so the robot
+machine needs only Python — no Node at runtime (Node is build-time only, in our CI).
 
-The Studio is the standalone app at ``remoroo_studio/`` (dev) or a prebuilt copy
-pointed to by ``REMOROO_STUDIO_DIR``. The server writes the cell project +
-``remoroo_cell/`` bundle under the chosen project dir (the operator's repo).
+Resolution order:
+  1. bundled:  ``remoroo/_studio/`` (studio_server.py + dist/ + edge_real.py)
+  2. repo dev: ``$REMOROO_STUDIO_DIR`` or a ``remoroo_studio/`` walking up (built with npm)
 """
 from __future__ import annotations
 
@@ -16,33 +17,50 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 Echo = Callable[[str], None]
 
 
-def find_studio_dir() -> Optional[Path]:
-    """Locate the studio: $REMOROO_STUDIO_DIR, else walk up from this file / cwd."""
-    env = os.environ.get("REMOROO_STUDIO_DIR")
-    if env:
-        p = Path(env).expanduser()
-        if (p / "server" / "studio_server.mjs").exists():
-            return p
-    seen: set[Path] = set()
-    for start in (Path(__file__).resolve(), Path.cwd().resolve()):
-        for base in [start, *start.parents]:
-            cand = base / "remoroo_studio"
-            if cand in seen:
-                continue
-            seen.add(cand)
-            if (cand / "server" / "studio_server.mjs").exists():
-                return cand
+class Studio(NamedTuple):
+    dist: Path
+    server_py: Path
+    edge_py: Path
+    build_dir: Optional[Path]  # set only when running from the repo (needs `npm run build`)
+
+
+def _bundled() -> Optional[Studio]:
+    base = Path(__file__).resolve().parent / "_studio"
+    if (base / "studio_server.py").exists():
+        return Studio(base / "dist", base / "studio_server.py", base / "edge_real.py", None)
     return None
 
 
+def _repo() -> Optional[Studio]:
+    cands: list[Path] = []
+    env = os.environ.get("REMOROO_STUDIO_DIR")
+    if env:
+        cands.append(Path(env).expanduser())
+    for start in (Path(__file__).resolve(), Path.cwd().resolve()):
+        for b in [start, *start.parents]:
+            cands.append(b / "remoroo_studio")
+    seen: set[Path] = set()
+    for c in cands:
+        if c in seen:
+            continue
+        seen.add(c)
+        if (c / "server" / "studio_server.py").exists():
+            return Studio(c / "dist", c / "server" / "studio_server.py", c / "server" / "edge_real.py", c)
+    return None
+
+
+def find_studio() -> Optional[Studio]:
+    return _bundled() or _repo()
+
+
 def lan_ip() -> str:
-    """Best-effort primary LAN IPv4 (so another device can reach the studio)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -53,54 +71,38 @@ def lan_ip() -> str:
         return "localhost"
 
 
-def ensure_built(studio_dir: Path, echo: Echo = print) -> bool:
-    """Make sure ``dist/`` exists; build it once if needed (npm install + build)."""
-    if (studio_dir / "dist" / "index.html").exists():
+def ensure_built(studio: Studio, echo: Echo) -> bool:
+    if (studio.dist / "index.html").exists():
         return True
+    if studio.build_dir is None:
+        echo("The bundled studio is missing dist/ — reinstall remoroo.")
+        return False
     npm = shutil.which("npm")
     if not npm:
-        echo(
-            "npm/Node not found — can't build the studio. Install Node 22+, or set "
-            "REMOROO_STUDIO_DIR to a prebuilt studio (one containing dist/)."
-        )
+        echo("Studio isn't prebuilt and npm/Node isn't installed. Install Node 22+ to build it (dev), or reinstall a prebuilt remoroo.")
         return False
-    if not (studio_dir / "node_modules").exists():
-        echo("Installing studio dependencies (one-time: npm install)…")
-        if subprocess.run([npm, "install"], cwd=str(studio_dir)).returncode != 0:
-            echo("npm install failed.")
+    if not (studio.build_dir / "node_modules").exists():
+        echo("Installing studio dependencies (one-time)…")
+        if subprocess.run([npm, "install"], cwd=str(studio.build_dir)).returncode != 0:
             return False
-    echo("Building the studio (one-time: npm run build)…")
-    if subprocess.run([npm, "run", "build"], cwd=str(studio_dir)).returncode != 0:
-        echo("Studio build failed.")
-        return False
-    return True
+    echo("Building the studio (one-time)…")
+    return subprocess.run([npm, "run", "build"], cwd=str(studio.build_dir)).returncode == 0
 
 
 def _print_qr(url: str) -> None:
     try:
-        import qrcode  # optional dependency
+        import qrcode  # optional
 
         qr = qrcode.QRCode(border=1)
         qr.add_data(url)
         qr.make(fit=True)
         qr.print_ascii(invert=True)
     except Exception:
-        pass  # QR is a nicety; the URL is what matters
+        pass
 
 
-def _spawn_edge(studio_dir: Path, project_dir: Path, echo: Echo) -> tuple[Optional[subprocess.Popen], str]:
-    """Spawn the REAL edge service (server/edge_real.py) for this cell on a local
-    port; returns (process, edge_url). Falls back to ("", "") if Python is missing."""
-    py = shutil.which("python3") or shutil.which("python")
-    if not py:
-        echo("python3 not found — can't launch the real edge; using the built-in sim.")
-        return None, ""
-    eport = os.environ.get("EDGE_PORT", "7779")
-    env = dict(os.environ)
-    env.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell")})
-    proc = subprocess.Popen([py, str(studio_dir / "server" / "edge_real.py")], env=env)
-    echo(f"Started the real edge (edge_real.py) on :{eport} (drives primitives.py + cuRobo).")
-    return proc, f"http://127.0.0.1:{eport}"
+def _python() -> Optional[str]:
+    return sys.executable or shutil.which("python3") or shutil.which("python")
 
 
 def serve_studio(
@@ -112,23 +114,18 @@ def serve_studio(
     brain_url: str = "",
     spawn_edge: bool = False,
 ) -> bool:
-    """Find + build + serve the Studio, print the LAN URL/QR, and block until
-    interrupted. With `spawn_edge` (or an explicit `edge_url`) the gates run on the
-    REAL edge; `brain_url` points the agent dock at the brain. Returns True on a
-    clean shutdown, False if it couldn't start."""
-    studio_dir = find_studio_dir()
-    if studio_dir is None:
-        echo(
-            "Couldn't find Remoroo Studio. Run from the remoroo repo, or set "
-            "REMOROO_STUDIO_DIR to the studio directory."
-        )
+    """Find + (build if dev) + serve the Studio with the Python server, print the
+    LAN URL/QR, and block until interrupted. With `spawn_edge`/`edge_url` the gates
+    run on the REAL edge; `brain_url` points the agent dock at the brain."""
+    studio = find_studio()
+    if studio is None:
+        echo("Couldn't find Remoroo Studio (not bundled with this install and no repo). Reinstall remoroo, or set REMOROO_STUDIO_DIR.")
         return False
-    if not ensure_built(studio_dir, echo):
+    if not ensure_built(studio, echo):
         return False
-
-    node = shutil.which("node")
-    if not node:
-        echo("node not found on PATH — install Node 22+.")
+    py = _python()
+    if not py:
+        echo("No Python interpreter found to run the studio server.")
         return False
 
     project_dir = Path(project_dir).resolve()
@@ -138,10 +135,15 @@ def serve_studio(
 
     edge_proc = None
     if spawn_edge and not edge_url:
-        edge_proc, edge_url = _spawn_edge(studio_dir, project_dir, echo)
+        eport = os.environ.get("EDGE_PORT", "7779")
+        eenv = dict(os.environ)
+        eenv.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell")})
+        edge_proc = subprocess.Popen([py, str(studio.edge_py)], env=eenv)
+        edge_url = f"http://127.0.0.1:{eport}"
+        echo(f"Started the real edge (edge_real.py) on :{eport} — drives primitives.py + cuRobo.")
 
     env = dict(os.environ)
-    env.update({"PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir)})
+    env.update({"PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist)})
     if edge_url:
         env["EDGE_URL"] = edge_url
     if brain_url:
@@ -153,12 +155,12 @@ def serve_studio(
     echo(f"  │    {url}")
     echo(f"  │  (local: http://localhost:{port}/?token={token})")
     echo(f"  │  Project + remoroo_cell/ will be written under: {project_dir}")
-    echo(f"  │  edge: {edge_url or 'sim (built-in)'} · agent: {brain_url or 'sim'}")
+    echo(f"  │  edge: {edge_url or 'sim (client-side)'} · agent: {brain_url or 'sim'}")
     echo("  │  Press Ctrl+C here to stop serving.")
     echo("  └──────────────────────────────────────────────────────────────")
     _print_qr(url)
 
-    proc = subprocess.Popen([node, "server/studio_server.mjs"], cwd=str(studio_dir), env=env)
+    proc = subprocess.Popen([py, str(studio.server_py)], cwd=str(studio.server_py.parent), env=env)
     try:
         proc.wait()
         return True
