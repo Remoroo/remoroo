@@ -32,7 +32,9 @@ PROJECT = Path(os.environ.get("PROJECT", HERE.parent / "project")).resolve()
 PORT = int(os.environ.get("PORT", "7777"))
 TOKEN = os.environ.get("TOKEN", os.urandom(8).hex())
 EDGE_URL = os.environ.get("EDGE_URL", "").rstrip("/")
-BRAIN_URL = os.environ.get("BRAIN_URL", "").rstrip("/")
+BRAIN_URL = os.environ.get("BRAIN_URL", "").rstrip("/")  # the control plane (run API + agent)
+RUN_ID = os.environ.get("RUN_ID", "")  # the @robot_setup run the browser attaches to
+SESSION_KEY = os.environ.get("SESSION_KEY", "")  # auth for the CP run API (browser never sees it)
 
 MIME = {
     ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript",
@@ -86,13 +88,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _proxy(self, base: str):
+    def _proxy(self, base: str, auth: str = ""):
         u = urlsplit(base)
         cls = HTTPSConnection if u.scheme == "https" else HTTPConnection
         conn = cls(u.hostname, u.port or (443 if u.scheme == "https" else 80), timeout=600)
         length = int(self.headers.get("Content-Length", "0") or 0)
         body = self.rfile.read(length) if length else None
         headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "connection", "content-length")}
+        if auth:  # inject the CP session key; the browser never holds it
+            headers["Authorization"] = f"Bearer {auth}"
         if body is not None:
             headers["Content-Length"] = str(len(body))
         try:
@@ -153,6 +157,45 @@ class Handler(BaseHTTPRequestHandler):
             cell_path.write_bytes(self.rfile.read(length))
             self._json({"ok": True, "path": str(cell_path)})
             return
+        # cell.yaml — the canonical RobotModel inputs the operator authors at G0.
+        # Stored verbatim (the SPA sends YAML text) so the edge/agent read it as-is.
+        yaml_path = PROJECT / "remoroo_cell" / "cell.yaml"
+        if path == "/project/cellyaml" and self.command == "GET":
+            if not yaml_path.exists():
+                self._json({"error": "no cell.yaml"}, 404)
+                return
+            text = yaml_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/yaml")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(text)))
+            self.end_headers()
+            self.wfile.write(text)
+            return
+        if path == "/project/cellyaml" and self.command == "PUT":
+            yaml_path.parent.mkdir(parents=True, exist_ok=True)
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            yaml_path.write_bytes(self.rfile.read(length))
+            self._json({"ok": True, "path": str(yaml_path)})
+            return
+        # Gate completion = real artifact presence under remoroo_cell/ (the setup
+        # output contract). The SPA polls this to drive the G0–G9 rail — no sim.
+        if path == "/project/artifacts" and self.command == "GET":
+            cell = PROJECT / "remoroo_cell"
+            has = lambda *rels: any((cell / r).exists() for r in rels)
+            self._json({
+                "detect": has("cell.yaml"),
+                "toolchain": has("requirements.lock"),
+                "bridge": has("primitives.py"),
+                "calibrate": has("calibration/report.md", "calibration/hand_eye.yaml"),
+                "spheres": has("robot_model/collision_spheres.yml"),
+                "model": has("robot_model/robot.urdf"),
+                "world": has("world/scene.json", "world/collision.obj", "world/collision.ply"),
+                "capture": has("capture/schema.json", "capture/sample_episode"),
+                "taskspec": has("task_spec.md"),
+                "signoff": has("setup_report.md"),
+            })
+            return
         if path == "/project/export" and self.command == "POST":
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length)
@@ -180,11 +223,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p, q = self._route()
         if p == "/health":
-            self._json({"ok": True, "edge": "real" if EDGE_URL else "sim", "brain": bool(BRAIN_URL)})
+            self._json({"ok": True, "edge": "real" if EDGE_URL else "none", "brain": bool(BRAIN_URL), "run_id": RUN_ID})
+        elif p == "/studio/session":
+            self._json({"run_id": RUN_ID, "edge": "real" if EDGE_URL else "none", "brain": bool(BRAIN_URL)})
         elif p == "/live/joints" or p.startswith("/edge/"):
-            self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "no edge; SPA uses sim"}, 501)
-        elif p.startswith("/agent/"):
-            self._proxy(BRAIN_URL) if BRAIN_URL else self._json({"error": "no brain; SPA uses sim agent"}, 501)
+            self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "edge not connected"}, 501)
+        elif p.startswith("/runs/") or p.startswith("/agent/"):
+            self._proxy(BRAIN_URL, SESSION_KEY) if BRAIN_URL else self._json({"error": "no control plane"}, 501)
         elif p.startswith("/project/"):
             self._project(p, q)
         else:
@@ -192,10 +237,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p, q = self._route()
-        if p.startswith("/edge/"):
-            self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "no edge"}, 501)
-        elif p.startswith("/agent/"):
-            self._proxy(BRAIN_URL) if BRAIN_URL else self._json({"error": "no brain"}, 501)
+        if p.startswith("/runs/") or p.startswith("/agent/"):
+            self._proxy(BRAIN_URL, SESSION_KEY) if BRAIN_URL else self._json({"error": "no control plane"}, 501)
+        elif p.startswith("/edge/"):
+            self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "edge not connected"}, 501)
         elif p.startswith("/project/"):
             self._project(p, q)
         else:

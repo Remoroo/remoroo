@@ -226,29 +226,9 @@ def setup(
     Equivalent to:
         remoroo run --local --goal "@robot_setup"
     """
-    # Visual surface (default): serve Remoroo Studio over the LAN and let the
-    # operator drive setup in the browser. The robot computer usually has no
-    # display. --no-studio / --headless fall through to the agent-driven TUI below.
-    if studio and not headless:
-        from .paths import resolve_repo_path
-        from .studio_launch import serve_studio
-
-        repo_path = resolve_repo_path(repo)
-        typer.secho(
-            "🤖  remoroo setup → Remoroo Studio (visual, LAN-served). Open the "
-            "printed URL on your laptop/tablet, and keep a hand on the E-stop "
-            "once you reach motion steps. (Use --no-studio for the agent-driven TUI.)",
-            fg=typer.colors.YELLOW,
-        )
-        ok = serve_studio(
-            repo_path,
-            echo=typer.echo,
-            edge_url=edge_url or "",
-            brain_url=agent_url or "",
-            spawn_edge=edge,
-        )
-        raise typer.Exit(code=0 if ok else 1)
-
+    # Studio mode (default) drives the REAL @robot_setup run and shows it in the
+    # browser (no terminal). It needs the full session setup (auth, engine, run
+    # creation, local worker) — so it dispatches below after cfg is built, NOT here.
     from .auth import ensure_logged_in
     from .configs import get_api_url, get_default_engine
     from .engine.utils.doctor import ensure_ready, resolve_execution_engine
@@ -451,6 +431,20 @@ def setup(
             code = exit_code_for_result(lr.success, lr.partial_success)
             echo_session_finished_line(lr, code)
             raise typer.Exit(code=code)
+
+        if studio:
+            # Default: the visual Studio drives the real @robot_setup run in the
+            # browser (no terminal/TUI). Serves the SPA over the LAN, proxies the
+            # run API to the control plane, and runs the local worker here.
+            from .studio_launch import launch_setup_studio
+
+            typer.secho(
+                "🤖  remoroo setup → Remoroo Studio (visual, LAN-served). Open the printed URL on "
+                "your laptop/tablet; the agent drives setup there. Keep a hand on the E-stop at motion steps.",
+                fg=typer.colors.YELLOW,
+            )
+            ok = launch_setup_studio(cfg, echo=typer.echo, spawn_edge=edge, edge_url=edge_url or "", agent_url=agent_url or "")
+            raise typer.Exit(code=0 if ok else 1)
 
         lr, code = run_unified_local_session(cfg)
         echo_session_finished_line(lr, code)

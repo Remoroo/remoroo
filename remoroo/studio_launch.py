@@ -1,14 +1,19 @@
 """Launch Remoroo Studio (the visual setup surface) from the CLI.
 
-`remoroo setup` serves the Studio from the robot computer over the LAN and prints
-the URL/QR the operator opens on their laptop/tablet (the robot computer usually
-has no display). The Studio ships **prebuilt** (minified ``dist/``) as CLI package
-data under ``remoroo/_studio/`` and is served by a **Python** server, so the robot
-machine needs only Python — no Node at runtime (Node is build-time only, in our CI).
+`remoroo setup` (studio mode) drives the REAL `@robot_setup` agent run and shows
+it entirely in the browser — no terminal, no TUI. It:
 
-Resolution order:
-  1. bundled:  ``remoroo/_studio/`` (studio_server.py + dist/ + edge_real.py)
-  2. repo dev: ``$REMOROO_STUDIO_DIR`` or a ``remoroo_studio/`` walking up (built with npm)
+  1. creates the run on the control plane and starts the LOCAL worker (the same
+     battle-tested machinery the TUI/headless paths use — `prepare_local_worker_context`
+     + `_headless_step_loop`), so the agent executes the gate tools on the robot;
+  2. serves the prebuilt Studio over the LAN and reverse-proxies the run API
+     (`/runs/{id}/stream`, `/awaiting`, `/answer`, ...) to the control plane so the
+     browser streams the agent's live events + answers ask_human;
+  3. optionally spawns the real edge (`edge_real.py`) for live joints + cuRobo.
+
+The Studio ships prebuilt (minified ``dist/`` + Python servers) as CLI package
+data under ``remoroo/_studio/`` and is served by Python — the robot needs only
+Python at runtime (Node is build-time only).
 """
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
@@ -79,7 +85,7 @@ def ensure_built(studio: Studio, echo: Echo) -> bool:
         return False
     npm = shutil.which("npm")
     if not npm:
-        echo("Studio isn't prebuilt and npm/Node isn't installed. Install Node 22+ to build it (dev), or reinstall a prebuilt remoroo.")
+        echo("Studio isn't prebuilt and npm/Node isn't installed (dev). Install Node 22+ or reinstall a prebuilt remoroo.")
         return False
     if not (studio.build_dir / "node_modules").exists():
         echo("Installing studio dependencies (one-time)…")
@@ -105,77 +111,177 @@ def _python() -> Optional[str]:
     return sys.executable or shutil.which("python3") or shutil.which("python")
 
 
-def serve_studio(
-    project_dir: Path,
-    port: int = 7777,
-    token: Optional[str] = None,
-    echo: Echo = print,
-    edge_url: str = "",
-    brain_url: str = "",
-    spawn_edge: bool = False,
-) -> bool:
-    """Find + (build if dev) + serve the Studio with the Python server, print the
-    LAN URL/QR, and block until interrupted. With `spawn_edge`/`edge_url` the gates
-    run on the REAL edge; `brain_url` points the agent dock at the brain."""
-    studio = find_studio()
-    if studio is None:
-        echo("Couldn't find Remoroo Studio (not bundled with this install and no repo). Reinstall remoroo, or set REMOROO_STUDIO_DIR.")
-        return False
-    if not ensure_built(studio, echo):
-        return False
+def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional[subprocess.Popen], str]:
+    py = _python()
+    if not py:
+        echo("python not found — can't launch the real edge; the gates needing it will show 'edge not connected'.")
+        return None, ""
+    eport = os.environ.get("EDGE_PORT", "7779")
+    env = dict(os.environ)
+    env.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell")})
+    proc = subprocess.Popen([py, str(studio.edge_py)], env=env)
+    echo(f"Started the real edge (edge_real.py) on :{eport} — live joints + cuRobo.")
+    return proc, f"http://127.0.0.1:{eport}"
+
+
+def _spawn_studio(studio: Studio, env: dict, echo: Echo) -> Optional[subprocess.Popen]:
     py = _python()
     if not py:
         echo("No Python interpreter found to run the studio server.")
-        return False
+        return None
+    return subprocess.Popen([py, str(studio.server_py)], cwd=str(studio.server_py.parent), env=env)
 
+
+def _banner(echo: Echo, url: str, port: int, token: str, project_dir: Path, edge_url: str, brain_url: str, run_id: str) -> None:
+    echo("")
+    echo("  ┌─ Remoroo Studio ─────────────────────────────────────────────")
+    echo("  │  Open this on your laptop/tablet (same network):")
+    echo(f"  │    {url}")
+    echo(f"  │  (local: http://localhost:{port}/?token={token})")
+    echo(f"  │  Project + remoroo_cell/ under: {project_dir}")
+    echo(f"  │  edge: {edge_url or 'not connected'} · run: {run_id or '(editor only)'}")
+    echo("  │  Press Ctrl+C here to stop.")
+    echo("  └──────────────────────────────────────────────────────────────")
+    _print_qr(url)
+
+
+def _serve_loop(studio_proc: subprocess.Popen, others: list[Optional[subprocess.Popen]], on_stop, echo: Echo) -> bool:
+    try:
+        studio_proc.wait()
+        return True
+    except KeyboardInterrupt:
+        echo("\nStopping…")
+        return True
+    finally:
+        if on_stop:
+            on_stop()
+        for p in [studio_proc, *others]:
+            if p is None:
+                continue
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+
+
+def serve_studio(project_dir: Path, port: int = 7777, token: Optional[str] = None, echo: Echo = print,
+                 edge_url: str = "", brain_url: str = "", spawn_edge: bool = False) -> bool:
+    """Editor-only / dev serve (no agent run). Used when there's no CP session."""
+    studio = find_studio()
+    if studio is None:
+        echo("Couldn't find Remoroo Studio (not bundled and no repo). Reinstall remoroo or set REMOROO_STUDIO_DIR.")
+        return False
+    if not ensure_built(studio, echo):
+        return False
     project_dir = Path(project_dir).resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
     token = token or secrets.token_hex(8)
-    url = f"http://{lan_ip()}:{port}/?token={token}"
-
     edge_proc = None
     if spawn_edge and not edge_url:
-        eport = os.environ.get("EDGE_PORT", "7779")
-        eenv = dict(os.environ)
-        eenv.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell")})
-        edge_proc = subprocess.Popen([py, str(studio.edge_py)], env=eenv)
-        edge_url = f"http://127.0.0.1:{eport}"
-        echo(f"Started the real edge (edge_real.py) on :{eport} — drives primitives.py + cuRobo.")
-
+        edge_proc, edge_url = _start_edge(studio, project_dir, echo)
     env = dict(os.environ)
     env.update({"PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist)})
     if edge_url:
         env["EDGE_URL"] = edge_url
     if brain_url:
         env["BRAIN_URL"] = brain_url
+    proc = _spawn_studio(studio, env, echo)
+    if proc is None:
+        return False
+    url = f"http://{lan_ip()}:{port}/?token={token}"
+    _banner(echo, url, port, token, project_dir, edge_url, brain_url, "")
+    return _serve_loop(proc, [edge_proc], None, echo)
 
-    echo("")
-    echo("  ┌─ Remoroo Studio ─────────────────────────────────────────────")
-    echo("  │  Open this on your laptop/tablet (same network):")
-    echo(f"  │    {url}")
-    echo(f"  │  (local: http://localhost:{port}/?token={token})")
-    echo(f"  │  Project + remoroo_cell/ will be written under: {project_dir}")
-    echo(f"  │  edge: {edge_url or 'sim (client-side)'} · agent: {brain_url or 'sim'}")
-    echo("  │  Press Ctrl+C here to stop serving.")
-    echo("  └──────────────────────────────────────────────────────────────")
-    _print_qr(url)
 
-    proc = subprocess.Popen([py, str(studio.server_py)], cwd=str(studio.server_py.parent), env=env)
+def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, edge_url: str = "",
+                        agent_url: str = "", port: int = 7777) -> bool:
+    """Create the real @robot_setup run + local worker, serve the Studio, and
+    proxy the run API to the control plane so the browser is the entire UX."""
+    from .run_local import (
+        prepare_local_worker_context,
+        finalize_local_worker_session,
+        _headless_step_loop,
+        RunPrepareError,
+    )
+    from .engine.local_worker import WorkerService
+
+    studio = find_studio()
+    if studio is None:
+        echo("Couldn't find Remoroo Studio. Reinstall remoroo or set REMOROO_STUDIO_DIR.")
+        return False
+    if not ensure_built(studio, echo):
+        return False
+
+    project_dir = Path(cfg.repo_path).resolve()
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. create the run on the control plane + prepare the local worker context
+    echo("Starting the @robot_setup run on the control plane…")
     try:
-        proc.wait()
-        return True
-    except KeyboardInterrupt:
-        echo("\nStopping the studio…")
-        proc.terminate()
+        ctx = prepare_local_worker_context(
+            repo_path=cfg.repo_path, goal=cfg.goal, metrics=cfg.metrics_list, brain_url=cfg.brain_url,
+            engine=cfg.engine, verbose=cfg.verbose, cache_env=cfg.cache_env, in_place=cfg.in_place,
+            agentic=cfg.agentic, engine_version=cfg.engine_version, model=cfg.model,
+            resume_run_id=cfg.resume_run_id, max_wall_time_s=cfg.max_wall_time_s,
+            allow_overage=cfg.allow_overage, interactive=getattr(cfg, "interactive", True),
+            operator_note=getattr(cfg, "operator_note", ""),
+        )
+    except RunPrepareError as exc:
+        echo(f"❌ Could not start the run: {exc.message}")
+        return False
+
+    token = secrets.token_hex(8)
+    edge_proc = None
+    if spawn_edge and not edge_url:
+        edge_proc, edge_url = _start_edge(studio, project_dir, echo)
+
+    # 2. serve the studio, proxying the run API to the CP (api_url) with the session key
+    env = dict(os.environ)
+    env.update({
+        "PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist),
+        "BRAIN_URL": (agent_url or ctx.api_url or cfg.brain_url or "").rstrip("/"),
+        "RUN_ID": ctx.remote_run_id,
+        "SESSION_KEY": ctx.session_key or "",
+    })
+    if edge_url:
+        env["EDGE_URL"] = edge_url
+    studio_proc = _spawn_studio(studio, env, echo)
+    if studio_proc is None:
+        ctx.stop_heartbeat.set()
+        return False
+
+    url = f"http://{lan_ip()}:{port}/?token={token}"
+    _banner(echo, url, port, token, project_dir, edge_url, env["BRAIN_URL"], ctx.remote_run_id)
+    echo("  The agent is now driving setup — watch + answer it in the browser.")
+
+    # 3. run the worker loop in the background (executes the agent's gate tools here)
+    def _worker_loop():
         try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
-        return True
-    finally:
-        if edge_proc is not None:
-            edge_proc.terminate()
-            try:
-                edge_proc.wait(timeout=5)
-            except Exception:
-                edge_proc.kill()
+            worker = WorkerService(
+                repo_root=str(ctx.repo_path), artifact_dir=str(ctx.run_output_dir),
+                original_repo_root=ctx.original_repo_path, run_id=ctx.remote_run_id,
+                engine=ctx.engine, persistence_dir=str(ctx.run_output_dir),
+                cache_env=ctx.cache_env, in_place=ctx.in_place,
+            )
+            outcome, _ = _headless_step_loop(
+                run_id=ctx.remote_run_id,
+                poll_fn=lambda timeout, run_id: ctx.server.get_next_step(timeout=timeout, run_id=run_id),
+                handle_fn=worker.handle_request,
+                submit_fn=ctx.server.submit_result,
+            )
+            finalize_local_worker_session(ctx, {
+                "final_result": outcome.final_result, "outcome": outcome.outcome,
+                "success": outcome.success, "partial_success": outcome.partial_success,
+                "_cleanup_worker": worker,
+            })
+            echo(f"\n✅ Setup run finished: {outcome.outcome}. Studio still serving for review — Ctrl+C to stop.")
+        except Exception as e:  # noqa: BLE001
+            echo(f"\n⚠ Worker loop error: {e}")
+        finally:
+            ctx.stop_heartbeat.set()
+
+    worker_thread = threading.Thread(target=_worker_loop, daemon=True)
+    worker_thread.start()
+
+    return _serve_loop(studio_proc, [edge_proc], on_stop=lambda: ctx.stop_heartbeat.set(), echo=echo)
