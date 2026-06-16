@@ -66,12 +66,20 @@ import numpy as np, time
 
 class ZedCamera:
     def __init__(self, cfg):
+        self.serial = cfg.get("serial", "auto")
         self.cam = sl.Camera()
         self.init = sl.InitParameters()
         self.init.depth_mode = sl.DEPTH_MODE.NEURAL
         self.init.coordinate_units = sl.UNIT.METER
 
     def start(self):
+        # Jetson/Argus EGL: if DISPLAY points at a dead/headless X server the SDK
+        # aborts with "(Argus) Failed to initialize EGLDisplay" / "CAMERA FAILED TO
+        # SETUP". Clearing DISPLAY makes it use the Tegra EGL *device* directly,
+        # which works headless (this is why the zed_api systemd service succeeds).
+        import os; os.environ.pop("DISPLAY", None)
+        if str(self.serial).isdigit():          # select THIS cam when 2 are on the bus
+            self.init.set_from_serial_number(int(self.serial))
         if self.cam.open(self.init) != sl.ERROR_CODE.SUCCESS:
             raise RuntimeError("ZED open failed")
         self._rgb = sl.Mat(); self._depth = sl.Mat()
