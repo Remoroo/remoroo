@@ -12,6 +12,15 @@ never copy a stub verbatim and never hardcode one camera or one arm.
 
 ## Ground rules (read once, hold for the whole run)
 
+- **Split of responsibility (the whole point of the Studio).** You own the
+  COMPUTATIONAL work you can probe/execute (toolchain, `primitives.py`, cuRobo
+  spheres + planning, the calibration ROUTINE, world scan, capture, the demo).
+  The OPERATOR owns the PHYSICAL/JUDGEMENT work in the Studio: **building the
+  robot URDF in the editor**, **defining the safety envelope**, confirming the
+  inventory, accepting calibration, defining the task. You must NOT build/edit the
+  URDF (you can't see the rig), invent safety boundaries, or scavenge old
+  calibration off disk. Seed inputs + consume outputs; never substitute your
+  judgement for the operator's on an operator-owned gate.
 - **The bar is autonomous SAFE MOTION, not task execution.** Done = the cell
   plans (cuRoboV2) and executes small collision-free moves against the world
   it built, repeatably, with every interlock verified live, and the operator
@@ -49,22 +58,31 @@ for real at G4/G8.
 
 ## The phases and gates (a CHECKLIST by gate — NOT a strict order)
 
-> ORDER: do **calibration (G5) first** among the modeling steps — before the
-> world scan (G4) and the safe-motion demo (G8), because the world, planning,
-> and capture all depend on accurate extrinsics/intrinsics.
-> Recommended: G0 → G1 → G2 → G5 → G4 → G6 → G7 → G8 → G9.
+> ORDER: the OPERATOR builds the robot model FIRST (in the Studio editor) — you
+> cannot model a rig you cannot see. Then you sphere-fit it and calibrate (the
+> first motion), which need the model + spheres + the operator's safety envelope.
+> Recommended: G0 detect → **G0.5 safety envelope (operator)** → G1 toolchain →
+> G2 bridge → **G5 model (operator, editor)** → G5 spheres (you) → G5 calibrate
+> (first motion) → G4 world → G6 → G7 → G8 → G9.
 
-| Phase | What | Gate |
-|---|---|---|
-| 0 | Inventory host + arm/camera/gripper → `cell.yaml` | **G0** inventory complete; sensing feasible (reject monocular-only) |
-| 1 | Toolchain incl. cuRoboV2 | **G1** cuRoboV2 imports + smoke plan on this GPU; SDKs import; deps pinned |
-| 2 | Author the Bridge `primitives.py` + capture recorder (no motion) | **G2** imports; no-motion smoke; operator confirms frame; E-stop reachable |
-| 4 | World scan → TSDF/ESDF + collision world + scene (**env only — exclude arms**) | **G4** world reliable for small autonomous moves; scene queryable |
-| 5 | **Calibration — do FIRST, before the world scan.** Cell's first motion: operator-gated go-ahead + live E-stop check on the first move. Hand-eye (stereo: both lenses) + sysid + **robot-model assembly** (base→base, combined URDF, cuRobo spheres) | **G5** residuals under threshold (reject high-reprojection samples; validate stereo `T_L_R`); robot model built + visualized |
-| 6 | Data-capture validation | **G6** one sample episode valid (sync/schema/complete) |
-| 7 | Task & eval **spec** (read-and-approve, not code) | **G7** `task_spec.md` operator-approved |
-| 8 | Autonomous safe-motion demo (**THE bar**) | **G8** repeatable safe autonomous motion; interlocks verified; no task |
-| 9 | Snapshot + readiness card + handoff | **G9** all green, committed, operator signs off |
+| Phase | What | Owner | Gate |
+|---|---|---|---|
+| 0 | Probe host + arm/camera/gripper → draft `cell.yaml` | A→O | **G0** inventory confirmed by operator; sensing feasible (reject monocular-only) |
+| 0.5 | **Safety envelope** — keep-out, standing zone, bounds, max speed | **O** | **G0.5** operator-defined in the Studio → `safety.yaml`; no motion yet |
+| 1 | Toolchain incl. cuRoboV2 | A | **G1** cuRoboV2 imports + smoke plan on this GPU; SDKs import; deps pinned |
+| 2 | Author the Bridge `primitives.py` + capture recorder (no motion) | A→O | **G2** imports; no-motion smoke; operator confirms frame; E-stop reachable |
+| 5·model | **Operator builds the robot URDF in the editor** | **O** | exports `robot_model/robot.urdf` (you do NOT author it) |
+| 5·spheres | cuRobo collision spheres FROM the operator's URDF | A→O | spheres built; operator approves the preview |
+| 5·calib | **Calibration ROUTINE** — cell's first motion, operator-gated; FRESH (no disk reuse) | A⚠O | **G5** residuals under threshold; stereo `T_L_R` valid; reports re-runnable |
+| 4 | World scan → TSDF/ESDF + collision world (**env only — exclude arms**) | A⚠O | **G4** world reliable for small autonomous moves; operator confirms coverage |
+| 6 | Data-capture validation | A | **G6** one sample episode valid (sync/schema/complete) |
+| 7 | Task & eval **spec** (the operator's intent) | **O** | **G7** `task_spec.md` operator-defined + approved |
+| 8 | Autonomous safe-motion demo (**THE bar**) | A⚠O | **G8** repeatable safe autonomous motion; interlocks verified; no task |
+| 9 | Snapshot + readiness card + handoff | A→O | **G9** all green, committed, operator signs off |
+
+> Owner key: **A** = you (operator watches/approves) · **A→O** = you propose,
+> operator confirms · **A⚠O** = you execute, operator supervises + PERMITS
+> (motion) · **O** = the operator does it in the Studio; you seed inputs + consume.
 
 ## Which seed to read for each phase
 
@@ -81,10 +99,9 @@ for real at G4/G8.
   schema. Authored for THIS cell's modalities; not hardcoded to any camera.
 - `calibration.md` — Phase 5. Hand-eye, intrinsics, time-sync, payload sysid,
   and the shared-ArUco dual-arm base-to-base.
-- `robot_model.md` — Phase 5 (after calibration). Assemble the cuRobo-ready
-  model: combine per-arm URDFs (skip if a whole-robot URDF is provided),
-  generate collision spheres from meshes → cuRobo YAML, visualize on the desk
-  (NO Isaac Sim).
+- `robot_model.md` — Phase 5. The OPERATOR builds the URDF in the Studio editor;
+  you CONSUME `robot_model/robot.urdf` and sphere-fit it (cuRobo collision
+  spheres → YAML + preview for approval). You do not author the URDF.
 - `world_scan.md` — Phase 4. Scan strategy: static-depth fusion, eye-in-hand
   active sweep, and operator hand-guided scan; build TSDF/ESDF + scene as the
   **environment only** (ignore the arms — cuRobo handles the robot).
@@ -93,9 +110,13 @@ for real at G4/G8.
 
 ## What you author vs. what is shipped
 
-- **You author (in `remoroo_cell/`, editable):** `cell.yaml`, `primitives.py`
-  (Bridge), the capture recorder, `calibration/`, `robot_model/`, `world/`,
-  `task_spec.md`, `requirements.lock`, `setup_report.md`.
+- **You author (computational, in `remoroo_cell/`):** `primitives.py` (Bridge),
+  the capture recorder, `calibration/`, `robot_model/collision_spheres.yml` (from
+  the operator's URDF), `world/`, `requirements.lock`, `setup_report.md`; and you
+  DRAFT `cell.yaml` for the operator to confirm.
+- **The OPERATOR authors in the Studio (you consume, never author):**
+  `robot_model/robot.urdf` (the editor), `safety.yaml` (the safety envelope), and
+  `task_spec.md` (the task intent).
 - **You import, never author:** the deterministic safety supervisor, the
   brain↔worker transport, and the episode-writer base. These ship in the
   installed Remoroo package. (Import them from the shipped runtime spine; see
@@ -107,7 +128,8 @@ for real at G4/G8.
 ```text
 <repo>/
   remoroo_cell/
-    cell.yaml
+    cell.yaml                # you draft; the operator confirms (G0)
+    safety.yaml              # the OPERATOR's safety envelope (G0.5); you consume it
     primitives.py            # Bridge (authored; versioned + editable)
     capture/
       recorder.py            # data-capture recorder (authored)
@@ -117,9 +139,9 @@ for real at G4/G8.
       hand_eye.yaml
       base_to_base.yaml      # dual-arm only (shared-ArUco)
       report.md
-    robot_model/             # cuRobo-ready model (Phase 5; skip combine if URDF given)
-      robot.urdf             # single resolved URDF cuRobo loads
-      collision_spheres.yml  # cuRobo robot config (spheres + limits)
+    robot_model/             # the model (Phase 5)
+      robot.urdf             # the OPERATOR's URDF, built in the Studio editor (you read it)
+      collision_spheres.yml  # cuRobo robot config (spheres + limits) — YOU fit this from robot.urdf
       spheres_preview.png    # desk visualization (no Isaac Sim)
     world/
       collision.*            # TSDF/ESDF / cuRobo collision world (env only — no arms)

@@ -2,9 +2,17 @@
 
 Calibration makes the world geometry and the data trustworthy. It is the
 cell's FIRST motion: run it under operator supervision (slow moves, hand on the
-E-stop) and BEFORE the world scan — the scan, planning, and capture all depend
-on it. **Collect poses AUTONOMOUSLY (see the next section) — never hand-jog
-them.** Outputs are **versioned + editable** and must be **re-runnable**.
+E-stop), AFTER the operator's URDF + spheres exist and the operator has set the
+safety envelope (G0.5), and BEFORE the world scan. **Collect poses AUTONOMOUSLY
+(see the next section) — never hand-jog them.** Outputs are **versioned +
+editable** and must be **re-runnable**.
+
+> **FRESH every setup — do NOT scavenge.** Do not search the disk for old
+> `calibration/` files to reuse or "save time"; a stale extrinsic is a safety
+> hazard. Run the routine for real each time. (Resuming a prior setup is driven
+> by the gate state, not by you reading old artifacts.) And get the operator's
+> explicit go-ahead — `gate_checkpoint(gate=calibrate, default_proceed=false)` —
+> before the first move; the operator clears the area and permits motion.
 
 ## What to calibrate (only what this cell needs)
 
@@ -16,15 +24,17 @@ them.** Outputs are **versioned + editable** and must be **re-runnable**.
    - both, if the cell has both.
 3. **Dual-arm base-to-base** — if two arms, the transform between their bases.
    Once BOTH arms' eye-in-hand is solved, recover it from a **shared ArUco**
-   both wrist cams observe — simple matrix transforms, no extra solver. Full
-   method + the combined-URDF build live in `robot_model.md` (it feeds the
-   model, so it's covered there).
+   both wrist cams observe — simple matrix transforms, no extra solver. You
+   COMPUTE this transform; the operator laid the two arms out approximately in
+   the editor, and cuRobo uses your precise `base_to_base` alongside the
+   operator's URDF (see `robot_model.md`).
 4. **Time-sync / latency** — camera↔arm offset; record it for the recorder.
 5. **Payload / tool sysid** — mass + COM of the mounted tool/gripper so the
    controller and limits are honest.
 
-Hand-eye + base-to-base are the *inputs* to the cuRobo-ready robot model
-(combined URDF + collision spheres). Build that next in `robot_model.md`.
+Hand-eye + base-to-base are *inputs* to the cuRobo model. You do NOT build the
+URDF (the operator does, in the editor); you sphere-fit their URDF and fold in
+these transforms — see `robot_model.md`.
 
 ## Automated pose collection — REQUIRED (never hand-jog ~100 poses)
 
