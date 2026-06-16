@@ -114,7 +114,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()  # close-delimited (HTTP/1.0) — streams SSE fine
         try:
             while True:
-                chunk = resp.read(2048)
+                # read1() returns as soon as ANY data is available; plain read(n)
+                # blocks until n bytes accumulate, which buffers small SSE events
+                # in the proxy and makes the live agent feed look frozen.
+                chunk = resp.read1(65536)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
