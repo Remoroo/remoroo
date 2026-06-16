@@ -21,13 +21,16 @@ never copy a stub verbatim and never hardcode one camera or one arm.
   "do not edit", or immutability language to anything you author.
 - **The human is the safety net.** Every motion is operator-supervised with an
   E-stop. You must get an explicit operator go-ahead before *any* motion
-  (Phase 3) and before the autonomous demo (Phase 8). These gates never
-  auto-pass on a timeout.
-- **Discover before you ask.** Probe hardware yourself first
-  (`hardware_preflight`, `bash`, `run_steps`); read any operator-provided
-  files (`read_file`, `view_image`); use `ask_human` only for genuine gaps and
-  safety/scope decisions. You have a raised `ask_human` budget — still spend
-  it carefully and batch questions.
+  (the FIRST motion is calibration's first pose move — Phase 5) and before the
+  autonomous demo (Phase 8). These never auto-pass on a timeout.
+- **Ask first — this is collaborative.** It is the operator's responsibility to
+  provide the info needed to get through setup; your job is to make it easy and
+  make them glad they did it. OPEN by asking the operator the questions that
+  shape the cell (arm/DOF, each camera + role/mount + stereo?, gripper/payload,
+  network/creds, standing zone) via `ask_human` BEFORE scanning the filesystem.
+  Probe (`hardware_preflight`, `bash`, `run_steps`) and read provided files
+  (`read_file`, `view_image`) to FILL GAPS and VERIFY — not as the first move.
+  UNDER-asking is the failure here; batch the opening questions, give defaults.
 - **No fakes.** A gate passes on real evidence, or you fix it, or you stop
   with an actionable message. Never present a stub as working hardware.
 
@@ -44,16 +47,20 @@ static depth cam, stereo, or any combination that yields reliable metric
 geometry. Record this feasibility judgement in `cell.yaml` at G0 and prove it
 for real at G4/G8.
 
-## The phases and gates (do them in order)
+## The phases and gates (a CHECKLIST by gate — NOT a strict order)
+
+> ORDER: do **calibration (G5) first** among the modeling steps — before the
+> world scan (G4) and the safe-motion demo (G8), because the world, planning,
+> and capture all depend on accurate extrinsics/intrinsics.
+> Recommended: G0 → G1 → G2 → G5 → G4 → G6 → G7 → G8 → G9.
 
 | Phase | What | Gate |
 |---|---|---|
 | 0 | Inventory host + arm/camera/gripper → `cell.yaml` | **G0** inventory complete; sensing feasible (reject monocular-only) |
 | 1 | Toolchain incl. cuRoboV2 | **G1** cuRoboV2 imports + smoke plan on this GPU; SDKs import; deps pinned |
 | 2 | Author the Bridge `primitives.py` + capture recorder (no motion) | **G2** imports; no-motion smoke; operator confirms frame; E-stop reachable |
-| 3 | Motion enablement (operator-gated) | **G3** supervised micro-move + **live E-stop verified**; bounds recorded |
 | 4 | World scan → TSDF/ESDF + collision world + scene (**env only — exclude arms**) | **G4** world reliable for small autonomous moves; scene queryable |
-| 5 | Calibration + sysid + **robot-model assembly** (base→base, combined URDF, cuRobo spheres) | **G5** residuals under threshold; cuRobo robot model built + visualized |
+| 5 | **Calibration — do FIRST, before the world scan.** Cell's first motion: operator-gated go-ahead + live E-stop check on the first move. Hand-eye (stereo: both lenses) + sysid + **robot-model assembly** (base→base, combined URDF, cuRobo spheres) | **G5** residuals under threshold (reject high-reprojection samples; validate stereo `T_L_R`); robot model built + visualized |
 | 6 | Data-capture validation | **G6** one sample episode valid (sync/schema/complete) |
 | 7 | Task & eval **spec** (read-and-approve, not code) | **G7** `task_spec.md` operator-approved |
 | 8 | Autonomous safe-motion demo (**THE bar**) | **G8** repeatable safe autonomous motion; interlocks verified; no task |

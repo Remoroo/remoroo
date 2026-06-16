@@ -15,10 +15,98 @@ For the canonical, always-current description of what setup does, run
 """
 from __future__ import annotations
 
+import json as _json
+import time as _time
 from pathlib import Path
 from typing import Optional
 
 import typer
+
+
+# --- Conversation continuity ------------------------------------------------
+# The v2 AgentLoop checkpoints its full message history to
+# `<repo>/.remoroo/runs/<run_id>/checkpoint.json` and restores it on start when
+# the goal+metric match (see remoroo_brain/v2/agent_loop.py
+# _load_and_restore_checkpoint). `remoroo setup` always mints a NEW run_id, so
+# nothing is ever restored — every run cold-starts. To "continue the
+# conversation" we mint a fresh run_id but SEED its checkpoint from a prior
+# setup run; the brain then rehydrates the whole conversation. This needs no
+# brain change and sidesteps the "run already finished" resume rejection.
+
+_SETUP_POINTER_REL = ".remoroo_init/last_setup_run.json"
+
+
+def _setup_pointer_path(repo_path: Path) -> Path:
+    return repo_path / _SETUP_POINTER_REL
+
+
+def _checkpoint_path(repo_path: Path, run_id: str) -> Path:
+    return repo_path / ".remoroo" / "runs" / run_id / "checkpoint.json"
+
+
+def _read_last_setup_run(repo_path: Path) -> Optional[str]:
+    p = _setup_pointer_path(repo_path)
+    if not p.exists():
+        return None
+    try:
+        return _json.loads(p.read_text(encoding="utf-8")).get("run_id") or None
+    except Exception:
+        return None
+
+
+def _write_last_setup_run(repo_path: Path, run_id: str) -> None:
+    p = _setup_pointer_path(repo_path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            _json.dumps(
+                {
+                    "run_id": run_id,
+                    "updated_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                }
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def seed_checkpoint_from_prior(
+    repo_path: Path, prior_run_id: str, new_run_id: str
+) -> Optional[int]:
+    """Copy the prior setup run's checkpoint (+ run_state/trace) into the new
+    run's namespace so the brain restores the full conversation. Returns the
+    number of messages carried over, or None if there is no usable prior
+    checkpoint (caller then starts fresh)."""
+    src = _checkpoint_path(repo_path, prior_run_id)
+    if not src.exists():
+        return None
+    try:
+        raw = src.read_text(encoding="utf-8")
+        data = _json.loads(raw)
+    except Exception:
+        return None
+    history = data.get("history") or []
+    if not history:
+        return None
+    dst = _checkpoint_path(repo_path, new_run_id)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(raw, encoding="utf-8")
+    except OSError:
+        return None
+    # Best-effort: carry sibling artifacts too (run_state lives inside the
+    # checkpoint already, but copy standalone files if present).
+    for sibling in ("run_state.json", "trace.jsonl"):
+        s = src.parent / sibling
+        if s.exists():
+            try:
+                (dst.parent / sibling).write_text(
+                    s.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+            except OSError:
+                pass
+    return len(history)
 
 
 def setup(
@@ -60,6 +148,30 @@ def setup(
         "--headless",
         help="Skip the Rich TUI (CI / non-tty environments).",
     ),
+    studio: bool = typer.Option(
+        True,
+        "--studio/--no-studio",
+        help=(
+            "Launch the visual Remoroo Studio (served over the LAN — open the "
+            "printed URL on your laptop/tablet; the robot computer usually has no "
+            "display). Use --no-studio for the agent-driven TUI flow."
+        ),
+    ),
+    edge: bool = typer.Option(
+        False,
+        "--edge",
+        help=(
+            "Also launch the REAL edge service (server/edge_real.py) for this cell, "
+            "so the studio's gates drive primitives.py + cuRobo instead of the sim. "
+            "Requires cuRobo + the authored remoroo_cell/ on this machine."
+        ),
+    ),
+    edge_url: Optional[str] = typer.Option(
+        None, "--edge-url", help="Point the studio at an already-running edge service (instead of --edge)."
+    ),
+    agent_url: Optional[str] = typer.Option(
+        None, "--agent-url", help="Point the studio's agent dock at a brain endpoint (else the built-in sim agent)."
+    ),
     note: Optional[str] = typer.Option(
         None,
         "--note",
@@ -80,6 +192,23 @@ def setup(
             "appended to --note. Handy for longer cell descriptions."
         ),
     ),
+    cont: bool = typer.Option(
+        False,
+        "--continue",
+        "-c",
+        help=(
+            "Continue the MOST RECENT setup conversation for this repo: reuse "
+            "its checkpoint so the agent keeps all its context (what it learned "
+            "about the cell, which gates passed) instead of cold-starting and "
+            "re-reading everything. Use after an error or a stop."
+        ),
+    ),
+    resume_run_id: Optional[str] = typer.Option(
+        None,
+        "--resume",
+        metavar="RUN_ID",
+        help="Continue a SPECIFIC prior setup run by id (implies --continue).",
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", help="Verbose logging."
     ),
@@ -97,6 +226,29 @@ def setup(
     Equivalent to:
         remoroo run --local --goal "@robot_setup"
     """
+    # Visual surface (default): serve Remoroo Studio over the LAN and let the
+    # operator drive setup in the browser. The robot computer usually has no
+    # display. --no-studio / --headless fall through to the agent-driven TUI below.
+    if studio and not headless:
+        from .paths import resolve_repo_path
+        from .studio_launch import serve_studio
+
+        repo_path = resolve_repo_path(repo)
+        typer.secho(
+            "🤖  remoroo setup → Remoroo Studio (visual, LAN-served). Open the "
+            "printed URL on your laptop/tablet, and keep a hand on the E-stop "
+            "once you reach motion steps. (Use --no-studio for the agent-driven TUI.)",
+            fg=typer.colors.YELLOW,
+        )
+        ok = serve_studio(
+            repo_path,
+            echo=typer.echo,
+            edge_url=edge_url or "",
+            brain_url=agent_url or "",
+            spawn_edge=edge,
+        )
+        raise typer.Exit(code=0 if ok else 1)
+
     from .auth import ensure_logged_in
     from .configs import get_api_url, get_default_engine
     from .engine.utils.doctor import ensure_ready, resolve_execution_engine
@@ -143,6 +295,38 @@ def setup(
     out_dir = resolve_out_dir(out, repo_path)
     run_id = new_run_id()
     max_wall_time_s = int(budget_hours * 3600)
+
+    # Conversation continuity (--continue / --resume): seed THIS run's checkpoint
+    # from a prior setup run so the agent resumes with full context instead of
+    # cold-starting. A fresh run_id avoids the "run already finished" resume
+    # rejection; the brain restores history from the seeded checkpoint.
+    prior_run_id = resume_run_id or (_read_last_setup_run(repo_path) if cont else None)
+    if (cont or resume_run_id) and not prior_run_id:
+        typer.secho(
+            "❌ --continue: no prior setup run recorded for this repo "
+            f"({_setup_pointer_path(repo_path)} not found). Run `remoroo setup` "
+            "once first, then `remoroo setup --continue`.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+    if prior_run_id:
+        carried = seed_checkpoint_from_prior(repo_path, prior_run_id, run_id)
+        if carried is None:
+            typer.secho(
+                f"⚠ Could not continue from {prior_run_id}: no usable checkpoint "
+                f"at {_checkpoint_path(repo_path, prior_run_id)}. Starting fresh.",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            typer.secho(
+                f"↻ Continuing the setup conversation from {prior_run_id} "
+                f"({carried} messages restored) — the agent keeps its context "
+                "and won't re-read the repo from scratch.",
+                fg=typer.colors.GREEN,
+            )
+    # Record THIS run as the latest setup run so a later --continue finds it
+    # (chains forward: each continue seeds from the previous one).
+    _write_last_setup_run(repo_path, run_id)
 
     # Resolve operator guidance (--note text + --note-file contents). This is
     # injected into the agent's prompt at launch as authoritative guidance, so
