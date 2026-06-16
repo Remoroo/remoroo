@@ -12,12 +12,6 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  PY=python3
-else
-  PY=python
-fi
-
 echo "🔒 uv lock --check"
 uv lock --check
 
@@ -25,10 +19,11 @@ echo "📦 uv build → dist/"
 rm -rf dist dist_pip_build
 uv build
 
-echo "📦 pip: $PY -m build → dist_pip_build/ (sanity check, same pyproject)"
-"$PY" -m pip install -q --upgrade pip
-"$PY" -m pip install -q "build>=1.0.0"
-"$PY" -m build --outdir dist_pip_build
+echo "📦 pip: build → dist_pip_build/ (sanity check, same pyproject)"
+# Run the PEP 517 'build' frontend in an ephemeral, isolated env via uvx so we
+# don't install into a system/Homebrew Python (PEP 668 externally-managed).
+# 'build' still creates its own isolated build env (pip path) for the wheel/sdist.
+uvx --from "build>=1.0.0" pyproject-build --outdir dist_pip_build
 
 echo "✅ uv artifacts (used for PyPI in CI):"
 ls -la dist/
