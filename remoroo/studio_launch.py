@@ -62,6 +62,16 @@ def _repo() -> Optional[Studio]:
     return None
 
 
+def _pkg_version() -> str:
+    """The installed remoroo version — surfaced in the Studio so the operator can
+    confirm the robot is running the build they deployed (the deploy→robot gap)."""
+    try:
+        from importlib.metadata import version
+        return version("remoroo")
+    except Exception:
+        return ""
+
+
 def _stable_token(project_dir: Path) -> str:
     """A STABLE per-project Studio token, persisted outside the repo.
 
@@ -208,7 +218,7 @@ def serve_studio(project_dir: Path, port: int = 7777, token: Optional[str] = Non
     if spawn_edge and not edge_url:
         edge_proc, edge_url = _start_edge(studio, project_dir, echo)
     env = dict(os.environ)
-    env.update({"PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist)})
+    env.update({"PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist), "STUDIO_VERSION": _pkg_version()})
     if edge_url:
         env["EDGE_URL"] = edge_url
     if brain_url:
@@ -267,6 +277,7 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
     env = dict(os.environ)
     env.update({
         "PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist),
+        "STUDIO_VERSION": _pkg_version(),
         "BRAIN_URL": (agent_url or ctx.api_url or cfg.brain_url or "").rstrip("/"),
         "RUN_ID": ctx.remote_run_id,
         "SESSION_KEY": ctx.session_key or "",

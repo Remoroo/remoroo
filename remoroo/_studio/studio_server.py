@@ -65,14 +65,28 @@ def _cookie_token(headers) -> str:
     return ""
 
 
-def token_ok(query: dict, headers) -> bool:
-    # Accept the token via ?token= (the launch URL), a Bearer header, OR the
-    # rs_token cookie. The cookie is set the moment the operator opens the launch
-    # URL once, so the whole browser session stays authenticated even if a later
-    # URL/tab/reload drops the ?token= (the cause of spurious 401s over the LAN).
+def auth_reason(query: dict, headers):
+    """Return (ok, info). Accept the token via ?token= (launch URL), a Bearer
+    header, OR the rs_token cookie. `info` is which method matched, or — on
+    failure — exactly what was present, so a 401 is never a mystery."""
     q = (query.get("token") or [""])[0]
     auth = (headers.get("Authorization") or "").replace("Bearer ", "")
-    return q == TOKEN or auth == TOKEN or _cookie_token(headers) == TOKEN
+    ck = _cookie_token(headers)
+    if q == TOKEN:
+        return True, "query"
+    if auth == TOKEN:
+        return True, "bearer"
+    if ck == TOKEN:
+        return True, "cookie"
+    return False, {"query_present": bool(q), "cookie_present": bool(ck), "bearer_present": bool(auth)}
+
+
+def token_ok(query: dict, headers) -> bool:
+    return auth_reason(query, headers)[0]
+
+
+def _pre(s: str) -> str:
+    return (s[:4] + "…") if s else "∅"
 
 
 def git_commit(repo: Path, rel: str) -> bool:
@@ -162,8 +176,25 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- project IO ----
     def _project(self, path: str, query: dict):
-        if not token_ok(query, self.headers):
-            self._json({"error": "token required"}, 401)
+        ok, info = auth_reason(query, self.headers)
+        if not ok:
+            # GROUND TRUTH: log exactly why auth failed (to the `remoroo setup`
+            # terminal) + return it to the UI so a 401 is never a guessing game.
+            qtok = (query.get("token") or [""])[0]
+            print(
+                f"[studio-auth] 401 {self.command} {path} — {info} · "
+                f"query={_pre(qtok)} cookie={_pre(_cookie_token(self.headers))} "
+                f"expected={_pre(TOKEN)}",
+                flush=True,
+            )
+            none_present = isinstance(info, dict) and not any(info.values())
+            self._json({
+                "error": "token required",
+                "reason": "no_token_sent" if none_present else "token_mismatch",
+                "got": info,
+                "hint": "Open the Studio via the exact URL the CLI printed (with ?token=…). "
+                        "If you just restarted setup, reopen that fresh URL.",
+            }, 401)
             return
         cell_path = PROJECT / "cell.studio.json"
         if path == "/project/cell" and self.command == "GET":
@@ -316,8 +347,14 @@ class Handler(BaseHTTPRequestHandler):
         p, q = self._route()
         if p == "/health":
             self._json({"ok": True, "edge": "real" if EDGE_URL else "none", "brain": bool(BRAIN_URL), "run_id": RUN_ID})
+        elif p == "/studio/whoami":
+            # Auth self-check the SPA calls on boot → it can warn the operator
+            # IMMEDIATELY if they're not authenticated, not after a failed save.
+            ok, _info = auth_reason(q, self.headers)
+            self._json({"authed": ok, "version": os.environ.get("STUDIO_VERSION", "")})
         elif p == "/studio/session":
-            self._json({"run_id": RUN_ID, "edge": "real" if EDGE_URL else "none", "brain": bool(BRAIN_URL)})
+            self._json({"run_id": RUN_ID, "edge": "real" if EDGE_URL else "none", "brain": bool(BRAIN_URL),
+                        "version": os.environ.get("STUDIO_VERSION", "")})
         elif p == "/live/joints" or p.startswith("/edge/"):
             self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "edge not connected"}, 501)
         elif p.startswith("/runs/") or p.startswith("/agent/"):
