@@ -56,10 +56,23 @@ def lan_ip() -> str:
         return "localhost"
 
 
+def _cookie_token(headers) -> str:
+    """Read the studio auth cookie (set when the SPA is opened with a valid token)."""
+    for part in (headers.get("Cookie") or "").split(";"):
+        part = part.strip()
+        if part.startswith("rs_token="):
+            return part[len("rs_token="):]
+    return ""
+
+
 def token_ok(query: dict, headers) -> bool:
+    # Accept the token via ?token= (the launch URL), a Bearer header, OR the
+    # rs_token cookie. The cookie is set the moment the operator opens the launch
+    # URL once, so the whole browser session stays authenticated even if a later
+    # URL/tab/reload drops the ?token= (the cause of spurious 401s over the LAN).
     q = (query.get("token") or [""])[0]
     auth = (headers.get("Authorization") or "").replace("Bearer ", "")
-    return q == TOKEN or auth == TOKEN
+    return q == TOKEN or auth == TOKEN or _cookie_token(headers) == TOKEN
 
 
 def git_commit(repo: Path, rel: str) -> bool:
@@ -127,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _static(self, path: str):
+    def _static(self, path: str, query: dict | None = None):
         rel = "index.html" if path == "/" else path.lstrip("/")
         f = (DIST / rel)
         if not f.exists() or f.is_dir():
@@ -139,6 +152,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", MIME.get(f.suffix, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
+        # When the SPA is opened with a valid ?token=, set an auth cookie so the
+        # whole browser session stays authenticated even if the URL later drops the
+        # token (the LAN/remote-tab 401 cause). 30-day session.
+        if query and (query.get("token") or [""])[0] == TOKEN:
+            self.send_header("Set-Cookie", f"rs_token={TOKEN}; Path=/; SameSite=Lax; Max-Age=2592000")
         self.end_headers()
         self.wfile.write(data)
 
@@ -213,7 +231,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._json({})
             return
-        if path == "/project/setup_state" and self.command == "PUT":
+        if path == "/project/setup_state" and self.command in ("PUT", "POST"):
+            # POST is accepted too so navigator.sendBeacon (flush-on-close, POST-only)
+            # can persist the final state when the operator closes the tab.
             state_path.parent.mkdir(parents=True, exist_ok=True)
             length = int(self.headers.get("Content-Length", "0") or 0)
             state_path.write_bytes(self.rfile.read(length))
@@ -305,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
         elif p.startswith("/project/"):
             self._project(p, q)
         else:
-            self._static(p)
+            self._static(p, q)
 
     def do_POST(self):
         p, q = self._route()
