@@ -163,12 +163,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers(); self.wfile.write(b"Not built. Run the studio build.")
             return
         data = f.read_bytes()
+        # INJECT THE TOKEN into the SPA's HTML so the client ALWAYS has it — no
+        # matter how the page was opened (bare IP, bookmark, no ?token=). This is
+        # the definitive fix for the recurring "query=∅ cookie=∅" 401s: the token
+        # ships WITH the page that asks for it, instead of relying on the operator's
+        # URL/cookie carrying it. (The studio is on the robot's LAN; anyone who can
+        # load the page is already on it.)
+        if f.suffix == ".html":
+            tag = f"<script>window.__RS_TOKEN__={json.dumps(TOKEN)};</script>".encode()
+            data = data.replace(b"</head>", tag + b"</head>", 1) if b"</head>" in data else tag + data
         self.send_response(200)
         self.send_header("Content-Type", MIME.get(f.suffix, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
-        # When the SPA is opened with a valid ?token=, set an auth cookie so the
-        # whole browser session stays authenticated even if the URL later drops the
-        # token (the LAN/remote-tab 401 cause). 30-day session.
         if query and (query.get("token") or [""])[0] == TOKEN:
             self.send_header("Set-Cookie", f"rs_token={TOKEN}; Path=/; SameSite=Lax; Max-Age=2592000")
         self.end_headers()
