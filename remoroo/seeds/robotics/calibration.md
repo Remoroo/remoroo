@@ -14,6 +14,37 @@ editable** and must be **re-runnable**.
 > explicit go-ahead — `gate_checkpoint(gate=calibrate, default_proceed=false)` —
 > before the first move; the operator clears the area and permits motion.
 
+## The Studio integration contract — `calibration/collect_poses.py`
+
+Calibration is the Studio's **hero wizard**: the operator clicks *Start* and the
+**Studio runs YOUR routine live via the edge** and renders a pose cloud + a
+residual gauge. So author `remoroo_cell/calibration/collect_poses.py` with this
+**exact streaming entry point** (the edge imports and calls it):
+
+```python
+def run(bridge, cell, on_event=None):
+    """Autonomously collect hand-eye poses and solve. The Studio runs THIS and
+    renders the stream. Plan poses with cuRobo (collision-free, WITHIN the
+    operator's G0.5 safety envelope, slow), move, detect the board, solve AX=XB
+    incrementally, reject high-reprojection samples.
+
+    Call on_event(dict) as you go (no-op if None → headless):
+      {"type":"status","message":str,"residual_mm":float?}
+      {"type":"pose","index":int,"cam_pose":[x,y,z,qx,qy,qz,qw],
+       "residual_mm":float,"accepted":bool}
+        # cam_pose = the CAMERA ORIGIN in the ROBOT BASE frame (renders as a dot)
+
+    On finish: WRITE calibration/hand_eye.yaml + report.md, and RETURN:
+      {"residual_mm":float,"num_poses":int,"accepted":int,"rejected":int,
+       "stereo_ok":bool}
+    """
+```
+
+The operator's *Start* is the motion go-ahead; *Accept* (on convergence)
+advances the gate. Keep `run` importable + side-effect-free at import time (guard
+any `__main__`). If `bridge` is None or a step fails, raise — the Studio surfaces
+it honestly (no fake success).
+
 ## What to calibrate (only what this cell needs)
 
 1. **Camera intrinsics** — skip if factory intrinsics are trustworthy

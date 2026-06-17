@@ -199,6 +199,75 @@ class Handler(BaseHTTPRequestHandler):
                 "signoff": has("setup_report.md"),
             })
             return
+        # The PERSISTED gate state machine — the single source of truth for setup
+        # progress, read by both the Studio (boot hydration; survives refresh /
+        # reconnect / process death) and the agent (on `remoroo setup --continue`,
+        # so it resumes deterministically instead of re-deriving from the repo).
+        state_path = PROJECT / "remoroo_cell" / "setup_state.json"
+        if path == "/project/setup_state" and self.command == "GET":
+            if not state_path.exists():
+                self._json({})  # nothing persisted yet
+                return
+            try:
+                self._json(json.loads(state_path.read_text()))
+            except Exception:
+                self._json({})
+            return
+        if path == "/project/setup_state" and self.command == "PUT":
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            state_path.write_bytes(self.rfile.read(length))
+            self._json({"ok": True, "path": str(state_path)})
+            return
+        # Read REAL artifacts back so a resume/refresh shows actual progress, not an
+        # empty stage: the cuRobo collision spheres + the scanned world cloud.
+        if path == "/project/spheres" and self.command == "GET":
+            f = PROJECT / "remoroo_cell" / "robot_model" / "collision_spheres.yml"
+            if not f.exists():
+                self._json({"spheres": []}); return
+            try:
+                import yaml  # type: ignore
+                data = yaml.safe_load(f.read_text()) or {}
+                cs = (((data.get("robot_cfg") or {}).get("kinematics") or {}).get("collision_spheres")
+                      or data.get("collision_spheres") or {})
+                out = []
+                for link, arr in (cs or {}).items():
+                    for s in (arr or []):
+                        c, r = s.get("center"), s.get("radius")
+                        if c and r is not None and len(c) >= 3:
+                            out.append({"link": link, "center": [float(c[0]), float(c[1]), float(c[2])], "radius": float(r)})
+                self._json({"spheres": out})
+            except Exception as e:  # noqa: BLE001
+                self._json({"spheres": [], "error": str(e)})
+            return
+        if path == "/project/world" and self.command == "GET":
+            # The agent's world/scan.py writes a simple world/cloud.json
+            # ({"points":[[x,y,z],...], "coverage":0.x}) for the Studio to render.
+            f = PROJECT / "remoroo_cell" / "world" / "cloud.json"
+            if not f.exists():
+                self._json({"points": [], "coverage": 0}); return
+            try:
+                self._json(json.loads(f.read_text()))
+            except Exception as e:  # noqa: BLE001
+                self._json({"points": [], "coverage": 0, "error": str(e)})
+            return
+        # The operator's MODEL, persisted at the model gate: overlay robot_model/
+        # robot.urdf + meshes/ into remoroo_cell/ so the agent + cuRobo consume the
+        # complete URDF immediately. Overlay (extractall) — does NOT wipe other
+        # artifacts (calibration/, world/, ...), unlike the full /project/export.
+        if path == "/project/model" and self.command == "POST":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(length)
+            dest = PROJECT / "remoroo_cell"
+            dest.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    zf.extractall(dest)
+            except Exception as e:  # noqa: BLE001
+                self._json({"error": f"bad model bundle: {e}"}, 400)
+                return
+            self._json({"ok": True, "path": str(dest / "robot_model" / "robot.urdf")})
+            return
         if path == "/project/export" and self.command == "POST":
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length)

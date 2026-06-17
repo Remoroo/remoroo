@@ -5,8 +5,25 @@ autonomous moves**, and a **queryable scene**. The gate is *functional*: not a
 sweep count, not a resolution number — *can we plan safe autonomous motion
 against this world?* Take **as many sweeps as it takes**.
 
-Do this after G3 (you may move, slowly, supervised). The operator watches the
-live reconstruction; show frames/clips with `view_image` / `view_video`.
+Do this after calibration (you may move, slowly, supervised). The operator
+watches the live reconstruction in the Studio.
+
+## The Studio integration contract — `world/scan.py`
+
+The Studio's World gate runs YOUR scan live (Start / Re-scan) and renders the
+cloud as it fills. Author `remoroo_cell/world/scan.py` with this **streaming entry
+point** (the edge imports + calls it; same shape as `calibration/collect_poses.py`):
+
+```python
+def run(bridge, cell, on_event=None):
+    """Scan the environment and build the world. Stream as you go (no-op if None):
+      {"type":"status","message":str,"coverage":float}      # coverage in 0..1
+      {"type":"points","xyz":[[x,y,z],...]}                  # NEW points (base frame)
+    Write the cuRobo collision world + scene, AND a simple
+    `world/cloud.json` = {"points":[[x,y,z],...], "coverage":0.x} for the Studio to
+    render on resume. RETURN {"coverage":float,"points":int}. Env only — subtract
+    the arm. Raise on failure (no fake success)."""
+```
 
 > **The world is the ENVIRONMENT ONLY — subtract the arm(s).** Never fuse the
 > robot's own body into the world. cuRobo carries the arm(s) as collision

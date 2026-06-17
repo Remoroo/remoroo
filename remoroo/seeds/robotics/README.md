@@ -149,6 +149,7 @@ for real at G4/G8.
       scan_report.md
     task_spec.md             # task + eval SPEC (operator-approved; NOT code)
     requirements.lock
+    setup_state.json         # AUTHORITATIVE gate state machine — read it on --continue; keep it in lockstep
     setup_report.md          # the readiness card: G0–G8 status + evidence
 ```
 

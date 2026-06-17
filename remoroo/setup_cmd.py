@@ -158,12 +158,15 @@ def setup(
         ),
     ),
     edge: bool = typer.Option(
-        False,
-        "--edge",
+        True,
+        "--edge/--no-edge",
         help=(
-            "Also launch the REAL edge service (server/edge_real.py) for this cell, "
-            "so the studio's gates drive primitives.py + cuRobo instead of the sim. "
-            "Requires cuRobo + the authored remoroo_cell/ on this machine."
+            "Launch the REAL edge service (server/edge_real.py) for this cell so the "
+            "studio's gates drive the live robot — primitives.py + cuRobo + the live "
+            "camera (the calibration/world wizards stream from it). On by default "
+            "(setup runs on the robot computer); --no-edge for a no-hardware machine. "
+            "The edge degrades gracefully and connects the bridge once primitives.py "
+            "is authored (G2)."
         ),
     ),
     edge_url: Optional[str] = typer.Option(

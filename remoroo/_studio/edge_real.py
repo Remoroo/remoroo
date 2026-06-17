@@ -41,19 +41,29 @@ sys.path.insert(0, str(CELL_DIR.parent))
 # --------------------------------------------------------------------------- #
 _bridge = None
 _bridge_err: str | None = None
+_bridge_last_try: float = 0.0
 
 
 def get_bridge():
-    """Construct + connect the cell Bridge once (authored at G2)."""
-    global _bridge, _bridge_err
-    if _bridge is not None or _bridge_err is not None:
+    """Construct + connect the cell Bridge. primitives.py is authored at G2 — i.e.
+    AFTER the edge starts — so we must NOT cache the early failure forever, or the
+    live robot never connects this session. On failure we retry (with a short
+    backoff) so the bridge comes up the moment primitives.py exists / the robot is
+    reachable."""
+    global _bridge, _bridge_err, _bridge_last_try
+    if _bridge is not None:
         return _bridge
+    now = time.time()
+    if _bridge_err is not None and (now - _bridge_last_try) < 3.0:
+        return None  # backoff between retries
+    _bridge_last_try = now
     try:
-        from remoroo_cell.primitives import Bridge  # type: ignore
+        from remoroo_cell.primitives import Bridge  # type: ignore  # re-attempted until authored (G2)
 
         b = Bridge.from_cell_yaml(str(CELL_DIR / "cell.yaml"))
         b.connect()
         _bridge = b
+        _bridge_err = None
     except Exception as e:  # noqa: BLE001
         _bridge_err = f"{type(e).__name__}: {e}"
     return _bridge
@@ -284,21 +294,74 @@ def _delegate_script(rel: str):
     return p if p.exists() else None
 
 
-def sse_calibrate(_q):
-    script = _delegate_script("calibration/collect_poses.py")
+def _run_streaming_script(rel: str, entry_desc: str, _q):
+    """Import an agent-authored script and stream its on_event callbacks as SSE.
+
+    Contract: the script exposes ``run(bridge, cell, on_event=callback) -> result``
+    and calls on_event(dict) per step. We run it on a worker thread and forward
+    each event; the final frame is {done, result}. REAL — drives the live bridge;
+    no simulation. Honest errors when the script isn't authored or doesn't match.
+    """
+    script = _delegate_script(rel)
     if script is None:
-        yield {"done": True, "result": {"error": "calibration/collect_poses.py not authored yet (G5)"}}
+        yield {"done": True, "result": {"error": f"{rel} not authored yet — the agent writes it ({entry_desc})"}}
         return
-    # The authored script owns the autonomous loop; here we just report it must be
-    # run via the cell's runtime. A full integration imports + streams its callback.
-    yield {"done": True, "result": {"error": "run calibration via the cell runtime; live streaming TBD", "script": str(script)}}
+    b = get_bridge()
+    if b is None:
+        yield {"done": True, "result": {"error": _bridge_err or "no bridge connected"}}
+        return
+    import importlib.util
+    import queue
+    import threading
+
+    try:
+        spec = importlib.util.spec_from_file_location(Path(rel).stem, str(script))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    except Exception as e:  # noqa: BLE001
+        yield {"done": True, "result": {"error": f"import {rel} failed: {type(e).__name__}: {e}"}}
+        return
+    if not hasattr(mod, "run"):
+        yield {"done": True, "result": {"error": f"{rel} has no run(bridge, cell, on_event=...) entry"}}
+        return
+
+    q: "queue.Queue" = queue.Queue()
+    SENTINEL = object()
+    cy = load_cell_yaml()
+
+    def worker():
+        try:
+            result = mod.run(b, cy, on_event=q.put)
+            q.put({"type": "done", "result": result or {}})
+        except Exception as e:  # noqa: BLE001
+            q.put({"type": "done", "result": {"error": f"{type(e).__name__}: {e}"}})
+        finally:
+            q.put(SENTINEL)
+
+    threading.Thread(target=worker, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is SENTINEL:
+            break
+        if isinstance(item, dict) and item.get("type") == "done":
+            yield {"done": True, "result": item.get("result", {})}
+        else:
+            yield item  # pose / status events stream straight through
+
+
+def sse_calibrate(_q):
+    """Run the agent's hand-eye routine live and stream pose/residual events.
+    Events: {type:'pose', index, cam_pose:[x,y,z,qx,qy,qz,qw], residual_mm, accepted}
+            {type:'status', message} ; final {done, result:{residual_mm, accepted,
+            rejected, num_poses, stereo_ok}}."""
+    yield from _run_streaming_script("calibration/collect_poses.py", "run(bridge, cell, on_event=...)", _q)
 
 
 def sse_scan(_q):
-    if _delegate_script("world/scan.py") is None:
-        yield {"done": True, "result": {"error": "world/scan.py not authored yet (G4)"}}
-        return
-    yield {"done": True, "result": {"error": "run world scan via the cell runtime; live streaming TBD"}}
+    """Run the agent's world scan live and stream coverage/points events.
+    Events: {type:'points', xyz:[[x,y,z],...]} {type:'status', coverage, message}
+            final {done, result:{coverage, points, scene}}."""
+    yield from _run_streaming_script("world/scan.py", "run(bridge, cell, on_event=...)", _q)
 
 
 def sse_record(q):
