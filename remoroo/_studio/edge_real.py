@@ -310,16 +310,25 @@ def _run_streaming_script(rel: str, entry_desc: str, _q):
     if b is None:
         yield {"done": True, "result": {"error": _bridge_err or "no bridge connected"}}
         return
-    import importlib.util
+    import importlib
     import queue
     import threading
 
+    # Import as a PACKAGE module (remoroo_cell.calibration.collect_poses), NOT a
+    # standalone file: the agent's script reuses siblings (e.g. run.py) via package/
+    # relative imports, which need the package context. Loading it standalone via
+    # spec_from_file_location gives __package__="" → relative import resolves a None
+    # parent → "'NoneType' object has no attribute '__dict__'". CELL_DIR.parent is on
+    # sys.path (see top), so the dotted path imports. Reload to pick up agent edits.
+    modpath = f"{CELL_DIR.name}." + (rel[:-3] if rel.endswith(".py") else rel).replace("/", ".")
     try:
-        spec = importlib.util.spec_from_file_location(Path(rel).stem, str(script))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        mod = importlib.import_module(modpath)
+        try:
+            mod = importlib.reload(mod)
+        except Exception:
+            pass  # a reload glitch shouldn't break an otherwise-good import
     except Exception as e:  # noqa: BLE001
-        yield {"done": True, "result": {"error": f"import {rel} failed: {type(e).__name__}: {e}"}}
+        yield {"done": True, "result": {"error": f"import {modpath} failed: {type(e).__name__}: {e}"}}
         return
     if not hasattr(mod, "run"):
         yield {"done": True, "result": {"error": f"{rel} has no run(bridge, cell, on_event=...) entry"}}
