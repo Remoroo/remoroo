@@ -62,6 +62,33 @@ def _repo() -> Optional[Studio]:
     return None
 
 
+def _stable_token(project_dir: Path) -> str:
+    """A STABLE per-project Studio token, persisted outside the repo.
+
+    The token was random per launch (`secrets.token_hex`), so every `remoroo
+    setup` restart minted a new one and silently invalidated the remote operator's
+    open browser tab/bookmark — the SPA still loaded (static is unauthenticated)
+    but every /project write 401'd ("couldn't save the model"). A stable token
+    keeps the operator's URL working across restarts.
+    """
+    import hashlib
+
+    key = hashlib.sha1(str(Path(project_dir).resolve()).encode()).hexdigest()[:16]
+    cache = Path.home() / ".cache" / "remoroo" / "studio_tokens"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        f = cache / key
+        if f.exists():
+            t = f.read_text().strip()
+            if t:
+                return t
+        t = secrets.token_hex(8)
+        f.write_text(t)
+        return t
+    except Exception:
+        return secrets.token_hex(8)  # never block launch on token persistence
+
+
 def find_studio() -> Optional[Studio]:
     return _bundled() or _repo()
 
@@ -176,7 +203,7 @@ def serve_studio(project_dir: Path, port: int = 7777, token: Optional[str] = Non
         return False
     project_dir = Path(project_dir).resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
-    token = token or secrets.token_hex(8)
+    token = token or _stable_token(project_dir)
     edge_proc = None
     if spawn_edge and not edge_url:
         edge_proc, edge_url = _start_edge(studio, project_dir, echo)
@@ -231,7 +258,7 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
         echo(f"❌ Could not start the run: {exc.message}")
         return False
 
-    token = secrets.token_hex(8)
+    token = _stable_token(project_dir)
     edge_proc = None
     if spawn_edge and not edge_url:
         edge_proc, edge_url = _start_edge(studio, project_dir, echo)
