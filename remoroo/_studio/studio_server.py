@@ -297,6 +297,34 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self._json({"spheres": [], "error": str(e)})
             return
+        # Serve the PERSISTED model (robot_model/robot.urdf) + its meshes so the
+        # studio can AUTOLOAD the full geometry from the repo on reopen — instead
+        # of losing the URDF/meshes (blobs are in-browser only).
+        if path == "/project/modelurdf" and self.command == "GET":
+            f = PROJECT / "remoroo_cell" / "robot_model" / "robot.urdf"
+            if not f.exists():
+                self._json({"error": "no model"}, 404); return
+            text = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(text)))
+            self.end_headers(); self.wfile.write(text); return
+        if path == "/project/meshlist" and self.command == "GET":
+            mdir = PROJECT / "remoroo_cell" / "meshes"
+            files = sorted(p.name for p in mdir.glob("*") if p.is_file()) if mdir.exists() else []
+            self._json({"meshes": files}); return
+        if path == "/project/mesh" and self.command == "GET":
+            safe = Path((query.get("name") or [""])[0]).name  # basename only — no traversal
+            f = PROJECT / "remoroo_cell" / "meshes" / safe
+            if not safe or not f.exists() or not f.is_file():
+                self.send_response(404); self.end_headers(); return
+            data = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", MIME.get(f.suffix, "application/octet-stream"))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers(); self.wfile.write(data); return
         if path == "/project/world" and self.command == "GET":
             # The agent's world/scan.py writes a simple world/cloud.json
             # ({"points":[[x,y,z],...], "coverage":0.x}) for the Studio to render.

@@ -148,8 +148,42 @@ def _python() -> Optional[str]:
     return sys.executable or shutil.which("python3") or shutil.which("python")
 
 
+def _edge_python(echo: Echo) -> tuple[str, bool]:
+    """Pick the interpreter to run the REAL edge (edge_real.py + the agent's
+    primitives.py / collect_poses.py / cuRobo). This is NOT the CLI's interpreter:
+    `remoroo` is usually a uv-tool isolated venv WITHOUT numpy/cuRobo/the robot
+    SDKs, so running the edge there fails ('No module named numpy'). We pick the
+    ROBOTICS python: REMOROO_EDGE_PYTHON if set (trusted), else the first candidate
+    that can `import numpy`. Returns (python, numpy_ok)."""
+    import subprocess as sp
+
+    explicit = os.environ.get("REMOROO_EDGE_PYTHON")
+    if explicit:
+        ok = False
+        try:
+            ok = sp.run([explicit, "-c", "import numpy"], capture_output=True, timeout=20).returncode == 0
+        except Exception:
+            ok = False
+        return explicit, ok
+
+    venv = os.environ.get("VIRTUAL_ENV")
+    candidates = [
+        sys.executable,
+        (str(Path(venv) / "bin" / "python") if venv else None),
+        shutil.which("python3"),
+        shutil.which("python"),
+    ]
+    for c in dict.fromkeys([x for x in candidates if x]):
+        try:
+            if sp.run([c, "-c", "import numpy"], capture_output=True, timeout=20).returncode == 0:
+                return c, True
+        except Exception:
+            continue
+    return (sys.executable or "python3"), False
+
+
 def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional[subprocess.Popen], str]:
-    py = _python()
+    py, numpy_ok = _edge_python(echo)
     if not py:
         echo("python not found — can't launch the real edge; the gates needing it will show 'edge not connected'.")
         return None, ""
@@ -157,7 +191,10 @@ def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional
     env = dict(os.environ)
     env.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell")})
     proc = subprocess.Popen([py, str(studio.edge_py)], env=env)
-    echo(f"Started the real edge (edge_real.py) on :{eport} — live joints + cuRobo.")
+    echo(f"Started the real edge (edge_real.py) on :{eport} using {py}")
+    if not numpy_ok:
+        echo("  ⚠ that python has NO numpy — calibration/world/cuRobo will fail with import errors.")
+        echo("    Set REMOROO_EDGE_PYTHON=/path/to/your/robotics/python (the env with numpy + cuRobo + the robot SDKs) and re-run.")
     return proc, f"http://127.0.0.1:{eport}"
 
 
