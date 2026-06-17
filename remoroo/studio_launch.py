@@ -150,35 +150,46 @@ def _python() -> Optional[str]:
 
 def _edge_python(echo: Echo) -> tuple[str, bool]:
     """Pick the interpreter to run the REAL edge (edge_real.py + the agent's
-    primitives.py / collect_poses.py / cuRobo). This is NOT the CLI's interpreter:
-    `remoroo` is usually a uv-tool isolated venv WITHOUT numpy/cuRobo/the robot
-    SDKs, so running the edge there fails ('No module named numpy'). We pick the
-    ROBOTICS python: REMOROO_EDGE_PYTHON if set (trusted), else the first candidate
-    that can `import numpy`. Returns (python, numpy_ok)."""
+    primitives.py / collect_poses.py / cuRobo). This is NOT the CLI's own
+    interpreter: `remoroo` is usually a uv-tool isolated venv WITHOUT numpy/cuRobo/
+    the robot SDKs, so the edge fails there ('No module named numpy').
+
+    We use the env `remoroo setup` was LAUNCHED FROM, automatically — captured by
+    CONDA_PREFIX / VIRTUAL_ENV (these survive even though `remoroo` is a uv-tool).
+    Priority: REMOROO_EDGE_PYTHON (explicit) → the first candidate that can
+    `import numpy` (the activated robotics env, normally) → the launched-from env
+    even if numpy isn't found (with a warning). Returns (python, numpy_ok)."""
     import subprocess as sp
+
+    def has_numpy(p: str) -> bool:
+        try:
+            return sp.run([p, "-c", "import numpy"], capture_output=True, timeout=20).returncode == 0
+        except Exception:
+            return False
 
     explicit = os.environ.get("REMOROO_EDGE_PYTHON")
     if explicit:
-        ok = False
-        try:
-            ok = sp.run([explicit, "-c", "import numpy"], capture_output=True, timeout=20).returncode == 0
-        except Exception:
-            ok = False
-        return explicit, ok
+        return explicit, has_numpy(explicit)
 
+    conda = os.environ.get("CONDA_PREFIX")
     venv = os.environ.get("VIRTUAL_ENV")
+    # Ordered: the activated env (what you launched from) first, then PATH, then the
+    # CLI's own interpreter as a last resort.
     candidates = [
-        sys.executable,
+        (str(Path(conda) / "bin" / "python") if conda else None),
         (str(Path(venv) / "bin" / "python") if venv else None),
         shutil.which("python3"),
         shutil.which("python"),
+        sys.executable,
     ]
-    for c in dict.fromkeys([x for x in candidates if x]):
-        try:
-            if sp.run([c, "-c", "import numpy"], capture_output=True, timeout=20).returncode == 0:
-                return c, True
-        except Exception:
-            continue
+    ordered = [p for p in dict.fromkeys(candidates) if p]
+    for p in ordered:
+        if has_numpy(p):
+            return p, True
+    # None have numpy → prefer the launched-from env (not the uv-tool python) + warn.
+    for p in ordered:
+        if p != sys.executable:
+            return p, False
     return (sys.executable or "python3"), False
 
 
