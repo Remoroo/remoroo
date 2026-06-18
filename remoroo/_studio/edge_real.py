@@ -60,6 +60,16 @@ def _safety_spine_module():
             self.max_joint_speed_frac = max_joint_speed_frac
             self.bounds_min = bounds_min
             self.bounds_max = bounds_max
+            self.estopped = False        # E-stop STATE the cell's primitives.py reads/writes
+
+        def estop(self):
+            self.estopped = True
+
+        def reset_estop(self):
+            self.estopped = False
+
+        def is_estopped(self):
+            return bool(self.estopped)
 
         @classmethod
         def from_cell(cls, cell):

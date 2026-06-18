@@ -37,6 +37,18 @@ class SafetySupervisor:
     max_joint_speed_frac: float
     bounds_min: np.ndarray
     bounds_max: np.ndarray
+    # E-stop STATE — part of the safety contract a cell's primitives.py reads/writes
+    # (`self.safety.estopped`) to gate motion. Defaults disengaged.
+    estopped: bool = False
+
+    def estop(self) -> None:
+        self.estopped = True
+
+    def reset_estop(self) -> None:
+        self.estopped = False
+
+    def is_estopped(self) -> bool:
+        return bool(self.estopped)
 
     @classmethod
     def from_cell(cls, cell: Dict[str, Any]) -> "SafetySupervisor":
