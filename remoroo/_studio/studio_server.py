@@ -260,12 +260,19 @@ class Handler(BaseHTTPRequestHandler):
         # so it resumes deterministically instead of re-deriving from the repo).
         state_path = PROJECT / "remoroo_cell" / "setup_state.json"
         if path == "/project/setup_state" and self.command == "GET":
+            # [RESUME-DEBUG] Is there a setup_state.json on disk at boot? This is the same
+            # file the AGENT reads, so it tells us whether a "fresh" folder really has a
+            # persisted state machine — and what it claims.
             if not state_path.exists():
+                print(f"[RESUME-DEBUG] GET setup_state: NO FILE at {state_path} → returning {{}} (fresh)", flush=True)
                 self._json({})  # nothing persisted yet
                 return
             try:
-                self._json(json.loads(state_path.read_text()))
-            except Exception:
+                raw = state_path.read_text()
+                print(f"[RESUME-DEBUG] GET setup_state: FILE EXISTS at {state_path} ({len(raw)} bytes): {raw[:600]}", flush=True)
+                self._json(json.loads(raw))
+            except Exception as _e:
+                print(f"[RESUME-DEBUG] GET setup_state: FILE EXISTS but unreadable ({_e})", flush=True)
                 self._json({})
             return
         if path == "/project/setup_state" and self.command in ("PUT", "POST"):
@@ -273,7 +280,12 @@ class Handler(BaseHTTPRequestHandler):
             # can persist the final state when the operator closes the tab.
             state_path.parent.mkdir(parents=True, exist_ok=True)
             length = int(self.headers.get("Content-Length", "0") or 0)
-            state_path.write_bytes(self.rfile.read(length))
+            body = self.rfile.read(length)
+            # [RESUME-DEBUG] Who WRITES the state machine, and with what gates? If a fresh
+            # boot writes done gates, the writer (the studio's snapshot) is the culprit.
+            existed = state_path.exists()
+            print(f"[RESUME-DEBUG] {self.command} setup_state: writing {len(body)} bytes (file existed={existed}): {body[:600].decode('utf-8','replace')}", flush=True)
+            state_path.write_bytes(body)
             self._json({"ok": True, "path": str(state_path)})
             return
         # Read REAL artifacts back so a resume/refresh shows actual progress, not an
