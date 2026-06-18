@@ -311,10 +311,16 @@ class Handler(BaseHTTPRequestHandler):
                 body_run = payload.get("run_id")
             except Exception:
                 payload, body_run = None, None
-            if RUN_ID and body_run and body_run != RUN_ID:
-                print(f"[RESUME-DEBUG] REJECTED setup_state write from STALE run {body_run} "
-                      f"(current run is {RUN_ID}) — this is the phantom-resume source", flush=True)
-                self._json({"ok": False, "rejected": "stale_run", "current": RUN_ID}, 409)
+            # Require the CURRENT run's id. Reject mismatches AND writes with no run_id —
+            # the latter are stale tabs running the pre-fix SPA (the bug's real source:
+            # old browser tabs from prior `remoroo setup` runs, reconnecting + persisting
+            # their old run's gates into this run's shared state file). Only the live run
+            # may write; if no live-run tab is open, the file stays absent → agent sees fresh.
+            if RUN_ID and body_run != RUN_ID:
+                why = "stale_run" if body_run else "no_run_id(pre-fix tab)"
+                print(f"[RESUME-DEBUG] REJECTED setup_state write ({why}) body_run={body_run} "
+                      f"current={RUN_ID} — blocked phantom-resume pollution", flush=True)
+                self._json({"ok": False, "rejected": why, "current": RUN_ID}, 409)
                 return
             global _LAST_SETUP_DBG
             gates_now = _json.dumps((payload or {}).get("gates"), sort_keys=True) if payload else body[:80].decode("utf-8", "replace")
@@ -426,6 +432,22 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         return u.path, parse_qs(u.query)
 
+    def _stale_run(self, p: str) -> bool:
+        """In setup mode this studio server is pinned to ONE run (RUN_ID). A request for a
+        DIFFERENT run's /runs/<id>/… is a STALE browser tab from a prior `remoroo setup`
+        (still open, reconnecting, streaming its old run, polluting this run's state). Refuse
+        it so stale tabs can't drive or corrupt the live run. Run CREATION is done by the CLI,
+        never the SPA, so the SPA only ever addresses RUN_ID here."""
+        if not RUN_ID or not p.startswith("/runs/"):
+            return False
+        parts = p.split("/")  # ['', 'runs', '<id>', ...]
+        rid = parts[2] if len(parts) > 2 else ""
+        if rid and rid != RUN_ID:
+            print(f"[RESUME-DEBUG] REFUSED stale-run proxy {self.command} {p} (run {rid} ≠ live {RUN_ID})", flush=True)
+            self._json({"error": "stale run — this studio is bound to a different run", "current": RUN_ID}, 409)
+            return True
+        return False
+
     def do_GET(self):
         p, q = self._route()
         if p == "/health":
@@ -441,6 +463,8 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/live/joints" or p.startswith("/edge/"):
             self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "edge not connected"}, 501)
         elif p.startswith("/runs/") or p.startswith("/agent/"):
+            if self._stale_run(p):
+                return
             self._proxy(BRAIN_URL, SESSION_KEY) if BRAIN_URL else self._json({"error": "no control plane"}, 501)
         elif p.startswith("/project/"):
             self._project(p, q)
@@ -450,6 +474,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         p, q = self._route()
         if p.startswith("/runs/") or p.startswith("/agent/"):
+            if self._stale_run(p):
+                return
             self._proxy(BRAIN_URL, SESSION_KEY) if BRAIN_URL else self._json({"error": "no control plane"}, 501)
         elif p.startswith("/edge/"):
             self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "edge not connected"}, 501)
