@@ -187,7 +187,7 @@ class CalibSession:
             if q0[j] + step > hi - 1e-3:        # near the upper limit → nudge down instead
                 step = -abs(delta)
             target = float(np.clip(q0[j] + step, lo, hi))
-            step = target - q0[j]
+            step = float(target - q0[j])     # q0[j] is np.float64 → keep step a python float
         q1 = q0.copy()
         q1[j] += step
         self.bridge.move_to_joints(q1)
@@ -197,7 +197,7 @@ class CalibSession:
         max_err = float(np.max(np.abs(obs - cmd)))
         estop = bool(self.bridge.estop_ok())
         # need a real commanded motion (a clamped-to-zero nudge can't prove anything)
-        self.motion_ok = (max_err < tol) and estop and (abs(step) > 1e-4)
+        self.motion_ok = bool((max_err < tol) and estop and (abs(step) > 1e-4))
         return {"type": "motion_check", "ok": self.motion_ok, "max_err_rad": round(max_err, 5),
                 "joint": j, "estop_ok": estop, "commanded": _T(cmd), "observed": _T(obs)}
 

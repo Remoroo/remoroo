@@ -1003,6 +1003,21 @@ ROUTES = {
 }
 
 
+def _json_default(o):
+    """Make numpy scalars/arrays JSON-serializable (the engine returns them); the stock
+    encoder raises `Object of type bool_ is not JSON serializable` otherwise."""
+    import numpy as np
+    if isinstance(o, np.bool_):
+        return bool(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quieter
         pass
@@ -1052,7 +1067,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(405); self._cors(); self.end_headers()
 
     def _serve_json(self, obj):
-        data = json.dumps(obj).encode("utf-8")
+        # The engine is numpy-heavy, so a result can carry np.bool_/np.float64/np.ndarray that
+        # the stock json encoder rejects. Serialize numpy at THIS boundary (where JSON-ness is
+        # owned), not by hand-casting every field in 20 verbs. And NEVER let a dumps failure
+        # raise out of the handler — a dead handler thread drops the socket → the studio proxy
+        # reports 502. On failure, return an honest {error} the UI can show.
+        try:
+            data = json.dumps(obj, default=_json_default).encode("utf-8")
+        except Exception as e:  # noqa: BLE001
+            data = json.dumps({"error": f"serialization failed: {type(e).__name__}: {e}"}).encode("utf-8")
         self.send_response(200); self.send_header("Content-Type", "application/json"); self._cors()
         self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
 
