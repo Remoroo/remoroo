@@ -516,8 +516,13 @@ class RealBridge:
         for n in self.joint_names:
             if n not in jp:
                 raise RuntimeError(f"joint {n!r} not in observation.joint_positions")
-            v = jp[n]
-            out.append(float(v[0]) if hasattr(v, "__len__") else float(v))
+            # The cell may report a joint as a scalar, a 0-d array (np.array(0.5)), or a 1-d
+            # array ([0.5]) — all valid. `reshape(-1)` flattens every case; a 0-d array has
+            # __len__ but NO `[0]`, which is what crashed before.
+            arr = np.asarray(jp[n], float).reshape(-1)
+            if arr.size == 0:
+                raise RuntimeError(f"joint {n!r} has an empty value in observation.joint_positions")
+            out.append(float(arr[0]))
         return np.asarray(out, float)
 
     def read_pose(self):
