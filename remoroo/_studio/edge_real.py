@@ -37,21 +37,80 @@ PORT = int(os.environ.get("EDGE_PORT", "7779"))
 sys.path.insert(0, str(CELL_DIR.parent))
 
 
-def _ensure_safety_shim_resolves() -> None:
-    """The cell's primitives.py imports its safety/transport spine from `remoroo.edge`
-    (shipped), with a `safety_shim` fallback. A cell that's missing its local shim — or that
-    was authored with a bare `import safety_shim` — used to fail HARD ("No module named
-    'safety_shim'") and take the whole Bridge (hence calibration + the live camera feed) down.
-    Pre-register the shipped spine under BOTH the bare and package-qualified shim names so the
-    Bridge imports regardless of how the fallback was written."""
-    if "safety_shim" in sys.modules:
-        return
+def _safety_spine_module():
+    """The safety/transport spine the cell Bridge imports — prefer the shipped `remoroo.edge`,
+    else a SELF-CONTAINED inline copy so this works even when run from the working tree without
+    the `remoroo` package installed (no external dependency)."""
     try:
-        from remoroo import edge as _spine  # the shipped spine (remoroo/edge.py)
-    except Exception:  # noqa: BLE001 — working-tree run without the installed package
-        return
-    sys.modules.setdefault("safety_shim", _spine)
-    sys.modules.setdefault(f"{CELL_DIR.name}.safety_shim", _spine)
+        from remoroo import edge as spine  # shipped spine (remoroo/edge.py), if importable
+        return spine
+    except Exception:  # noqa: BLE001 — build the inline fallback below
+        pass
+    import types as _types
+    import json as _json
+    import time as _time
+    from pathlib import Path as _Path
+    import numpy as _np
+
+    mod = _types.ModuleType("safety_shim")
+
+    class SafetySupervisor:  # plain class (no @dataclass — robust under any module load context)
+        def __init__(self, max_cartesian_speed_mps, max_joint_speed_frac, bounds_min, bounds_max):
+            self.max_cartesian_speed_mps = max_cartesian_speed_mps
+            self.max_joint_speed_frac = max_joint_speed_frac
+            self.bounds_min = bounds_min
+            self.bounds_max = bounds_max
+
+        @classmethod
+        def from_cell(cls, cell):
+            s = cell.get("safety", {}) or {}
+            w = (cell.get("workspace") or {}).get("bounds_m", {}) or {}
+            return cls(float(s.get("max_cartesian_speed_mps", 0.10)),
+                       float(s.get("max_joint_speed_frac", 0.10)),
+                       _np.asarray(w.get("min", [-0.5, -0.5, 0.0]), float),
+                       _np.asarray(w.get("max", [0.5, 0.5, 0.8]), float))
+
+        def clamp_speed(self, frac):
+            f = self.max_joint_speed_frac if frac is None else min(frac, self.max_joint_speed_frac)
+            return max(0.0, f)
+
+        def joints_within_limits(self, arm, q):
+            return bool(_np.all(_np.isfinite(q)))
+
+        def point_in_bounds(self, xyz):
+            xyz = _np.asarray(xyz, float)
+            return bool(_np.all(xyz >= self.bounds_min) and _np.all(xyz <= self.bounds_max))
+
+        def trajectory_ok(self, arm, plan):
+            pts = getattr(plan, "cartesian_waypoints", None)
+            return True if pts is None else all(self.point_in_bounds(_np.asarray(p, float)) for p in pts)
+
+    class EpisodeWriter:
+        def __init__(self, out_dir):
+            self.dir = _Path(out_dir); self.dir.mkdir(parents=True, exist_ok=True); self._frames = []
+
+        def add(self, **frame):
+            self._frames.append({"t": _time.time(), **frame})
+
+        def close(self):
+            (self.dir / "meta.json").write_text(_json.dumps({"schema": "remoroo_episode_v1",
+                                                             "n_frames": len(self._frames)}, indent=2))
+            return self.dir
+
+    mod.SafetySupervisor = SafetySupervisor
+    mod.EpisodeWriter = EpisodeWriter
+    return mod
+
+
+def _ensure_safety_shim_resolves() -> None:
+    """The cell's primitives.py imports its safety/transport spine from `remoroo.edge` (shipped)
+    with a `safety_shim` fallback. A cell missing its local shim — or authored with a bare
+    `import safety_shim` — used to fail HARD ("No module named 'safety_shim'") and take the whole
+    Bridge (hence calibration + the live camera feed) down. Pre-register the spine under BOTH the
+    bare and package-qualified shim names so the Bridge imports regardless of how it was written."""
+    spine = _safety_spine_module()
+    sys.modules.setdefault("safety_shim", spine)
+    sys.modules.setdefault(f"{CELL_DIR.name}.safety_shim", spine)
 
 
 _ensure_safety_shim_resolves()
