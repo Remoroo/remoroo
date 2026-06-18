@@ -161,7 +161,7 @@ def load_cell_yaml() -> dict:
     try:
         import yaml  # type: ignore
 
-        return yaml.safe_load((CELL_DIR / "cell.yaml").read_text()) or {}
+        return yaml.safe_load((CELL_DIR / "cell.yaml").read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
 
@@ -209,7 +209,7 @@ def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
 
     rm = CELL_DIR / "robot_model"
     rm.mkdir(parents=True, exist_ok=True)
-    (rm / "robot.urdf").write_text(urdf_text)
+    (rm / "robot.urdf").write_text(urdf_text, encoding="utf-8")
 
     by_link: dict[str, list[dict]] = {}
     for s in spheres:
@@ -225,7 +225,7 @@ def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
         }
     }
     out = rm / "collision_spheres.yml"
-    out.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    out.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     return out
 
 
@@ -687,7 +687,7 @@ def _load_pipeline(cy: dict, cal: dict, urdf_path: str):
     pf = CELL_DIR / "calibration" / "pipeline.yaml"
     if pf.exists():
         import yaml  # type: ignore
-        spec = yaml.safe_load(pf.read_text()) or {}
+        spec = yaml.safe_load(pf.read_text(encoding="utf-8")) or {}
         psteps, tspecs = pipeline.parse(spec)
         urdf_cams = urdf_io.find_camera_links(urdf_path) if os.path.exists(urdf_path) else []
         cell_cams = [str(c.get("name") or c.get("id") or "") for c in (cy.get("cameras") or [])]
@@ -800,7 +800,7 @@ def _calib_set_target(spec: dict) -> dict:
     cal["target"] = spec
     cal.pop("board", None)                       # the open target supersedes the legacy board
     cy["calibration"] = cal
-    (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False))
+    (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False), encoding="utf-8")
 
     if _CALIB is not None:
         _import_authored_targets()
@@ -923,7 +923,7 @@ def _pipeline_for_ui() -> dict:
     pf = CELL_DIR / "calibration" / "pipeline.yaml"
     if pf.exists():
         import yaml  # type: ignore
-        spec = yaml.safe_load(pf.read_text()) or {}
+        spec = yaml.safe_load(pf.read_text(encoding="utf-8")) or {}
         psteps, tspecs = pipeline.parse(spec)
         urdf_cams = urdf_io.find_camera_links(urdf_path)
         cell_cams = [str(c.get("name") or c.get("id") or "") for c in (cy.get("cameras") or [])]

@@ -530,7 +530,7 @@ def _write_calib_json(calib_dir: str, camera: str, result: CalibResult, provenan
         "board_scale": round(float(result.board_scale), 6),
         "residual_px": round(float(result.residual_px), 4),
         "t_lr_err_deg": result.t_lr_err_deg, "samples_used": result.samples_used,
-    }, indent=2))
+    }, indent=2), encoding="utf-8")
     return dst
 
 
@@ -592,5 +592,5 @@ class BaseToBaseSession:
             "kind": "base_to_base", "T_base_to_base": _T(self.result),
             "arm_a": self.item.partner_camera, "arm_b": self.item.secondary_camera,
             "captures": len(self.obs),
-        }, indent=2))
+        }, indent=2), encoding="utf-8")
         return {"type": "b2b_accept", "path": dst, "T_base_to_base": _T(self.result)}

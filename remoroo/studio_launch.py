@@ -200,7 +200,11 @@ def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional
         return None, ""
     eport = os.environ.get("EDGE_PORT", "7779")
     env = dict(os.environ)
-    env.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell")})
+    # Force UTF-8 for the edge subprocess: a robot with an ascii/C locale otherwise makes
+    # Path.read_text()/open() default to ascii, which crashes on any non-ascii byte in
+    # cell.yaml / pipeline.yaml / the agent's code (e.g. a "—" in a comment → 0xe2).
+    env.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell"),
+                "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
     proc = subprocess.Popen([py, str(studio.edge_py)], env=env)
     echo(f"Started the real edge (edge_real.py) on :{eport} using {py}")
     if not numpy_ok:
@@ -266,7 +270,8 @@ def serve_studio(project_dir: Path, port: int = 7777, token: Optional[str] = Non
     if spawn_edge and not edge_url:
         edge_proc, edge_url = _start_edge(studio, project_dir, echo)
     env = dict(os.environ)
-    env.update({"PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist), "STUDIO_VERSION": _pkg_version()})
+    env.update({"PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist),
+                "STUDIO_VERSION": _pkg_version(), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
     if edge_url:
         env["EDGE_URL"] = edge_url
     if brain_url:
