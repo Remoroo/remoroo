@@ -47,6 +47,24 @@ def default_chain() -> Chain:
     return Chain(origins, axes)
 
 
+def seven_dof_chain() -> Chain:
+    """A 7-DOF redundant arm — proves the engine makes no '6 joints' assumption (the gauge
+    rule estimates interior joints 1..J-2 for whatever J the URDF gives)."""
+    origins = [make_T(np.eye(3), [0, 0, 0.13]) for _ in range(7)]
+    axes = [[0, 0, 1], [0, 1, 0], [0, 1, 0], [0, 0, 1], [0, 1, 0], [0, 0, 1], [0, 1, 0]]
+    return Chain(origins, axes)
+
+
+def prismatic_chain() -> Chain:
+    """A gantry-style chain: two PRISMATIC axes (x, z) + four revolute wrist joints. Proves
+    the FK + solver are joint-TYPE agnostic (Chain.fk translates along a prismatic axis), not
+    'revolute arm' only."""
+    origins = [make_T(np.eye(3), [0, 0, 0.12]) for _ in range(6)]
+    axes = [[1, 0, 0], [0, 0, 1], [0, 0, 1], [0, 1, 0], [0, 1, 0], [0, 0, 1]]
+    types = ["prismatic", "prismatic", "revolute", "revolute", "revolute", "revolute"]
+    return Chain(origins, axes, types=types)
+
+
 def default_board(rows: int = 5, cols: int = 7, square: float = 0.03) -> BoardModel:
     xs = (np.arange(cols) - (cols - 1) / 2.0) * square
     ys = (np.arange(rows) - (rows - 1) / 2.0) * square

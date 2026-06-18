@@ -8,20 +8,23 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+# The fiducial abstraction lives in `fiducials/` (a Target = named 3D points + a detector +
+# min_points). The engine codes against `Target`; `BoardModel` is a thin back-compat
+# constructor for checkerboard-style targets so synth + older call sites keep working.
+from .fiducials.base import FiducialDetector, Target  # noqa: F401  (re-exported)
 
-@dataclass
-class BoardModel:
-    """A planar target. `points` are the 3D corner coordinates in the board frame
-    (z=0), indexed by corner id; `scale` is a multiplicative correction (1.0 = trust
-    the printed size) the solver can refine."""
-    points: np.ndarray            # (N, 3), board frame, z=0
-    rows: int = 0
-    cols: int = 0
-    square_m: float = 0.0
 
-    @property
-    def n(self) -> int:
-        return int(self.points.shape[0])
+class BoardModel(Target):
+    """Back-compat: a checkerboard-style planar target built from (points, rows, cols,
+    square). New code builds Targets via `calib_engine.fiducials.build_target`. `min_points`
+    defaults to 6 (a board view needs several corners); a single-marker target sets 4."""
+
+    def __init__(self, points: np.ndarray, rows: int = 0, cols: int = 0, square_m: float = 0.0,
+                 *, min_points: int = 6, detector: Optional[FiducialDetector] = None,
+                 planar: bool = True):
+        super().__init__(point_xyz=points, detector=detector, min_points=int(min_points),
+                         planar=planar, type="board")
+        self.rows, self.cols, self.square_m = int(rows), int(cols), float(square_m)
 
 
 @dataclass
@@ -69,6 +72,14 @@ class PlanItem:
     # shared-marker views recover the transform between their arms' bases.
     partner_camera: str = ""
     secondary_camera: str = ""
+    # ── authored-pipeline fields (set when the agent authored the step; see pipeline.py) ──
+    # `id` is the step's stable id (deps + the Studio rail key); defaults to camera_link.
+    # `target_id` selects which named Target this step binds (a pipeline may use several).
+    # `depends_on` are the step ids that must be ACCEPTED before this one can run (e.g. a
+    # base_to_base step depends on its two eye-in-hand steps). Empty for an auto-derived plan.
+    id: str = ""
+    target_id: str = ""
+    depends_on: List[str] = field(default_factory=list)
 
 
 @dataclass

@@ -111,16 +111,16 @@ capture:                              # the data-capture target (Phase 2/6)
   est_gb_per_hour: 40
 
 calibration:                          # Phase 5/G5 — input to the SHIPPED calib engine
-  board:                              # the ONE input not in the URDF — READ IT OFF THE
-                                      # PRINTED BOARD. The values below are a PLACEHOLDER
-                                      # EXAMPLE, not a measurement: do NOT ship them
-                                      # unconfirmed. Get the real type/size from the
-                                      # operator (ask_human) or the Studio board form.
-    dict: "DICT_5X5_1000"             # ArUco dictionary printed on the board (EXAMPLE)
-    squares_x: 7                      # ChArUco columns (EXAMPLE)
-    squares_y: 5                      # ChArUco rows (EXAMPLE)
-    square_len: 0.030                 # square side, METRES (EXAMPLE)
-    marker_len: 0.022                 # marker side, METRES (EXAMPLE)
+  target:                             # the printed target — an OPEN spec (NOT ChArUco-only).
+                                      # `type` selects a shipped detector (single_aruco |
+                                      # charuco | apriltag | aruco_grid | checkerboard) or a
+                                      # custom one in calibration/targets.py. The values are a
+                                      # PLACEHOLDER EXAMPLE — confirm the real type/size with
+                                      # the operator (ask_human) or the Studio target form.
+    type: "single_aruco"              # EXAMPLE — what the operator actually printed
+    params: { dict: "DICT_4X4_50", id: 7, size_m: 0.075 }
+  # The STEPS are authored separately in calibration/pipeline.yaml (which targets each step
+  # binds, in dependency order). cell.yaml.target is the single default the Studio form edits.
   accept_heldout_px: 1.5              # accept gate: held-out reprojection (tunable)
   accept_tip_mm: 3.0                  # accept gate: physical tip-landing (tunable)
   # Intrinsics are read LIVE from the camera SDK (obs.intrinsics) — NOT set here.

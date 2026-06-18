@@ -8,13 +8,14 @@ One calibration at a time (the gate is supervised, one item after another — F2
 """
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
+from . import steps
 from .geometry import Chain
 from .session import BaseToBaseSession, CalibSession, build_plan
-from .types import BoardModel, CalibResult, PlanItem
+from .types import BoardModel, CalibResult, PlanItem, Target
 
 
 def _planitem_json(p: PlanItem) -> dict:
@@ -22,6 +23,10 @@ def _planitem_json(p: PlanItem) -> dict:
             "kind": p.kind, "flange_link": p.flange_link, "arm": p.arm,
             "board_source": p.board_source,
             "partner_camera": p.partner_camera, "secondary_camera": p.secondary_camera,
+            # authored-pipeline identity: the step id (rail key + dep target), which named
+            # target it binds, and the step ids that must be accepted before it can run.
+            "id": p.id or p.camera_link, "target_id": p.target_id,
+            "depends_on": list(p.depends_on),
             # the camera's NOMINAL flange->optical (from the URDF) — the "before" pose the
             # stage slides FROM as calibration refines it toward the solved X.
             "nominal_T": np.asarray(p.nominal_T, float).round(6).tolist()}
@@ -42,6 +47,9 @@ class CalibService:
         calib_dir: Optional[str] = None,
         accept_heldout_px: float = 1.5,
         accept_tip_mm: float = 3.0,
+        plan_items: Optional[List[PlanItem]] = None,
+        targets: Optional[Dict[str, Target]] = None,
+        intrinsics: Optional[Dict[str, tuple]] = None,
     ):
         self.urdf_path = urdf_path
         self.board = board
@@ -55,35 +63,50 @@ class CalibService:
         # accept gate from cell.yaml (the operator's tuned thresholds), not a hardcoded default
         self.accept_heldout_px = accept_heldout_px
         self.accept_tip_mm = accept_tip_mm
+        # The AUTHORED pipeline (resolved PlanItems + named Targets), injected by the edge.
+        # When absent (older tests), fall back to deriving the plan from the URDF. The engine
+        # consumes the agent's steps; it does not guess them when they're authored.
+        self._authored: Optional[List[PlanItem]] = list(plan_items) if plan_items else None
+        self.targets: Dict[str, Target] = dict(targets or {})
+        # Per-camera (K, wh): a multi-camera rig solves each camera with ITS OWN intrinsics.
+        self.intrinsics: Dict[str, tuple] = dict(intrinsics or {})
         self.plan_items: List[PlanItem] = []
         self.session: Optional[CalibSession] = None
         self.b2b: Optional[BaseToBaseSession] = None
         self.accepted: dict = {}   # camera_link -> CalibResult (this Studio session)
 
+    def _resolve_plan(self) -> List[PlanItem]:
+        """The authored pipeline if the agent provided one, else the URDF-derived fallback."""
+        return list(self._authored) if self._authored is not None else build_plan(self.urdf_path)
+
     def handle(self, verb: str, body: Optional[dict] = None) -> dict:
         body = body or {}
-        if verb == "plan":
-            self.plan_items = build_plan(self.urdf_path)
-            return {"type": "plan", "items": [_planitem_json(p) for p in self.plan_items]}
+        if verb in ("plan", "pipeline"):
+            self.plan_items = self._resolve_plan()
+            return {"type": "pipeline", "items": [_planitem_json(p) for p in self.plan_items]}
 
         if verb == "select":
             if not self.plan_items:
-                self.plan_items = build_plan(self.urdf_path)
+                self.plan_items = self._resolve_plan()
             cam = body.get("camera_link")
             item = next((p for p in self.plan_items if p.camera_link == cam), None)
             if item is None:
                 return {"error": f"no camera {cam!r} in plan"}
-            if item.kind == "base_to_base":
-                return self._select_b2b(item)
+            # Build the executor for this step's KIND from the registry (no `if kind == ...`);
+            # the family decides which verb-slot it lives in. StepError (unknown kind, or a
+            # base-to-base whose partners aren't accepted yet) surfaces as an honest {error}.
+            try:
+                executor, family = steps.make_executor(item, self._step_ctx(item))
+            except steps.StepError as e:
+                return {"error": str(e)}
+            if family == "b2b":
+                self.session = None
+                self.b2b = executor
+                return {"type": "select", "camera_link": item.camera_link, "kind": item.kind,
+                        "flange_link": item.flange_link, "partner_camera": item.partner_camera,
+                        "secondary_camera": item.secondary_camera}
             self.b2b = None
-            # A world-fixed camera with a HANDHELD board has no moving chain (the flange is
-            # the world root) — use an empty Chain; the static path never touches it.
-            static = item.kind == "eye_to_hand" and getattr(item, "board_source", "handheld") != "arm"
-            chain = Chain([], []) if static else self.chain_provider(item.flange_link)
-            bridge = self.bridge_factory(item)
-            self.session = CalibSession(item, self.board, self.K, chain, bridge, wh=self.wh,
-                                        accept_heldout_px=self.accept_heldout_px,
-                                        accept_tip_mm=self.accept_tip_mm)
+            self.session = executor
             return {"type": "select", "camera_link": cam, "kind": item.kind, "flange_link": item.flange_link}
 
         # base_to_base verbs run against the dedicated dual-arm session
@@ -123,23 +146,18 @@ class CalibService:
             return out
         return {"error": f"unknown verb {verb!r}"}
 
-    def _select_b2b(self, item: PlanItem) -> dict:
-        """Build the dual-arm base_to_base session — needs BOTH wrist cameras already
-        calibrated (accepted) this session, so we have each arm's X."""
-        ra = self.accepted.get(item.partner_camera)
-        rb = self.accepted.get(item.secondary_camera)
-        if ra is None or rb is None:
-            missing = [c for c, r in ((item.partner_camera, ra), (item.secondary_camera, rb)) if r is None]
-            return {"error": f"calibrate + accept these cameras first: {', '.join(missing)}"}
-        pa = next(p for p in self.plan_items if p.camera_link == item.partner_camera)
-        pb = next(p for p in self.plan_items if p.camera_link == item.secondary_camera)
-        self.session = None
-        self.b2b = BaseToBaseSession(
-            item, self.board, self.K,
-            self.chain_provider(pa.flange_link), self.chain_provider(pb.flange_link),
-            self.bridge_factory(pa), self.bridge_factory(pb),
-            ra.T_optical, rb.T_optical,
+    def _step_ctx(self, item: PlanItem) -> steps.StepContext:
+        """Inject what the step factories need. The target is the one THIS step bound
+        (`item.target_id` into the authored targets), falling back to the single default
+        board for an un-authored / single-target run."""
+        target = self.targets.get(item.target_id) or self.board
+        # the bound camera's own intrinsics (multi-cam); else the service default K.
+        kv = self.intrinsics.get(item.camera_link)
+        K = kv[0] if kv and kv[0] is not None else self.K
+        wh = tuple(kv[1]) if kv and kv[1] is not None else self.wh
+        return steps.StepContext(
+            target=target, K=K, chain_provider=self.chain_provider,
+            bridge_factory=self.bridge_factory, wh=wh,
+            accept_heldout_px=self.accept_heldout_px, accept_tip_mm=self.accept_tip_mm,
+            accepted=self.accepted, plan_items=self.plan_items,
         )
-        return {"type": "select", "camera_link": item.camera_link, "kind": "base_to_base",
-                "flange_link": item.flange_link, "partner_camera": item.partner_camera,
-                "secondary_camera": item.secondary_camera}

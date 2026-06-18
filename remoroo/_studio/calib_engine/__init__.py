@@ -8,7 +8,8 @@ See ADC/remoroo_calibration_redesign.md (§8) for the design + phase plan.
 """
 from __future__ import annotations
 
-from .types import BoardModel, CalibResult, CaptureSample
+from .types import BoardModel, CalibResult, CaptureSample, Target
+from .fiducials import build_target
 from .geometry import Chain
 from .solve import solve_base_to_base, solve_eye_in_hand, solve_handeye_closed, solve_static_camera
 from .metrics import (
@@ -26,7 +27,7 @@ from .curate import build_weights, flag_suspect_corners, homography_resnap, solv
 from . import urdf_io
 
 __all__ = [
-    "BoardModel", "CalibResult", "CaptureSample", "Chain",
+    "BoardModel", "Target", "build_target", "CalibResult", "CaptureSample", "Chain",
     "solve_eye_in_hand", "solve_handeye_closed", "solve_base_to_base", "solve_static_camera", "solve_curated",
     "held_out_reprojection", "tip_landing_error", "observability",
     "parameter_covariance", "consensus_spread", "reprojection_detail", "predict_uv",

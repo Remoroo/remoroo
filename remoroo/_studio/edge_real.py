@@ -392,25 +392,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # make `calib_engine` 
 
 
 class RealBridge:
-    """Adapts the cell's primitives Bridge + camera + ChArUco detector to calib_engine's
-    BridgeProtocol. The flange pose is reported as chain.fk(joints) (the URDF model FK),
-    so the bundle's FK-correction has a chain to refine; joints are read in the chain's
-    joint order. Joint-move probes the common cell API names (the agent authors one)."""
+    """Adapts the cell's primitives Bridge + a SPECIFIC camera + the AUTHORED fiducial target
+    to calib_engine's BridgeProtocol. It is scoped to one (camera, arm) binding from the
+    authored pipeline step, so on a multi-camera / multi-arm cell every capture comes from the
+    RIGHT camera and every move drives the RIGHT arm — never the shared-bridge ambiguity that
+    silently moved the wrong arm. The flange pose is chain.fk(joints) (URDF model FK) so the
+    bundle's FK-correction has a chain to refine; joints are read in the chain's joint order."""
 
-    def __init__(self, cell_bridge, chain, joint_names, board_params, dict_name,
-                 K=None, dist=None, sdk_T_lr=None):
+    def __init__(self, cell_bridge, chain, joint_names, target,
+                 camera_id="", arm_id="", K=None, dist=None, sdk_T_lr=None):
         self.b = cell_bridge
         self.chain = chain
         self.joint_names = joint_names
-        self.board_params = board_params
-        self.dict_name = dict_name
+        self.target = target             # the authored Target (its detector + 3D points)
+        self.camera_id = camera_id       # which cell camera this step's frames come from
+        self.arm_id = arm_id             # which cell arm this step moves (per-arm routing)
         self.K = K
         self.dist = dist                 # optional radial-tangential coeffs (7.2)
         self._sdk_T_lr = sdk_T_lr        # optional 4x4 left->right stereo baseline (F9)
 
+    def _observation(self):
+        """Per-camera observation if the cell Bridge supports `get_observation(camera=...)`
+        (multi-camera); else the shared observation (single-camera cell)."""
+        if self.camera_id:
+            try:
+                return self.b.get_observation(camera=self.camera_id)
+            except TypeError:
+                pass
+        return self.b.get_observation()
+
     def read_joints(self):
         import numpy as np
-        jp = (self.b.get_observation().joint_positions) or {}
+        jp = (self._observation().joint_positions) or {}
         out = []
         for n in self.joint_names:
             if n not in jp:
@@ -424,21 +437,39 @@ class RealBridge:
 
     def move_to_joints(self, joints):
         q = [float(x) for x in joints]
+        # Per-arm routing (the multi-arm SAFETY fix). When the step bound an arm, drive THAT
+        # arm explicitly: prefer an arm-aware move, then the multi-arm primitive, then a
+        # single-arm fallback. This removes the `_calib_arm` side-channel the engine never set.
+        if self.arm_id:
+            fn = getattr(self.b, "move_to_joints", None)
+            if callable(fn):
+                try:
+                    fn(q, arm=self.arm_id); return     # move_to_joints(joints, arm=...)
+                except TypeError:
+                    pass
+            fn = getattr(self.b, "move_joints", None)
+            if callable(fn):
+                try:
+                    fn(self.arm_id, q); return          # move_joints(arm, joints)
+                except TypeError:
+                    pass
         for name in ("move_to_joints", "move_joints", "goto_joints", "set_joint_positions", "move_j"):
             fn = getattr(self.b, name, None)
             if callable(fn):
                 fn(q)
                 return
-        raise RuntimeError("cell Bridge has no joint-move method (expected one of "
-                           "move_to_joints/move_joints/goto_joints/set_joint_positions/move_j)")
+        raise RuntimeError("cell Bridge has no joint-move method (expected move_to_joints(joints, "
+                           "arm=...) for multi-arm, or one of move_joints/goto_joints/"
+                           "set_joint_positions/move_j)")
 
     def estop_ok(self):
         return True
 
     def _detect(self, img):
         import numpy as np
-        from calib_engine.detect import detect_charuco
-        ids, uv = detect_charuco(np.asarray(img), dict_name=self.dict_name, **self.board_params)
+        # The AUTHORED target owns detection — the edge never names a fiducial type. A single
+        # marker, ChArUco, AprilTag, grid, or checkerboard all flow through target.detect.
+        ids, uv = self.target.detect(np.asarray(img))
         # 7.2: the solver is pinhole on RECTIFIED imagery. If the cell feeds a raw frame +
         # distortion coeffs, undistort the corners to the rectified pixels first.
         if self.dist is not None and self.K is not None and len(ids):
@@ -453,7 +484,7 @@ class RealBridge:
         """Right stereo lens corners (for the F9 left/right self-check). Probes obs.right /
         right_image; returns empty if the camera doesn't expose a second lens."""
         import numpy as np
-        obs = self.b.get_observation()
+        obs = self._observation()
         img = next((getattr(obs, a, None) for a in ("right", "right_image", "rgb_right")
                     if getattr(obs, a, None) is not None), None)
         if img is None:
@@ -488,26 +519,13 @@ class RealBridge:
         return True
 
     def capture_image(self):
-        """The raw RGB frame from the cell camera (for the live-cam inset + overlay)."""
-        obs = self.b.get_observation()
+        """The raw RGB frame from THIS step's bound camera (per-camera on a multi-cam cell)."""
+        obs = self._observation()
         img = next((getattr(obs, a, None) for a in ("rgb", "color", "image", "rgb_image", "left")
                     if getattr(obs, a, None) is not None), None)
         if img is None:
             raise RuntimeError("observation has no image (expected obs.rgb/color/image)")
         return img
-
-
-def _calib_config():
-    cy = load_cell_yaml()
-    cal = (cy.get("calibration") or {})
-    bp = (cal.get("board") or {})
-    board_params = {
-        "squares_x": int(bp.get("squares_x", 7)), "squares_y": int(bp.get("squares_y", 5)),
-        "square_len": float(bp.get("square_len", 0.03)), "marker_len": float(bp.get("marker_len", 0.022)),
-    }
-    return (board_params, str(bp.get("dict", "DICT_5X5_1000")), cal.get("K"),
-            cal.get("wh", [1280, 720]), cal.get("dist"), cal.get("T_left_right"),
-            float(cal.get("accept_heldout_px", 1.5)), float(cal.get("accept_tip_mm", 3.0)))
 
 
 def _as_K(kcfg):
@@ -517,21 +535,92 @@ def _as_K(kcfg):
     return np.asarray(kcfg, float).reshape(3, 3)
 
 
-def _intrinsics_from_bridge(b):
-    """Read FACTORY intrinsics live off the cell camera's observation (the SDK already
-    has them — ZED: calibration_parameters.left_cam; RealSense: the stream profile). This
-    is why calibration must NOT demand a hand-typed cell.yaml K: the camera publishes a
-    trustworthy K every frame. Returns (K 3x3, (w,h)) or (None, None) if absent."""
+def _target_spec_from_cell(cal: dict):
+    """The cell's OPEN target spec — `calibration.target: {type, params}`. No silent ChArUco
+    default: a legacy `calibration.board` is read as a charuco target only when its keys are
+    fully present; otherwise None (the caller errors loudly)."""
+    t = cal.get("target")
+    if isinstance(t, dict) and t.get("type"):
+        return {"type": str(t["type"]), "params": dict(t.get("params") or {})}
+    b = cal.get("board")
+    if isinstance(b, dict) and all(k in b for k in ("squares_x", "squares_y", "square_len", "marker_len")):
+        return {"type": "charuco", "params": {
+            "squares_x": int(b["squares_x"]), "squares_y": int(b["squares_y"]),
+            "square_len": float(b["square_len"]), "marker_len": float(b["marker_len"]),
+            "dict": str(b.get("dict", "DICT_5X5_1000"))}}
+    return None
+
+
+def _import_authored_targets():
+    """Import the agent-authored remoroo_cell/calibration/targets.py if present — it registers
+    any CUSTOM detectors via calib_engine.fiducials.register. Common rigs need no such file
+    (the pipeline's target specs use shipped types)."""
+    if (CELL_DIR / "calibration" / "targets.py").exists():
+        import importlib
+        try:
+            importlib.import_module(f"{CELL_DIR.name}.calibration.targets")
+        except Exception:  # noqa: BLE001 — a broken custom module shouldn't crash select; loud later
+            pass
+
+
+def _intrinsics_from_bridge(b, camera_id: str = ""):
+    """Factory intrinsics live off the cell camera's observation, scoped to ONE camera. The
+    Bridge may expose `get_observation(camera=<id>)` (multi-cam) and/or key obs.intrinsics by
+    camera id; both are handled. Returns (K 3x3, (w,h)) or (None, None) if absent."""
     import numpy as np
     try:
-        intr = getattr(b.get_observation(), "intrinsics", None)
+        obs = b.get_observation(camera=camera_id) if camera_id else b.get_observation()
+    except TypeError:
+        obs = b.get_observation()
     except Exception:  # noqa: BLE001 — no camera up yet; caller falls back / errors clearly
         return None, None
+    intr = getattr(obs, "intrinsics", None)
+    if isinstance(intr, dict) and camera_id and camera_id in intr and isinstance(intr[camera_id], dict):
+        intr = intr[camera_id]                     # obs.intrinsics keyed per camera
     if isinstance(intr, dict) and all(k in intr for k in ("fx", "fy", "cx", "cy")):
         K = np.array([[intr["fx"], 0.0, intr["cx"]], [0.0, intr["fy"], intr["cy"]], [0.0, 0.0, 1.0]], float)
         wh = (int(intr.get("width", 1280)), int(intr.get("height", 720)))
         return K, wh
     return None, None
+
+
+def _camera_intrinsics(b, camera_id: str, cal: dict):
+    """Per-camera K: a cell.yaml override (a cam with no factory K) else the SDK's factory K."""
+    if cal.get("K") is not None:
+        return _as_K(cal["K"]), tuple(cal.get("wh", [1280, 720]))
+    return _intrinsics_from_bridge(b, camera_id)
+
+
+def _load_pipeline(cy: dict, cal: dict, urdf_path: str):
+    """The AUTHORED pipeline (remoroo_cell/calibration/pipeline.yaml) → (plan_items, targets).
+    If the agent hasn't authored one yet, fall back to a URDF-derived plan bound to the cell's
+    single open target — never a silent fabricated board."""
+    from calib_engine import fiducials, pipeline, steps, urdf_io
+    pf = CELL_DIR / "calibration" / "pipeline.yaml"
+    if pf.exists():
+        import yaml  # type: ignore
+        spec = yaml.safe_load(pf.read_text()) or {}
+        psteps, tspecs = pipeline.parse(spec)
+        urdf_cams = urdf_io.find_camera_links(urdf_path) if os.path.exists(urdf_path) else []
+        cell_cams = [str(c.get("name") or c.get("id") or "") for c in (cy.get("cameras") or [])]
+        arms = [str(a.get("name") or "") for a in (cy.get("arms") or [])]
+        pipeline.validate(psteps, tspecs, kinds=steps.known_kinds(), family_of=steps.family_of,
+                          cameras=list({*urdf_cams, *cell_cams}), arms=arms)
+        items = pipeline.resolve_items(psteps, urdf_path)
+        targets = pipeline.build_targets(tspecs, fiducials.build_target)
+        return items, targets
+    # Fallback: no authored pipeline yet → derive the plan from the URDF, bound to the cell's
+    # one open target. Keeps a simple single-camera cell working before the pipeline is authored.
+    from calib_engine.session import build_plan
+    spec = _target_spec_from_cell(cal)
+    if spec is None:
+        raise RuntimeError("no calibration target configured — author remoroo_cell/calibration/"
+                           "pipeline.yaml, or set cell.yaml calibration.target {type, params}.")
+    target = fiducials.build_target(spec)
+    items = build_plan(urdf_path)
+    for it in items:
+        it.target_id = "default"
+    return items, {"default": target}
 
 
 _CALIB = None
@@ -542,109 +631,142 @@ def _calib_service():
     if _CALIB is not None:
         return _CALIB
     from calib_engine import urdf_io
-    from calib_engine.detect import charuco_board_points
+    from calib_engine.geometry import Chain
     from calib_engine.service import CalibService
-    from calib_engine.types import BoardModel
 
     b = get_bridge()
     if b is None:
         raise RuntimeError(_bridge_err or "no bridge connected")
     import numpy as np
-    board_params, dict_name, kcfg, wh, distcfg, tlr, acc_px, acc_mm = _calib_config()
-    dist = np.asarray(distcfg, float) if distcfg is not None else None
-    sdk_T_lr = np.asarray(tlr, float).reshape(4, 4) if tlr is not None else None
-    # Intrinsics: prefer an explicit cell.yaml override (a cam with no factory K), else read
-    # the camera's factory K live off the SDK. Only error if the camera reports nothing AND
-    # there is no override — the agent never has to hand-author a K for a ZED/RealSense.
-    if kcfg is not None:
-        K = _as_K(kcfg)
-        wh = tuple(wh)
-    else:
-        K, wh_sdk = _intrinsics_from_bridge(b)
-        if wh_sdk is not None:
-            wh = wh_sdk
-    if K is None:
-        raise RuntimeError(
-            "no camera intrinsics available — the cell camera's get_observation().intrinsics "
-            "is empty and cell.yaml calibration.K is unset. Have primitives.py report factory "
-            "intrinsics {fx,fy,cx,cy,width,height} from the camera SDK (ZED: "
-            "get_camera_information().camera_configuration.calibration_parameters.left_cam), or "
-            "set calibration.K in cell.yaml as a fallback."
-        )
-    pts = charuco_board_points(dict_name=dict_name, **board_params)
-    board = BoardModel(points=pts, rows=board_params["squares_y"], cols=board_params["squares_x"],
-                       square_m=board_params["square_len"])
+    cy = load_cell_yaml()
+    cal = (cy.get("calibration") or {})
+    acc_px = float(cal.get("accept_heldout_px", 1.5))
+    acc_mm = float(cal.get("accept_tip_mm", 3.0))
+    dist = np.asarray(cal["dist"], float) if cal.get("dist") is not None else None
+    sdk_T_lr = np.asarray(cal["T_left_right"], float).reshape(4, 4) if cal.get("T_left_right") is not None else None
     urdf_path = str(CELL_DIR / "robot_model" / "robot.urdf")
+
+    _import_authored_targets()
+    items, targets = _load_pipeline(cy, cal, urdf_path)
+    default_target = next(iter(targets.values())) if targets else None
+
+    # Per-camera intrinsics: each bound camera reads its OWN factory K (a multi-cam rig no
+    # longer solves camera #2 with camera #1's K). Keyed by the camera link the step bound.
+    intrinsics: dict = {}
+    for cam in {p.camera_link for p in items if p.kind != "base_to_base"}:
+        intrinsics[cam] = _camera_intrinsics(b, cam, cal)
+    K0, wh0 = next((kv for kv in intrinsics.values() if kv[0] is not None), (None, (1280, 720)))
+    if K0 is None:
+        K0, wh0 = _camera_intrinsics(b, "", cal)
+    if K0 is None:
+        raise RuntimeError(
+            "no camera intrinsics available — get_observation().intrinsics is empty and "
+            "cell.yaml calibration.K is unset. Have primitives.py report factory intrinsics "
+            "{fx,fy,cx,cy,width,height} per camera (ZED: calibration_parameters.left_cam), or "
+            "set calibration.K in cell.yaml as a fallback.")
 
     def chain_provider(flange):
         return urdf_io.chain_from_urdf(urdf_path, flange)[0]
 
     def bridge_factory(item):
-        # A world-fixed camera with a handheld board has no moving chain — the static path
-        # only needs capture()/capture_image(), never joints/move. Build a chainless bridge.
-        if item.kind == "eye_to_hand" and getattr(item, "board_source", "handheld") != "arm":
-            from calib_engine.geometry import Chain
-            return RealBridge(b, Chain([], []), [], board_params, dict_name, K=K, dist=dist, sdk_T_lr=sdk_T_lr)
+        target = targets.get(item.target_id) or default_target
+        cam, arm = item.camera_link, item.arm
+        Kc = intrinsics.get(cam, (K0, wh0))[0] or K0
+        static = item.kind in ("eye_to_hand", "static") and getattr(item, "board_source", "handheld") != "arm"
+        if static:
+            return RealBridge(b, Chain([], []), [], target, camera_id=cam, arm_id="",
+                              K=Kc, dist=dist, sdk_T_lr=sdk_T_lr)
         chain, names, _ = urdf_io.chain_from_urdf(urdf_path, item.flange_link)
-        return RealBridge(b, chain, names, board_params, dict_name, K=K, dist=dist, sdk_T_lr=sdk_T_lr)
+        return RealBridge(b, chain, names, target, camera_id=cam, arm_id=arm,
+                          K=Kc, dist=dist, sdk_T_lr=sdk_T_lr)
 
-    _CALIB = CalibService(urdf_path, board, K, bridge_factory, chain_provider, wh=tuple(wh),
+    _CALIB = CalibService(urdf_path, default_target, K0, bridge_factory, chain_provider, wh=tuple(wh0),
                           calib_dir=str(CELL_DIR / "calibration"),
-                          accept_heldout_px=acc_px, accept_tip_mm=acc_mm)
+                          accept_heldout_px=acc_px, accept_tip_mm=acc_mm,
+                          plan_items=items, targets=targets,
+                          intrinsics={c: kv for c, kv in intrinsics.items() if kv[0] is not None})
     return _CALIB
 
 
-def _calib_set_board(body: dict) -> dict:
-    """Persist the printed board to cell.yaml calibration.board and apply it. If a service
-    is already live (a camera was selected), update its board + detector IN PLACE so the
-    in-progress session is preserved (nulling the cache would drop it → "no calibration
-    selected"); otherwise the next select reads the fresh cell.yaml."""
-    global _CALIB
-    import yaml  # type: ignore
+def _board_body_to_target_spec(body: dict) -> dict:
+    """Back-compat: an old set_board POST (dict/squares_x/...) → an open charuco target spec."""
     b = body or {}
-    board = {
+    return {"type": "charuco", "params": {
         "dict": str(b.get("dict", "DICT_5X5_1000")),
         "squares_x": int(b["squares_x"]), "squares_y": int(b["squares_y"]),
-        "square_len": float(b["square_len"]), "marker_len": float(b["marker_len"]),
-    }
+        "square_len": float(b["square_len"]), "marker_len": float(b["marker_len"])}}
+
+
+def _calib_set_target(spec: dict) -> dict:
+    """Persist the OPEN target spec ({type, params}) to cell.yaml calibration.target and apply
+    it. If a service is live, swap the Target + detector IN PLACE so the in-progress session is
+    preserved. The edge never names a fiducial — `type` selects a shipped or authored detector."""
+    global _CALIB
+    import yaml  # type: ignore
+    from calib_engine import fiducials
+    spec = {"type": str((spec or {}).get("type") or ""), "params": dict((spec or {}).get("params") or {})}
+    if not spec["type"]:
+        return {"error": "target needs a 'type' (e.g. single_aruco | charuco | apriltag | aruco_grid | checkerboard)"}
     cy = load_cell_yaml()
     cal = dict(cy.get("calibration") or {})
-    cal["board"] = board
+    cal["target"] = spec
+    cal.pop("board", None)                       # the open target supersedes the legacy board
     cy["calibration"] = cal
     (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False))
 
     if _CALIB is not None:
-        from calib_engine.detect import charuco_board_points
-        from calib_engine.types import BoardModel
-        dict_name = board["dict"]
-        bp = {k: board[k] for k in ("squares_x", "squares_y", "square_len", "marker_len")}
-        new_board = BoardModel(points=charuco_board_points(dict_name=dict_name, **bp),
-                               rows=bp["squares_y"], cols=bp["squares_x"], square_m=bp["square_len"])
-        _CALIB.board = new_board
+        _import_authored_targets()
+        try:
+            tgt = fiducials.build_target(spec)
+        except Exception as e:  # noqa: BLE001 — a bad spec must fail loudly, not silently
+            return {"error": f"target build failed: {type(e).__name__}: {e}"}
+        _CALIB.board = tgt
+        _CALIB.targets["default"] = tgt
         if _CALIB.session is not None:
-            _CALIB.session.board = new_board
-            rb = _CALIB.session.bridge
-            if hasattr(rb, "board_params"):
-                rb.board_params = bp
-            if hasattr(rb, "dict_name"):
-                rb.dict_name = dict_name
-    return {"type": "set_board", "board": board}
+            _CALIB.session.board = tgt
+            _CALIB.session.min_corners = int(tgt.min_points)
+            if hasattr(_CALIB.session.bridge, "target"):
+                _CALIB.session.bridge.target = tgt
+    return {"type": "set_target", "target": spec}
+
+
+def _first_camera(cy: dict) -> str:
+    cams = cy.get("cameras") or []
+    return str(cams[0].get("name") or cams[0].get("id") or "") if cams else ""
+
+
+def _snapshot_target_and_camera(cy: dict, cal: dict):
+    """The target + camera the live-cam inset should detect against: the SELECTED step's if a
+    session is live, else the cell's default target + first camera. Returns (target, camera_id)
+    or (None, reason)."""
+    sess = getattr(_CALIB, "session", None) if _CALIB is not None else None
+    if sess is not None and getattr(sess, "bridge", None) is not None and hasattr(sess.bridge, "target"):
+        return sess.bridge.target, getattr(sess.bridge, "camera_id", ""), None
+    _import_authored_targets()
+    spec = _target_spec_from_cell(cal)
+    if spec is None:
+        return None, "", "no calibration target configured — set calibration.target {type, params}"
+    from calib_engine import fiducials
+    return fiducials.build_target(spec), _first_camera(cy), None
 
 
 def _calib_snapshot() -> dict:
-    """Current camera frame (JPEG, base64) + factory intrinsics + the ChArUco detection
-    overlay (corner pixels) for the live-cam inset. Needs cv2 + a connected camera; any
-    failure returns {error} and the UI falls back to a placeholder."""
+    """Current camera frame (JPEG) + factory intrinsics + the AUTHORED target's detection
+    overlay for the live-cam inset. The fiducial is the cell's target — never a hardcoded
+    board. Needs cv2 + a connected camera; any failure returns {error} → UI placeholder."""
     import base64
     import numpy as np
     import cv2  # type: ignore
-    from calib_engine.detect import detect_charuco
 
     b = get_bridge()
     if b is None:
         return {"error": _bridge_err or "no bridge connected"}
-    board_params, dict_name, kcfg, wh, *_ = _calib_config()
-    rb = RealBridge(b, None, [], board_params, dict_name)
+    cy = load_cell_yaml()
+    cal = cy.get("calibration") or {}
+    target, camera_id, err = _snapshot_target_and_camera(cy, cal)
+    if err:
+        return {"error": err}
+    rb = RealBridge(b, None, [], target, camera_id=camera_id)
     img = np.asarray(rb.capture_image())
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -653,11 +775,11 @@ def _calib_snapshot() -> dict:
     if not ok:
         return {"error": "jpeg encode failed"}
     h, w = img.shape[:2]
-    ids, uv = detect_charuco(img, dict_name=dict_name, **board_params)
-    K, _ = _intrinsics_from_bridge(b)
+    ids, uv = target.detect(img)
+    K, _ = _intrinsics_from_bridge(b, camera_id)
     return {
         "type": "snapshot", "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
-        "w": int(w), "h": int(h), "seen": bool(len(ids) >= 6), "n_corners": int(len(ids)),
+        "w": int(w), "h": int(h), "seen": bool(len(ids) >= target.min_points), "n_corners": int(len(ids)),
         "corners": np.asarray(uv, float).round(1).tolist(),
         "intrinsics": None if K is None else {"fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2]},
     }
@@ -688,35 +810,56 @@ def _calib_frame_image(index: int) -> dict:
             "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii")}
 
 
+def _pipeline_for_ui() -> dict:
+    """The AUTHORED pipeline steps + target specs for the Studio, as a pure URDF read — NO
+    bridge / intrinsics / cv2 (so the operator sees the steps before the camera is up). Uses
+    the authored pipeline.yaml if present, else the URDF-derived fallback bound to the cell's
+    target. Targets are returned as SPECS (not built), keeping this cv2-free."""
+    import xml.etree.ElementTree as ET
+    from calib_engine import pipeline, steps, urdf_io
+    from calib_engine.service import _planitem_json
+    urdf_path = str(CELL_DIR / "robot_model" / "robot.urdf")
+    if not os.path.exists(urdf_path):
+        return {"error": f"no URDF at {urdf_path} — build the rig first"}
+    cy = load_cell_yaml()
+    cal = cy.get("calibration") or {}
+    _import_authored_targets()
+    pf = CELL_DIR / "calibration" / "pipeline.yaml"
+    if pf.exists():
+        import yaml  # type: ignore
+        spec = yaml.safe_load(pf.read_text()) or {}
+        psteps, tspecs = pipeline.parse(spec)
+        urdf_cams = urdf_io.find_camera_links(urdf_path)
+        cell_cams = [str(c.get("name") or c.get("id") or "") for c in (cy.get("cameras") or [])]
+        arms = [str(a.get("name") or "") for a in (cy.get("arms") or [])]
+        pipeline.validate(psteps, tspecs, kinds=steps.known_kinds(), family_of=steps.family_of,
+                          cameras=list({*urdf_cams, *cell_cams}), arms=arms)
+        items = pipeline.resolve_items(psteps, urdf_path)
+        target_specs = {tid: {"type": t.type, "params": t.params} for tid, t in tspecs.items()}
+    else:
+        from calib_engine.session import build_plan
+        items = build_plan(urdf_path)
+        spec = _target_spec_from_cell(cal)
+        for it in items:
+            it.target_id = "default"
+        target_specs = {"default": spec} if spec else {}
+    links = [l.get("name") for l in ET.parse(urdf_path).getroot().findall("link")]
+    return {"type": "pipeline", "items": [_planitem_json(p) for p in items],
+            "links": links, "urdf": urdf_path, "targets": target_specs}
+
+
 def _calib_handle(verb: str, body: dict) -> dict:
     try:
-        # `plan` is a pure URDF read — it must NOT need the bridge / intrinsics / cv2, so
-        # the operator sees the rig's cameras even before the camera is up. Heavier deps
-        # (bridge, K, board, cv2) are only built on `select`.
-        if verb == "plan":
-            import xml.etree.ElementTree as ET
-            from calib_engine.service import _planitem_json
-            from calib_engine.session import build_plan
-            urdf_path = str(CELL_DIR / "robot_model" / "robot.urdf")
-            if not os.path.exists(urdf_path):
-                return {"error": f"no URDF at {urdf_path} — build the rig first"}
-            items = [_planitem_json(p) for p in build_plan(urdf_path)]
-            links = [l.get("name") for l in ET.parse(urdf_path).getroot().findall("link")]
-            # Return the ACTUAL configured board from cell.yaml (if any) so the form shows
-            # what the operator/agent really set — NOT a fabricated default. `board` is null
-            # when nothing is configured yet (then the UI offers a clearly-labelled example).
-            bp = ((load_cell_yaml().get("calibration") or {}).get("board") or {})
-            board = {
-                "dict": bp.get("dict"), "squares_x": bp.get("squares_x"),
-                "squares_y": bp.get("squares_y"), "square_len": bp.get("square_len"),
-                "marker_len": bp.get("marker_len"),
-            } if bp else None
-            return {"type": "plan", "items": items, "links": links, "urdf": urdf_path, "board": board}
-        if verb == "set_board":
-            # The ONE thing not in the URDF — the printed board — set from the Studio form.
-            # Persist it to cell.yaml calibration.board and drop the cached service so the
-            # next `select` rebuilds with the new params (and the new detector).
-            return _calib_set_board(body)
+        # `pipeline`/`plan` is a pure URDF read — no bridge / intrinsics / cv2, so the operator
+        # sees the authored steps even before the camera is up. Heavier deps (bridge, K,
+        # targets, cv2) are only built on `select`.
+        if verb in ("plan", "pipeline"):
+            return _pipeline_for_ui()
+        if verb in ("set_target", "set_board"):
+            # The printed target — the ONE input not in the URDF — set from the Studio form.
+            # `set_board` is the legacy ChArUco-only POST; convert it to an open target spec.
+            spec = body if verb == "set_target" else _board_body_to_target_spec(body)
+            return _calib_set_target(spec)
         if verb == "snapshot":
             # The live-cam inset: the current frame (JPEG) + factory intrinsics + the board
             # detection overlay. Edge-only (needs the image + cv2); degrades to {error} so the

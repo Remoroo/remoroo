@@ -115,7 +115,7 @@ class CalibSession:
         *,
         wh: Tuple[int, int] = (1280, 720),
         nominal_joints: Optional[np.ndarray] = None,
-        min_corners: int = 6,
+        min_corners: Optional[int] = None,
         seed: int = 0,
         accept_heldout_px: float = 1.5,
         accept_tip_mm: float = 3.0,
@@ -127,7 +127,9 @@ class CalibSession:
         self.bridge = bridge
         self.wh = wh
         self.nominal_joints = np.zeros(chain.n) if nominal_joints is None else np.asarray(nominal_joints, float)
-        self.min_corners = min_corners
+        # The minimum usable view is a property of the TARGET, not a hardcoded 6 (a single
+        # marker has 4 corners, a board many) — derive it unless explicitly overridden.
+        self.min_corners = int(board.min_points) if min_corners is None else int(min_corners)
         self.rng = np.random.default_rng(seed)
         self.accept_heldout_px = accept_heldout_px
         self.accept_tip_mm = accept_tip_mm
@@ -136,7 +138,9 @@ class CalibSession:
         #   moving-link camera            -> "eye_in_hand"
         #   world-fixed, handheld board   -> "static"  (operator moves the board, NO robot motion)
         #   world-fixed, arm presents it  -> "eye_to_hand" (the arm-presented bundle)
-        if item.kind == "eye_to_hand":
+        if item.kind == "static":
+            self.kind = "static"
+        elif item.kind == "eye_to_hand":
             self.kind = "eye_to_hand" if getattr(item, "board_source", "handheld") == "arm" else "static"
         else:
             self.kind = "eye_in_hand"
@@ -547,7 +551,7 @@ class BaseToBaseSession:
         self.X_a, self.X_b = np.asarray(X_a, float), np.asarray(X_b, float)
         self.obs: List[dict] = []
         self.result: Optional[np.ndarray] = None
-        self.min_corners = 6
+        self.min_corners = int(board.min_points)
 
     def capture(self) -> dict:
         """Both arms view the shared board once; store (joints, camera->board) for each."""

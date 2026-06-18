@@ -135,20 +135,22 @@ class Bridge:
         return self._arm_drivers[arm].move_joints(q_target, speed=speed)  # TODO adapt
 
     # ---- Calibration joint-move contract (the SHIPPED calib engine calls this) ----
-    def move_to_joints(self, joints) -> None:
-        """SINGLE-ARM joint move in URDF joint order — what the shipped calibration
-        engine (`calib_engine`) probes for + calls (also accepts move_joints/goto_joints/
-        set_joint_positions/move_j). Distinct from the multi-arm `move_joints(arm, q)`
-        above: the engine works one PlanItem (one arm) at a time and passes just the
-        joint vector. Wrap the supervised move for the arm being calibrated:
-            self.move_joints(self._calib_arm, np.asarray(joints, float),
+    def move_to_joints(self, joints, arm: Optional[str] = None) -> None:
+        """PER-ARM joint move in URDF joint order — what the shipped calibration engine
+        (`calib_engine`) calls for an arm-driven step. The `arm` id comes from the authored
+        pipeline step and is LOAD-BEARING SAFETY on a multi-arm cell: drive EXACTLY that arm,
+        never a shared default (passing `arm` is how the engine avoids moving the wrong arm).
+        Route the supervised move:
+            self.move_joints(arm or self.arms[0], np.asarray(joints, float),
                              speed_frac=self.cell['safety']['max_joint_speed_frac'])
-        For DUAL-ARM, set self._calib_arm to the arm whose camera is being calibrated
-        (the engine calibrates A, then B, then A↔B). For calibration the engine also
-        needs get_observation() to return: joint_positions as a {urdf_joint_name: value}
-        map covering EVERY revolute joint, an RGB image (rgb/color/left), and
-        intrinsics {fx,fy,cx,cy,width,height} from the camera SDK. See calibration.md."""
-        ...  # TODO route to the arm being calibrated
+        (A single-arm cell may ignore `arm`. The engine also accepts the multi-arm
+        `move_joints(arm, joints)` directly.) For calibration the engine also needs
+        get_observation(camera=<urdf_link>) to return, FOR THAT CAMERA: joint_positions as a
+        {urdf_joint_name: value} map over EVERY revolute joint, that camera's RGB image
+        (rgb/color/left), and that camera's intrinsics {fx,fy,cx,cy,width,height} from the SDK
+        — key `self._cameras` by URDF camera-link name so each camera is calibrated against its
+        OWN frame. See calibration.md (authored pipeline + targets)."""
+        ...  # TODO route to the named arm (NOT a shared side-channel)
 
     def plan_and_move(self, arm: str, target_pose: np.ndarray, *, world=None) -> bool:
         """THE Phase-8 primitive: plan a collision-free path with cuRoboV2
