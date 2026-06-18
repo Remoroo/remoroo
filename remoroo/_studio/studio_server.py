@@ -132,6 +132,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"error": "upstream unreachable", "detail": str(e)}, 502)
             return
+        # [RESUME-DEBUG] Is this a RUN request, and does the CP say the run is new or
+        # resumed? Log the upstream status + a marker so we can see resume at the source.
+        _dbg_run = self.path.startswith("/runs/") or "/runs" in self.path
+        if _dbg_run:
+            print(f"[RESUME-DEBUG] proxy {self.command} {self.path} → CP status={resp.status}", flush=True)
         self.send_response(resp.status)
         for k, v in resp.getheaders():
             if k.lower() in ("transfer-encoding", "connection", "content-length"):
@@ -147,6 +152,19 @@ class Handler(BaseHTTPRequestHandler):
                 chunk = resp.read1(65536)
                 if not chunk:
                     break
+                # [RESUME-DEBUG] surface the run-stream events that drive the gate rail.
+                # If the very first stream carries gate_advanced/file_created/run_resumed,
+                # the CP is REPLAYING a prior run → the run was resumed, not created fresh.
+                if _dbg_run:
+                    try:
+                        txt = chunk.decode("utf-8", "replace")
+                        for line in txt.splitlines():
+                            low = line.lower()
+                            if any(k in low for k in ("gate_advanced", "gate_checkpoint", "file_created",
+                                                      "run_resumed", "resumed", "\"current_gate\"", "restor")):
+                                print(f"[RESUME-DEBUG] run-stream: {line[:300]}", flush=True)
+                    except Exception:
+                        pass
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -281,10 +299,19 @@ class Handler(BaseHTTPRequestHandler):
             state_path.parent.mkdir(parents=True, exist_ok=True)
             length = int(self.headers.get("Content-Length", "0") or 0)
             body = self.rfile.read(length)
-            # [RESUME-DEBUG] Who WRITES the state machine, and with what gates? If a fresh
-            # boot writes done gates, the writer (the studio's snapshot) is the culprit.
-            existed = state_path.exists()
-            print(f"[RESUME-DEBUG] {self.command} setup_state: writing {len(body)} bytes (file existed={existed}): {body[:600].decode('utf-8','replace')}", flush=True)
+            # [RESUME-DEBUG] Who WRITES the state machine, and with what gates? De-duped:
+            # only log the FIRST write and whenever the gate map actually changes (the
+            # studio re-persists every poll, which would otherwise spam).
+            global _LAST_SETUP_DBG
+            try:
+                import json as _json
+                gates_now = _json.dumps(_json.loads(body).get("gates"), sort_keys=True)
+            except Exception:
+                gates_now = body[:80].decode("utf-8", "replace")
+            if gates_now != globals().get("_LAST_SETUP_DBG"):
+                existed = state_path.exists()
+                print(f"[RESUME-DEBUG] {self.command} setup_state CHANGED (file existed={existed}): {body[:600].decode('utf-8','replace')}", flush=True)
+                _LAST_SETUP_DBG = gates_now
             state_path.write_bytes(body)
             self._json({"ok": True, "path": str(state_path)})
             return
