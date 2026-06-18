@@ -88,10 +88,13 @@ class CalibService:
         if verb == "select":
             if not self.plan_items:
                 self.plan_items = self._resolve_plan()
-            cam = body.get("camera_link")
-            item = next((p for p in self.plan_items if p.camera_link == cam), None)
+            # The Studio selects a step by its authored ID (e.g. "arm1_cam1"); older callers
+            # pass the camera link. Match on EITHER so both work.
+            sel = body.get("camera_link")
+            item = next((p for p in self.plan_items
+                         if (p.id or p.camera_link) == sel or p.camera_link == sel), None)
             if item is None:
-                return {"error": f"no camera {cam!r} in plan"}
+                return {"error": f"no step {sel!r} in pipeline"}
             # Build the executor for this step's KIND from the registry (no `if kind == ...`);
             # the family decides which verb-slot it lives in. StepError (unknown kind, or a
             # base-to-base whose partners aren't accepted yet) surfaces as an honest {error}.
@@ -107,7 +110,8 @@ class CalibService:
                         "secondary_camera": item.secondary_camera}
             self.b2b = None
             self.session = executor
-            return {"type": "select", "camera_link": cam, "kind": item.kind, "flange_link": item.flange_link}
+            return {"type": "select", "camera_link": item.camera_link, "kind": item.kind,
+                    "flange_link": item.flange_link, "id": item.id or item.camera_link}
 
         # base_to_base verbs run against the dedicated dual-arm session
         if verb in ("b2b_capture", "b2b_solve", "b2b_accept"):
