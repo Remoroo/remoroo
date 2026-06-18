@@ -210,6 +210,10 @@ class CalibSession:
                               fk_pose=self.bridge.read_pose(), corner_ids=ids, corners=uv)
             T_c_board = _estimate_target_pose(s, self.board.points, self.K)
             self.T_board_est = s.fk_pose @ self.X_est @ T_c_board
+            # Center pose suggestions on the CONFIGURATION WHERE THE BOARD IS SEEN — the operator
+            # aimed the arm here. Sampling around home (zeros, the default) swings the camera away
+            # from the board and proposes large, irrelevant, often-unsafe motions.
+            self.nominal_joints = np.asarray(s.joints, float)
         return {"type": "detect", "seen": seen, "n_corners": int(len(ids))}
 
     # ── static-camera capture (world-fixed cam, handheld board, NO robot motion) ─
