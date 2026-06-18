@@ -505,6 +505,19 @@ def _calib_service():
 
 def _calib_handle(verb: str, body: dict) -> dict:
     try:
+        # `plan` is a pure URDF read — it must NOT need the bridge / intrinsics / cv2, so
+        # the operator sees the rig's cameras even before the camera is up. Heavier deps
+        # (bridge, K, board, cv2) are only built on `select`.
+        if verb == "plan":
+            import xml.etree.ElementTree as ET
+            from calib_engine.service import _planitem_json
+            from calib_engine.session import build_plan
+            urdf_path = str(CELL_DIR / "robot_model" / "robot.urdf")
+            if not os.path.exists(urdf_path):
+                return {"error": f"no URDF at {urdf_path} — build the rig first"}
+            items = [_planitem_json(p) for p in build_plan(urdf_path)]
+            links = [l.get("name") for l in ET.parse(urdf_path).getroot().findall("link")]
+            return {"type": "plan", "items": items, "links": links, "urdf": urdf_path}
         return _calib_service().handle(verb, body)
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
