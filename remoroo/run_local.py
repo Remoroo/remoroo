@@ -282,16 +282,6 @@ def prepare_local_worker_context(
             resp.raise_for_status()
             run_data = resp.json()
             remote_run_id = run_data["run_id"]
-            # [RESUME-DEBUG] What did POST /runs return? If a "fresh" setup gets back a run
-            # with prior status/created_at (or a resumed/existing flag), the control plane is
-            # reusing a run for this (repo_path, goal) → that's the resume at the source.
-            try:
-                print(f"[RESUME-DEBUG] POST /runs → run_id={remote_run_id} "
-                      f"status={run_data.get('status')!r} created_at={run_data.get('created_at')!r} "
-                      f"resumed={run_data.get('resumed')!r} existing={run_data.get('existing')!r} "
-                      f"keys={sorted(run_data.keys())}", flush=True)
-            except Exception:
-                pass
             budget_ui = _budget_tui_from_run_json(max_wall_time_s, run_data)
     except RunPrepareError:
         raise

@@ -137,9 +137,13 @@ def chain_from_urdf(urdf_path: str, flange_link: str):
             continue
         axis_el = j.find("axis")
         axis = [float(v) for v in (axis_el.get("xyz", "0 0 1").split())] if axis_el is not None else [0.0, 0.0, 1.0]
+        lim_el = j.find("limit")
+        limit = ([float(lim_el.get("lower")), float(lim_el.get("upper"))]
+                 if lim_el is not None and lim_el.get("lower") is not None and lim_el.get("upper") is not None
+                 else None)  # None = continuous / unspecified → callers treat as wide-open
         by_child[child.get("link")] = {
             "type": j.get("type"), "parent": parent.get("link"),
-            "T": _origin_to_T(j.find("origin")), "axis": axis, "name": j.get("name"),
+            "T": _origin_to_T(j.find("origin")), "axis": axis, "name": j.get("name"), "limit": limit,
         }
     # walk flange -> root, then reverse to base -> flange
     path = []
@@ -156,7 +160,7 @@ def chain_from_urdf(urdf_path: str, flange_link: str):
         raise ValueError(f"no movable joint between the base and {flange_link}")
     base_link = path[first]["parent"]
 
-    origins, axes, names = [], [], []
+    origins, axes, names, limits, types = [], [], [], [], []
     pending = np.eye(4)
     for j in path[first:]:
         if j["type"] == "fixed":
@@ -165,8 +169,10 @@ def chain_from_urdf(urdf_path: str, flange_link: str):
         origins.append(pending @ j["T"])
         axes.append(j["axis"])
         names.append(j["name"])
+        limits.append(j.get("limit"))
+        types.append("prismatic" if j["type"] == "prismatic" else "revolute")
         pending = np.eye(4)
-    return Chain(origins, axes), names, base_link
+    return Chain(origins, axes, limits=limits, types=types), names, base_link
 
 
 def read_nominal_optical(urdf_path: str, camera_link: str) -> np.ndarray:

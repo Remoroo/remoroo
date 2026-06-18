@@ -30,7 +30,7 @@ from .metrics import (
     weak_rotation_axis,
 )
 from .posegen import suggest_next_pose
-from .solve import _estimate_target_pose, solve_eye_in_hand
+from .solve import _estimate_target_pose, solve_eye_in_hand, solve_static_camera
 from .types import BoardModel, CalibResult, CaptureSample, PlanItem
 
 
@@ -50,6 +50,9 @@ class BridgeProtocol(Protocol):
     # feasible(joints)-> bool cuRobo collision/in-envelope filter (7.7), checked at suggest
     # move_tcp_to_world(p_base) -> None drive the TCP to a base-frame point (tip test, 7.1)
     # marker_in_cam() -> 4x4 camera->shared-marker (base-to-base, dual-arm)
+    # motion_probe() -> {"joint": int, "delta": float} the RIG-SPECIFIC safe test motion for
+    #   the pre-flight check, AUTHORED BY THE AGENT for THIS cell (which joint is safe to
+    #   twitch, how far). Absent -> the engine computes the least-flange-effect joint.
 
 
 def _T(x) -> list:
@@ -73,16 +76,24 @@ def build_plan(urdf_path: str) -> List[PlanItem]:
             flange_link=flange, nominal_flange_body=flange_body,
             nominal_T=flange_body @ body_optical, arm=flange,
         ))
-    # Dual-arm: two eye-in-hand cameras on DISTINCT flanges -> a base_to_base item.
-    eih = [p for p in items if p.kind == "eye_in_hand"]
-    flanges = {p.flange_link for p in eih}
-    if len(eih) >= 2 and len(flanges) >= 2:
-        a, b = eih[0], eih[1]
-        items.append(PlanItem(
-            camera_link=f"base_to_base[{a.arm}|{b.arm}]", optical_frame="", kind="base_to_base",
-            flange_link=a.flange_link, nominal_flange_body=np.eye(4), nominal_T=np.eye(4),
-            arm=a.arm, partner_camera=a.camera_link, secondary_camera=b.camera_link,
-        ))
+    # Multi-arm: link the FIRST arm's wrist camera to EACH other arm's wrist camera — a
+    # spanning set of N-1 base_to_base items for N arms (2 arms -> 1, 3 arms -> 2, a
+    # humanoid's several limbs -> one per limb). Other base pairs follow transitively. One
+    # representative eye-in-hand camera per distinct flange (arm). Each runs after both its
+    # eye-in-hand calibrations are accepted.
+    by_flange: dict = {}
+    for p in items:
+        if p.kind == "eye_in_hand":
+            by_flange.setdefault(p.flange_link, p)
+    reps = list(by_flange.values())
+    if len(reps) >= 2:
+        a = reps[0]
+        for b in reps[1:]:
+            items.append(PlanItem(
+                camera_link=f"base_to_base[{a.arm}|{b.arm}]", optical_frame="", kind="base_to_base",
+                flange_link=a.flange_link, nominal_flange_body=np.eye(4), nominal_T=np.eye(4),
+                arm=a.arm, partner_camera=a.camera_link, secondary_camera=b.camera_link,
+            ))
     return items
 
 
@@ -121,7 +132,15 @@ class CalibSession:
         self.accept_heldout_px = accept_heldout_px
         self.accept_tip_mm = accept_tip_mm
 
-        self.kind = item.kind if item.kind in ("eye_in_hand", "eye_to_hand") else "eye_in_hand"
+        # Resolve the SOLVE kind from the plan item:
+        #   moving-link camera            -> "eye_in_hand"
+        #   world-fixed, handheld board   -> "static"  (operator moves the board, NO robot motion)
+        #   world-fixed, arm presents it  -> "eye_to_hand" (the arm-presented bundle)
+        if item.kind == "eye_to_hand":
+            self.kind = "eye_to_hand" if getattr(item, "board_source", "handheld") == "arm" else "static"
+        else:
+            self.kind = "eye_in_hand"
+        self.static = self.kind == "static"
         self.samples: List[CaptureSample] = []
         self.right_samples: List[CaptureSample] = []     # F9 stereo right-lens captures
         self.heldout: List[CaptureSample] = []           # cached held-out set (7.8)
@@ -136,32 +155,79 @@ class CalibSession:
         self._capture_right = getattr(bridge, "capture_right", None)
         self._sdk_T_lr = getattr(bridge, "sdk_T_lr", None)
         self._move_tcp = getattr(bridge, "move_tcp_to_world", None)
+        self._motion_probe = getattr(bridge, "motion_probe", None)  # agent-authored {joint,delta}
 
     # ── C.0 pre-flight motion check (gates everything) ──────────────────────
-    def motion_check(self, joint: int = 0, delta: float = 0.05, tol: float = 0.02) -> dict:
+    def motion_check(self, joint: Optional[int] = None, delta: float = 0.05, tol: float = 0.02) -> dict:
         q0 = self.bridge.read_joints()
+        # WHICH joint to twitch + how much is RIG-SPECIFIC, so the agent owns it: if the
+        # cell's Bridge authors `motion_probe()` (it knows what's safe to move on THIS rig —
+        # arm, humanoid, gantry, near the operator) we use its {joint, delta}. Otherwise we
+        # COMPUTE the safest joint (the one that moves the flange origin the least) from the
+        # chain — never a hardcoded index, never "the last joint is the wrist". The engine
+        # only owns the universal part: nudge → read back → confirm it moved + E-stop.
+        probe = self._motion_probe() if callable(getattr(self, "_motion_probe", None)) else None
+        if joint is not None:
+            j = int(joint)
+        elif probe and probe.get("joint") is not None:
+            j = int(probe["joint"])
+        else:
+            j = self.chain.least_effect_joint(q0)
+        if probe and probe.get("delta") is not None:
+            delta = float(probe["delta"])
+        j = max(0, min(j, self.chain.n - 1))
+        step = float(delta)
+        lim = self.chain.limits[j] if j < len(self.chain.limits) else None
+        if lim is not None:
+            lo, hi = lim
+            if q0[j] + step > hi - 1e-3:        # near the upper limit → nudge down instead
+                step = -abs(delta)
+            target = float(np.clip(q0[j] + step, lo, hi))
+            step = target - q0[j]
         q1 = q0.copy()
-        q1[joint] += delta
+        q1[j] += step
         self.bridge.move_to_joints(q1)
         obs = self.bridge.read_joints() - q0
         self.bridge.move_to_joints(q0)                    # return to start
         cmd = q1 - q0
         max_err = float(np.max(np.abs(obs - cmd)))
         estop = bool(self.bridge.estop_ok())
-        self.motion_ok = (max_err < tol) and estop
+        # need a real commanded motion (a clamped-to-zero nudge can't prove anything)
+        self.motion_ok = (max_err < tol) and estop and (abs(step) > 1e-4)
         return {"type": "motion_check", "ok": self.motion_ok, "max_err_rad": round(max_err, 5),
-                "estop_ok": estop, "commanded": _T(cmd), "observed": _T(obs)}
+                "joint": j, "estop_ok": estop, "commanded": _T(cmd), "observed": _T(obs)}
 
     # ── detect (board seen?) + bootstrap the board pose estimate ────────────
     def detect(self) -> dict:
         ids, uv = self.bridge.capture()
         seen = len(ids) >= self.min_corners
-        if seen and self.T_board_est is None:
+        if seen and self.T_board_est is None and not self.static:
             s = CaptureSample(id=-1, joints=self.bridge.read_joints(),
                               fk_pose=self.bridge.read_pose(), corner_ids=ids, corners=uv)
             T_c_board = _estimate_target_pose(s, self.board.points, self.K)
             self.T_board_est = s.fk_pose @ self.X_est @ T_c_board
         return {"type": "detect", "seen": seen, "n_corners": int(len(ids))}
+
+    # ── static-camera capture (world-fixed cam, handheld board, NO robot motion) ─
+    def capture_static(self, held_out: bool = False) -> dict:
+        """One view of the operator-placed board for a world-fixed camera. No joints, no FK,
+        no motion — just the camera's detected corners (+ retained frame)."""
+        ids, uv = self.bridge.capture()
+        img = None
+        if not held_out and self._capture_image is not None:
+            try:
+                img = np.asarray(self._capture_image())
+            except Exception:  # noqa: BLE001
+                img = None
+        bucket = self.heldout if held_out else self.samples
+        s = CaptureSample(id=(2000 if held_out else 0) + len(bucket), joints=np.zeros(0),
+                          fk_pose=np.eye(4), corner_ids=ids, corners=uv, image=img)
+        accepted = len(ids) >= self.min_corners
+        if accepted:
+            bucket.append(s)
+        return {"type": "capture", "index": s.id, "n_corners": int(len(ids)),
+                "accepted": accepted, "held_out": held_out, "has_image": img is not None,
+                "collected": len(self.samples), "static": True}
 
     # ── suggest -> move -> capture loop ─────────────────────────────────────
     def suggest_pose(self) -> dict:
@@ -189,6 +255,8 @@ class CalibSession:
         return {"type": "move_to", "ok": True, "joints": _T(q)}
 
     def capture(self, held_out: bool = False) -> dict:
+        if self.static:
+            return self.capture_static(held_out)
         ids, uv = self.bridge.capture()
         joints = self.bridge.read_joints()
         fk_pose = self.bridge.read_pose()
@@ -218,8 +286,16 @@ class CalibSession:
                 "accepted": accepted, "held_out": held_out, "has_image": img is not None,
                 "collected": len(self.samples)}
 
-    # ── solve (reprojection bundle) ─────────────────────────────────────────
+    # ── solve (reprojection bundle, or static PnP) ──────────────────────────
     def solve(self) -> dict:
+        if self.static:
+            # world-fixed camera: robust single-pose PnP over the fixed-board views. No
+            # kinematics, no FK correction, no stereo (one lens localizes the board).
+            self.result = solve_static_camera(self.samples, self.board.points, self.K)
+            self.X_est = self.result.T_optical
+            return {"type": "solve", "train_rms_px": round(self.result.residual_px, 3),
+                    "scale": 1.0, "X": _T(self.result.T_optical), "board": _T(np.eye(4)),
+                    "samples": self.result.samples_used, "kind": "static", "t_lr_err_deg": None}
         self.result = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
         self.X_est = self.result.T_optical
         self.T_board_est = self.result.T_board
@@ -258,6 +334,19 @@ class CalibSession:
         set instead of re-driving the arm (7.8) — used after curation so a curate edit costs
         no extra motion."""
         assert self.result is not None, "solve before validate"
+        if self.static:
+            # No robot motion: split the captured views — fit on a subset, score the rest.
+            # If the board moved between views (it must stay put), held-out blows up — the
+            # honest signal. tip/observability/stereo/consensus don't apply to a fixed cam.
+            n = len(self.samples)
+            k = max(1, min(n_heldout, n // 3))
+            train, test = self.samples[: n - k], self.samples[n - k:]
+            sub = solve_static_camera(train, self.board.points, self.K) if len(train) >= 1 else self.result
+            heldout_px = held_out_reprojection(sub, test, self.board.points, self.K, self.chain) if test else float("nan")
+            passed = heldout_px == heldout_px and heldout_px < self.accept_heldout_px
+            return {"type": "validate", "heldout_px": round(float(heldout_px), 3), "tip_mm": None,
+                    "rot_worst_deg": 0.0, "observability": None, "t_lr_err_deg": None,
+                    "consensus_deg": 0.0, "n_heldout": len(test), "pass": bool(passed)}
         if recollect or not self.heldout:
             self.heldout = []
             for _ in range(n_heldout):

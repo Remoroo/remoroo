@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from .types import BoardModel, CalibResult, CaptureSample
 from .geometry import Chain
-from .solve import solve_base_to_base, solve_eye_in_hand, solve_handeye_closed
+from .solve import solve_base_to_base, solve_eye_in_hand, solve_handeye_closed, solve_static_camera
 from .metrics import (
     consensus_spread,
     held_out_reprojection,
@@ -27,7 +27,7 @@ from . import urdf_io
 
 __all__ = [
     "BoardModel", "CalibResult", "CaptureSample", "Chain",
-    "solve_eye_in_hand", "solve_handeye_closed", "solve_base_to_base", "solve_curated",
+    "solve_eye_in_hand", "solve_handeye_closed", "solve_base_to_base", "solve_static_camera", "solve_curated",
     "held_out_reprojection", "tip_landing_error", "observability",
     "parameter_covariance", "consensus_spread", "reprojection_detail", "predict_uv",
     "stereo_consistency", "weak_rotation_axis",

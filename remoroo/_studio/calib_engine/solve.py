@@ -326,6 +326,41 @@ def solve_eye_in_hand(
     return result
 
 
+def solve_static_camera(
+    views: Sequence[CaptureSample],
+    board_points: np.ndarray,
+    K: np.ndarray,
+    *,
+    robust: bool = True,
+    f_scale: float = 1.5,
+) -> CalibResult:
+    """A WORLD-FIXED camera, operator-hand-moved board (eye-to-hand, handheld). The board is
+    placed where the camera should be ANCHORED (the world/reference frame) and a few views
+    are captured with NO robot motion; the camera is localized by a robust single-pose PnP
+    that pools ALL views' corners (the board is one fixed placement, so every view shares the
+    same board->camera). Result `T_optical` = board->camera = world->optical (board = world
+    origin). If the operator moved the board between views, held-out reprojection blows up —
+    the honest signal to keep it fixed. No kinematics, no FK correction."""
+    pts = np.concatenate([np.asarray(board_points)[v.corner_ids] for v in views])
+    uv = np.concatenate([np.asarray(v.corners, float) for v in views])
+    T0 = _estimate_target_pose(views[0], board_points, K)     # PnP init from the first view
+
+    def resid(x):
+        T = make_T(rodrigues(x[:3]), x[3:])
+        return (project(K, transform_points(T, pts)) - uv).ravel()
+
+    x0 = np.concatenate([rotvec_from_R(T0[:3, :3]), T0[:3, 3]])
+    res = least_squares(resid, x0, loss="huber" if robust else "linear", f_scale=f_scale,
+                        method="trf", max_nfev=400)
+    T = make_T(rodrigues(res.x[:3]), res.x[3:])
+    rms = float(np.sqrt(np.mean(res.fun ** 2))) if res.fun.size else 0.0
+    return CalibResult(
+        T_optical=T, T_board=np.eye(4), fk_offsets=np.zeros(0), board_scale=1.0,
+        residual_px=rms, samples_used=len(views), kind="static",
+        converged=bool(res.success), message=str(res.message), metrics={"train_rms_px": rms},
+    )
+
+
 def solve_base_to_base(
     obs: Sequence[dict],
     X_a: np.ndarray,

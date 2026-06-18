@@ -90,6 +90,14 @@ contract (verify it in the G2 bridge smoke before you checkpoint calibrate):
 
 **Optional Bridge methods the engine USES IF PRESENT** (probed by name; absent → that
 feature simply isn't offered, never an error):
+- **`motion_probe() -> {"joint": int, "delta": float}`** — the RIG-SPECIFIC safe test
+  motion for the pre-flight check, **authored by YOU** for this cell. Only you know what's
+  safe to twitch on THIS rig (which joint, how far) — a 6-DOF arm, a 7-DOF arm, a humanoid
+  limb, a gantry's prismatic axis, or a joint chosen to stay clear of the operator. If you
+  don't author it, the engine falls back to a COMPUTED choice: the joint that moves the
+  flange origin the least (smallest, safest excursion) — never a hardcoded "joint 0" or
+  "the last joint". Author `motion_probe` whenever the computed default isn't the safest
+  test motion for your cell.
 - a **cartesian TCP move** — `move_tcp_to_world` / `move_tcp` / `move_to_point` /
   `move_cartesian` / `move_l` taking a base-frame point — enables the **physical
   tip-landing test** (drive the TCP to the predicted fiducial; the operator watches it
@@ -98,6 +106,14 @@ feature simply isn't offered, never an error):
   enables the **stereo `T_L_R` self-check** (a ZED's second lens is a free sanity check).
 - a **feasibility check** — `is_joint_pose_feasible(joints)->bool` (cuRobo) — lets
   suggested poses be **collision/in-envelope filtered before** the operator accepts.
+
+**NOTHING about the engine is rig-specific.** It derives EVERYTHING from the model: the
+plan + each camera's kinematic chain (revolute AND prismatic joints) from the URDF; pose
+sampling within the URDF joint LIMITS, with each joint's range set by how much it tilts the
+camera's view (computed, not by joint index); the safe test joint computed from FK; N-arm
+base-to-base (one item per extra arm). No assumption of arm count, DOF, joint type, or "the
+last 3 joints are a wrist". A 1-arm cell, 3 arms, or a humanoid all flow through the same
+code — the only per-cell inputs are the Bridge (above) and the printed board.
 
 **Rectified-only contract (load-bearing):** the solver is a pinhole model on the
 camera's **rectified** left image + **rectified** intrinsics (what a ZED/RealSense

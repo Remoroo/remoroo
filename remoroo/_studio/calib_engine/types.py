@@ -59,6 +59,12 @@ class PlanItem:
     nominal_flange_body: np.ndarray  # (4,4)
     nominal_T: np.ndarray            # (4,4) flange->optical seed
     arm: str = ""
+    # For a WORLD-FIXED camera (kind eye_to_hand): how the board reaches its view.
+    #   "handheld" (default) -> operator places/moves a board, NO robot motion; the engine
+    #                           localizes the camera by PnP against the (fixed) board.
+    #   "arm"               -> a presenting arm carries the board (the eye_to_hand bundle).
+    # Derived as "handheld" by build_plan; the agent may switch it to "arm" + name the arm.
+    board_source: str = "handheld"
     # base_to_base only: the two wrist cameras (each already calibrated eye-in-hand) whose
     # shared-marker views recover the transform between their arms' bases.
     partner_camera: str = ""

@@ -189,15 +189,48 @@ class Chain:
     real arm. In synth we build a chain programmatically.
     """
 
-    def __init__(self, origins: Sequence[np.ndarray], axes: Sequence[np.ndarray]):
+    def __init__(self, origins: Sequence[np.ndarray], axes: Sequence[np.ndarray],
+                 limits: Optional[Sequence[Sequence[float]]] = None,
+                 types: Optional[Sequence[str]] = None):
         assert len(origins) == len(axes)
         self.origins: List[np.ndarray] = [np.asarray(o, float) for o in origins]
         self.axes: List[np.ndarray] = [np.asarray(a, float) / np.linalg.norm(a) for a in axes]
         self.n = len(self.axes)
+        # Per-joint (lower, upper) limits FROM THE URDF (radians for revolute, metres for
+        # prismatic) — pose generation + the motion-check nudge sample/clamp within these
+        # instead of guessing fixed ranges. None = unspecified/continuous (wide-open).
+        self.limits: List[Optional[tuple]] = (
+            [None] * self.n if limits is None
+            else [None if lo is None else (float(lo), float(hi)) for (lo, hi) in limits]
+        )
+        # Joint TYPE per joint. The chain to ANY camera (on an arm, a humanoid, a gantry) is
+        # a serial path of revolute and/or PRISMATIC joints — we model both, so the engine
+        # never assumes "6-DOF revolute arm".
+        self.types: List[str] = (["revolute"] * self.n if types is None
+                                 else ["prismatic" if str(t) == "prismatic" else "revolute" for t in types])
 
     def fk(self, theta: np.ndarray) -> np.ndarray:
         theta = np.asarray(theta, float)
         T = np.eye(4)
         for i in range(self.n):
-            T = T @ self.origins[i] @ make_T(rodrigues(self.axes[i] * theta[i]), np.zeros(3))
+            if self.types[i] == "prismatic":            # translate along the axis
+                joint = make_T(np.eye(3), self.axes[i] * theta[i])
+            else:                                        # revolute: rotate about the axis
+                joint = make_T(rodrigues(self.axes[i] * theta[i]), np.zeros(3))
+            T = T @ self.origins[i] @ joint
         return T
+
+    def least_effect_joint(self, q: np.ndarray, eps: float = 1e-3) -> int:
+        """The joint whose unit motion moves the FLANGE ORIGIN the least — the safest joint
+        to twitch for a motion-check (smallest cartesian excursion). COMPUTED from FK for
+        THIS chain, so it's general (no "the last joint is the wrist" assumption). When
+        several joints tie (e.g. a straight chain where multiple joints rotate about the
+        flange axis), prefer the MOST DISTAL — moving it disturbs the least of the robot."""
+        p0 = self.fk(q)[:3, 3]
+        ds = []
+        for i in range(self.n):
+            dq = np.asarray(q, float).copy()
+            dq[i] += eps
+            ds.append(float(np.linalg.norm(self.fk(dq)[:3, 3] - p0)))
+        mn = min(ds)
+        return max(i for i, d in enumerate(ds) if d <= mn + 1e-6)

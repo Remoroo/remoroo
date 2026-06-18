@@ -111,12 +111,16 @@ capture:                              # the data-capture target (Phase 2/6)
   est_gb_per_hour: 40
 
 calibration:                          # Phase 5/G5 — input to the SHIPPED calib engine
-  board:                              # the ONE input not in the URDF (the printed board)
-    dict: "DICT_5X5_1000"             # ArUco dictionary printed on the board
-    squares_x: 7                      # ChArUco columns
-    squares_y: 5                      # ChArUco rows
-    square_len: 0.030                 # square side, METRES
-    marker_len: 0.022                 # marker side, METRES
+  board:                              # the ONE input not in the URDF — READ IT OFF THE
+                                      # PRINTED BOARD. The values below are a PLACEHOLDER
+                                      # EXAMPLE, not a measurement: do NOT ship them
+                                      # unconfirmed. Get the real type/size from the
+                                      # operator (ask_human) or the Studio board form.
+    dict: "DICT_5X5_1000"             # ArUco dictionary printed on the board (EXAMPLE)
+    squares_x: 7                      # ChArUco columns (EXAMPLE)
+    squares_y: 5                      # ChArUco rows (EXAMPLE)
+    square_len: 0.030                 # square side, METRES (EXAMPLE)
+    marker_len: 0.022                 # marker side, METRES (EXAMPLE)
   accept_heldout_px: 1.5              # accept gate: held-out reprojection (tunable)
   accept_tip_mm: 3.0                  # accept gate: physical tip-landing (tunable)
   # Intrinsics are read LIVE from the camera SDK (obs.intrinsics) — NOT set here.

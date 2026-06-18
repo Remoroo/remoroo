@@ -287,6 +287,25 @@ def make_base_to_base_dataset(*, seed: int = 0, n_obs: int = 8):
     return {"obs": obs, "X_a": X_a, "X_b": X_b, "chain_a": chain, "chain_b": chain, "T_AB": T_AB}
 
 
+def make_static_camera_views(*, seed: int = 0, n_views: int = 8, noise_px: float = 0.3):
+    """A WORLD-FIXED camera and a FIXED board (operator placed it at the reference). Returns
+    (views, T_optical_true, board, K): N captures of the same board from the fixed camera, so
+    solve_static_camera must recover T_optical = board->camera. The camera doesn't move."""
+    rng = np.random.default_rng(seed)
+    board = default_board()
+    K = default_K()
+    # camera looks at the board from ~0.6 m, off to one side (a plausible overhead/static cam)
+    T_cam_board = _look_at(np.array([0.1, -0.6, 0.4]), np.zeros(3))  # camera pose in board frame
+    T_optical = inv_T(T_cam_board)                                   # board->camera
+    views: List[CaptureSample] = []
+    for i in range(n_views):
+        pc = transform_points(T_optical, board.points)
+        uv = project(K, pc) + rng.normal(0.0, noise_px, (board.n, 2))
+        views.append(CaptureSample(id=i, joints=np.zeros(0), fk_pose=np.eye(4),
+                                   corner_ids=np.arange(board.n), corners=uv))
+    return views, T_optical, board, K
+
+
 def render_corners_image(uv: np.ndarray, wh: Tuple[int, int] = (1280, 720)) -> np.ndarray:
     """A minimal synthetic grayscale frame: bright squares at the corner pixels on a mid-gray
     background. Enough for a cv2 cornerSubPix smoke test + the frame_image serving path; NOT

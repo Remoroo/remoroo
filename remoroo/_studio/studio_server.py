@@ -35,6 +35,7 @@ EDGE_URL = os.environ.get("EDGE_URL", "").rstrip("/")
 BRAIN_URL = os.environ.get("BRAIN_URL", "").rstrip("/")  # the control plane (run API + agent)
 RUN_ID = os.environ.get("RUN_ID", "")  # the @robot_setup run the browser attaches to
 SESSION_KEY = os.environ.get("SESSION_KEY", "")  # auth for the CP run API (browser never sees it)
+_STALE_RUNS_SEEN: set = set()  # stale run ids already logged (so a retrying tab logs once)
 
 MIME = {
     ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript",
@@ -132,11 +133,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"error": "upstream unreachable", "detail": str(e)}, 502)
             return
-        # [RESUME-DEBUG] Is this a RUN request, and does the CP say the run is new or
-        # resumed? Log the upstream status + a marker so we can see resume at the source.
-        _dbg_run = self.path.startswith("/runs/") or "/runs" in self.path
-        if _dbg_run:
-            print(f"[RESUME-DEBUG] proxy {self.command} {self.path} → CP status={resp.status}", flush=True)
         self.send_response(resp.status)
         for k, v in resp.getheaders():
             if k.lower() in ("transfer-encoding", "connection", "content-length"):
@@ -152,19 +148,6 @@ class Handler(BaseHTTPRequestHandler):
                 chunk = resp.read1(65536)
                 if not chunk:
                     break
-                # [RESUME-DEBUG] surface the run-stream events that drive the gate rail.
-                # If the very first stream carries gate_advanced/file_created/run_resumed,
-                # the CP is REPLAYING a prior run → the run was resumed, not created fresh.
-                if _dbg_run:
-                    try:
-                        txt = chunk.decode("utf-8", "replace")
-                        for line in txt.splitlines():
-                            low = line.lower()
-                            if any(k in low for k in ("gate_advanced", "gate_checkpoint", "file_created",
-                                                      "run_resumed", "resumed", "\"current_gate\"", "restor")):
-                                print(f"[RESUME-DEBUG] run-stream: {line[:300]}", flush=True)
-                    except Exception:
-                        pass
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -278,19 +261,12 @@ class Handler(BaseHTTPRequestHandler):
         # so it resumes deterministically instead of re-deriving from the repo).
         state_path = PROJECT / "remoroo_cell" / "setup_state.json"
         if path == "/project/setup_state" and self.command == "GET":
-            # [RESUME-DEBUG] Is there a setup_state.json on disk at boot? This is the same
-            # file the AGENT reads, so it tells us whether a "fresh" folder really has a
-            # persisted state machine — and what it claims.
             if not state_path.exists():
-                print(f"[RESUME-DEBUG] GET setup_state: NO FILE at {state_path} → returning {{}} (fresh)", flush=True)
                 self._json({})  # nothing persisted yet
                 return
             try:
-                raw = state_path.read_text()
-                print(f"[RESUME-DEBUG] GET setup_state: FILE EXISTS at {state_path} ({len(raw)} bytes): {raw[:600]}", flush=True)
-                self._json(json.loads(raw))
-            except Exception as _e:
-                print(f"[RESUME-DEBUG] GET setup_state: FILE EXISTS but unreadable ({_e})", flush=True)
+                self._json(json.loads(state_path.read_text()))
+            except Exception:
                 self._json({})
             return
         if path == "/project/setup_state" and self.command in ("PUT", "POST"):
@@ -300,34 +276,18 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or 0)
             body = self.rfile.read(length)
             # RUN-SCOPED GUARD: setup_state.json is one file per project dir, but several
-            # studio tabs (incl. STALE ones from prior `remoroo setup` runs that are still
-            # open + reconnecting + streaming their old run) can all PUT to it and clobber
-            # each other — polluting the LIVE run's state machine, which the agent then
-            # reads as a phantom "resume". Only the CURRENT run (RUN_ID) may write it. A
-            # write tagged with any other run_id is a stale tab → reject, don't persist.
+            # studio tabs — including STALE ones from prior `remoroo setup` runs still open
+            # and reconnecting — can all PUT to it and clobber the LIVE run's state machine,
+            # which the agent then reads as a phantom "resume". Only the CURRENT run (RUN_ID)
+            # may write it; a write tagged with any other (or no) run_id is a stale tab → drop.
             import json as _json
             try:
-                payload = _json.loads(body)
-                body_run = payload.get("run_id")
+                body_run = _json.loads(body).get("run_id")
             except Exception:
-                payload, body_run = None, None
-            # Require the CURRENT run's id. Reject mismatches AND writes with no run_id —
-            # the latter are stale tabs running the pre-fix SPA (the bug's real source:
-            # old browser tabs from prior `remoroo setup` runs, reconnecting + persisting
-            # their old run's gates into this run's shared state file). Only the live run
-            # may write; if no live-run tab is open, the file stays absent → agent sees fresh.
+                body_run = None
             if RUN_ID and body_run != RUN_ID:
-                why = "stale_run" if body_run else "no_run_id(pre-fix tab)"
-                print(f"[RESUME-DEBUG] REJECTED setup_state write ({why}) body_run={body_run} "
-                      f"current={RUN_ID} — blocked phantom-resume pollution", flush=True)
-                self._json({"ok": False, "rejected": why, "current": RUN_ID}, 409)
+                self._json({"ok": False, "rejected": "stale_run", "current": RUN_ID}, 409)
                 return
-            global _LAST_SETUP_DBG
-            gates_now = _json.dumps((payload or {}).get("gates"), sort_keys=True) if payload else body[:80].decode("utf-8", "replace")
-            if gates_now != globals().get("_LAST_SETUP_DBG"):
-                existed = state_path.exists()
-                print(f"[RESUME-DEBUG] {self.command} setup_state CHANGED (run={body_run} existed={existed}): {body[:600].decode('utf-8','replace')}", flush=True)
-                _LAST_SETUP_DBG = gates_now
             state_path.write_bytes(body)
             self._json({"ok": True, "path": str(state_path)})
             return
@@ -443,7 +403,10 @@ class Handler(BaseHTTPRequestHandler):
         parts = p.split("/")  # ['', 'runs', '<id>', ...]
         rid = parts[2] if len(parts) > 2 else ""
         if rid and rid != RUN_ID:
-            print(f"[RESUME-DEBUG] REFUSED stale-run proxy {self.command} {p} (run {rid} ≠ live {RUN_ID})", flush=True)
+            if rid not in _STALE_RUNS_SEEN:
+                _STALE_RUNS_SEEN.add(rid)
+                print(f"[remoroo-studio] ignoring a stale browser tab bound to run {rid} "
+                      f"(this studio serves run {RUN_ID}); close that old tab.", flush=True)
             self._json({"error": "stale run — this studio is bound to a different run", "current": RUN_ID}, 409)
             return True
         return False

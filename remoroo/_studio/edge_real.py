@@ -506,7 +506,8 @@ def _calib_config():
         "square_len": float(bp.get("square_len", 0.03)), "marker_len": float(bp.get("marker_len", 0.022)),
     }
     return (board_params, str(bp.get("dict", "DICT_5X5_1000")), cal.get("K"),
-            cal.get("wh", [1280, 720]), cal.get("dist"), cal.get("T_left_right"))
+            cal.get("wh", [1280, 720]), cal.get("dist"), cal.get("T_left_right"),
+            float(cal.get("accept_heldout_px", 1.5)), float(cal.get("accept_tip_mm", 3.0)))
 
 
 def _as_K(kcfg):
@@ -549,7 +550,7 @@ def _calib_service():
     if b is None:
         raise RuntimeError(_bridge_err or "no bridge connected")
     import numpy as np
-    board_params, dict_name, kcfg, wh, distcfg, tlr = _calib_config()
+    board_params, dict_name, kcfg, wh, distcfg, tlr, acc_px, acc_mm = _calib_config()
     dist = np.asarray(distcfg, float) if distcfg is not None else None
     sdk_T_lr = np.asarray(tlr, float).reshape(4, 4) if tlr is not None else None
     # Intrinsics: prefer an explicit cell.yaml override (a cam with no factory K), else read
@@ -579,11 +580,17 @@ def _calib_service():
         return urdf_io.chain_from_urdf(urdf_path, flange)[0]
 
     def bridge_factory(item):
+        # A world-fixed camera with a handheld board has no moving chain — the static path
+        # only needs capture()/capture_image(), never joints/move. Build a chainless bridge.
+        if item.kind == "eye_to_hand" and getattr(item, "board_source", "handheld") != "arm":
+            from calib_engine.geometry import Chain
+            return RealBridge(b, Chain([], []), [], board_params, dict_name, K=K, dist=dist, sdk_T_lr=sdk_T_lr)
         chain, names, _ = urdf_io.chain_from_urdf(urdf_path, item.flange_link)
         return RealBridge(b, chain, names, board_params, dict_name, K=K, dist=dist, sdk_T_lr=sdk_T_lr)
 
     _CALIB = CalibService(urdf_path, board, K, bridge_factory, chain_provider, wh=tuple(wh),
-                          calib_dir=str(CELL_DIR / "calibration"))
+                          calib_dir=str(CELL_DIR / "calibration"),
+                          accept_heldout_px=acc_px, accept_tip_mm=acc_mm)
     return _CALIB
 
 
@@ -695,7 +702,16 @@ def _calib_handle(verb: str, body: dict) -> dict:
                 return {"error": f"no URDF at {urdf_path} — build the rig first"}
             items = [_planitem_json(p) for p in build_plan(urdf_path)]
             links = [l.get("name") for l in ET.parse(urdf_path).getroot().findall("link")]
-            return {"type": "plan", "items": items, "links": links, "urdf": urdf_path}
+            # Return the ACTUAL configured board from cell.yaml (if any) so the form shows
+            # what the operator/agent really set — NOT a fabricated default. `board` is null
+            # when nothing is configured yet (then the UI offers a clearly-labelled example).
+            bp = ((load_cell_yaml().get("calibration") or {}).get("board") or {})
+            board = {
+                "dict": bp.get("dict"), "squares_x": bp.get("squares_x"),
+                "squares_y": bp.get("squares_y"), "square_len": bp.get("square_len"),
+                "marker_len": bp.get("marker_len"),
+            } if bp else None
+            return {"type": "plan", "items": items, "links": links, "urdf": urdf_path, "board": board}
         if verb == "set_board":
             # The ONE thing not in the URDF — the printed board — set from the Studio form.
             # Persist it to cell.yaml calibration.board and drop the cached service so the

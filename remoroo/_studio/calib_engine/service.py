@@ -20,6 +20,7 @@ from .types import BoardModel, CalibResult, PlanItem
 def _planitem_json(p: PlanItem) -> dict:
     return {"camera_link": p.camera_link, "optical_frame": p.optical_frame,
             "kind": p.kind, "flange_link": p.flange_link, "arm": p.arm,
+            "board_source": p.board_source,
             "partner_camera": p.partner_camera, "secondary_camera": p.secondary_camera,
             # the camera's NOMINAL flange->optical (from the URDF) — the "before" pose the
             # stage slides FROM as calibration refines it toward the solved X.
@@ -39,6 +40,8 @@ class CalibService:
         out_urdf: Optional[str] = None,
         fiducial_obs=None,
         calib_dir: Optional[str] = None,
+        accept_heldout_px: float = 1.5,
+        accept_tip_mm: float = 3.0,
     ):
         self.urdf_path = urdf_path
         self.board = board
@@ -49,6 +52,9 @@ class CalibService:
         self.out_urdf = out_urdf or urdf_path
         self.fiducial_obs = fiducial_obs
         self.calib_dir = calib_dir
+        # accept gate from cell.yaml (the operator's tuned thresholds), not a hardcoded default
+        self.accept_heldout_px = accept_heldout_px
+        self.accept_tip_mm = accept_tip_mm
         self.plan_items: List[PlanItem] = []
         self.session: Optional[CalibSession] = None
         self.b2b: Optional[BaseToBaseSession] = None
@@ -70,9 +76,14 @@ class CalibService:
             if item.kind == "base_to_base":
                 return self._select_b2b(item)
             self.b2b = None
-            chain = self.chain_provider(item.flange_link)
+            # A world-fixed camera with a HANDHELD board has no moving chain (the flange is
+            # the world root) — use an empty Chain; the static path never touches it.
+            static = item.kind == "eye_to_hand" and getattr(item, "board_source", "handheld") != "arm"
+            chain = Chain([], []) if static else self.chain_provider(item.flange_link)
             bridge = self.bridge_factory(item)
-            self.session = CalibSession(item, self.board, self.K, chain, bridge, wh=self.wh)
+            self.session = CalibSession(item, self.board, self.K, chain, bridge, wh=self.wh,
+                                        accept_heldout_px=self.accept_heldout_px,
+                                        accept_tip_mm=self.accept_tip_mm)
             return {"type": "select", "camera_link": cam, "kind": item.kind, "flange_link": item.flange_link}
 
         # base_to_base verbs run against the dedicated dual-arm session

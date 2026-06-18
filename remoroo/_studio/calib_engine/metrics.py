@@ -26,8 +26,12 @@ def predict_uv(
     mode-aware reprojection used by held-out, the contact-sheet, and curation flagging
     (so eye-to-hand is never scored with the eye-in-hand model)."""
     X, Tb, fk, scale = result.T_optical, result.T_board, result.fk_offsets, result.board_scale
-    T_fk = chain.fk(s.joints + fk)
     pb = board_points[s.corner_ids] * scale
+    if result.kind == "static":
+        # world-fixed camera, board at the world/reference origin: X = board->camera, so the
+        # board points project straight through X. No kinematics (the camera doesn't move).
+        return project(K, transform_points(X, pb))
+    T_fk = chain.fk(s.joints + fk)
     if result.kind == "eye_to_hand":
         pc = transform_points(inv_T(X), transform_points(T_fk @ Tb, pb))
     else:

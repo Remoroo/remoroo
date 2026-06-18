@@ -65,10 +65,36 @@ def suggest_next_pose(
     best_q: Optional[np.ndarray] = None
     best_score = -1.0
     R_ref = (chain.fk(base) @ X_est)[:3, :3]
-    for _ in range(n_cand):
+    lims = getattr(chain, "limits", None) or [None] * chain.n
+
+    # Per-joint sampling range, COMPUTED from each joint's effect on the camera's VIEWING
+    # DIRECTION — NOT from the joint index. A joint that mostly ROLLS the camera in place
+    # (small optical-axis tilt) keeps the board in frame, so sample it WIDE for orientation
+    # diversity; a joint that PITCHES/YAWS the view (large tilt) swings the board out of
+    # frame, so sample it NARROW. This is the rig-agnostic generalisation of the old
+    # "first 3 = positioning, last 3 = wrist" split — it holds for any DOF count, a 7-DOF
+    # arm, a humanoid limb, etc. The chosen range is then intersected with the URDF limit.
+    z0 = (chain.fk(base) @ X_est)[:3, 2]
+    span = []
+    for i in range(chain.n):
+        dq = base.copy(); dq[i] += 1e-3
+        z = (chain.fk(dq) @ X_est)[:3, 2]
+        tilt = float(np.arccos(np.clip(float(z0 @ z), -1.0, 1.0)) / 1e-3)  # view-tilt rad per rad
+        span.append(wrist_range if tilt < 0.3 else base_range)
+
+    def _sample() -> np.ndarray:
         q = base.copy()
-        q[:3] = q[:3] + rng.uniform(-base_range, base_range, 3)
-        q[3:] = q[3:] + rng.uniform(-wrist_range, wrist_range, chain.n - 3)
+        for i in range(chain.n):
+            lo, hi = base[i] - span[i], base[i] + span[i]
+            lim = lims[i] if i < len(lims) else None
+            if lim is not None:                          # never leave the URDF joint limits
+                m = 0.02 * (lim[1] - lim[0])
+                lo, hi = max(lo, lim[0] + m), min(hi, lim[1] - m)
+            q[i] = rng.uniform(lo, hi) if hi > lo else base[i]
+        return q
+
+    for _ in range(n_cand):
+        q = _sample()
         T_bc = chain.fk(q) @ X_est
         if not _board_fully_visible(T_bc, T_board_est, board, K, wh):
             continue
