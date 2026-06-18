@@ -391,6 +391,125 @@ def sse_record(q):
         yield {"done": True, "result": {"error": f"{type(e).__name__}: {e}", "frames": 0, "durationSec": seconds, "droppedFrames": 0, "sizeMB": 0, "schemaOk": False, "syncOk": False}}
 
 
+# --------------------------------------------------------------------------- #
+# Calibration protocol (P5): /edge/calib/<verb> -> calib_engine CalibService.   #
+# Robot-only (needs cv2 + the connected cell); the dispatch/kinematics are       #
+# CI-tested off-robot via FakeBridge (calib_engine/tests/test_service.py).        #
+# --------------------------------------------------------------------------- #
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # make `calib_engine` importable
+
+
+class RealBridge:
+    """Adapts the cell's primitives Bridge + camera + ChArUco detector to calib_engine's
+    BridgeProtocol. The flange pose is reported as chain.fk(joints) (the URDF model FK),
+    so the bundle's FK-correction has a chain to refine; joints are read in the chain's
+    joint order. Joint-move probes the common cell API names (the agent authors one)."""
+
+    def __init__(self, cell_bridge, chain, joint_names, board_params, dict_name):
+        self.b = cell_bridge
+        self.chain = chain
+        self.joint_names = joint_names
+        self.board_params = board_params
+        self.dict_name = dict_name
+
+    def read_joints(self):
+        import numpy as np
+        jp = (self.b.get_observation().joint_positions) or {}
+        out = []
+        for n in self.joint_names:
+            if n not in jp:
+                raise RuntimeError(f"joint {n!r} not in observation.joint_positions")
+            v = jp[n]
+            out.append(float(v[0]) if hasattr(v, "__len__") else float(v))
+        return np.asarray(out, float)
+
+    def read_pose(self):
+        return self.chain.fk(self.read_joints())
+
+    def move_to_joints(self, joints):
+        q = [float(x) for x in joints]
+        for name in ("move_to_joints", "move_joints", "goto_joints", "set_joint_positions", "move_j"):
+            fn = getattr(self.b, name, None)
+            if callable(fn):
+                fn(q)
+                return
+        raise RuntimeError("cell Bridge has no joint-move method (expected one of "
+                           "move_to_joints/move_joints/goto_joints/set_joint_positions/move_j)")
+
+    def estop_ok(self):
+        return True
+
+    def capture(self):
+        import numpy as np
+        from calib_engine.detect import detect_charuco
+        obs = self.b.get_observation()
+        img = next((getattr(obs, a, None) for a in ("rgb", "color", "image", "rgb_image", "left")
+                    if getattr(obs, a, None) is not None), None)
+        if img is None:
+            raise RuntimeError("observation has no image (expected obs.rgb/color/image)")
+        return detect_charuco(np.asarray(img), dict_name=self.dict_name, **self.board_params)
+
+
+def _calib_config():
+    cy = load_cell_yaml()
+    cal = (cy.get("calibration") or {})
+    bp = (cal.get("board") or {})
+    board_params = {
+        "squares_x": int(bp.get("squares_x", 7)), "squares_y": int(bp.get("squares_y", 5)),
+        "square_len": float(bp.get("square_len", 0.03)), "marker_len": float(bp.get("marker_len", 0.022)),
+    }
+    return board_params, str(bp.get("dict", "DICT_5X5_1000")), cal.get("K"), cal.get("wh", [1280, 720])
+
+
+def _as_K(kcfg):
+    import numpy as np
+    if isinstance(kcfg, dict):
+        return np.array([[kcfg["fx"], 0, kcfg["cx"]], [0, kcfg["fy"], kcfg["cy"]], [0, 0, 1.0]], float)
+    return np.asarray(kcfg, float).reshape(3, 3)
+
+
+_CALIB = None
+
+
+def _calib_service():
+    global _CALIB
+    if _CALIB is not None:
+        return _CALIB
+    from calib_engine import urdf_io
+    from calib_engine.detect import charuco_board_points
+    from calib_engine.service import CalibService
+    from calib_engine.types import BoardModel
+
+    b = get_bridge()
+    if b is None:
+        raise RuntimeError(_bridge_err or "no bridge connected")
+    board_params, dict_name, kcfg, wh = _calib_config()
+    if kcfg is None:
+        raise RuntimeError("calibration.K (intrinsics) not set in cell.yaml — set it from the ZED SDK")
+    K = _as_K(kcfg)
+    pts = charuco_board_points(dict_name=dict_name, **board_params)
+    board = BoardModel(points=pts, rows=board_params["squares_y"], cols=board_params["squares_x"],
+                       square_m=board_params["square_len"])
+    urdf_path = str(CELL_DIR / "robot_model" / "robot.urdf")
+
+    def chain_provider(flange):
+        return urdf_io.chain_from_urdf(urdf_path, flange)[0]
+
+    def bridge_factory(item):
+        chain, names, _ = urdf_io.chain_from_urdf(urdf_path, item.flange_link)
+        return RealBridge(b, chain, names, board_params, dict_name)
+
+    _CALIB = CalibService(urdf_path, board, K, bridge_factory, chain_provider, wh=tuple(wh))
+    return _CALIB
+
+
+def _calib_handle(verb: str, body: dict) -> dict:
+    try:
+        return _calib_service().handle(verb, body)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 # route table: path -> (kind, handler). kind in {"json","json_body","sse"}
 ROUTES = {
     "/health": ("json", lambda q: {"ok": True, "edge": "real", "cell": str(CELL_DIR)}),
@@ -430,18 +549,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_json(fn(q))
         self.send_response(405); self._cors(); self.end_headers()
 
+    def _read_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if not length:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:
+            return {}
+
     def do_POST(self):
         path, q, route = self._route()
+        # Calibration protocol: /edge/calib/<verb> -> the stateful CalibService.
+        if path.startswith("/edge/calib/"):
+            return self._serve_json(_calib_handle(path[len("/edge/calib/"):], self._read_body()))
         if not route:
             self.send_response(404); self._cors(); self.end_headers(); self.wfile.write(b"not found"); return
         kind, fn = route
-        body = {}
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        if length:
-            try:
-                body = json.loads(self.rfile.read(length).decode("utf-8"))
-            except Exception:
-                body = {}
+        body = self._read_body()
         if kind == "json_body":
             return self._serve_json(fn(q, body))
         if kind == "json":
