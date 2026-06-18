@@ -36,6 +36,26 @@ PORT = int(os.environ.get("EDGE_PORT", "7779"))
 # Make `import remoroo_cell.primitives` resolve (the cell lives in the repo).
 sys.path.insert(0, str(CELL_DIR.parent))
 
+
+def _ensure_safety_shim_resolves() -> None:
+    """The cell's primitives.py imports its safety/transport spine from `remoroo.edge`
+    (shipped), with a `safety_shim` fallback. A cell that's missing its local shim — or that
+    was authored with a bare `import safety_shim` — used to fail HARD ("No module named
+    'safety_shim'") and take the whole Bridge (hence calibration + the live camera feed) down.
+    Pre-register the shipped spine under BOTH the bare and package-qualified shim names so the
+    Bridge imports regardless of how the fallback was written."""
+    if "safety_shim" in sys.modules:
+        return
+    try:
+        from remoroo import edge as _spine  # the shipped spine (remoroo/edge.py)
+    except Exception:  # noqa: BLE001 — working-tree run without the installed package
+        return
+    sys.modules.setdefault("safety_shim", _spine)
+    sys.modules.setdefault(f"{CELL_DIR.name}.safety_shim", _spine)
+
+
+_ensure_safety_shim_resolves()
+
 # --------------------------------------------------------------------------- #
 # Lazy, cached access to the authored cell + toolchain (never crash on import) #
 # --------------------------------------------------------------------------- #
@@ -736,24 +756,28 @@ def _first_camera(cy: dict) -> str:
 
 
 def _snapshot_target_and_camera(cy: dict, cal: dict):
-    """The target + camera the live-cam inset should detect against: the SELECTED step's if a
-    session is live, else the cell's default target + first camera. Returns (target, camera_id)
-    or (None, reason)."""
+    """The target + camera the live-cam inset detects against: the SELECTED step's if a session
+    is live, else the cell's default target + first camera. The target may be None (none
+    configured yet) — the raw frame still shows; only the detection OVERLAY needs it."""
     sess = getattr(_CALIB, "session", None) if _CALIB is not None else None
     if sess is not None and getattr(sess, "bridge", None) is not None and hasattr(sess.bridge, "target"):
-        return sess.bridge.target, getattr(sess.bridge, "camera_id", ""), None
-    _import_authored_targets()
+        return sess.bridge.target, getattr(sess.bridge, "camera_id", "")
     spec = _target_spec_from_cell(cal)
     if spec is None:
-        return None, "", "no calibration target configured — set calibration.target {type, params}"
-    from calib_engine import fiducials
-    return fiducials.build_target(spec), _first_camera(cy), None
+        return None, _first_camera(cy)              # show the frame, no overlay yet
+    try:
+        _import_authored_targets()
+        from calib_engine import fiducials
+        return fiducials.build_target(spec), _first_camera(cy)
+    except Exception:  # noqa: BLE001 — a bad target spec must not blank the live feed
+        return None, _first_camera(cy)
 
 
 def _calib_snapshot() -> dict:
-    """Current camera frame (JPEG) + factory intrinsics + the AUTHORED target's detection
-    overlay for the live-cam inset. The fiducial is the cell's target — never a hardcoded
-    board. Needs cv2 + a connected camera; any failure returns {error} → UI placeholder."""
+    """Current camera frame (JPEG) + factory intrinsics + (when a target is configured) its
+    detection overlay, for the live-cam inset. The RAW FEED shows as soon as the camera is up —
+    it does NOT require a calibration target; only the overlay does. Needs cv2 + a connected
+    camera; any failure returns {error} → UI placeholder."""
     import base64
     import numpy as np
     import cv2  # type: ignore
@@ -763,9 +787,7 @@ def _calib_snapshot() -> dict:
         return {"error": _bridge_err or "no bridge connected"}
     cy = load_cell_yaml()
     cal = cy.get("calibration") or {}
-    target, camera_id, err = _snapshot_target_and_camera(cy, cal)
-    if err:
-        return {"error": err}
+    target, camera_id = _snapshot_target_and_camera(cy, cal)
     rb = RealBridge(b, None, [], target, camera_id=camera_id)
     img = np.asarray(rb.capture_image())
     if img.ndim == 2:
@@ -775,11 +797,17 @@ def _calib_snapshot() -> dict:
     if not ok:
         return {"error": "jpeg encode failed"}
     h, w = img.shape[:2]
-    ids, uv = target.detect(img)
+    ids, uv = (np.empty(0, int), np.empty((0, 2)))
+    if target is not None:
+        try:
+            ids, uv = target.detect(img)            # overlay only; a detector miss isn't fatal
+        except Exception:  # noqa: BLE001
+            ids, uv = (np.empty(0, int), np.empty((0, 2)))
     K, _ = _intrinsics_from_bridge(b, camera_id)
     return {
         "type": "snapshot", "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
-        "w": int(w), "h": int(h), "seen": bool(len(ids) >= target.min_points), "n_corners": int(len(ids)),
+        "w": int(w), "h": int(h),
+        "seen": bool(target is not None and len(ids) >= target.min_points), "n_corners": int(len(ids)),
         "corners": np.asarray(uv, float).round(1).tolist(),
         "intrinsics": None if K is None else {"fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2]},
     }

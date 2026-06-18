@@ -136,11 +136,13 @@ def setup(
         help="Show the model picker before launching the TUI.",
     ),
     budget_hours: float = typer.Option(
-        4.0,
+        12.0,
         "--budget",
         help=(
-            "Time budget in hours (default 4.0). Setup is interactive and "
-            "resumable — re-run to continue where it left off."
+            "Time budget in hours (default 12.0). Setup is interactive and "
+            "resumable — re-run to continue where it left off. Time spent "
+            "blocked on operator gates (gate_checkpoint / ask_human) is "
+            "excluded from this budget."
         ),
     ),
     headless: bool = typer.Option(
