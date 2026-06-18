@@ -759,7 +759,11 @@ def _calib_service():
     def bridge_factory(item):
         target = targets.get(item.target_id) or default_target
         cam, arm = item.camera_link, item.arm
-        Kc = intrinsics.get(cam, (K0, wh0))[0] or K0
+        # This camera's own intrinsics, or the service default. `intrinsics` already holds only
+        # cameras with a real K (filtered below), so .get is either a (K, wh) tuple or None — a
+        # plain None check, NOT `K_array or K0` (a numpy array has no truth value).
+        kv = intrinsics.get(cam)
+        Kc = kv[0] if kv is not None else K0
         static = item.kind in ("eye_to_hand", "static") and getattr(item, "board_source", "handheld") != "arm"
         if static:
             return RealBridge(b, Chain([], []), [], target, camera_id=cam, arm_id="",
