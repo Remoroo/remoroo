@@ -358,14 +358,6 @@ def _run_streaming_script(rel: str, entry_desc: str, _q):
             yield item  # pose / status events stream straight through
 
 
-def sse_calibrate(_q):
-    """Run the agent's hand-eye routine live and stream pose/residual events.
-    Events: {type:'pose', index, cam_pose:[x,y,z,qx,qy,qz,qw], residual_mm, accepted}
-            {type:'status', message} ; final {done, result:{residual_mm, accepted,
-            rejected, num_poses, stereo_ok}}."""
-    yield from _run_streaming_script("calibration/collect_poses.py", "run(bridge, cell, on_event=...)", _q)
-
-
 def sse_scan(_q):
     """Run the agent's world scan live and stream coverage/points events.
     Events: {type:'points', xyz:[[x,y,z],...]} {type:'status', coverage, message}
@@ -405,12 +397,16 @@ class RealBridge:
     so the bundle's FK-correction has a chain to refine; joints are read in the chain's
     joint order. Joint-move probes the common cell API names (the agent authors one)."""
 
-    def __init__(self, cell_bridge, chain, joint_names, board_params, dict_name):
+    def __init__(self, cell_bridge, chain, joint_names, board_params, dict_name,
+                 K=None, dist=None, sdk_T_lr=None):
         self.b = cell_bridge
         self.chain = chain
         self.joint_names = joint_names
         self.board_params = board_params
         self.dict_name = dict_name
+        self.K = K
+        self.dist = dist                 # optional radial-tangential coeffs (7.2)
+        self._sdk_T_lr = sdk_T_lr        # optional 4x4 left->right stereo baseline (F9)
 
     def read_joints(self):
         import numpy as np
@@ -439,15 +435,66 @@ class RealBridge:
     def estop_ok(self):
         return True
 
-    def capture(self):
+    def _detect(self, img):
         import numpy as np
         from calib_engine.detect import detect_charuco
+        ids, uv = detect_charuco(np.asarray(img), dict_name=self.dict_name, **self.board_params)
+        # 7.2: the solver is pinhole on RECTIFIED imagery. If the cell feeds a raw frame +
+        # distortion coeffs, undistort the corners to the rectified pixels first.
+        if self.dist is not None and self.K is not None and len(ids):
+            from calib_engine.geometry import undistort_points
+            uv = undistort_points(uv, self.K, self.dist)
+        return ids, uv
+
+    def capture(self):
+        return self._detect(self.capture_image())
+
+    def capture_right(self):
+        """Right stereo lens corners (for the F9 left/right self-check). Probes obs.right /
+        right_image; returns empty if the camera doesn't expose a second lens."""
+        import numpy as np
+        obs = self.b.get_observation()
+        img = next((getattr(obs, a, None) for a in ("right", "right_image", "rgb_right")
+                    if getattr(obs, a, None) is not None), None)
+        if img is None:
+            return np.zeros(0, int), np.zeros((0, 2))
+        return self._detect(np.asarray(img))
+
+    def sdk_T_lr(self):
+        return self._sdk_T_lr
+
+    def move_tcp_to_world(self, p_base):
+        """Drive the TCP to a base-frame point (the physical tip-landing test, 7.1). Probes
+        the cell's common API names; raises if the Bridge can't do a cartesian point move."""
+        p = [float(x) for x in p_base]
+        for name in ("move_tcp_to_world", "move_tcp", "move_to_point", "move_cartesian", "move_l"):
+            fn = getattr(self.b, name, None)
+            if callable(fn):
+                fn(p)
+                return
+        raise RuntimeError("cell Bridge has no cartesian TCP move (expected move_tcp_to_world/"
+                           "move_tcp/move_to_point/move_cartesian/move_l) — tip-landing needs it")
+
+    def feasible(self, joints):
+        """Optional cuRobo collision/in-envelope filter (7.7): if the cell Bridge exposes
+        one, suggested poses are filtered BEFORE the operator accepts; else accept all."""
+        for name in ("is_joint_pose_feasible", "feasible", "plan_feasible"):
+            fn = getattr(self.b, name, None)
+            if callable(fn):
+                try:
+                    return bool(fn([float(x) for x in joints]))
+                except Exception:  # noqa: BLE001
+                    return True
+        return True
+
+    def capture_image(self):
+        """The raw RGB frame from the cell camera (for the live-cam inset + overlay)."""
         obs = self.b.get_observation()
         img = next((getattr(obs, a, None) for a in ("rgb", "color", "image", "rgb_image", "left")
                     if getattr(obs, a, None) is not None), None)
         if img is None:
             raise RuntimeError("observation has no image (expected obs.rgb/color/image)")
-        return detect_charuco(np.asarray(img), dict_name=self.dict_name, **self.board_params)
+        return img
 
 
 def _calib_config():
@@ -458,7 +505,8 @@ def _calib_config():
         "squares_x": int(bp.get("squares_x", 7)), "squares_y": int(bp.get("squares_y", 5)),
         "square_len": float(bp.get("square_len", 0.03)), "marker_len": float(bp.get("marker_len", 0.022)),
     }
-    return board_params, str(bp.get("dict", "DICT_5X5_1000")), cal.get("K"), cal.get("wh", [1280, 720])
+    return (board_params, str(bp.get("dict", "DICT_5X5_1000")), cal.get("K"),
+            cal.get("wh", [1280, 720]), cal.get("dist"), cal.get("T_left_right"))
 
 
 def _as_K(kcfg):
@@ -466,6 +514,23 @@ def _as_K(kcfg):
     if isinstance(kcfg, dict):
         return np.array([[kcfg["fx"], 0, kcfg["cx"]], [0, kcfg["fy"], kcfg["cy"]], [0, 0, 1.0]], float)
     return np.asarray(kcfg, float).reshape(3, 3)
+
+
+def _intrinsics_from_bridge(b):
+    """Read FACTORY intrinsics live off the cell camera's observation (the SDK already
+    has them — ZED: calibration_parameters.left_cam; RealSense: the stream profile). This
+    is why calibration must NOT demand a hand-typed cell.yaml K: the camera publishes a
+    trustworthy K every frame. Returns (K 3x3, (w,h)) or (None, None) if absent."""
+    import numpy as np
+    try:
+        intr = getattr(b.get_observation(), "intrinsics", None)
+    except Exception:  # noqa: BLE001 — no camera up yet; caller falls back / errors clearly
+        return None, None
+    if isinstance(intr, dict) and all(k in intr for k in ("fx", "fy", "cx", "cy")):
+        K = np.array([[intr["fx"], 0.0, intr["cx"]], [0.0, intr["fy"], intr["cy"]], [0.0, 0.0, 1.0]], float)
+        wh = (int(intr.get("width", 1280)), int(intr.get("height", 720)))
+        return K, wh
+    return None, None
 
 
 _CALIB = None
@@ -483,10 +548,28 @@ def _calib_service():
     b = get_bridge()
     if b is None:
         raise RuntimeError(_bridge_err or "no bridge connected")
-    board_params, dict_name, kcfg, wh = _calib_config()
-    if kcfg is None:
-        raise RuntimeError("calibration.K (intrinsics) not set in cell.yaml — set it from the ZED SDK")
-    K = _as_K(kcfg)
+    import numpy as np
+    board_params, dict_name, kcfg, wh, distcfg, tlr = _calib_config()
+    dist = np.asarray(distcfg, float) if distcfg is not None else None
+    sdk_T_lr = np.asarray(tlr, float).reshape(4, 4) if tlr is not None else None
+    # Intrinsics: prefer an explicit cell.yaml override (a cam with no factory K), else read
+    # the camera's factory K live off the SDK. Only error if the camera reports nothing AND
+    # there is no override — the agent never has to hand-author a K for a ZED/RealSense.
+    if kcfg is not None:
+        K = _as_K(kcfg)
+        wh = tuple(wh)
+    else:
+        K, wh_sdk = _intrinsics_from_bridge(b)
+        if wh_sdk is not None:
+            wh = wh_sdk
+    if K is None:
+        raise RuntimeError(
+            "no camera intrinsics available — the cell camera's get_observation().intrinsics "
+            "is empty and cell.yaml calibration.K is unset. Have primitives.py report factory "
+            "intrinsics {fx,fy,cx,cy,width,height} from the camera SDK (ZED: "
+            "get_camera_information().camera_configuration.calibration_parameters.left_cam), or "
+            "set calibration.K in cell.yaml as a fallback."
+        )
     pts = charuco_board_points(dict_name=dict_name, **board_params)
     board = BoardModel(points=pts, rows=board_params["squares_y"], cols=board_params["squares_x"],
                        square_m=board_params["square_len"])
@@ -497,10 +580,105 @@ def _calib_service():
 
     def bridge_factory(item):
         chain, names, _ = urdf_io.chain_from_urdf(urdf_path, item.flange_link)
-        return RealBridge(b, chain, names, board_params, dict_name)
+        return RealBridge(b, chain, names, board_params, dict_name, K=K, dist=dist, sdk_T_lr=sdk_T_lr)
 
-    _CALIB = CalibService(urdf_path, board, K, bridge_factory, chain_provider, wh=tuple(wh))
+    _CALIB = CalibService(urdf_path, board, K, bridge_factory, chain_provider, wh=tuple(wh),
+                          calib_dir=str(CELL_DIR / "calibration"))
     return _CALIB
+
+
+def _calib_set_board(body: dict) -> dict:
+    """Persist the printed board to cell.yaml calibration.board and apply it. If a service
+    is already live (a camera was selected), update its board + detector IN PLACE so the
+    in-progress session is preserved (nulling the cache would drop it → "no calibration
+    selected"); otherwise the next select reads the fresh cell.yaml."""
+    global _CALIB
+    import yaml  # type: ignore
+    b = body or {}
+    board = {
+        "dict": str(b.get("dict", "DICT_5X5_1000")),
+        "squares_x": int(b["squares_x"]), "squares_y": int(b["squares_y"]),
+        "square_len": float(b["square_len"]), "marker_len": float(b["marker_len"]),
+    }
+    cy = load_cell_yaml()
+    cal = dict(cy.get("calibration") or {})
+    cal["board"] = board
+    cy["calibration"] = cal
+    (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False))
+
+    if _CALIB is not None:
+        from calib_engine.detect import charuco_board_points
+        from calib_engine.types import BoardModel
+        dict_name = board["dict"]
+        bp = {k: board[k] for k in ("squares_x", "squares_y", "square_len", "marker_len")}
+        new_board = BoardModel(points=charuco_board_points(dict_name=dict_name, **bp),
+                               rows=bp["squares_y"], cols=bp["squares_x"], square_m=bp["square_len"])
+        _CALIB.board = new_board
+        if _CALIB.session is not None:
+            _CALIB.session.board = new_board
+            rb = _CALIB.session.bridge
+            if hasattr(rb, "board_params"):
+                rb.board_params = bp
+            if hasattr(rb, "dict_name"):
+                rb.dict_name = dict_name
+    return {"type": "set_board", "board": board}
+
+
+def _calib_snapshot() -> dict:
+    """Current camera frame (JPEG, base64) + factory intrinsics + the ChArUco detection
+    overlay (corner pixels) for the live-cam inset. Needs cv2 + a connected camera; any
+    failure returns {error} and the UI falls back to a placeholder."""
+    import base64
+    import numpy as np
+    import cv2  # type: ignore
+    from calib_engine.detect import detect_charuco
+
+    b = get_bridge()
+    if b is None:
+        return {"error": _bridge_err or "no bridge connected"}
+    board_params, dict_name, kcfg, wh, *_ = _calib_config()
+    rb = RealBridge(b, None, [], board_params, dict_name)
+    img = np.asarray(rb.capture_image())
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if img.shape[-1] == 3 else img
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    if not ok:
+        return {"error": "jpeg encode failed"}
+    h, w = img.shape[:2]
+    ids, uv = detect_charuco(img, dict_name=dict_name, **board_params)
+    K, _ = _intrinsics_from_bridge(b)
+    return {
+        "type": "snapshot", "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
+        "w": int(w), "h": int(h), "seen": bool(len(ids) >= 6), "n_corners": int(len(ids)),
+        "corners": np.asarray(uv, float).round(1).tolist(),
+        "intrinsics": None if K is None else {"fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2]},
+    }
+
+
+def _calib_frame_image(index: int) -> dict:
+    """JPEG (base64) of a RETAINED capture frame — the camera image behind the curate
+    contact-sheet overlay (A/B). Reaches into the live session's samples; {error} if the
+    frame wasn't retained (off-robot) so the UI falls back to the pixel-only overlay."""
+    import base64
+    import numpy as np
+    import cv2  # type: ignore
+    sess = getattr(_CALIB, "session", None) if _CALIB is not None else None
+    if sess is None:
+        return {"error": "no calibration selected"}
+    s = next((x for x in sess.samples if x.id == index), None)
+    if s is None or s.image is None:
+        return {"error": "no retained frame for this capture"}
+    img = np.asarray(s.image)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if img.shape[-1] == 3 else img
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+    if not ok:
+        return {"error": "jpeg encode failed"}
+    h, w = img.shape[:2]
+    return {"type": "frame_image", "id": index, "w": int(w), "h": int(h),
+            "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii")}
 
 
 def _calib_handle(verb: str, body: dict) -> dict:
@@ -518,6 +696,18 @@ def _calib_handle(verb: str, body: dict) -> dict:
             items = [_planitem_json(p) for p in build_plan(urdf_path)]
             links = [l.get("name") for l in ET.parse(urdf_path).getroot().findall("link")]
             return {"type": "plan", "items": items, "links": links, "urdf": urdf_path}
+        if verb == "set_board":
+            # The ONE thing not in the URDF — the printed board — set from the Studio form.
+            # Persist it to cell.yaml calibration.board and drop the cached service so the
+            # next `select` rebuilds with the new params (and the new detector).
+            return _calib_set_board(body)
+        if verb == "snapshot":
+            # The live-cam inset: the current frame (JPEG) + factory intrinsics + the board
+            # detection overlay. Edge-only (needs the image + cv2); degrades to {error} so the
+            # UI shows a placeholder off-robot.
+            return _calib_snapshot()
+        if verb == "frame_image":
+            return _calib_frame_image(int((body or {}).get("index", -1)))
         return _calib_service().handle(verb, body)
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
@@ -533,7 +723,6 @@ ROUTES = {
     "/edge/safety": ("json", h_safety),
     "/edge/buildRobot": ("json_body", h_build_robot),
     "/live/joints": ("sse", sse_live_joints),
-    "/edge/calibrate": ("sse", sse_calibrate),
     "/edge/scanWorld": ("sse", sse_scan),
     "/edge/record": ("sse", sse_record),
     "/edge/plan": ("sse", sse_plan),

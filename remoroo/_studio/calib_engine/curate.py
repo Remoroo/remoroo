@@ -68,19 +68,47 @@ def flag_suspect_corners(
 ) -> Dict[int, List[int]]:
     """Per-image, the corner ids whose reprojection error exceeds `px_thresh` — the
     handful the Studio pre-flags so the operator only inspects what matters."""
-    from .geometry import inv_T, project, transform_points
+    from .metrics import predict_uv
 
-    X, Tb, fk, scale = result.T_optical, result.T_board, result.fk_offsets, result.board_scale
     flagged: Dict[int, List[int]] = {}
     for s in samples:
-        T_cb = inv_T(chain.fk(s.joints + fk) @ X)
-        pw = transform_points(Tb, board_points[s.corner_ids] * scale)
-        uv = project(K, transform_points(T_cb, pw))
+        uv = predict_uv(result, s, board_points, K, chain)
         err = np.linalg.norm(uv - s.corners, axis=1)
         bad = [int(s.corner_ids[i]) for i in np.where(err > px_thresh)[0]]
         if bad:
             flagged[s.id] = bad
     return flagged
+
+
+def homography_resnap(sample: CaptureSample, board_points: np.ndarray, corner_id: int) -> np.ndarray:
+    """Re-derive ONE corner's pixel from the planar structure of the board: fit the
+    homography board(x,y) -> pixels from the OTHER (good) corners of this image (DLT), then
+    map the target corner's board point through it. Pure numpy — the geometric truth from
+    the board plane, available without cv2 and without the image. cornerSubPix (below)
+    then locks it to the image gradient when cv2 + the frame are present."""
+    ids = list(sample.corner_ids.astype(int))
+    if corner_id not in ids:
+        raise ValueError(f"corner {corner_id} not in sample {sample.id}")
+    ti = ids.index(corner_id)
+    src = board_points[sample.corner_ids][:, :2]      # (M,2) board plane
+    dst = np.asarray(sample.corners, float)           # (M,2) pixels
+    keep = [i for i in range(len(ids)) if i != ti]
+    if len(keep) < 4:
+        raise ValueError("need >=4 other corners to fit a homography")
+    H = _fit_homography(src[keep], dst[keep])
+    p = H @ np.array([src[ti, 0], src[ti, 1], 1.0])
+    return p[:2] / p[2]
+
+
+def _fit_homography(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Direct linear transform: 3x3 H with dst ~ H @ [src;1], from >=4 correspondences."""
+    A = []
+    for (x, y), (u, v) in zip(src, dst):
+        A.append([-x, -y, -1, 0, 0, 0, u * x, u * y, u])
+        A.append([0, 0, 0, -x, -y, -1, v * x, v * y, v])
+    _, _, Vt = np.linalg.svd(np.asarray(A, float))
+    H = Vt[-1].reshape(3, 3)
+    return H / H[2, 2]
 
 
 def resnap_corner(image: np.ndarray, approx_uv) -> "np.ndarray":

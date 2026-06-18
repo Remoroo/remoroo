@@ -134,6 +134,22 @@ class Bridge:
             return False
         return self._arm_drivers[arm].move_joints(q_target, speed=speed)  # TODO adapt
 
+    # ---- Calibration joint-move contract (the SHIPPED calib engine calls this) ----
+    def move_to_joints(self, joints) -> None:
+        """SINGLE-ARM joint move in URDF joint order — what the shipped calibration
+        engine (`calib_engine`) probes for + calls (also accepts move_joints/goto_joints/
+        set_joint_positions/move_j). Distinct from the multi-arm `move_joints(arm, q)`
+        above: the engine works one PlanItem (one arm) at a time and passes just the
+        joint vector. Wrap the supervised move for the arm being calibrated:
+            self.move_joints(self._calib_arm, np.asarray(joints, float),
+                             speed_frac=self.cell['safety']['max_joint_speed_frac'])
+        For DUAL-ARM, set self._calib_arm to the arm whose camera is being calibrated
+        (the engine calibrates A, then B, then A↔B). For calibration the engine also
+        needs get_observation() to return: joint_positions as a {urdf_joint_name: value}
+        map covering EVERY revolute joint, an RGB image (rgb/color/left), and
+        intrinsics {fx,fy,cx,cy,width,height} from the camera SDK. See calibration.md."""
+        ...  # TODO route to the arm being calibrated
+
     def plan_and_move(self, arm: str, target_pose: np.ndarray, *, world=None) -> bool:
         """THE Phase-8 primitive: plan a collision-free path with cuRoboV2
         against `world` (the Phase-4 collision world), gate it through the

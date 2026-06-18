@@ -97,8 +97,10 @@ for real at G4/G8.
   extrinsics (RealSense / ZED / GenICam).
 - `data_capture.md` — Phases 2 & 6. The data-capture **recorder** + episode
   schema. Authored for THIS cell's modalities; not hardcoded to any camera.
-- `calibration.md` — Phase 5. Hand-eye, intrinsics, time-sync, payload sysid,
-  and the shared-ArUco dual-arm base-to-base.
+- `calibration.md` — Phase 5. The hand-eye SOLVER is a **shipped engine**
+  (`calib_engine`, imported never authored); you author only the Bridge contract
+  it calls + the printed-board params in cell.yaml, then supervise the
+  Studio-driven loop. Intrinsics are read live from the camera SDK.
 - `robot_model.md` — Phase 5. The OPERATOR builds the URDF in the Studio editor;
   you CONSUME `robot_model/robot.urdf` and sphere-fit it (cuRobo collision
   spheres → YAML + preview for approval). You do not author the URDF.
@@ -111,17 +113,20 @@ for real at G4/G8.
 ## What you author vs. what is shipped
 
 - **You author (computational, in `remoroo_cell/`):** `primitives.py` (Bridge),
-  the capture recorder, `calibration/`, `robot_model/collision_spheres.yml` (from
-  the operator's URDF), `world/`, `requirements.lock`, `setup_report.md`; and you
-  DRAFT `cell.yaml` for the operator to confirm.
+  the capture recorder, `robot_model/collision_spheres.yml` (from the operator's
+  URDF), `world/`, `requirements.lock`, `setup_report.md`; and you DRAFT `cell.yaml`
+  for the operator to confirm. (You do NOT author calibration math — the shipped
+  engine writes `calibration/`; you provide the Bridge + board params it needs.)
 - **The OPERATOR authors in the Studio (you consume, never author):**
   `robot_model/robot.urdf` (the editor), `safety.yaml` (the safety envelope), and
   `task_spec.md` (the task intent).
 - **You import, never author:** the deterministic safety supervisor, the
-  brain↔worker transport, and the episode-writer base. These ship in the
-  installed Remoroo package. (Import them from the shipped runtime spine; see
-  `bridge_primitives.md` for the import surface and a fallback shim if the
-  spine isn't importable yet during R&D.)
+  brain↔worker transport, the episode-writer base, and the **calibration engine**
+  (`calib_engine` — detection, observability pose-gen, the reprojection bundle,
+  held-out/tip-landing metrics, curation, optical-frame write-back). These ship in
+  the installed Remoroo package / the Studio edge. (Import them from the shipped
+  runtime spine; see `bridge_primitives.md` for the import surface and a fallback
+  shim if the spine isn't importable yet during R&D.)
 
 ## Target layout after setup
 
@@ -135,10 +140,9 @@ for real at G4/G8.
       recorder.py            # data-capture recorder (authored)
       schema.json
       sample_episode/
-    calibration/
-      hand_eye.yaml
-      base_to_base.yaml      # dual-arm only (shared-ArUco)
-      report.md
+    calibration/             # WRITTEN BY THE SHIPPED ENGINE (not hand-authored)
+      <camera>.json          # CalibResult per camera (X, fk_offsets, metrics)
+      base_to_base.json      # dual-arm only (shared-ArUco)
     robot_model/             # the model (Phase 5)
       robot.urdf             # the OPERATOR's URDF, built in the Studio editor (you read it)
       collision_spheres.yml  # cuRobo robot config (spheres + limits) — YOU fit this from robot.urdf

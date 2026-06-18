@@ -12,7 +12,7 @@ watches the live reconstruction in the Studio.
 
 The Studio's World gate runs YOUR scan live (Start / Re-scan) and renders the
 cloud as it fills. Author `remoroo_cell/world/scan.py` with this **streaming entry
-point** (the edge imports + calls it; same shape as `calibration/collect_poses.py`):
+point** (the edge imports + calls it):
 
 ```python
 def run(bridge, cell, on_event=None):

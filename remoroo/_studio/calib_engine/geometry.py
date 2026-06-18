@@ -10,7 +10,7 @@ Conventions:
 """
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -116,15 +116,64 @@ def R_to_rpy(R: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Pinhole projection                                                           #
 # --------------------------------------------------------------------------- #
-def project(K: np.ndarray, pts_cam: np.ndarray) -> np.ndarray:
-    """Project (N,3) camera-frame points to (N,2) pixels with intrinsics K (no distortion)."""
+def project(K: np.ndarray, pts_cam: np.ndarray, dist: Optional[np.ndarray] = None) -> np.ndarray:
+    """Project (N,3) camera-frame points to (N,2) pixels with intrinsics K.
+
+    The solver operates on RECTIFIED imagery (the stereo SDK's left rectified frame +
+    its rectified K), where the pinhole model holds and `dist` is None — this is the
+    load-bearing contract (see `detect`/`session`). `dist` is supported only so a caller
+    can model a non-rectified lens for tests / a future raw-frame path: OpenCV
+    [k1,k2,p1,p2,k3] radial-tangential."""
     pts_cam = np.asarray(pts_cam, float)
     z = pts_cam[:, 2]
     x = pts_cam[:, 0] / z
     y = pts_cam[:, 1] / z
+    if dist is not None:
+        x, y = _distort(x, y, np.asarray(dist, float))
     u = K[0, 0] * x + K[0, 2]
     v = K[1, 1] * y + K[1, 2]
     return np.stack([u, v], axis=1)
+
+
+def _distort(x: np.ndarray, y: np.ndarray, d: np.ndarray):
+    k1, k2, p1, p2 = d[0], d[1], d[2], d[3]
+    k3 = d[4] if d.size > 4 else 0.0
+    r2 = x * x + y * y
+    radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 ** 3
+    xd = x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+    yd = y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+    return xd, yd
+
+
+def undistort_points(uv: np.ndarray, K: np.ndarray, dist: np.ndarray, iters: int = 6) -> np.ndarray:
+    """Map raw distorted pixels (N,2) to the RECTIFIED pixels the pinhole solver expects,
+    by iteratively inverting the radial-tangential model (same scheme as cv2.undistortPoints
+    + re-projection through K). Pure numpy so it runs in CI; only used when a cell feeds a
+    NON-rectified frame + distortion coeffs (the ZED/RealSense rectified path skips it)."""
+    uv = np.asarray(uv, float)
+    d = np.asarray(dist, float)
+    x = (uv[:, 0] - K[0, 2]) / K[0, 0]
+    y = (uv[:, 1] - K[1, 2]) / K[1, 1]
+    xu, yu = x.copy(), y.copy()
+    for _ in range(iters):
+        xd, yd = _distort(xu, yu, d)
+        xu = xu + (x - xd)
+        yu = yu + (y - yd)
+    return np.stack([K[0, 0] * xu + K[0, 2], K[1, 1] * yu + K[1, 2]], axis=1)
+
+
+def average_transforms(Ts: Sequence[np.ndarray]) -> np.ndarray:
+    """Chordal L2 mean of a set of 4x4 transforms: average translations, and average
+    rotations by summing the rotation matrices and projecting back to SO(3) via SVD."""
+    Ts = [np.asarray(T, float) for T in Ts]
+    t = np.mean([T[:3, 3] for T in Ts], axis=0)
+    Rsum = np.sum([T[:3, :3] for T in Ts], axis=0)
+    U, _, Vt = np.linalg.svd(Rsum)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1
+        R = U @ Vt
+    return make_T(R, t)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,223 +1,177 @@
-# Calibration & system identification — `remoroo_cell/calibration/` (Phase 5 → G5)
+# Calibration & system identification — Phase 5 → G5 (the SHIPPED engine)
 
-Calibration makes the world geometry and the data trustworthy. It is the
-cell's FIRST motion: run it under operator supervision (slow moves, hand on the
-E-stop), AFTER the operator's URDF + spheres exist and the operator has set the
-safety envelope (G0.5), and BEFORE the world scan. **Collect poses AUTONOMOUSLY
-(see the next section) — never hand-jog them.** Outputs are **versioned +
-editable** and must be **re-runnable**.
+Calibration makes the world geometry and the data trustworthy. It is the cell's
+FIRST motion: run it under operator supervision (slow moves, hand on the E-stop),
+AFTER the operator's URDF + spheres exist and the operator has set the safety
+envelope (G0.5), and BEFORE the world scan.
+
+> **You do NOT author calibration math, and there is NO `collect_poses.py`.** The
+> calibration engine is **SHIPPED** with Remoroo (the `calib_engine` module that
+> travels with the Studio edge). It is version-pinned and CI-tested; you import it
+> via the Studio, never reauthor it — exactly like the safety supervisor and the
+> transport spine. Your only cell-specific job is the **Bridge** (`primitives.py`)
+> the engine calls, plus the one input the URDF can't give: the **printed board**.
 
 > **FRESH every setup — do NOT scavenge.** Do not search the disk for old
 > `calibration/` files to reuse or "save time"; a stale extrinsic is a safety
-> hazard. Run the routine for real each time. (Resuming a prior setup is driven
-> by the gate state, not by you reading old artifacts.) And get the operator's
+> hazard. The engine runs the routine for real each time. Get the operator's
 > explicit go-ahead — `gate_checkpoint(gate=calibrate, default_proceed=false)` —
 > before the first move; the operator clears the area and permits motion.
 
-## The Studio integration contract — `calibration/collect_poses.py`
+## What the shipped engine does (so you know what NOT to build)
 
-Calibration is the Studio's **hero wizard**: the operator clicks *Start* and the
-**Studio runs YOUR routine live via the edge** and renders a pose cloud + a
-residual gauge. So author `remoroo_cell/calibration/collect_poses.py` with this
-**exact streaming entry point** (the edge imports and calls it):
+`calib_engine` provides, version-robust and tested against a synthetic-data
+harness with known ground truth:
 
-```python
-def run(bridge, cell, on_event=None):
-    """Autonomously collect hand-eye poses and solve. The Studio runs THIS and
-    renders the stream. Plan poses with cuRobo (collision-free, WITHIN the
-    operator's G0.5 safety envelope, slow), move, detect the board, solve AX=XB
-    incrementally, reject high-reprojection samples.
+- **Detection** — ArUco/ChArUco with an OpenCV-version fallback (no API guessing).
+- **Plan derivation from the URDF** — one item per camera: a camera on a moving
+  flange → **eye-in-hand**; a camera anchored to the world → **eye-to-hand** (its
+  own observation model — static camera, board on the gripper); two arms each with a
+  wrist camera → a **base-to-base** item (the transform between the arms' bases from
+  a board both cams see, recovered once both eye-in-hand solves are accepted). Each
+  item starts from the camera's **nominal** transform in the URDF and is *refined*,
+  not guessed.
+- **Observability-guided pose generation** — next-best pose by information gain
+  (which DOF of `X` is still weakly observed), collision-free + in-envelope.
+  ~20–40 *informative* poses, not thousands.
+- **The solve = a reprojection-error BUNDLE** — closed-form `calibrateHandEye`
+  (Tsai/Park) is only the initializer; the deliverable jointly fits
+  `X + board world-pose + a small per-joint FK correction + board scale`, robust
+  (Huber). This removes systematic FK/scale bias instead of averaging around it
+  (the path off the ~1° floor that defeats pose-count-only approaches).
+- **Honest metrics** — **held-out** reprojection (train/validate split), a
+  **task-space tip-landing** prediction, per-DOF observability/covariance,
+  multi-solver consensus spread, and the stereo `T_L_R` self-check. Accept is
+  judged on *held-out + tip-landing*, **never** training residual.
+- **Corner curation + sub-pixel re-snap + eye-nudge** — the operator can exclude
+  bad images/corners and nudge the camera frame by eye; the optimizer re-snaps and
+  every edit must improve the held-out error.
+- **Optical-frame I/O** — reads each camera's nominal transform, writes the
+  calibrated result back to an explicit **`*_optical_frame`** child link (left
+  rectified for stereo), never the camera body center, with tracked provenance.
 
-    Call on_event(dict) as you go (no-op if None → headless):
-      {"type":"status","message":str,"residual_mm":float?}
-      {"type":"pose","index":int,"cam_pose":[x,y,z,qx,qy,qz,qw],
-       "residual_mm":float,"accepted":bool}
-        # cam_pose = the CAMERA ORIGIN in the ROBOT BASE frame (renders as a dot)
+The Studio drives the supervised loop and renders the rig, the live-cam detection
+overlay, the pose cloud, the observability meter, and the before→after camera
+slide. **The operator clicks Start/Accept/Reject; the engine does the math.**
 
-    On finish: WRITE calibration/hand_eye.yaml + report.md, and RETURN:
-      {"residual_mm":float,"num_poses":int,"accepted":int,"rejected":int,
-       "stereo_ok":bool}
-    """
+## YOUR job — the Bridge contract the engine calls
+
+The engine talks to THIS cell only through `primitives.py`. Make it satisfy this
+contract (verify it in the G2 bridge smoke before you checkpoint calibrate):
+
+1. **`get_observation()`** returns an object exposing:
+   - `joint_positions` — a `{joint_name: value}` map covering **every revolute
+     joint in the URDF**. The engine reads them in **URDF joint order**; joint
+     states are what let the bundle fit the FK correction. (Names must match the
+     URDF `<joint name=…>`.)
+   - an **RGB image** under one of `rgb` / `color` / `image` / `rgb_image` /
+     `left` (the left rectified lens for a stereo cam).
+   - **`intrinsics`** — `{fx, fy, cx, cy, width, height}` read from the **camera
+     SDK** (factory intrinsics are trustworthy; do NOT hand-type a `K`):
+     ```python
+     # ZED (Stereolabs):
+     ci = cam.get_camera_information().camera_configuration.calibration_parameters.left_cam
+     intrinsics = {"fx": ci.fx, "fy": ci.fy, "cx": ci.cx, "cy": ci.cy,
+                   "width": w, "height": h}
+     # RealSense: intr = profile.as_video_stream_profile().intrinsics
+     #            {"fx": intr.fx, "fy": intr.fy, "cx": intr.ppx, "cy": intr.ppy, ...}
+     ```
+     The edge reads these live at calibration time — **you only confirm they are
+     populated.** (See `camera_capture.md`; this is the same observation you
+     already build for capture.)
+2. **A joint-move method** named one of `move_to_joints` / `move_joints` /
+   `goto_joints` / `set_joint_positions` / `move_j`, taking a **joint-position
+   vector in URDF order**, planning collision-free + slow within the operator's
+   G0.5 envelope (cuRobo + the spheres). The engine probes these names; expose one.
+3. **The E-stop hook** (already from G2). The first commanded move is the
+   operator-gated **pre-flight motion check**: the engine nudges one joint, reads
+   joints back, and confirms the arm moved by ~the commanded delta and the E-stop
+   halts it — this catches a wrong/stub move API *before* a wasted calibration.
+
+**Optional Bridge methods the engine USES IF PRESENT** (probed by name; absent → that
+feature simply isn't offered, never an error):
+- a **cartesian TCP move** — `move_tcp_to_world` / `move_tcp` / `move_to_point` /
+  `move_cartesian` / `move_l` taking a base-frame point — enables the **physical
+  tip-landing test** (drive the TCP to the predicted fiducial; the operator watches it
+  land). Without it the tip metric is the software fiducial-consistency only.
+- a **right-lens capture** — `get_observation().right` / `right_image` / `rgb_right` —
+  enables the **stereo `T_L_R` self-check** (a ZED's second lens is a free sanity check).
+- a **feasibility check** — `is_joint_pose_feasible(joints)->bool` (cuRobo) — lets
+  suggested poses be **collision/in-envelope filtered before** the operator accepts.
+
+**Rectified-only contract (load-bearing):** the solver is a pinhole model on the
+camera's **rectified** left image + **rectified** intrinsics (what a ZED/RealSense
+publishes). If the cell can only provide a RAW frame, also supply distortion coeffs in
+`cell.yaml calibration.dist` ([k1,k2,p1,p2,k3]) so the edge undistorts the corners first.
+
+That's the whole cell-specific surface. No solver, no pose generation, no
+`cv2.calibrateHandEye` in your code.
+
+## The one text input — the printed board (cell.yaml `calibration`)
+
+The board is the only thing the URDF can't give. The operator enters it in the
+**Studio board-params form** (read off the printed board); it lands in `cell.yaml`:
+
+```yaml
+calibration:
+  board:
+    dict: "DICT_5X5_1000"   # the ArUco dictionary printed on the board
+    squares_x: 7            # ChArUco columns
+    squares_y: 5            # ChArUco rows
+    square_len: 0.030       # chessboard square side, METRES
+    marker_len: 0.022       # ArUco marker side, METRES
+  # intrinsics: read LIVE from the camera SDK (obs.intrinsics). The two below are an
+  # OPTIONAL override only for a camera with no factory K — normally omit them:
+  # K:  [fx, 0, cx,  0, fy, cy,  0, 0, 1]   # or {fx, fy, cx, cy}
+  # wh: [1280, 720]
+  # dist: [k1, k2, p1, p2, k3]   # OPTIONAL — only if the cell feeds a RAW (unrectified) frame
+  # T_left_right: [...4x4...]    # OPTIONAL — SDK stereo baseline, enables the T_L_R self-check
+  accept_heldout_px: 1.5    # accept gate: held-out reprojection (tunable)
+  accept_tip_mm: 3.0        # accept gate: physical tip-landing (tunable)
 ```
 
-The operator's *Start* is the motion go-ahead; *Accept* (on convergence)
-advances the gate. Keep `run` importable + side-effect-free at import time (guard
-any `__main__`). If `bridge` is None or a step fails, raise — the Studio surfaces
-it honestly (no fake success).
+Propose a sensible default board but **do NOT hardcode it** — confirm with the
+operator what they actually printed. Wrong params fail loudly (the live detection
+overlay shows the board not-seen before any motion), not silently.
 
-## What to calibrate (only what this cell needs)
+## How the gate runs (you orchestrate + supervise; you do not drive the math)
 
-1. **Camera intrinsics** — skip if factory intrinsics are trustworthy
-   (RealSense/ZED usually are). Otherwise calibrate from a target.
-2. **Hand-eye extrinsics** — the core one:
-   - *eye-in-hand* (wrist cam): solve camera↔gripper `X` from `AX = XB`.
-   - *eye-to-hand* (static cam): solve camera↔base.
-   - both, if the cell has both.
-3. **Dual-arm base-to-base** — if two arms, the transform between their bases.
-   Once BOTH arms' eye-in-hand is solved, recover it from a **shared ArUco**
-   both wrist cams observe — simple matrix transforms, no extra solver. You
-   COMPUTE this transform; the operator laid the two arms out approximately in
-   the editor, and cuRobo uses your precise `base_to_base` alongside the
-   operator's URDF (see `robot_model.md`).
-4. **Time-sync / latency** — camera↔arm offset; record it for the recorder.
-5. **Payload / tool sysid** — mass + COM of the mounted tool/gripper so the
-   controller and limits are honest.
+1. Ensure the Bridge exposes joints + image + intrinsics + a joint-move method,
+   and `calibration.board` is set. Confirm the G2 smoke passed.
+2. `gate_checkpoint(gate=calibrate, default_proceed=false)`. The operator clears
+   the area and permits motion.
+3. The Studio runs the SHIPPED engine live over the edge: derive the plan from the
+   URDF → pre-flight motion check → detect the board → observability-guided
+   suggest/Accept/move/capture loop → solve the bundle → validate on **fresh
+   held-out + tip-landing** → curate/nudge if needed → the operator **Accepts**.
+4. You **supervise**: watch the held-out / observability / consensus the protocol
+   reports. On a **PROBLEM** report (motion check fails → joint-move API wrong; no
+   intrinsics → camera not reporting `obs.intrinsics`; board not seen → wrong
+   `calibration.board`), **fix the Bridge or cell.yaml yourself** and **re-issue
+   the same checkpoint**. Never tell the operator to edit code.
+5. For **dual-arm**, calibrate each wrist camera eye-in-hand, then the plan's
+   **base-to-base** item: place ONE board both cams can see and capture a few shared
+   views — the engine recovers the transform between the arms' bases (matrix algebra,
+   no extra solve) and writes `calibration/base_to_base.json`, which cuRobo uses
+   alongside the operator's URDF layout (see `robot_model.md`).
+6. **Time-sync / payload sysid** (camera↔arm latency, tool mass/COM) are recorded
+   for the recorder + controller where the cell needs them — small, separate from
+   the hand-eye solve.
 
-Hand-eye + base-to-base are *inputs* to the cuRobo model. You do NOT build the
-URDF (the operator does, in the editor); you sphere-fit their URDF and fold in
-these transforms — see `robot_model.md`.
-
-## Automated pose collection — REQUIRED (never hand-jog ~100 poses)
-
-Hand-jogging poses defeats the purpose and does not scale. Two facts drive the
-design:
-
-- **You do NOT need ~100 poses.** Hand-eye accuracy *plateaus* around 12-20
-  *well-chosen* poses (MoveIt's calibrator plateaus ~12-15); 100 mediocre poses
-  are worse than 15 diverse ones. Rotation-axis DIVERSITY beats raw count.
-- **Remoroo can move itself.** You already have cuRobo (collision-free
-  planning), a coarse world, the robot URDF, and a depth/stereo wrist cam — so
-  generate poses, plan to them, capture, and solve hands-off.
-
-Author `calibration/collect_poses.py` running this autonomous loop. The
-operator's ONLY job is to place the board once and supervise with the E-stop.
-
-**This needs only SUPERVISED motion — not the scanned world or full autonomy.**
-cuRobo plans self-collision- and joint-limit-safe moves from the robot URDF
-alone; for external obstacles rely on a conservative workspace box (table plane
-+ bounds from `cell.yaml`) plus the operator-cleared area, slow speed, and the
-E-stop — NOT a TSDF scan (the scan comes AFTER calibration and depends on its
-extrinsics). To AIM the camera you only need a ROUGH initial hand-eye guess:
-take it from the mount CAD (the camera is bolted to the flange at a roughly
-known offset) or from 2-3 hand-guided board-visible poses; it self-refines once
-the first solve lands. You do NOT need a prior accurate calibration to generate
-poses, and you do NOT need the world scan to move safely here.
-
-1. **Place the target once.** Operator drops a ChArUco / AprilGrid board flat in
-   the workspace (its location/orientation need NOT be measured — multi-pose
-   hand-eye cancels it). Take one look to detect it and get an initial
-   `T_cam_target`. No board available -> see the markerless option below.
-2. **Generate observability-optimized candidates (target-centric).** Sample
-   camera viewpoints on a hemisphere/cone around the board: vary AZIMUTH +
-   ELEVATION about the board normal (~±30-45 deg), vary STANDOFF (e.g. 0.3-0.6 m
-   so the board fills a good fraction of the frame), vary IN-PLANE ROLL, and
-   above all **maximize rotation-AXIS diversity between poses** — clustered
-   orientations make `AX=XB` near-singular (Tsai-Lenz). Require the WHOLE board
-   to project inside the FOV at a non-degenerate angle (project board corners
-   through the camera model; reject out-of-frame / too oblique).
-3. **Filter reachable + collision-free with cuRobo.** Convert each candidate
-   camera pose to the required EE pose via the current hand-eye guess; run cuRobo
-   IK + SELF-collision + joint-limit check against the robot model plus a
-   conservative workspace box (table plane + bounds from `cell.yaml`) — NOT a
-   TSDF scan (it does not exist yet). Keep only the reachable, in-limits,
-   collision-free ones.
-4. **Execute + capture, hands-off.** Per kept pose: cuRobo plans a collision-free
-   trajectory, move at safety-rated slow speed, settle, capture synchronized L+R
-   frames, detect the board (solvePnP). Record (`T_base_ee` from FK,
-   `T_cam_target` from detection). The FIRST move is the operator-gated E-stop
-   check (Phase 5 intro).
-5. **Auto-reject bad samples** in the loop: too few detected corners, high
-   per-corner reprojection error, board too oblique, or motion not settled — drop
-   them before they reach the solve.
-6. **Active stopping (don't over-collect).** After ~6-8 poses, solve hand-eye and
-   estimate parameter covariance/condition. Then pick the NEXT pose by
-   information gain (next-best-view: the candidate that most reduces parameter
-   uncertainty; arXiv 2303.06766) or keep drawing from the diverse set, and STOP
-   when residual (`trans_std_mm`, `rot_std_deg`) and uncertainty PLATEAU —
-   typically 12-20 poses, a few minutes, fully autonomous. Report how many you
-   actually needed, not a fixed 100.
-7. **Validate** (stereo `T_L_R` agreement + held-out reprojection, below) BEFORE
-   writing `hand_eye.yaml`.
-
-### Markerless option (no board) — when the URDF + a GPU are available
-If a board is impractical, calibrate against the ROBOT ITSELF: segment the arm
-in the wrist images with a pretrained model (e.g. SAM), render the known
-URDF/mesh via differentiable rendering, and optimize camera<->EE so the rendered
-arm matches the masks across a handful of auto-moved poses (EasyHeC++,
-arXiv 2410.09293 — fully automatic, markerless, no per-arm training). Needs the
-robot mesh (you have it from setup) + a GPU. Default to the marker pipeline;
-use this as the no-board path. Open-source automation refs: `easy_handeye2`
-(auto-move + capture via MoveIt) and MoveIt Calibration.
-
-## Hand-eye (eye-in-hand) pattern — OpenCV
-
-```python
-import cv2, numpy as np
-
-# Collect N (>=12) poses: move to AUTO-GENERATED, cuRobo-filtered poses (~12-20, NOT 100),
-# at each capture (a) the gripper pose in base frame from the arm, and
-# (b) the calibration target pose in the camera frame.
-R_g2b, t_g2b = [], []   # gripper -> base  (from arm FK)
-R_t2c, t_t2c = [], []   # target  -> camera (from cv2.solvePnP on the board)
-
-for pose in auto_generated_poses:        # target-centric + cuRobo-filtered (see above)
-    bridge.move_joints(arm, pose, speed_frac=cell["safety"]["max_joint_speed_frac"])
-    obs = bridge.get_observation()
-    # (a) arm FK -> gripper pose in base
-    Rg, tg = gripper_pose_in_base(obs)      # from read_eef_pose / FK
-    # (b) detect board -> target pose in camera
-    ok, rvec, tvec = detect_board_pose(obs.rgb, obs.intrinsics)  # solvePnP
-    if not ok:
-        continue
-    R_g2b.append(Rg); t_g2b.append(tg)
-    R_t2c.append(cv2.Rodrigues(rvec)[0]); t_t2c.append(tvec)
-
-R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-    R_g2b, t_g2b, R_t2c, t_t2c, method=cv2.CALIB_HAND_EYE_TSAI,
-)
-```
-
-For eye-to-hand, calibrate camera↔base with the same data arranged for that
-configuration (`cv2.calibrateHandEye` with base↔gripper inverted, or
-`calibrateRobotWorldHandEye`).
-
-## Acceptance (G5) — thresholds are TUNABLE (R&D), start conservative
-
-- Hand-eye **reprojection / residual** below threshold (e.g. start ~ a few mm /
-  ~1°); record the actual number — do not just assert "passed".
-- Reprojection error consistent across held-out poses (no overfit).
-- Time-sync offset measured and stable.
-- Payload sysid mass within a sane band of the known tool mass.
-
-These numbers are starting points; tune per cell and record the chosen values.
-What matters is that the residual is **measured, reported, and good enough for
-safe motion**, and the procedure can be re-run.
-
-## `remoroo_cell/calibration/` outputs
+## Outputs (written by the engine, consumed downstream)
 
 ```text
-calibration/
-  intrinsics.yaml        # if calibrated (else note "factory")
-  hand_eye.yaml          # X transforms (eye-in-hand / eye-to-hand)
-  base_to_base.yaml      # dual-arm only
-  time_sync.yaml         # camera<->arm latency (s)
-  payload.yaml           # tool mass + COM
-  report.md              # residuals, pose count, plots/screenshots, verdict
-  recompute.py           # re-runs the solve from saved correspondences
+remoroo_cell/
+  calibration/<camera>.json        # the CalibResult per camera (X, fk_offsets, board
+                                   #   scale, metrics: held-out px, tip mm, observability,
+                                   #   consensus, T_L_R; samples used)
+  calibration/base_to_base.json    # dual-arm only: transform between the two arm bases
+  robot_model/robot.urdf           # updated: calibrated *_optical_frame per camera,
+                                   #   with provenance (sdk | measured | assumed)
 ```
 
-`report.md` is the G5 evidence: pose count, residual numbers, what passed/
-failed, and the thresholds used. The hand-eye + base transforms feed the
-robot model (`robot_model.md`) and world scan (`world_scan.md`) and get
-embedded in every episode (`data_capture.md`).
-
-
-## Stereo (eye-in-hand) hand-eye — calibrate BOTH lenses and validate
-
-A stereo wrist camera (e.g. ZED) has two lenses (left + right). Do not calibrate
-only one lens:
-
-- Solve hand-eye for BOTH lenses against the SAME target across the SAME pose
-  set, producing `T_cam_gripper` for the left lens and for the right lens.
-- VALIDATE against the SDK-provided stereo baseline. Most stereo SDKs expose the
-  factory left->right extrinsic (Stereolabs gives `T_L_R`). The two
-  independently-solved hand-eye results must agree with it:
-  `inv(T_L_gripper) @ T_R_gripper` should equal the SDK `T_L_R` within
-  tolerance. If they disagree beyond threshold the calibration is bad — reject
-  it and recollect; do NOT write it to `hand_eye.yaml`.
-- Use MANY, DIVERSE poses (wide rotation + translation coverage), not the
-  minimum — more, varied poses condition the solve far better.
-- REJECT samples with high per-pose reprojection error before solving (robust
-  outlier rejection). Record pose count, `trans_std_mm`, `rot_std_deg`, the
-  SDK-baseline agreement, and reprojection RMSE in `report.md`; recollect if any
-  is above target.
+The calibrated `*_optical_frame` transforms make the rig in 3D match reality and
+feed the cuRobo model (`robot_model.md`), the world scan (`world_scan.md`), and
+every recorded episode (`data_capture.md`). The accept evidence is the **held-out
+reprojection + tip-landing**, surfaced in the Studio — not a training residual and
+not a paragraph you write.

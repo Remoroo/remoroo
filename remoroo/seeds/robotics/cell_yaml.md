@@ -110,6 +110,22 @@ capture:                              # the data-capture target (Phase 2/6)
   schema_path: "remoroo_cell/capture/schema.json"
   est_gb_per_hour: 40
 
+calibration:                          # Phase 5/G5 — input to the SHIPPED calib engine
+  board:                              # the ONE input not in the URDF (the printed board)
+    dict: "DICT_5X5_1000"             # ArUco dictionary printed on the board
+    squares_x: 7                      # ChArUco columns
+    squares_y: 5                      # ChArUco rows
+    square_len: 0.030                 # square side, METRES
+    marker_len: 0.022                 # marker side, METRES
+  accept_heldout_px: 1.5              # accept gate: held-out reprojection (tunable)
+  accept_tip_mm: 3.0                  # accept gate: physical tip-landing (tunable)
+  # Intrinsics are read LIVE from the camera SDK (obs.intrinsics) — NOT set here.
+  # K/wh below are an OPTIONAL override for a camera with no factory K (normally omit):
+  # K: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+  # wh: [1280, 720]
+  # dist: [k1, k2, p1, p2, k3]        # OPTIONAL — only if the cell feeds a RAW frame
+  # T_left_right: [...]               # OPTIONAL — SDK stereo baseline (enables T_L_R self-check)
+
 gates:                                # the readiness card mirrors setup_report.md
   G0: pending
   G1: pending
