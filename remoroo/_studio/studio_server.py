@@ -299,18 +299,28 @@ class Handler(BaseHTTPRequestHandler):
             state_path.parent.mkdir(parents=True, exist_ok=True)
             length = int(self.headers.get("Content-Length", "0") or 0)
             body = self.rfile.read(length)
-            # [RESUME-DEBUG] Who WRITES the state machine, and with what gates? De-duped:
-            # only log the FIRST write and whenever the gate map actually changes (the
-            # studio re-persists every poll, which would otherwise spam).
-            global _LAST_SETUP_DBG
+            # RUN-SCOPED GUARD: setup_state.json is one file per project dir, but several
+            # studio tabs (incl. STALE ones from prior `remoroo setup` runs that are still
+            # open + reconnecting + streaming their old run) can all PUT to it and clobber
+            # each other — polluting the LIVE run's state machine, which the agent then
+            # reads as a phantom "resume". Only the CURRENT run (RUN_ID) may write it. A
+            # write tagged with any other run_id is a stale tab → reject, don't persist.
+            import json as _json
             try:
-                import json as _json
-                gates_now = _json.dumps(_json.loads(body).get("gates"), sort_keys=True)
+                payload = _json.loads(body)
+                body_run = payload.get("run_id")
             except Exception:
-                gates_now = body[:80].decode("utf-8", "replace")
+                payload, body_run = None, None
+            if RUN_ID and body_run and body_run != RUN_ID:
+                print(f"[RESUME-DEBUG] REJECTED setup_state write from STALE run {body_run} "
+                      f"(current run is {RUN_ID}) — this is the phantom-resume source", flush=True)
+                self._json({"ok": False, "rejected": "stale_run", "current": RUN_ID}, 409)
+                return
+            global _LAST_SETUP_DBG
+            gates_now = _json.dumps((payload or {}).get("gates"), sort_keys=True) if payload else body[:80].decode("utf-8", "replace")
             if gates_now != globals().get("_LAST_SETUP_DBG"):
                 existed = state_path.exists()
-                print(f"[RESUME-DEBUG] {self.command} setup_state CHANGED (file existed={existed}): {body[:600].decode('utf-8','replace')}", flush=True)
+                print(f"[RESUME-DEBUG] {self.command} setup_state CHANGED (run={body_run} existed={existed}): {body[:600].decode('utf-8','replace')}", flush=True)
                 _LAST_SETUP_DBG = gates_now
             state_path.write_bytes(body)
             self._json({"ok": True, "path": str(state_path)})
