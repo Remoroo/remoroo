@@ -65,10 +65,15 @@ def _safety_spine_module():
         def from_cell(cls, cell):
             s = cell.get("safety", {}) or {}
             w = (cell.get("workspace") or {}).get("bounds_m", {}) or {}
-            return cls(float(s.get("max_cartesian_speed_mps", 0.10)),
-                       float(s.get("max_joint_speed_frac", 0.10)),
-                       _np.asarray(w.get("min", [-0.5, -0.5, 0.0]), float),
-                       _np.asarray(w.get("max", [0.5, 0.5, 0.8]), float))
+            # None-SAFE: a cell.yaml key present-but-null (`max_joint_speed_frac:`) makes
+            # dict.get(k, default) return None, NOT the default → float(None) crashes the
+            # Bridge connect. Coerce None to the default.
+            def _f(v, d):
+                return float(d) if v is None else float(v)
+            return cls(_f(s.get("max_cartesian_speed_mps"), 0.10),
+                       _f(s.get("max_joint_speed_frac"), 0.10),
+                       _np.asarray(w.get("min") or [-0.5, -0.5, 0.0], float),
+                       _np.asarray(w.get("max") or [0.5, 0.5, 0.8], float))
 
         def clamp_speed(self, frac):
             f = self.max_joint_speed_frac if frac is None else min(frac, self.max_joint_speed_frac)
@@ -144,7 +149,11 @@ def get_bridge():
         _bridge = b
         _bridge_err = None
     except Exception as e:  # noqa: BLE001
-        _bridge_err = f"{type(e).__name__}: {e}"
+        # Capture WHERE it failed (file:line) — a bare "TypeError: float()..." off a customer
+        # machine is undiagnosable; the deepest frame tells us which line in which module.
+        tb = traceback.extract_tb(e.__traceback__)
+        where = f" (at {os.path.basename(tb[-1].filename)}:{tb[-1].lineno})" if tb else ""
+        _bridge_err = f"{type(e).__name__}: {e}{where}"
     return _bridge
 
 
@@ -719,8 +728,8 @@ def _calib_service():
     import numpy as np
     cy = load_cell_yaml()
     cal = (cy.get("calibration") or {})
-    acc_px = float(cal.get("accept_heldout_px", 1.5))
-    acc_mm = float(cal.get("accept_tip_mm", 3.0))
+    acc_px = float(cal.get("accept_heldout_px") or 1.5)   # None-safe (key present-but-null)
+    acc_mm = float(cal.get("accept_tip_mm") or 3.0)
     dist = np.asarray(cal["dist"], float) if cal.get("dist") is not None else None
     sdk_T_lr = np.asarray(cal["T_left_right"], float).reshape(4, 4) if cal.get("T_left_right") is not None else None
     urdf_path = str(CELL_DIR / "robot_model" / "robot.urdf")

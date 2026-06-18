@@ -42,11 +42,15 @@ class SafetySupervisor:
     def from_cell(cls, cell: Dict[str, Any]) -> "SafetySupervisor":
         s = cell.get("safety", {}) or {}
         w = (cell.get("workspace") or {}).get("bounds_m", {}) or {}
+        # None-SAFE: a key present-but-null in cell.yaml makes dict.get(k, default) return
+        # None (not the default) → float(None) would crash the Bridge connect.
+        def _f(v, d):
+            return float(d) if v is None else float(v)
         return cls(
-            max_cartesian_speed_mps=float(s.get("max_cartesian_speed_mps", 0.10)),
-            max_joint_speed_frac=float(s.get("max_joint_speed_frac", 0.10)),
-            bounds_min=np.asarray(w.get("min", [-0.5, -0.5, 0.0]), float),
-            bounds_max=np.asarray(w.get("max", [0.5, 0.5, 0.8]), float),
+            max_cartesian_speed_mps=_f(s.get("max_cartesian_speed_mps"), 0.10),
+            max_joint_speed_frac=_f(s.get("max_joint_speed_frac"), 0.10),
+            bounds_min=np.asarray(w.get("min") or [-0.5, -0.5, 0.0], float),
+            bounds_max=np.asarray(w.get("max") or [0.5, 0.5, 0.8], float),
         )
 
     def clamp_speed(self, frac: Optional[float]) -> float:
