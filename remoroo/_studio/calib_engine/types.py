@@ -94,6 +94,10 @@ class CalibResult:
     samples_used: int
     kind: str = "eye_in_hand"     # which model produced this (eye_in_hand|eye_to_hand)
     t_lr_err_deg: Optional[float] = None  # stereo left/right self-check vs the SDK baseline
+    # The camera intrinsics the bundle USED. When K was refined jointly (a multi-point board over
+    # diverse views), this is the REFINED 3x3; otherwise the factory K passed in. Everything that
+    # reprojects through this result must use THIS K, not the original factory K.
+    K: Optional[np.ndarray] = None
     metrics: Dict[str, float] = field(default_factory=dict)
     converged: bool = True
     message: str = ""

@@ -10,8 +10,9 @@ is absent, `ensure_optical_frame` adds it (identity offset) so we always write t
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -173,6 +174,124 @@ def chain_from_urdf(urdf_path: str, flange_link: str):
         types.append("prismatic" if j["type"] == "prismatic" else "revolute")
         pending = np.eye(4)
     return Chain(origins, axes, limits=limits, types=types), names, base_link
+
+
+# --------------------------------------------------------------------------- #
+# The CANONICAL ARM MAP — the single source of truth tying arm name ↔ side ↔   #
+# base/ee/flange links ↔ ordered joints ↔ camera. Consumed by cuRobo (per-arm  #
+# base/ee/cspace), the Bridge (arm→joint order), calibration, and the Studio.  #
+# --------------------------------------------------------------------------- #
+@dataclass
+class ArmSpec:
+    """One arm of the cell, derived from the URDF (operator-verifies `side`)."""
+    name: str                       # cell.yaml arm name when known, else provisional
+    side: str                       # "left" | "right" | "center" — a GEOMETRIC GUESS to verify
+    base_link: str                  # the SHARED planning root (cuRobo base_link)
+    mount_link: str                 # first link of this arm's subtree (under the root)
+    ee_link: str                    # end-effector (cuRobo ee_link for Cartesian planning)
+    flange_link: str                # the camera flange (calibration binds its chain here)
+    joint_names: List[str]          # this arm's movable joints, URDF ORDER (the bridge contract)
+    camera: str                     # the URDF camera link on this arm ("" if none)
+    dof: int
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _children_map(root: ET.Element) -> Dict[str, list]:
+    m: Dict[str, list] = {}
+    for j in root.findall("joint"):
+        c, p = j.find("child"), j.find("parent")
+        if c is None or p is None:
+            continue
+        m.setdefault(p.get("link"), []).append((c.get("link"), j.get("type")))
+    return m
+
+
+def _ee_below(root: ET.Element, flange: str) -> str:
+    """The best end-effector link reachable from `flange` through FIXED joints: prefer a name
+    that looks like a tool tip (tcp/tool/ee/grip), else the deepest fixed non-camera leaf. So
+    a wrist camera on the flange isn't mistaken for the end-effector."""
+    ch = _children_map(root)
+    PREF = ("tcp", "tool", "_ee", "grip", "hand")
+    best, best_score = flange, -1.0
+    stack, seen = [(flange, 0)], {flange}
+    while stack:
+        link, depth = stack.pop()
+        low = link.lower()
+        cam = low.endswith("_optical_frame") or (
+            any(h in low for h in CAMERA_HINTS) and not any(h in low for h in NON_CAMERA_HINTS))
+        score = depth + (100 if any(p in low for p in PREF) else 0)
+        if not cam and score > best_score:
+            best_score, best = score, link
+        for (c, t) in ch.get(link, []):
+            if t == "fixed" and c not in seen:
+                seen.add(c)
+                stack.append((c, depth + 1))
+    return best
+
+
+def enumerate_arms(urdf_path: str, camera_to_arm: Optional[Dict[str, str]] = None) -> List[ArmSpec]:
+    """Derive the canonical arm map from the URDF. Each maximal movable chain under the shared
+    root is one arm; camera-bearing chains are matched first (so the wrist camera binds its arm),
+    then any camera-less movable chains. `side` is a GEOMETRIC guess from the mount's lateral (Y)
+    offset — the operator VERIFIES it (the live-mirror wiggle test) since a URDF can have L/R
+    swapped. `camera_to_arm` (cell.yaml cameras[].name→attached_to) names the arms; absent →
+    provisional names. Pure stdlib + the existing chain derivation; fully testable off-robot."""
+    root = ET.parse(urdf_path).getroot()
+    children = {j.find("child").get("link") for j in root.findall("joint") if j.find("child") is not None}
+    all_links = [l.get("name") for l in root.findall("link")]
+    roots = [l for l in all_links if l not in children]
+    base_link = roots[0] if roots else (all_links[0] if all_links else "world")
+
+    arms: List[ArmSpec] = []
+    used: set = set()
+
+    def _add(flange: str, camera: str) -> None:
+        try:
+            _, names, mount = chain_from_urdf(urdf_path, flange)
+        except ValueError:
+            return
+        if not names or set(names) & used:
+            return
+        used.update(names)
+        arms.append(ArmSpec(name="", side="", base_link=base_link, mount_link=mount,
+                            ee_link=_ee_below(root, flange), flange_link=flange,
+                            joint_names=list(names), camera=camera, dof=len(names)))
+
+    for cam in find_camera_links(urdf_path):       # camera-anchored arms first
+        _add(find_flange_link(urdf_path, cam), cam)
+
+    pmap = _parent_joint_map(root)
+    cmap = _children_map(root)
+    for link in all_links:                          # camera-less movable-chain tips
+        pj = pmap.get(link)
+        if not pj or pj[0] == "fixed":
+            continue
+        if any(t != "fixed" for (_, t) in cmap.get(link, [])):
+            continue                                # has a movable child → not a tip
+        _add(link, "")
+
+    # side: lateral (Y) offset of the mount in the base frame; split L/R about the midline.
+    ys: List[float] = []
+    for a in arms:
+        try:
+            ys.append(float(link_chain_transform(urdf_path, base_link, a.mount_link)[1, 3]))
+        except Exception:  # noqa: BLE001
+            ys.append(0.0)
+    mid = (max(ys) + min(ys)) / 2.0 if ys else 0.0
+    cam2arm = camera_to_arm or {}
+    for i, a in enumerate(arms):
+        a.side = "center" if len(arms) == 1 else ("left" if ys[i] > mid else "right")
+        a.name = cam2arm.get(a.camera) or a.camera or f"arm_{i + 1}"
+    return arms
+
+
+def arm_map_dict(urdf_path: str, camera_to_arm: Optional[Dict[str, str]] = None) -> dict:
+    """The canonical arm map as a JSON/YAML-friendly dict (what gets written to
+    robot_model/arms.yaml and shipped to the Studio)."""
+    arms = enumerate_arms(urdf_path, camera_to_arm)
+    return {"base_link": arms[0].base_link if arms else "", "arms": [a.to_dict() for a in arms]}
 
 
 def read_nominal_optical(urdf_path: str, camera_link: str) -> np.ndarray:

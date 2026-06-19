@@ -26,6 +26,9 @@ def predict_uv(
     mode-aware reprojection used by held-out, the contact-sheet, and curation flagging
     (so eye-to-hand is never scored with the eye-in-hand model)."""
     X, Tb, fk, scale = result.T_optical, result.T_board, result.fk_offsets, result.board_scale
+    # Reproject with the K the bundle actually used — the REFINED intrinsics when they were fit —
+    # so held-out / curation score the same model that was solved, not the stale factory K.
+    K = result.K if getattr(result, "K", None) is not None else K
     pb = board_points[s.corner_ids] * scale
     if result.kind == "static":
         # world-fixed camera, board at the world/reference origin: X = board->camera, so the

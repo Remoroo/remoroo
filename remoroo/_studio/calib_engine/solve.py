@@ -207,13 +207,19 @@ class _Problem:
         estimate_scale: bool,
         weights: Optional[Sequence[np.ndarray]],
         mode: str = "eye_in_hand",
+        estimate_intrinsics: bool = False,
     ):
         self.samples = list(samples)
         self.board_points = np.asarray(board_points, float)
         self.K = np.asarray(K, float)
         self.chain = chain
         self.estimate_fk = estimate_fk
-        self.estimate_scale = estimate_scale
+        # Board SCALE and the focal length are degenerate (a bigger board / longer focal / nearer
+        # board all rescale the image the same way), so we never estimate both: when refining the
+        # intrinsics we FIX scale=1 (the board's printed geometry is the metric anchor that makes
+        # the focal length identifiable across diverse views — exactly how camera calibration works).
+        self.estimate_intrinsics = estimate_intrinsics
+        self.estimate_scale = estimate_scale and not estimate_intrinsics
         self.mode = mode
         self.J = chain.n
         # Both ENDS of the chain are gauge freedoms, not real DOF:
@@ -230,13 +236,15 @@ class _Problem:
             self.w = [np.ones(len(s.corner_ids)) for s in self.samples]
         else:
             self.w = [np.asarray(w, float) for w in weights]
-        # parameter layout
+        # parameter layout: [ X(6) | board(6) | fk(n_fk) | scale(0|1) | intrinsics(0|4) ]
         self.i_X = slice(0, 6)
         self.i_board = slice(6, 12)
         self.i_fk = slice(12, 12 + self.n_fk)
         base = 12 + self.n_fk
-        self.i_scale = base if estimate_scale else None
-        self.nparams = base + (1 if estimate_scale else 0)
+        self.i_scale = base if self.estimate_scale else None
+        base += 1 if self.estimate_scale else 0
+        self.i_intr = slice(base, base + 4) if self.estimate_intrinsics else None
+        self.nparams = base + (4 if self.estimate_intrinsics else 0)
 
     def unpack(self, x: np.ndarray):
         X = make_T(rodrigues(x[self.i_X][:3]), x[self.i_X][3:])
@@ -245,10 +253,15 @@ class _Problem:
         if self.estimate_fk and self.n_fk > 0:
             fk[self.fk_lo : self.fk_lo + self.n_fk] = x[self.i_fk]
         scale = float(x[self.i_scale]) if self.estimate_scale else 1.0
-        return X, Tb, fk, scale
+        if self.estimate_intrinsics:
+            fx, fy, cx, cy = x[self.i_intr]
+            K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+        else:
+            K = self.K
+        return X, Tb, fk, scale, K
 
     def residual(self, x: np.ndarray) -> np.ndarray:
-        X, Tb, fk, scale = self.unpack(x)
+        X, Tb, fk, scale, K = self.unpack(x)
         out = []
         for s, w in zip(self.samples, self.w):
             T_fk = self.chain.fk(s.joints + fk)
@@ -262,7 +275,7 @@ class _Problem:
                 # eye-in-hand: camera on the flange (X = flange->camera), board fixed (Tb = board->base).
                 pw = transform_points(Tb, pb)               # board->base
                 pc = transform_points(inv_T(T_fk @ X), pw)  # base->camera
-            uv = project(self.K, pc)
+            uv = project(K, pc)
             r = (uv - s.corners) * w[:, None]
             out.append(r.ravel())
         return np.concatenate(out) if out else np.zeros(0)
@@ -273,6 +286,8 @@ class _Problem:
         x[self.i_board] = np.concatenate([rotvec_from_R(Tb[:3, :3]), Tb[:3, 3]])
         if self.estimate_scale:
             x[self.i_scale] = 1.0
+        if self.estimate_intrinsics:
+            x[self.i_intr] = [self.K[0, 0], self.K[1, 1], self.K[0, 2], self.K[1, 2]]
         return x
 
 
@@ -284,6 +299,7 @@ def solve_eye_in_hand(
     *,
     estimate_fk: bool = True,
     estimate_scale: bool = True,
+    estimate_intrinsics: bool = False,
     weights: Optional[Sequence[np.ndarray]] = None,
     robust: bool = True,
     f_scale: float = 1.5,
@@ -293,11 +309,14 @@ def solve_eye_in_hand(
 ) -> CalibResult:
     """Robust reprojection-error bundle. `mode` selects the observation model:
     eye_in_hand (camera on flange, board fixed) or eye_to_hand (static camera, board on
-    the gripper). Returns a CalibResult; the `_Problem` is stashed on it (`._problem`,
-    `._x`) so metrics can reuse it."""
+    the gripper). With `estimate_intrinsics`, the camera K (fx,fy,cx,cy) is refined JOINTLY
+    (board scale held fixed — they're degenerate), turning this into a full camera+hand-eye
+    calibration; only sound with a multi-point board over diverse views. Returns a CalibResult
+    (`.K` = the K actually used/refined); the `_Problem` is stashed on it for metrics."""
     prob = _Problem(
         samples, board_points, K, chain,
         estimate_fk=estimate_fk, estimate_scale=estimate_scale, weights=weights, mode=mode,
+        estimate_intrinsics=estimate_intrinsics,
     )
 
     # Initialise from the mode's closed form. A caller MAY pin X_init (the eye-nudge gives
@@ -328,7 +347,7 @@ def solve_eye_in_hand(
         loss="huber" if robust else "linear", f_scale=f_scale,
         method="trf", max_nfev=400, x_scale="jac",
     )
-    X, Tb, fk, scale = prob.unpack(res.x)
+    X, Tb, fk, scale, K_used = prob.unpack(res.x)
     r = res.fun
     rms = float(np.sqrt(np.sum(r ** 2) / r.size)) if r.size else 0.0
 
@@ -336,6 +355,7 @@ def solve_eye_in_hand(
         T_optical=X, T_board=Tb, fk_offsets=fk, board_scale=scale,
         residual_px=rms, samples_used=len(samples), kind=mode,
         converged=bool(res.success), message=str(res.message),
+        K=np.asarray(K_used, float),
         metrics={"train_rms_px": rms},
     )
     # Stash the problem + solution for metrics (covariance/observability/held-out).

@@ -341,22 +341,25 @@ class CalibSession:
         at `joints` — the amber overlay the operator compares to the live detection. Mode-aware
         (eye_in_hand / eye_to_hand / static), mirroring the solved-result reprojection model."""
         ids = self.board.point_ids
-        pb = self.board.points
+        # Predict with the EXACT fitted model: the solved board scale + REFINED intrinsics (and the
+        # per-joint FK correction below). Mismatching any of these against the solve shows up as a
+        # constant overlay drift the operator would misread as a bad calibration.
+        r = self.result
+        scale = float(r.board_scale) if r is not None else 1.0
+        K = r.K if (r is not None and getattr(r, "K", None) is not None) else self.K
+        pb = self.board.points * scale
         if self.static:
             pc = transform_points(self.X_est, pb)
         else:
-            # apply the SOLVED per-joint FK correction when available (post-solve), so the
-            # prediction matches the real reprojection model — without it the uncorrected FK
-            # bias shows up as a constant overlay drift the operator would misread.
             q = np.asarray(joints, float)
-            if self.result is not None and np.asarray(self.result.fk_offsets).size == self.chain.n:
-                q = q + np.asarray(self.result.fk_offsets, float)
+            if r is not None and np.asarray(r.fk_offsets).size == self.chain.n:
+                q = q + np.asarray(r.fk_offsets, float)
             T_fk = self.chain.fk(q)
             if self.kind == "eye_to_hand":
                 pc = transform_points(inv_T(self.X_est), transform_points(T_fk @ self.T_board_est, pb))
             else:
                 pc = transform_points(inv_T(T_fk @ self.X_est), transform_points(self.T_board_est, pb))
-        return ids, project(self.K, pc)
+        return ids, project(K, pc)
 
     @staticmethod
     def _corner_drift(ids_det, uv_det, uv_pred_full) -> Optional[float]:
@@ -522,6 +525,22 @@ class CalibSession:
                 "worst_rot_sigma_deg": m.get("worst_rot_sigma_deg"),
                 "worst_trans_sigma_mm": m.get("worst_trans_sigma_mm")}
 
+    def _intrinsics_diag(self) -> dict:
+        """Loud target/intrinsics diagnostics for the operator: the board-SCALE fit (far from 1.0
+        ⇒ the printed marker size or the camera intrinsics are wrong), whether K was REFINED and by
+        how much, and whether the target is a flip-ambiguous SINGLE marker (discouraged). These are
+        the signals that say 'it's the target/K, not the pose count'."""
+        r = self.result
+        single = int(getattr(self.board, "n", 0)) <= 4
+        out = {"board_points": int(getattr(self.board, "n", 0)), "single_marker": bool(single),
+               "intrinsics_refined": False, "focal_change_pct": None, "principal_shift_px": None}
+        if r is not None and getattr(r, "K", None) is not None and not np.allclose(r.K, self.K):
+            out["intrinsics_refined"] = True
+            out["focal_change_pct"] = round(float((r.K[0, 0] / self.K[0, 0] - 1.0) * 100.0), 2)
+            out["principal_shift_px"] = round(float(np.hypot(r.K[0, 2] - self.K[0, 2],
+                                                             r.K[1, 2] - self.K[1, 2])), 1)
+        return out
+
     # ── solve (reprojection bundle, or static PnP) ──────────────────────────
     def solve(self) -> dict:
         if self.static:
@@ -535,9 +554,15 @@ class CalibSession:
         # Over-parametrisation guard (10.7): the per-joint FK correction + board scale are only
         # identifiable with enough rotation-diverse poses. Fitting them on a thin set overfits
         # (absorbs noise into FK), so gate them on the sample count — a few poses solve X alone.
+        # INTRINSICS (K) are refined jointly only for a MULTI-POINT board (>=8 points, not a
+        # single 4-corner marker, where K is degenerate with scale/distance) over enough views —
+        # this is the v3 fix for a wrong factory K / unrectified image (the 9%-scale failure).
         n = len(self.samples)
+        many_points = int(getattr(self.board, "n", 0)) >= 8
+        est_intr = many_points and n >= 12
         self.result = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain,
-                                        mode=self.kind, estimate_fk=(n >= 10), estimate_scale=(n >= 10))
+                                        mode=self.kind, estimate_fk=(n >= 10),
+                                        estimate_scale=(n >= 10), estimate_intrinsics=est_intr)
         self.X_est = self.result.T_optical
         self.T_board_est = self.result.T_board
         self._note_observability(self.result)
@@ -557,7 +582,7 @@ class CalibSession:
                 "board": _T(self.result.T_board), "samples": self.result.samples_used,
                 "kind": self.kind,
                 "t_lr_err_deg": None if t_lr_err is None else round(float(t_lr_err), 3),
-                **self._obs_json(self.result)}
+                **self._obs_json(self.result), **self._intrinsics_diag()}
 
     def _fiducial_obs(self) -> List[dict]:
         """The fiducial for the (HW) tip metric is the board ORIGIN itself: across the
@@ -785,6 +810,9 @@ def _write_calib_json(calib_dir: str, camera: str, result: CalibResult, provenan
         "fk_offsets": [round(float(v), 8) for v in result.fk_offsets],
         "board_scale": round(float(result.board_scale), 6),
         "residual_px": round(float(result.residual_px), 4),
+        # the REFINED camera intrinsics (when K was estimated) — downstream (depth, reprojection)
+        # must use these, not the stale factory K that produced the bad scale.
+        "K": _T(result.K) if getattr(result, "K", None) is not None else None,
         "t_lr_err_deg": result.t_lr_err_deg, "samples_used": result.samples_used,
     }, indent=2), encoding="utf-8")
     return dst

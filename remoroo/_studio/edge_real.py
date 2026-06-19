@@ -231,17 +231,33 @@ def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
     for s in spheres:
         by_link.setdefault(s["link"], []).append({"center": list(s["center"]), "radius": float(s["radius"])})
 
-    cfg = {
-        "robot_cfg": {
-            "kinematics": {
-                "urdf_path": "robot.urdf",
-                "collision_spheres": by_link,
-                "collision_sphere_buffer": 0.005,
-            }
-        }
-    }
+    # The CANONICAL ARM MAP (urdf-derived + cell.yaml arm names) — the single source of truth the
+    # old config lacked. Written to arms.yaml; per-arm cuRobo robot_cfg (base_link, ee_link, the
+    # arm's cspace joints, the other arm LOCKED) so the planner finally has a kinematic chain.
+    from calib_engine import urdf_io
+    from calib_engine.curobo_cfg import build_robot_cfg
+    cy = load_cell_yaml()
+    cam2arm = {}
+    for c in (cy.get("cameras") or []):
+        nm = str(c.get("name") or c.get("id") or "")
+        if nm and c.get("attached_to"):
+            cam2arm[nm] = str(c["attached_to"])
+    arm_map = urdf_io.arm_map_dict(str(rm / "robot.urdf"), camera_to_arm=cam2arm)
+    (rm / "arms.yaml").write_text(yaml.safe_dump(arm_map, sort_keys=False), encoding="utf-8")
+
     out = rm / "collision_spheres.yml"
-    out.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    if arm_map["arms"]:
+        for a in arm_map["arms"]:
+            cfg = build_robot_cfg(arm_map, by_link, plan_arm=a["name"], urdf_path="robot.urdf")
+            safe = str(a["name"]).replace("/", "_")
+            (rm / f"robot_cfg_{safe}.yml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        # default config = the first arm (back-compat for single-arm motion_gen)
+        first = build_robot_cfg(arm_map, by_link, plan_arm=arm_map["arms"][0]["name"], urdf_path="robot.urdf")
+        out.write_text(yaml.safe_dump(first, sort_keys=False), encoding="utf-8")
+    else:  # no arms derived (degenerate URDF) — spheres-only, loud
+        out.write_text(yaml.safe_dump({"robot_cfg": {"kinematics": {
+            "urdf_path": "robot.urdf", "collision_spheres": by_link,
+            "collision_sphere_buffer": 0.005}}}, sort_keys=False), encoding="utf-8")
     return out
 
 
@@ -252,10 +268,15 @@ def motion_gen():
 
     cy = load_cell_yaml()
     ws = (cy.get("workspace") or {})
-    # conservative table/box world from cell.yaml bounds (env-only; arm carried by spheres)
+    # conservative workspace box from cell.yaml bounds + the operator-modeled static OBSTACLES
+    # (table/wall/etc.) as proper cuRobo world cuboids — separate from the robot, the cuRobo way.
+    from calib_engine.curobo_cfg import build_world_cfg
     dims = ws.get("size", [1.5, 1.5, 1.0])
     center = ws.get("center", [0.0, 0.0, dims[2] / 2 - 0.5])
-    world = WorldConfig(cuboid=[Cuboid(name="table", pose=[*center, 1, 0, 0, 0], dims=list(dims))])
+    cubs = [Cuboid(name="workspace_floor", pose=[*center, 1, 0, 0, 0], dims=list(dims))]
+    for nm, c in build_world_cfg(cy.get("obstacles"))["cuboid"].items():
+        cubs.append(Cuboid(name=nm, pose=c["pose"], dims=c["dims"]))
+    world = WorldConfig(cuboid=cubs)
     robot_yaml = str(CELL_DIR / "robot_model" / "collision_spheres.yml")
     cfg = MotionGenConfig.load_from_robot_config(robot_yaml, world, interpolation_dt=0.02)
     mg = MotionGen(cfg)
@@ -1032,6 +1053,66 @@ def _calib_handle_locked(verb: str, body: dict) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+# --------------------------------------------------------------------------- #
+# Canonical arm map + static obstacles (the multi-arm model the Studio + cuRobo #
+# share). arms.yaml is the source of truth; obstacles live in cell.yaml.        #
+# --------------------------------------------------------------------------- #
+def h_arms(_q):
+    """The canonical arm map for the Studio: read `robot_model/arms.yaml` if built (the
+    operator-verified sides), else derive it fresh from the URDF + cell.yaml camera→arm names."""
+    import yaml  # type: ignore
+    rm = CELL_DIR / "robot_model"
+    f = rm / "arms.yaml"
+    if f.exists():
+        try:
+            return yaml.safe_load(f.read_text(encoding="utf-8")) or {"base_link": "", "arms": []}
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}", "arms": []}
+    urdf = rm / "robot.urdf"
+    if not urdf.exists():
+        return {"base_link": "", "arms": [], "reason": "no robot.urdf yet — model the cell first"}
+    from calib_engine import urdf_io
+    cy = load_cell_yaml()
+    cam2arm = {str(c.get("name") or ""): str(c.get("attached_to") or "")
+               for c in (cy.get("cameras") or []) if c.get("name") and c.get("attached_to")}
+    try:
+        return urdf_io.arm_map_dict(str(urdf), camera_to_arm=cam2arm)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "arms": []}
+
+
+def h_set_arms(_q, body):
+    """Persist operator-verified arm sides to arms.yaml (the live-mirror wiggle result). `sides`
+    is {arm_name: 'left'|'right'}. Sides drive the per-arm cuRobo cfg + the Studio labels."""
+    import yaml  # type: ignore
+    m = h_arms(None)
+    if isinstance(m, dict) and m.get("error"):
+        return m
+    sides = (body or {}).get("sides") or {}
+    for a in m.get("arms", []):
+        if a.get("name") in sides:
+            a["side"] = str(sides[a["name"]])
+    rm = CELL_DIR / "robot_model"
+    rm.mkdir(parents=True, exist_ok=True)
+    (rm / "arms.yaml").write_text(yaml.safe_dump(m, sort_keys=False), encoding="utf-8")
+    return {"ok": True, "arms": m.get("arms", [])}
+
+
+def h_obstacles(_q):
+    """Static obstacles (table/wall/box) the operator modeled — read from cell.yaml. cuRobo's
+    world is built from these (see `motion_gen`)."""
+    return {"obstacles": (load_cell_yaml().get("obstacles") or [])}
+
+
+def h_set_obstacles(_q, body):
+    """Persist the operator's obstacles to cell.yaml `obstacles` (consumed by cuRobo's world)."""
+    import yaml  # type: ignore
+    cy = load_cell_yaml()
+    cy["obstacles"] = list((body or {}).get("obstacles") or [])
+    (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False), encoding="utf-8")
+    return {"ok": True, "obstacles": cy["obstacles"]}
+
+
 # route table: path -> (kind, handler). kind in {"json","json_body","sse"}
 ROUTES = {
     "/health": ("json", lambda q: {"ok": True, "edge": "real", "cell": str(CELL_DIR)}),
@@ -1041,6 +1122,10 @@ ROUTES = {
     "/edge/estop": ("json", h_estop),
     "/edge/safety": ("json", h_safety),
     "/edge/buildRobot": ("json_body", h_build_robot),
+    "/edge/arms": ("json", h_arms),
+    "/edge/arms/set": ("json_body", h_set_arms),
+    "/edge/obstacles": ("json", h_obstacles),
+    "/edge/obstacles/set": ("json_body", h_set_obstacles),
     "/live/joints": ("sse", sse_live_joints),
     "/edge/scanWorld": ("sse", sse_scan),
     "/edge/record": ("sse", sse_record),
