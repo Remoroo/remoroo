@@ -35,8 +35,14 @@ robot YAML. Stay lightweight — do not pull in Isaac Sim.
 #      joint limits, self-collision ignore pairs, ee_link.
 import trimesh, numpy as np
 
-def spheres_from_mesh(mesh_path, radius=0.02, max_spheres=40):
+def spheres_from_mesh(mesh_path, scale=(1.0, 1.0, 1.0), radius=0.02, max_spheres=40):
     m = trimesh.load(mesh_path)
+    # APPLY THE URDF <mesh scale> FIRST — load-bearing. Vendor arm meshes (xArm, UR, …) are often
+    # in MILLIMETRES with scale="0.001 0.001 0.001"; if you skip this the geometry is ~1000× too
+    # small and every sphere comes out MICROSCOPIC (radii < 1 mm) → the arm has NO effective
+    # collision model and cuRobo plans straight through it. (Symptom seen on hardware: arm-link
+    # spheres at radius ~5e-5 m while camera spheres were a sane ~0.013 m.)
+    m.apply_scale(scale)
     # Voxelize, then place a sphere at each filled cell centre — simple,
     # deterministic, and Isaac-Sim-free. Cluster/decimate down to max_spheres.
     vox = m.voxelized(pitch=radius).fill()
@@ -47,6 +53,16 @@ def spheres_from_mesh(mesh_path, radius=0.02, max_spheres=40):
 #   robot_cfg.kinematics.collision_spheres = {link: [{center, radius}, ...]}
 # Then load it back into cuRobo and run the G1-style smoke plan to validate.
 ```
+
+**Mesh units are load-bearing — read + apply the URDF `<mesh scale>`.** Each
+`<collision><geometry><mesh scale=…>` must be applied before fitting, and confirm the mesh isn't
+otherwise in millimetres. A units slip makes the spheres MICROSCOPIC and the arm un-modelled (cuRobo
+will plan through it) — or, if doubled, fills the whole world. **SANITY-CHECK before you emit
+`collision_spheres.yml`:** each arm link's spheres should have radii on the order of CENTIMETRES (a
+wrist link ~1–5 cm) and their union should envelop the link mesh; if the median radius is below a few
+millimetres the scale is wrong — fix it, don't ship it (the Studio now flags a degenerate set with a
+red "planning UNSAFE" banner and falls back to a mesh approximation, but the cuRobo model is still
+broken until you regenerate it correctly).
 
 Tunables (R&D): per-link radius, sphere count, self-collision ignore pairs.
 Bigger/fewer spheres are safer but more conservative — tune until the real-world
