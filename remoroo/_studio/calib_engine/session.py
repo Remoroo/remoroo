@@ -18,7 +18,7 @@ import numpy as np
 
 from . import urdf_io
 from .curate import flag_suspect_corners, homography_resnap, resnap_corner, solve_curated
-from .geometry import Chain, inv_T, transform_points
+from .geometry import Chain, inv_T, make_T, project, rodrigues, rotation_angle, transform_points
 from .metrics import (
     consensus_spread,
     fiducial_consistency_mm,
@@ -28,6 +28,7 @@ from .metrics import (
     stereo_consistency,
     tip_landing_error,
     weak_rotation_axis,
+    well_observed,
 )
 from .posegen import suggest_next_pose
 from .solve import _estimate_target_pose, solve_eye_in_hand, solve_static_camera
@@ -119,6 +120,8 @@ class CalibSession:
         seed: int = 0,
         accept_heldout_px: float = 1.5,
         accept_tip_mm: float = 3.0,
+        accept_rot_sigma_deg: float = 0.5,
+        accept_trans_sigma_mm: float = 2.0,
     ):
         self.item = item
         self.board = board
@@ -133,6 +136,16 @@ class CalibSession:
         self.rng = np.random.default_rng(seed)
         self.accept_heldout_px = accept_heldout_px
         self.accept_tip_mm = accept_tip_mm
+        # Observability accept gate (the fix for the silent 2x-translation failure): X is only
+        # trustworthy if every DOF is pinned below these 1σ limits (deg / mm). Threaded from
+        # cell.yaml by the service; defaults are sane for a wrist-cam eye-in-hand.
+        self.accept_rot_sigma_deg = float(accept_rot_sigma_deg)
+        self.accept_trans_sigma_mm = float(accept_trans_sigma_mm)
+        # The supervised visual phase: seed (place + confirm the hand-eye seed) → collect
+        # (look-at orbit) → verify (drift tracking) → done. Static cams skip seed (no chain).
+        self.phase: str = "seed"
+        self._last_Tc_board: Optional[np.ndarray] = None   # PnP board->camera at the last detect
+        self._seed_sample: Optional[CaptureSample] = None  # the detect capture that seeded X
 
         # Resolve the SOLVE kind from the plan item:
         #   moving-link camera            -> "eye_in_hand"
@@ -216,6 +229,196 @@ class CalibSession:
             self.nominal_joints = np.asarray(s.joints, float)
         return {"type": "detect", "seen": seen, "n_corners": int(len(ids))}
 
+    # ── VISUAL SEED → CONFIRM (the operator places + trusts the hand-eye seed) ──────
+    def _pnp_candidates(self, sample: CaptureSample) -> List[np.ndarray]:
+        """Board->camera candidates for ONE view. For a multi-point board PnP is unique; for a
+        SINGLE marker (4 coplanar points) there is a 2-fold flip — so we LM-refine the canonical
+        solution AND restarts from 180° flips about the board's in-plane axes, then dedupe by
+        rotation distance. `_estimate_target_pose_robust` picks among these across poses."""
+        base = _estimate_target_pose(sample, self.board.points, self.K)
+        cands = [base]
+        for axis in ([np.pi, 0.0, 0.0], [0.0, np.pi, 0.0]):
+            seed = base.copy()
+            seed[:3, :3] = base[:3, :3] @ rodrigues(axis)
+            from .solve import refine_target_pose
+            ref, _ = refine_target_pose(sample, self.board.points, self.K, seed)
+            if ref[2, 3] > 0 and all(rotation_angle(ref[:3, :3].T @ c[:3, :3]) > np.radians(10)
+                                     for c in cands):
+                cands.append(ref)
+        return cands
+
+    def _estimate_target_pose_robust(self, samples: Sequence[CaptureSample]) -> np.ndarray:
+        """Board->camera for samples[0], choosing the planar-PnP flip CONSISTENT across the
+        given views (the board is one fixed object in the base, so every view's implied
+        board-in-base must agree). With a single view it's the canonical multi-start PnP."""
+        import itertools
+        cand = [self._pnp_candidates(s) for s in samples]
+        if len(samples) == 1:
+            return cand[0][0]
+        best, best_err = (0,) * len(samples), float("inf")
+        for combo in itertools.product(*[range(len(c)) for c in cand]):
+            bases = [s.fk_pose @ self.X_est @ cand[i][combo[i]] for i, s in enumerate(samples)]
+            err = max(float(np.linalg.norm(bases[i][:3, 3] - bases[j][:3, 3]))
+                      for i in range(len(bases)) for j in range(i + 1, len(bases)))
+            if err < best_err:
+                best_err, best = err, combo
+        return cand[0][best[0]]
+
+    def _fovx_deg(self) -> float:
+        return round(float(np.degrees(2 * np.arctan(self.wh[0] / (2 * self.K[0, 0])))), 2)
+
+    def seed(self) -> dict:
+        """Place the hand-eye seed for VISUAL confirmation (the original idea: use the URDF +
+        optical-centre nominal as X, locate the marker by PnP, render both in 3D, let the
+        operator confirm it points at the marker). Detect the marker, set X_est = nominal_T,
+        T_board_est = fk @ X_est @ (board->camera). Returns the camera optical pose, the board
+        pose (base), the flange pose (base) + FOV so the Studio draws the frustum + marker."""
+        if self.static:
+            return {"type": "seed", "static": True, "seen": False}
+        ids, uv = self.bridge.capture()
+        if len(ids) < self.min_corners:
+            return {"type": "seed", "seen": False, "n_corners": int(len(ids))}
+        q = np.asarray(self.bridge.read_joints(), float)
+        s = CaptureSample(id=-1, joints=q, fk_pose=self.bridge.read_pose(),
+                          corner_ids=ids, corners=uv)
+        self._seed_sample = s
+        self.X_est = np.asarray(self.item.nominal_T, float)        # the URDF + optical seed
+        self._last_Tc_board = self._estimate_target_pose_robust([s])
+        self.T_board_est = s.fk_pose @ self.X_est @ self._last_Tc_board
+        self.nominal_joints = q                                    # centre the IK seed here
+        self.phase = "seed"
+        return {"type": "seed", "seen": True, "n_corners": int(len(ids)),
+                "X": _T(self.X_est), "T_board": _T(self.T_board_est),
+                "T_flange": _T(s.fk_pose), "wh": list(self.wh), "fovx_deg": self._fovx_deg()}
+
+    def seed_nudge(self, x_new) -> dict:
+        """The operator dragged the seed camera frame in 3D → a new flange->optical X. The
+        marker is rigidly tied to the camera by the fixed PnP, so it moves with the frame;
+        the operator drags until the rendered marker overlaps the physical one."""
+        self.X_est = np.asarray(x_new, float).reshape(4, 4)
+        if self._last_Tc_board is not None and self._seed_sample is not None:
+            self.T_board_est = self._seed_sample.fk_pose @ self.X_est @ self._last_Tc_board
+        return {"type": "seed_nudge", "X": _T(self.X_est),
+                "T_board": None if self.T_board_est is None else _T(self.T_board_est)}
+
+    def seed_wiggle(self, deg: float = 3.0) -> dict:
+        """The seed-confirm signal a clueless operator trusts: jog the least-effect joint a few
+        degrees and compare the PREDICTED marker corners (under the seed X) to the DETECTED
+        ones at the jogged pose. A good seed tracks (small drift); a wrong seed drifts. The two
+        views also disambiguate the single-marker PnP flip (the board is fixed in base)."""
+        if self.T_board_est is None or self._seed_sample is None:
+            return {"type": "seed_wiggle", "ok": False, "reason": "seed first"}
+        q0 = np.asarray(self.bridge.read_joints(), float)
+        j = self.chain.least_effect_joint(q0)
+        step = float(np.radians(deg))
+        lim = self.chain.limits[j] if j < len(self.chain.limits) else None
+        if lim is not None and q0[j] + step > lim[1] - 1e-3:
+            step = -step
+        q1 = q0.copy(); q1[j] += step
+        self.bridge.move_to_joints(q1)
+        ids1, uv1_det = self.bridge.capture()
+        q1r = np.asarray(self.bridge.read_joints(), float)
+        wig = CaptureSample(id=-2, joints=q1r, fk_pose=self.bridge.read_pose(),
+                            corner_ids=ids1, corners=uv1_det)
+        # correct the flip using both views, then re-place the board with the agreed PnP
+        self._last_Tc_board = self._estimate_target_pose_robust([self._seed_sample, wig])
+        self.T_board_est = self._seed_sample.fk_pose @ self.X_est @ self._last_Tc_board
+        _, uv1_pred = self._predict_uv(q1r)
+        self.bridge.move_to_joints(q0)                            # return to start
+        drift = self._corner_drift(ids1, uv1_det, uv1_pred)
+        return {"type": "seed_wiggle", "ok": True, "joint": int(j),
+                "drift_px": None if drift is None else round(drift, 2),
+                "T_board": _T(self.T_board_est)}
+
+    def confirm_seed(self) -> dict:
+        """The operator confirmed the seed visually → enter the collect phase (the look-at
+        orbit refines X from here). The current X_est is frozen as the collection seed."""
+        self.phase = "collect"
+        return {"type": "confirm_seed", "phase": self.phase, "X": _T(self.X_est)}
+
+    def _predict_uv(self, joints) -> Tuple[np.ndarray, np.ndarray]:
+        """Predicted (ids, pixels) of the target's points under the CURRENT X_est/T_board_est
+        at `joints` — the amber overlay the operator compares to the live detection. Mode-aware
+        (eye_in_hand / eye_to_hand / static), mirroring the solved-result reprojection model."""
+        ids = self.board.point_ids
+        pb = self.board.points
+        if self.static:
+            pc = transform_points(self.X_est, pb)
+        else:
+            # apply the SOLVED per-joint FK correction when available (post-solve), so the
+            # prediction matches the real reprojection model — without it the uncorrected FK
+            # bias shows up as a constant overlay drift the operator would misread.
+            q = np.asarray(joints, float)
+            if self.result is not None and np.asarray(self.result.fk_offsets).size == self.chain.n:
+                q = q + np.asarray(self.result.fk_offsets, float)
+            T_fk = self.chain.fk(q)
+            if self.kind == "eye_to_hand":
+                pc = transform_points(inv_T(self.X_est), transform_points(T_fk @ self.T_board_est, pb))
+            else:
+                pc = transform_points(inv_T(T_fk @ self.X_est), transform_points(self.T_board_est, pb))
+        return ids, project(self.K, pc)
+
+    @staticmethod
+    def _corner_drift(ids_det, uv_det, uv_pred_full) -> Optional[float]:
+        """Mean pixel distance between detected and predicted corners on the SHARED ids
+        (predicted is indexed by point id; detected carries its own ids)."""
+        if len(ids_det) == 0:
+            return None
+        idx = np.asarray(ids_det, int)
+        d = uv_pred_full[idx] - np.asarray(uv_det, float)
+        return float(np.mean(np.linalg.norm(d, axis=1)))
+
+    def predicted_overlay(self) -> dict:
+        """The live amber overlay (G16): predict the marker corners under the current X at the
+        LIVE joints, return them with the green detection + the px drift between them. Drives
+        the live-cam overlay + the 3D marker during collect/verify."""
+        if self.T_board_est is None:
+            return {"type": "overlay", "ok": False, "reason": "seed first"}
+        q = np.asarray(self.bridge.read_joints(), float)
+        ids_p, uv_p = self._predict_uv(q)
+        try:
+            ids_d, uv_d = self.bridge.capture()
+        except Exception:  # noqa: BLE001 — overlay is best-effort; no detection still shows predicted
+            ids_d, uv_d = np.zeros(0, int), np.zeros((0, 2))
+        drift = self._corner_drift(ids_d, uv_d, uv_p)
+        return {"type": "overlay", "ok": True,
+                "predicted": np.asarray(uv_p, float).round(1).tolist(),
+                "predicted_ids": np.asarray(ids_p, int).tolist(),
+                "detected": np.asarray(uv_d, float).round(1).tolist(),
+                "detected_ids": np.asarray(ids_d, int).tolist(),
+                "drift_px": None if drift is None else round(drift, 2),
+                "T_board": _T(self.T_board_est), "X": _T(self.X_est)}
+
+    def verify(self, n_poses: int = 4, px_thresh: float = 3.0) -> dict:
+        """The visual accept check (alongside held-out): drive to a few orbit poses and confirm
+        the predicted marker overlay TRACKS the real marker at each (median drift < px_thresh).
+        A correct X tracks everywhere; an under-observed one drifts off as the arm moves. Returns
+        the arm to start. `tracks` plus the observability gate are required to accept."""
+        if self.static or self.T_board_est is None:
+            return {"type": "verify", "ok": False, "reason": "arm calibration only"}
+        q_home = np.asarray(self.bridge.read_joints(), float)
+        drifts: List[float] = []
+        for _ in range(n_poses):
+            sp = self.suggest_pose()
+            if not sp.get("feasible"):
+                continue
+            if not self.motion_ok:
+                break
+            self.move_to()
+            ov = self.predicted_overlay()
+            if ov.get("drift_px") is not None:
+                drifts.append(float(ov["drift_px"]))
+        self.bridge.move_to_joints(q_home)                       # return to where we started
+        self.phase = "verify"
+        if not drifts:
+            return {"type": "verify", "ok": False, "reason": "no poses tracked",
+                    "tracks": False, "n_poses": 0}
+        med = float(np.median(drifts))
+        return {"type": "verify", "ok": True, "tracks": bool(med < px_thresh),
+                "drift_px": round(med, 2), "worst_pose_px": round(float(np.max(drifts)), 2),
+                "px_thresh": px_thresh, "n_poses": len(drifts),
+                **self._obs_json(self.result)}
+
     # ── static-camera capture (world-fixed cam, handheld board, NO robot motion) ─
     def capture_static(self, held_out: bool = False) -> dict:
         """One view of the operator-placed board for a world-fixed camera. No joints, no FK,
@@ -241,13 +444,18 @@ class CalibSession:
     def suggest_pose(self) -> dict:
         if self.T_board_est is None:
             return {"type": "suggest_pose", "feasible": False, "reason": "no board yet"}
-        # Information gain (7.6): once we have a solve, steer the next pose toward the
-        # least-observed rotation axis; collision/in-envelope filtered by cuRobo if wired (7.7).
+        # Cartesian look-at orbit: seed the IK from the CURRENT joints (where the operator
+        # aimed the arm), and rank by next-best-view information gain once a solve exists
+        # (7.6) — collision/in-envelope filtered by cuRobo if wired (7.7).
+        try:
+            q_seed = np.asarray(self.bridge.read_joints(), float)
+        except Exception:  # noqa: BLE001 — fall back to the centred viewing config
+            q_seed = self.nominal_joints
         weak = weak_rotation_axis(self.result) if self.result is not None else None
         q, score = suggest_next_pose(
             self.chain, self.X_est, self.T_board_est, self.board, self.K, self.wh,
             [s.joints for s in self.samples], rng=self.rng, nominal_joints=self.nominal_joints,
-            feasible=self._feasible, weak_axis=weak,
+            q_seed=q_seed, feasible=self._feasible, weak_axis=weak, result=self.result,
         )
         self._pending = q
         return {"type": "suggest_pose", "feasible": q is not None,
@@ -294,6 +502,26 @@ class CalibSession:
                 "accepted": accepted, "held_out": held_out, "has_image": img is not None,
                 "collected": len(self.samples)}
 
+    def _note_observability(self, result) -> bool:
+        """Compute the observability accept gate for `result` and stash it on its metrics so
+        solve/observe/verify/accept all read the same numbers. Returns whether X is well
+        observed (every DOF pinned below the σ limits)."""
+        try:
+            ok, det = well_observed(result, rot_sigma_deg=self.accept_rot_sigma_deg,
+                                    trans_sigma_mm=self.accept_trans_sigma_mm)
+        except Exception:  # noqa: BLE001 — a near-degenerate covariance must not crash the solve
+            ok, det = False, {"observable": False, "worst_rot_sigma_deg": None,
+                              "worst_trans_sigma_mm": None}
+        result.metrics.update(det)
+        return ok
+
+    @staticmethod
+    def _obs_json(result) -> dict:
+        m = getattr(result, "metrics", {}) or {}
+        return {"observable": bool(m.get("observable", False)),
+                "worst_rot_sigma_deg": m.get("worst_rot_sigma_deg"),
+                "worst_trans_sigma_mm": m.get("worst_trans_sigma_mm")}
+
     # ── solve (reprojection bundle, or static PnP) ──────────────────────────
     def solve(self) -> dict:
         if self.static:
@@ -304,9 +532,15 @@ class CalibSession:
             return {"type": "solve", "train_rms_px": round(self.result.residual_px, 3),
                     "scale": 1.0, "X": _T(self.result.T_optical), "board": _T(np.eye(4)),
                     "samples": self.result.samples_used, "kind": "static", "t_lr_err_deg": None}
-        self.result = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+        # Over-parametrisation guard (10.7): the per-joint FK correction + board scale are only
+        # identifiable with enough rotation-diverse poses. Fitting them on a thin set overfits
+        # (absorbs noise into FK), so gate them on the sample count — a few poses solve X alone.
+        n = len(self.samples)
+        self.result = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain,
+                                        mode=self.kind, estimate_fk=(n >= 10), estimate_scale=(n >= 10))
         self.X_est = self.result.T_optical
         self.T_board_est = self.result.T_board
+        self._note_observability(self.result)
         # Stereo F9: solve the right lens on its own captures and check inv(X_L)@X_R
         # against the SDK left->right baseline. eye-in-hand only (right lens shares the flange).
         t_lr_err = None
@@ -322,7 +556,8 @@ class CalibSession:
                 "scale": round(self.result.board_scale, 5), "X": _T(self.result.T_optical),
                 "board": _T(self.result.T_board), "samples": self.result.samples_used,
                 "kind": self.kind,
-                "t_lr_err_deg": None if t_lr_err is None else round(float(t_lr_err), 3)}
+                "t_lr_err_deg": None if t_lr_err is None else round(float(t_lr_err), 3),
+                **self._obs_json(self.result)}
 
     def _fiducial_obs(self) -> List[dict]:
         """The fiducial for the (HW) tip metric is the board ORIGIN itself: across the
@@ -409,14 +644,20 @@ class CalibSession:
         motion; needs a few poses to be meaningful."""
         if len(self.samples) < max(6, self.min_corners):
             return {"type": "observe", "ready": False, "collected": len(self.samples)}
-        r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+        n = len(self.samples)
+        r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind,
+                              estimate_fk=(n >= 10), estimate_scale=(n >= 10))
         self.result = r                       # so the next suggest_pose can target the weak axis
         self.X_est = r.T_optical
         self.T_board_est = r.T_board
-        obs = observability(r)
+        ok, det = well_observed(r, rot_sigma_deg=self.accept_rot_sigma_deg,
+                                trans_sigma_mm=self.accept_trans_sigma_mm)
+        r.metrics.update(det)                 # one covariance computation feeds gate + meter
+        meter = ("Rx_deg", "Ry_deg", "Rz_deg", "tx_mm", "ty_mm", "tz_mm", "rot_worst_deg")
         return {"type": "observe", "ready": True, "collected": len(self.samples),
                 "train_rms_px": round(r.residual_px, 3),
-                "observability": {k: round(float(v), 4) for k, v in obs.items()}}
+                "observability": {k: round(float(det[k]), 4) for k in meter if k in det},
+                **self._obs_json(r)}
 
     # ── resnap: lock a coarse human corner drag to the truth (A) ─────────────
     def resnap(self, sample_id: int, corner_id: int, approx_uv) -> dict:
@@ -509,6 +750,17 @@ class CalibSession:
     def accept(self, urdf_path: str, out_path: Optional[str] = None, provenance: str = "measured",
                calib_dir: Optional[str] = None) -> dict:
         assert self.result is not None
+        # OBSERVABILITY ACCEPT GATE: an arm-driven hand-eye is refused unless every DOF of X is
+        # pinned (the fix for silently accepting 2x-translation garbage). A static camera has no
+        # hand-eye rotation coupling — its gate is held-out reprojection alone.
+        if not self.static:
+            observable = self.result.metrics.get("observable")
+            if observable is None:
+                observable = self._note_observability(self.result)
+            if not observable:
+                return {"type": "accept", "ok": False, "camera": self.item.camera_link,
+                        "error": "calibration is not observable — collect more rotation-diverse "
+                                 "poses (translation under-constrained)", **self._obs_json(self.result)}
         body_optical = inv_T(self.item.nominal_flange_body) @ self.result.T_optical
         dst = urdf_io.write_calibrated_optical(urdf_path, self.item.camera_link, body_optical,
                                                out_path=out_path, provenance=provenance)

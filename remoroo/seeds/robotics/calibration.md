@@ -35,18 +35,23 @@ harness with known ground truth:
   `base_to_base`, …). The engine runs whatever steps your `pipeline.yaml` declares, in
   dependency order — it does NOT derive the plan from URDF link-name strings. Each step
   starts from the bound camera's **nominal** URDF transform and is *refined*, not guessed.
-- **Observability-guided pose generation** — next-best pose by information gain
-  (which DOF of `X` is still weakly observed), collision-free + in-envelope.
-  ~20–40 *informative* poses, not thousands.
+- **Cartesian LOOK-AT pose generation** — the camera is ORBITED on a hemisphere over the
+  marker, every pose LOOKING AT it (so the marker is in frame BY CONSTRUCTION), the desired
+  camera pose converted to joints by the engine's damped-least-squares IK; ranked by
+  next-best-view information gain (which DOF of `X` is still weakly observed), collision-free +
+  in-envelope. ~20–40 *informative* poses that always face the marker — not blind joint jitter.
 - **The solve = a reprojection-error BUNDLE** — closed-form `calibrateHandEye`
   (Tsai/Park) is only the initializer; the deliverable jointly fits
   `X + board world-pose + a small per-joint FK correction + board scale`, robust
   (Huber). This removes systematic FK/scale bias instead of averaging around it
   (the path off the ~1° floor that defeats pose-count-only approaches).
-- **Honest metrics** — **held-out** reprojection (train/validate split), a
-  **task-space tip-landing** prediction, per-DOF observability/covariance,
-  multi-solver consensus spread, and the stereo `T_L_R` self-check. Accept is
-  judged on *held-out + tip-landing*, **never** training residual.
+- **Honest accept gates** — **held-out** reprojection (train/validate split); the
+  **OBSERVABILITY gate** (per-DOF 1σ of `X` from the parameter covariance — every DOF must be
+  pinned, so a low-rotation-diversity collection that leaves translation unobservable, the
+  classic *2x-translation* failure, is REFUSED, not silently accepted); a **VISUAL verify**
+  (the predicted marker overlay must TRACK the real marker across fresh poses); plus the
+  task-space tip-landing, consensus spread, and the stereo `T_L_R` self-check. Accept is
+  **never** the training residual.
 - **Corner curation + sub-pixel re-snap + eye-nudge** — the operator can exclude
   bad images/corners and nudge the camera frame by eye; the optimizer re-snaps and
   every edit must improve the held-out error.
@@ -54,9 +59,13 @@ harness with known ground truth:
   calibrated result back to an explicit **`*_optical_frame`** child link (left
   rectified for stereo), never the camera body center, with tracked provenance.
 
-The Studio drives the supervised loop and renders the rig, the live-cam detection
-overlay, the pose cloud, the observability meter, and the before→after camera
-slide. **The operator clicks Start/Accept/Reject; the engine does the math.**
+The Studio drives the supervised loop as a VISUAL process: the 3D arm MIRRORS the real robot
+(the live joint mirror auto-enables during calibrate), the engine SEEDS the hand-eye from the
+URDF nominal + the marker and draws the camera + frustum on the marker for the operator to
+confirm + WIGGLE, collection renders the look-at pose cloud + the observability meter, and the
+live cam shows the GREEN detected vs AMBER predicted corners (their drift is the trust signal)
+plus the before→after camera slide. **The operator confirms a picture and clicks Accept; the
+engine does the math.**
 
 ## YOUR job — the Bridge contract the engine calls
 
@@ -181,6 +190,8 @@ calibration:
   target: { type: single_aruco, params: { dict: DICT_4X4_50, id: 7, size_m: 0.075 } }
   accept_heldout_px: 1.5    # accept gate: held-out reprojection (tunable)
   accept_tip_mm: 3.0        # accept gate: physical tip-landing (tunable)
+  accept_rot_sigma_deg: 0.5 # accept gate: observability — worst per-DOF rotation 1σ of X (deg)
+  accept_trans_sigma_mm: 2.0 # accept gate: observability — worst per-DOF translation 1σ of X (mm)
   # K / wh: OPTIONAL override only for a camera with no factory K (normally omit — read live)
   # dist: [k1, k2, p1, p2, k3]   # OPTIONAL — only if the cell feeds a RAW (unrectified) frame
   # T_left_right: [...4x4...]    # OPTIONAL — SDK stereo baseline, enables the T_L_R self-check
@@ -198,8 +209,10 @@ overlay shows the board not-seen before any motion), not silently.
    the area and permits motion.
 3. The Studio runs the SHIPPED engine live over the edge: **execute your authored
    pipeline** step by step in dependency order → per step: pre-flight motion check →
-   detect the target → observability-guided suggest/Accept/move/capture loop → solve
-   the bundle → validate on **fresh held-out + tip-landing** → the operator **Accepts**.
+   detect the target → **SEED** the hand-eye + the operator confirms it visually (frustum on
+   the marker) and **WIGGLES** to confirm tracking → look-at suggest/Accept/move/capture loop →
+   solve the bundle → validate on **fresh held-out** + the **observability gate** + a **visual
+   verify** (the overlay tracks the marker) → the operator **Accepts**.
 4. You **supervise**: watch the held-out / observability / consensus the protocol
    reports. On a **PROBLEM** report (motion check fails → per-arm joint-move wrong; no
    intrinsics → camera not reporting `obs.intrinsics`; target not seen → wrong
@@ -230,5 +243,5 @@ remoroo_cell/
 The calibrated `*_optical_frame` transforms make the rig in 3D match reality and
 feed the cuRobo model (`robot_model.md`), the world scan (`world_scan.md`), and
 every recorded episode (`data_capture.md`). The accept evidence is the **held-out
-reprojection + tip-landing**, surfaced in the Studio — not a training residual and
-not a paragraph you write.
+reprojection + the observability gate + the visual verify (the overlay tracks the marker)**,
+surfaced in the Studio — not a training residual and not a paragraph you write.

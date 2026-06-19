@@ -27,7 +27,9 @@ def _build(item, ctx: StepContext) -> CalibSession:
     chain = Chain([], []) if _is_static(item) else ctx.chain_provider(item.flange_link)
     bridge = ctx.bridge_factory(item)
     return CalibSession(item, ctx.target, ctx.K, chain, bridge, wh=ctx.wh,
-                        accept_heldout_px=ctx.accept_heldout_px, accept_tip_mm=ctx.accept_tip_mm)
+                        accept_heldout_px=ctx.accept_heldout_px, accept_tip_mm=ctx.accept_tip_mm,
+                        accept_rot_sigma_deg=ctx.accept_rot_sigma_deg,
+                        accept_trans_sigma_mm=ctx.accept_trans_sigma_mm)
 
 
 register("eye_in_hand", "supervised")(_build)

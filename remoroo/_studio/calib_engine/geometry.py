@@ -220,6 +220,79 @@ class Chain:
             T = T @ self.origins[i] @ joint
         return T
 
+    def fk_all(self, theta: np.ndarray):
+        """Cumulative kinematics for the geometric Jacobian. Returns (frames, T_flange):
+        `frames[i]` is the base->frame transform AT joint i — after origin_i but BEFORE
+        joint i's motion — so joint i's axis and origin live in that frame. `T_flange` is the
+        full base->flange (== `fk(theta)`). Revolute and prismatic both handled."""
+        theta = np.asarray(theta, float)
+        T = np.eye(4)
+        frames: List[np.ndarray] = []
+        for i in range(self.n):
+            T = T @ self.origins[i]
+            frames.append(T.copy())                       # joint i acts in THIS frame
+            if self.types[i] == "prismatic":
+                T = T @ make_T(np.eye(3), self.axes[i] * theta[i])
+            else:
+                T = T @ make_T(rodrigues(self.axes[i] * theta[i]), np.zeros(3))
+        return frames, T
+
+    def jacobian(self, theta: np.ndarray) -> np.ndarray:
+        """The 6xn geometric (space) Jacobian at `theta`: columns map joint velocity to the
+        end-effector spatial velocity [v; w] in the BASE frame. Revolute joint i contributes
+        [z_i x (p_e - p_i); z_i]; prismatic contributes [z_i; 0], with z_i the joint axis and
+        p_i its origin, both in base. This is the analytic derivative the DLS IK inverts."""
+        frames, Te = self.fk_all(theta)
+        p_e = Te[:3, 3]
+        J = np.zeros((6, self.n))
+        for i in range(self.n):
+            R_i = frames[i][:3, :3]
+            p_i = frames[i][:3, 3]
+            z = R_i @ self.axes[i]
+            if self.types[i] == "prismatic":
+                J[:3, i] = z
+            else:
+                J[:3, i] = np.cross(z, p_e - p_i)
+                J[3:, i] = z
+        return J
+
+    def _clamp_to_limits(self, q: np.ndarray) -> np.ndarray:
+        """Clip each joint to its URDF (lower, upper); leave unspecified (None) joints free.
+        Always returns python floats (a numpy scalar leaking out of IK crashed JSON on the edge)."""
+        q = np.asarray(q, float).copy()
+        for i in range(self.n):
+            lim = self.limits[i] if i < len(self.limits) else None
+            if lim is not None:
+                q[i] = float(np.clip(q[i], lim[0], lim[1]))
+        return q
+
+    def ik(self, T_target: np.ndarray, q0: np.ndarray, *, iters: int = 120,
+           pos_tol: float = 1e-4, rot_tol: float = 1e-3, damping: float = 1e-2,
+           max_step: float = 0.3):
+        """Numerical IK by damped-least-squares (Levenberg) on the geometric Jacobian:
+        dq = J^T (J J^T + lambda^2 I)^-1 e, with e = [p_target - p_ee; log(R_target R_ee^T)].
+        Steps are clamped (stability) and projected to joint limits each iteration. Returns
+        (q, ok). This is the engine-side capability the cartesian look-at pose generator needs
+        (convert a desired camera pose -> flange pose -> joints); the robot's own planner is
+        NOT assumed (off-robot we have only the URDF chain)."""
+        q = self._clamp_to_limits(np.asarray(q0, float).copy())
+        I6 = np.eye(6)
+        lam2 = float(damping) ** 2
+        for _ in range(iters):
+            Te = self.fk(q)
+            p_err = T_target[:3, 3] - Te[:3, 3]
+            w_err = rotvec_from_R(T_target[:3, :3] @ Te[:3, :3].T)
+            if np.linalg.norm(p_err) < pos_tol and np.linalg.norm(w_err) < rot_tol:
+                return self._clamp_to_limits(q), True
+            J = self.jacobian(q)
+            e = np.concatenate([p_err, w_err])
+            dq = J.T @ np.linalg.solve(J @ J.T + lam2 * I6, e)
+            q = self._clamp_to_limits(q + np.clip(dq, -max_step, max_step))
+        Te = self.fk(q)
+        ok = bool(np.linalg.norm(T_target[:3, 3] - Te[:3, 3]) < pos_tol * 10
+                  and np.linalg.norm(rotvec_from_R(T_target[:3, :3] @ Te[:3, :3].T)) < rot_tol * 10)
+        return self._clamp_to_limits(q), ok
+
     def least_effect_joint(self, q: np.ndarray, eps: float = 1e-3) -> int:
         """The joint whose unit motion moves the FLANGE ORIGIN the least — the safest joint
         to twitch for a motion-check (smallest cartesian excursion). COMPUTED from FK for

@@ -1,11 +1,20 @@
-"""Observability-guided next-pose suggestion. Propose a joint configuration that (a)
-keeps the whole board in view from the predicted camera pose and (b) is maximally
-*informative* — here approximated by rotation diversity vs already-collected poses,
-which is the dominant driver of hand-eye observability. Pure numpy.
+"""Cartesian look-at next-pose generation — the fix for the "99% of suggestions miss the
+marker" failure. The OLD generator perturbed JOINTS around the viewing config and hoped the
+camera still saw the board; with a wrong hand-eye seed it usually didn't, and small joint
+moves also killed the rotation diversity the solve needs (→ unobservable translation → 2x
+garbage). The NEW generator works in CARTESIAN space, the way a human (and MoveIt) reasons:
 
-On the robot a cuRobo collision/in-envelope filter wraps this (the `feasible` hook);
-off-robot (FakeBridge) we skip it. A full Fisher-information ranking can replace the
-diversity proxy later without changing the call site.
+  1. orbit the camera on a hemisphere over the MARKER, every pose LOOKING AT the marker
+     (so the marker is in frame BY CONSTRUCTION, regardless of seed error);
+  2. convert each desired camera pose -> flange pose via the current hand-eye X, then to
+     joints by the engine's damped-least-squares IK (`Chain.ik`);
+  3. keep only poses that are reachable (IK ok), keep the whole board in frame from the
+     ACHIEVED pose, and pass the optional cuRobo feasibility filter;
+  4. RANK by next-best-view information gain — the pose that most pins the under-observed
+     DOF of X (`metrics.predicted_sigma_after`) — falling back, before any solve exists, to
+     rotation diversity x centering.
+
+Pure numpy (+ the engine IK). No cv2, no robot.
 """
 from __future__ import annotations
 
@@ -13,23 +22,87 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .geometry import Chain, inv_T, project, rotation_angle, rotvec_from_R, transform_points
-from .types import BoardModel
+from .geometry import (
+    Chain,
+    inv_T,
+    make_T,
+    project,
+    rotation_angle,
+    transform_points,
+)
+from .types import BoardModel, CaptureSample
+
+
+def look_at(eye, target, up=(0.0, 0.0, 1.0)) -> np.ndarray:
+    """Base->camera transform for a camera at `eye` whose +z (optical axis) points at
+    `target`. Camera x = up x z, y = z x x (orthonormal). If `up` is ~parallel to the view
+    direction, fall back to a different up so the basis stays well-conditioned."""
+    eye = np.asarray(eye, float).reshape(3)
+    target = np.asarray(target, float).reshape(3)
+    z = target - eye
+    nz = np.linalg.norm(z)
+    if nz < 1e-9:
+        z = np.array([0.0, 0.0, 1.0])
+    else:
+        z = z / nz
+    up = np.asarray(up, float).reshape(3)
+    if abs(float(up @ z)) > 0.95:                 # up nearly along the view → pick another
+        up = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x = np.cross(up, z)
+    x = x / (np.linalg.norm(x) + 1e-12)
+    y = np.cross(z, x)
+    R = np.stack([x, y, z], axis=1)
+    return make_T(R, eye)
+
+
+def _roll(T_cam: np.ndarray, roll: float) -> np.ndarray:
+    """Rotate a camera pose about its own optical (+z) axis by `roll` rad — in-plane variety
+    that adds rotation diversity without changing where the camera points."""
+    c, s = np.cos(roll), np.sin(roll)
+    Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    out = T_cam.copy()
+    out[:3, :3] = T_cam[:3, :3] @ Rz
+    return out
+
+
+def _orbit_camera_poses(
+    T_board: np.ndarray, normal_side: np.ndarray, *, n: int, dist_range: Tuple[float, float],
+    el_max_deg: float, roll_max_deg: float, rng: np.random.Generator,
+) -> List[np.ndarray]:
+    """`n` camera poses on a hemisphere over the marker, each LOOKING AT the marker centre.
+    `normal_side` is the unit direction (base frame) the visible face points toward (oriented
+    toward the operator's camera side, §10.4), so we never orbit BEHIND the marker. Elevation
+    is the polar angle off that normal (0 = head-on), azimuth sweeps around it, distance and
+    roll are sampled in range — a spread that excites all three rotation axes of X."""
+    c = T_board[:3, 3]
+    n_hat = normal_side / (np.linalg.norm(normal_side) + 1e-12)
+    # a tangent frame (t1, t2) spanning the plane perpendicular to n_hat
+    ref = np.array([1.0, 0.0, 0.0]) if abs(n_hat[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    t1 = np.cross(n_hat, ref); t1 /= np.linalg.norm(t1) + 1e-12
+    t2 = np.cross(n_hat, t1)
+    el_max = np.radians(el_max_deg)
+    roll_max = np.radians(roll_max_deg)
+    poses: List[np.ndarray] = []
+    for _ in range(n):
+        el = el_max * np.sqrt(rng.random())                    # area-uniform on the cap
+        az = rng.uniform(0.0, 2.0 * np.pi)
+        d = np.cos(el) * n_hat + np.sin(el) * (np.cos(az) * t1 + np.sin(az) * t2)
+        dist = rng.uniform(*dist_range)
+        eye = c + dist * d
+        poses.append(_roll(look_at(eye, c), rng.uniform(-roll_max, roll_max)))
+    return poses
 
 
 def _board_fully_visible(T_bc: np.ndarray, T_board: np.ndarray, board: BoardModel,
-                         K: np.ndarray, wh: Tuple[int, int], margin_frac: float = 0.10,
+                         K: np.ndarray, wh: Tuple[int, int], margin_frac: float = 0.08,
                          max_oblique_deg: float = 70.0) -> bool:
-    """The camera must FACE the target with slack. `margin_frac` keeps the target inside the
-    central (1 - 2*margin) of the frame — NOT at the very edge — so the nominal-hand-eye seed's
-    error can't push it out of the real image. `max_oblique_deg` rejects grazing views (target
-    seen near edge-on, where its corners are undetectable anyway)."""
+    """The camera must FACE the target with slack: the whole target inside the central
+    (1 - 2*margin) of the frame, in front (z>0), and not edge-on. Guards the ACHIEVED pose
+    after IK (the look-at aims the centre; this confirms every corner actually fits)."""
     W, H = wh
     pc = transform_points(inv_T(T_bc), transform_points(T_board, board.points))
-    if np.any(pc[:, 2] <= 0.1):
+    if np.any(pc[:, 2] <= 0.05):
         return False
-    # facing check: the target's normal (its z-axis in the camera frame) vs the viewing ray to
-    # the target centre. |cos| → 1 is fronto-parallel, → 0 is edge-on.
     normal_cam = (inv_T(T_bc) @ T_board)[:3, 2]
     view = pc.mean(0); view = view / (np.linalg.norm(view) + 1e-9)
     if np.degrees(np.arccos(np.clip(abs(float(normal_cam @ view)), 0.0, 1.0))) > max_oblique_deg:
@@ -42,12 +115,18 @@ def _board_fully_visible(T_bc: np.ndarray, T_board: np.ndarray, board: BoardMode
 
 def _centering(T_bc: np.ndarray, T_board: np.ndarray, board: BoardModel,
                K: np.ndarray, wh: Tuple[int, int]) -> float:
-    """1.0 when the target's centroid is at image centre, → 0 toward the edge. A centred
-    prediction has the most slack against hand-eye-seed error, so it's the SAFEST to suggest."""
+    """1.0 when the target centroid is at image centre, → 0 toward the edge (the safest
+    framing against residual seed error)."""
     pc = transform_points(inv_T(T_bc), transform_points(T_board, board.points))
     cen = project(K, pc).mean(0)
     off = float(np.linalg.norm(cen - np.array([wh[0] / 2.0, wh[1] / 2.0])) / (0.5 * min(wh)))
     return max(0.0, 1.0 - off)
+
+
+def _predict_corners(chain: Chain, X: np.ndarray, T_board: np.ndarray, board: BoardModel,
+                     K: np.ndarray, q: np.ndarray) -> np.ndarray:
+    pc = transform_points(inv_T(chain.fk(q) @ X), transform_points(T_board, board.points))
+    return project(K, pc)
 
 
 def suggest_next_pose(
@@ -61,89 +140,82 @@ def suggest_next_pose(
     *,
     rng: np.random.Generator,
     nominal_joints: Optional[np.ndarray] = None,
-    n_cand: int = 300,
-    wrist_range: float = 0.6,
-    base_range: float = 0.12,
+    q_seed: Optional[np.ndarray] = None,
     feasible=None,
-    weak_axis: Optional[np.ndarray] = None,
+    weak_axis: Optional[np.ndarray] = None,       # accepted for back-compat; NBV uses `result`
+    result=None,
+    n_cand: int = 32,
+    max_keep: int = 18,
+    el_max_deg: float = 50.0,
+    roll_max_deg: float = 35.0,
+    visible_margin: float = 0.18,
 ) -> Tuple[Optional[np.ndarray], float]:
-    """Return (joints, score) for the next pose, or (None, 0) if nothing feasible was
-    found. `score` is the information-gain estimate (rad) — higher is more informative.
+    """Return (joints, score) for the next pose, or (None, 0.0) if nothing reachable+visible
+    was found. `score` is the chosen pose's rotation diversity vs the collected set (rad), so
+    the UI's "next-pose gain" stays meaningful in BOTH selection regimes.
 
-    Information gain (7.6): when `weak_axis` is given (the least-observed rotation axis of
-    X, the top eigenvector of the rotation-covariance block from `observability`), a
-    candidate is rewarded for rotating ABOUT that axis — it directly excites the DOF the
-    solve is still uncertain in, instead of just being far from prior poses. With no
-    `weak_axis` (first poses, before a solve) it falls back to the rotation-DIVERSITY
-    proxy (min angle to collected poses). `feasible(joints)->bool` is the optional
-    collision/in-envelope filter (cuRobo, robot-side)."""
-    base = np.zeros(chain.n) if nominal_joints is None else np.asarray(nominal_joints, float)
-    collected_R = [(chain.fk(q) @ X_est)[:3, :3] for q in collected_joints]
-    wa = None
-    if weak_axis is not None:
-        wa = np.asarray(weak_axis, float)
-        n = np.linalg.norm(wa)
-        wa = wa / n if n > 1e-9 else None
-    best_q: Optional[np.ndarray] = None
-    best_score = -1.0
-    R_ref = (chain.fk(base) @ X_est)[:3, :3]
-    lims = getattr(chain, "limits", None) or [None] * chain.n
+    Selection: with a solve (`result`), pick the pose MINIMISING the predicted worst
+    translation σ of X (true next-best-view, `metrics.predicted_sigma_after`); before any
+    solve, pick the pose maximising rotation-diversity × centring. Either way the marker is in
+    frame by construction (look-at) and the pose is IK-reachable + feasibility-filtered."""
+    q_seed = (np.asarray(nominal_joints, float) if q_seed is None and nominal_joints is not None
+              else np.zeros(chain.n) if q_seed is None else np.asarray(q_seed, float))
+    c = T_board_est[:3, 3]
+    cam0 = (chain.fk(q_seed) @ X_est)[:3, 3]
+    dist0 = float(np.linalg.norm(cam0 - c))
+    dist0 = dist0 if dist0 > 0.05 else 0.4
+    dist_range = (0.85 * dist0, 1.2 * dist0)
+    # the visible face points toward the camera side (never orbit behind the marker)
+    normal = T_board_est[:3, 2].copy()
+    if float(normal @ (cam0 - c)) < 0:
+        normal = -normal
 
-    # BEFORE a solve exists, the hand-eye seed is the URDF NOMINAL — which can be wrong by tens
-    # of degrees, so any prediction of "where the camera points" is unreliable. The one thing
-    # that is NOT seed-dependent is joint-motion MAGNITUDE: a small joint move from the operator's
-    # viewing pose physically can't swing a small marker out of frame, whatever the seed. So
-    # explore SMALL until a solve (weak_axis) refines X; then widen for orientation diversity.
-    if weak_axis is None:
-        wrist_range, base_range = wrist_range * 0.4, base_range * 0.4
+    cam_poses = _orbit_camera_poses(T_board_est, normal, n=n_cand, dist_range=dist_range,
+                                    el_max_deg=el_max_deg, roll_max_deg=roll_max_deg, rng=rng)
+    collected_R = [(chain.fk(np.asarray(q, float)) @ X_est)[:3, :3] for q in collected_joints]
 
-    # Per-joint sampling range, COMPUTED from each joint's effect on the camera's VIEWING
-    # DIRECTION — NOT from the joint index. A joint that mostly ROLLS the camera in place
-    # (small optical-axis tilt) keeps the board in frame, so sample it WIDE for orientation
-    # diversity; a joint that PITCHES/YAWS the view (large tilt) swings the board out of
-    # frame, so sample it NARROW. This is the rig-agnostic generalisation of the old
-    # "first 3 = positioning, last 3 = wrist" split — it holds for any DOF count, a 7-DOF
-    # arm, a humanoid limb, etc. The chosen range is then intersected with the URDF limit.
-    z0 = (chain.fk(base) @ X_est)[:3, 2]
-    span = []
-    for i in range(chain.n):
-        dq = base.copy(); dq[i] += 1e-3
-        z = (chain.fk(dq) @ X_est)[:3, 2]
-        tilt = float(np.arccos(np.clip(float(z0 @ z), -1.0, 1.0)) / 1e-3)  # view-tilt rad per rad
-        span.append(wrist_range if tilt < 0.3 else base_range)
-
-    def _sample() -> np.ndarray:
-        q = base.copy()
-        for i in range(chain.n):
-            lo, hi = base[i] - span[i], base[i] + span[i]
-            lim = lims[i] if i < len(lims) else None
-            if lim is not None:                          # never leave the URDF joint limits
-                m = 0.02 * (lim[1] - lim[0])
-                lo, hi = max(lo, lim[0] + m), min(hi, lim[1] - m)
-            q[i] = rng.uniform(lo, hi) if hi > lo else base[i]
-        return q
-
-    for _ in range(n_cand):
-        q = _sample()
-        T_bc = chain.fk(q) @ X_est
-        if not _board_fully_visible(T_bc, T_board_est, board, K, wh):
+    candidates = []   # (q, T_bc, diversity_rad)
+    for T_cam_des in cam_poses:
+        T_flange_des = T_cam_des @ inv_T(X_est)            # camera = flange ∘ X  ->  flange = cam ∘ X⁻¹
+        q, ok = chain.ik(T_flange_des, q_seed, iters=45, pos_tol=2e-4, rot_tol=3e-3)
+        if not ok:
+            continue
+        T_bc = chain.fk(q) @ X_est                         # ACHIEVED camera pose (under the seed)
+        # A GENEROUS margin here is deliberate: the pose is checked against the (possibly
+        # wrong) seed X, so a wide buffer keeps the marker in frame under the TRUE X too —
+        # the residual miss is bounded by f·tan(seed_error), so we leave room for it.
+        if not _board_fully_visible(T_bc, T_board_est, board, K, wh, margin_frac=visible_margin):
             continue
         if feasible is not None and not feasible(q):
             continue
-        diversity = min((rotation_angle(R.T @ T_bc[:3, :3]) for R in collected_R), default=float(np.pi))
-        if wa is not None and collected_R:
-            # rotation axis of this candidate vs the reference, in the camera frame; reward
-            # alignment with the under-observed axis (|cos| since ± about the axis both help).
-            rv = rotvec_from_R(R_ref.T @ T_bc[:3, :3])
-            mag = float(np.linalg.norm(rv))
-            align = abs(float(rv @ wa)) / mag if mag > 1e-6 else 0.0
-            score = diversity * (0.3 + 0.7 * align)
-        else:
-            score = diversity
-        # Bias toward poses that keep the target CENTRED: among equally-diverse candidates the
-        # centred one survives hand-eye-seed error, so we don't suggest the edge case that drifts
-        # the marker out of frame the moment the arm moves there.
-        score = score * (0.4 + 0.6 * _centering(T_bc, T_board_est, board, K, wh))
-        if score > best_score:
-            best_score, best_q = score, q
-    return best_q, max(0.0, best_score)
+        div = min((rotation_angle(R.T @ T_bc[:3, :3]) for R in collected_R), default=float(np.pi))
+        candidates.append((q, T_bc, div))
+        if len(candidates) >= max_keep:                    # enough to rank — stop IK'ing
+            break
+
+    if not candidates:
+        return None, 0.0
+
+    if result is not None:
+        # NBV: choose the candidate that most pins the under-observed DOF of X.
+        from .metrics import predicted_sigma_after
+        best = None
+        best_sigma = float("inf")
+        for q, T_bc, div in candidates:
+            cand = CaptureSample(id=-1, joints=q, fk_pose=chain.fk(q),
+                                 corner_ids=board.point_ids,
+                                 corners=_predict_corners(chain, X_est, T_board_est, board, K, q))
+            sigma = predicted_sigma_after(result, cand, board.points, K, chain)
+            # tiny centring tiebreak so near-equal candidates prefer a safe framing
+            score = sigma - 0.01 * _centering(T_bc, T_board_est, board, K, wh)
+            if score < best_sigma:
+                best_sigma, best = score, (q, div)
+        return best[0], float(best[1])
+
+    # pre-solve: rotation diversity × centring (no seed-dependent joint-magnitude hack)
+    best_q, best_score, best_div = None, -1.0, 0.0
+    for q, T_bc, div in candidates:
+        s = div * (0.4 + 0.6 * _centering(T_bc, T_board_est, board, K, wh))
+        if s > best_score:
+            best_score, best_q, best_div = s, q, div
+    return best_q, float(best_div)

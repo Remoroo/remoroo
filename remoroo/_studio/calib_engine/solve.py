@@ -144,6 +144,24 @@ def _planar_pose_init(pts: np.ndarray, uv: np.ndarray, K: np.ndarray) -> np.ndar
     return make_T(R, t)
 
 
+def refine_target_pose(sample: CaptureSample, board_points: np.ndarray, K: np.ndarray,
+                       T_seed: np.ndarray) -> Tuple[np.ndarray, float]:
+    """LM-refine a board->camera pose from a GIVEN seed (not the canonical seeds). Used to
+    explore the planar-PnP flip neighbourhood for a single marker: seed from a flipped pose
+    and refine, so `_estimate_target_pose_robust` can pick the flip consistent across poses.
+    Returns (board->camera, residual cost)."""
+    pts = board_points[sample.corner_ids]
+    uv = sample.corners
+
+    def resid(x):
+        T = make_T(rodrigues(x[:3]), x[3:])
+        return (project(K, transform_points(T, pts)) - uv).ravel()
+
+    x0 = np.concatenate([rotvec_from_R(T_seed[:3, :3]), T_seed[:3, 3]])
+    res = least_squares(resid, x0, method="lm", max_nfev=200)
+    return make_T(rodrigues(res.x[:3]), res.x[3:]), float(res.cost)
+
+
 def _estimate_target_pose(sample: CaptureSample, board_points: np.ndarray, K: np.ndarray) -> np.ndarray:
     """Board->camera pose from observed corners. MULTI-START: the planar-homography pose
     has a two-fold (flip) ambiguity, so we LM-refine from both the homography seed AND the

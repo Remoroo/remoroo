@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import math
 import traceback
@@ -136,6 +137,11 @@ _ensure_safety_shim_resolves()
 _bridge = None
 _bridge_err: str | None = None
 _bridge_last_try: float = 0.0
+# Serialises every touch of the shared cell Bridge. The live-joints SSE polls
+# get_observation() ~20 Hz WHILE the calibration verbs move/capture on the SAME bridge — on a
+# real SDK two threads hitting it concurrently corrupts reads / commands. The lock makes the
+# live mirror and the supervised flow take turns on the one physical device (G14).
+_bridge_lock = threading.RLock()
 
 
 def get_bridge():
@@ -321,8 +327,20 @@ def h_build_robot(_q, body):
         return {"error": f"{type(e).__name__}: {e}", "spheres": spheres, "count": len(spheres), "approximate": True}
 
 
+def _joint_value(val) -> float:
+    """Coerce ONE reported joint value to a python float, whatever shape the cell uses: a
+    python scalar, a 0-d array `np.array(0.5)`, or a 1-d `[0.5]`. A 0-d array HAS `__len__`
+    but `val[0]` raises IndexError — the exact bug that made the live mirror emit only {error}
+    frames so the 3D robot never moved. `reshape(-1)[0]` flattens every case."""
+    import numpy as np
+    arr = np.asarray(val, float).reshape(-1)
+    return float(arr[0]) if arr.size else 0.0
+
+
 def sse_live_joints(_q):
-    """Poll the Bridge for joint state and emit {t, joints} frames (no 'done')."""
+    """Poll the Bridge for joint state and emit {t, joints} frames (no 'done'). Robust to the
+    0-d / 1-d / scalar joint-value shapes cells report; a single bad poll yields an {error}
+    frame but the loop keeps streaming so the mirror recovers."""
     b = get_bridge()
     if b is None:
         yield {"t": 0.0, "joints": {}, "error": _bridge_err or "no bridge"}
@@ -330,10 +348,9 @@ def sse_live_joints(_q):
     t0 = time.time()
     while True:
         try:
-            obs = b.get_observation()
-            joints = {}
-            for name, val in (obs.joint_positions or {}).items():
-                joints[name] = float(val[0]) if hasattr(val, "__len__") else float(val)
+            with _bridge_lock:                 # take turns with the calibration verbs (G14)
+                obs = b.get_observation()
+            joints = {name: _joint_value(val) for name, val in (obs.joint_positions or {}).items()}
             yield {"t": time.time() - t0, "joints": joints}
         except Exception as e:  # noqa: BLE001
             yield {"t": time.time() - t0, "joints": {}, "error": str(e)}
@@ -745,6 +762,8 @@ def _calib_service():
     cal = (cy.get("calibration") or {})
     acc_px = float(cal.get("accept_heldout_px") or 1.5)   # None-safe (key present-but-null)
     acc_mm = float(cal.get("accept_tip_mm") or 3.0)
+    acc_rot = float(cal.get("accept_rot_sigma_deg") or 0.5)   # observability accept gate (deg)
+    acc_tr = float(cal.get("accept_trans_sigma_mm") or 2.0)   # observability accept gate (mm)
     dist = np.asarray(cal["dist"], float) if cal.get("dist") is not None else None
     sdk_T_lr = np.asarray(cal["T_left_right"], float).reshape(4, 4) if cal.get("T_left_right") is not None else None
     urdf_path = str(CELL_DIR / "robot_model" / "robot.urdf")
@@ -790,6 +809,7 @@ def _calib_service():
     _CALIB = CalibService(urdf_path, default_target, K0, bridge_factory, chain_provider, wh=tuple(wh0),
                           calib_dir=str(CELL_DIR / "calibration"),
                           accept_heldout_px=acc_px, accept_tip_mm=acc_mm,
+                          accept_rot_sigma_deg=acc_rot, accept_trans_sigma_mm=acc_tr,
                           plan_items=items, targets=targets,
                           intrinsics={c: kv for c, kv in intrinsics.items() if kv[0] is not None})
     return _CALIB
@@ -891,13 +911,28 @@ def _calib_snapshot() -> dict:
         except Exception:  # noqa: BLE001
             ids, uv = (np.empty(0, int), np.empty((0, 2)))
     K, _ = _intrinsics_from_bridge(b, camera_id)
-    return {
+    out = {
         "type": "snapshot", "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
         "w": int(w), "h": int(h),
         "seen": bool(target is not None and len(ids) >= target.min_points), "n_corners": int(len(ids)),
         "corners": np.asarray(uv, float).round(1).tolist(),
         "intrinsics": None if K is None else {"fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2]},
     }
+    # When a session is live and seeded, overlay the PREDICTED marker corners (under the current
+    # hand-eye X at the live joints) + the px drift + the board/optical poses, so the live cam
+    # shows the amber prediction next to the green detection and the 3D stage can place the
+    # marker (G13/G16). Best-effort — never blanks the raw feed.
+    sess = getattr(_CALIB, "session", None) if _CALIB is not None else None
+    if sess is not None and getattr(sess, "T_board_est", None) is not None:
+        try:
+            ov = sess.predicted_overlay()
+            if ov.get("ok"):
+                out.update({"predicted": ov["predicted"], "predicted_ids": ov["predicted_ids"],
+                            "drift_px": ov["drift_px"], "t_board": ov["T_board"],
+                            "x_optical": ov["X"], "phase": getattr(sess, "phase", None)})
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 def _calib_frame_image(index: int) -> dict:
@@ -964,6 +999,16 @@ def _pipeline_for_ui() -> dict:
 
 
 def _calib_handle(verb: str, body: dict) -> dict:
+    # The pure-URDF reads (`pipeline`/`plan`) touch no bridge, so they don't need the lock;
+    # everything else may move/capture/read the shared device, so it serialises with the live
+    # SSE poll (G14). RLock so a handler that internally reads joints doesn't self-deadlock.
+    if verb not in ("plan", "pipeline"):
+        with _bridge_lock:
+            return _calib_handle_locked(verb, body)
+    return _calib_handle_locked(verb, body)
+
+
+def _calib_handle_locked(verb: str, body: dict) -> dict:
     try:
         # `pipeline`/`plan` is a pure URDF read — no bridge / intrinsics / cv2, so the operator
         # sees the authored steps even before the camera is up. Heavier deps (bridge, K,

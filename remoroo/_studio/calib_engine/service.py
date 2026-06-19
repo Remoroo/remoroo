@@ -47,6 +47,8 @@ class CalibService:
         calib_dir: Optional[str] = None,
         accept_heldout_px: float = 1.5,
         accept_tip_mm: float = 3.0,
+        accept_rot_sigma_deg: float = 0.5,
+        accept_trans_sigma_mm: float = 2.0,
         plan_items: Optional[List[PlanItem]] = None,
         targets: Optional[Dict[str, Target]] = None,
         intrinsics: Optional[Dict[str, tuple]] = None,
@@ -63,6 +65,8 @@ class CalibService:
         # accept gate from cell.yaml (the operator's tuned thresholds), not a hardcoded default
         self.accept_heldout_px = accept_heldout_px
         self.accept_tip_mm = accept_tip_mm
+        self.accept_rot_sigma_deg = accept_rot_sigma_deg
+        self.accept_trans_sigma_mm = accept_trans_sigma_mm
         # The AUTHORED pipeline (resolved PlanItems + named Targets), injected by the edge.
         # When absent (older tests), fall back to deriving the plan from the URDF. The engine
         # consumes the agent's steps; it does not guess them when they're authored.
@@ -127,6 +131,13 @@ class CalibService:
 
         if verb == "motion_check":  return s.motion_check()
         if verb == "detect":        return s.detect()
+        # ── supervised visual seed → confirm → verify (the operator places + trusts X) ──
+        if verb == "seed":          return s.seed()
+        if verb == "seed_nudge":    return s.seed_nudge(body.get("x_new"))
+        if verb == "seed_wiggle":   return s.seed_wiggle(float(body.get("deg", 3.0)))
+        if verb == "confirm_seed":  return s.confirm_seed()
+        if verb == "overlay":       return s.predicted_overlay()
+        if verb == "verify":        return s.verify(n_poses=int(body.get("n_poses", 4)))
         if verb == "suggest_pose":  return s.suggest_pose()
         if verb == "move_to":       return s.move_to(body.get("joints"))
         if verb == "capture":       return s.capture(bool(body.get("held_out", False)))
@@ -163,5 +174,7 @@ class CalibService:
             target=target, K=K, chain_provider=self.chain_provider,
             bridge_factory=self.bridge_factory, wh=wh,
             accept_heldout_px=self.accept_heldout_px, accept_tip_mm=self.accept_tip_mm,
+            accept_rot_sigma_deg=self.accept_rot_sigma_deg,
+            accept_trans_sigma_mm=self.accept_trans_sigma_mm,
             accepted=self.accepted, plan_items=self.plan_items,
         )

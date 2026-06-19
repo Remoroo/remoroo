@@ -39,6 +39,8 @@ class StepContext:
     wh: Tuple[int, int] = (1280, 720)
     accept_heldout_px: float = 1.5
     accept_tip_mm: float = 3.0
+    accept_rot_sigma_deg: float = 0.5
+    accept_trans_sigma_mm: float = 2.0
     accepted: Dict[str, object] = field(default_factory=dict)
     plan_items: List[object] = field(default_factory=list)
 

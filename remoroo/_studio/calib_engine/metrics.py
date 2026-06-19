@@ -132,16 +132,13 @@ def reprojection_detail(
     return out
 
 
-def parameter_covariance(result: CalibResult) -> np.ndarray:
-    """Covariance of the full parameter vector at the solution, via a finite-difference
-    Jacobian of the reprojection residual: Cov = sigma^2 (J^T J)^-1."""
-    prob: _Problem = result._problem   # type: ignore[attr-defined]
-    x: np.ndarray = result._x          # type: ignore[attr-defined]
+def _clean(v):
+    return np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _clean(v):
-        return np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
 
-    with np.errstate(all="ignore"):  # near-degenerate poses can spike 1/z; we sanitise below
+def _residual_jacobian(prob: _Problem, x: np.ndarray) -> np.ndarray:
+    """Finite-difference the reprojection residual Jacobian (m residuals x p params) at x."""
+    with np.errstate(all="ignore"):
         r0 = _clean(prob.residual(x))
         m, p = r0.size, x.size
         Jm = np.zeros((m, p))
@@ -150,15 +147,71 @@ def parameter_covariance(result: CalibResult) -> np.ndarray:
             dx = np.zeros(p)
             dx[k] = eps
             Jm[:, k] = (_clean(prob.residual(x + dx)) - r0) / eps
-        Jm = np.clip(_clean(Jm), -1e6, 1e6)
-        JtJ = Jm.T @ Jm
-        dof = max(1, m - p)
-        sigma2 = float(np.sum(r0 ** 2) / dof)
-        try:
-            cov = np.linalg.inv(JtJ) * sigma2
-        except np.linalg.LinAlgError:
-            cov = np.linalg.pinv(JtJ) * sigma2
-    return cov
+    return np.clip(_clean(Jm), -1e6, 1e6)
+
+
+def _reprojection_information(result: CalibResult):
+    """The Fisher information of the solve: (JᵀJ, sigma², prob, x). Cov = sigma² (JᵀJ)⁻¹.
+    Shared by `parameter_covariance` and the next-best-view `predicted_sigma_after`."""
+    prob: _Problem = result._problem   # type: ignore[attr-defined]
+    x: np.ndarray = result._x          # type: ignore[attr-defined]
+    Jm = _residual_jacobian(prob, x)
+    r0 = _clean(prob.residual(x))
+    with np.errstate(all="ignore"):
+        JtJ = _clean(Jm.T @ Jm)
+    dof = max(1, r0.size - x.size)
+    sigma2 = float(np.sum(r0 ** 2) / dof)
+    return JtJ, sigma2, prob, x
+
+
+def _cov_from_info(JtJ: np.ndarray, sigma2: float) -> np.ndarray:
+    try:
+        return np.linalg.inv(JtJ) * sigma2
+    except np.linalg.LinAlgError:
+        return np.linalg.pinv(JtJ) * sigma2
+
+
+def parameter_covariance(result: CalibResult) -> np.ndarray:
+    """Covariance of the full parameter vector at the solution, via a finite-difference
+    Jacobian of the reprojection residual: Cov = sigma^2 (J^T J)^-1."""
+    JtJ, sigma2, _, _ = _reprojection_information(result)
+    return _cov_from_info(JtJ, sigma2)
+
+
+def well_observed(result: CalibResult, *, rot_sigma_deg: float = 0.5,
+                  trans_sigma_mm: float = 2.0):
+    """The OBSERVABILITY ACCEPT GATE (the fix for the silent 2x-translation failure): a
+    calibration is only trustworthy if EVERY DOF of X is pinned. Returns (ok, detail) where
+    `ok` requires the worst rotation 1σ < `rot_sigma_deg` AND the worst translation 1σ <
+    `trans_sigma_mm`. A low-rotation-diversity collection leaves translation unobservable →
+    huge trans σ → ok=False, so the gate refuses it instead of accepting garbage."""
+    obs = observability(result)
+    worst_rot = float(obs["rot_worst_deg"])
+    worst_trans = float(max(obs["tx_mm"], obs["ty_mm"], obs["tz_mm"]))
+    ok = bool(worst_rot < rot_sigma_deg and worst_trans < trans_sigma_mm)
+    detail = {"observable": ok, "worst_rot_sigma_deg": round(worst_rot, 4),
+              "worst_trans_sigma_mm": round(worst_trans, 4),
+              "rot_sigma_deg_limit": rot_sigma_deg, "trans_sigma_mm_limit": trans_sigma_mm}
+    detail.update({k: round(float(v), 4) for k, v in obs.items()})
+    return ok, detail
+
+
+def predicted_sigma_after(result: CalibResult, candidate: CaptureSample,
+                          board_points: np.ndarray, K: np.ndarray, chain: Chain) -> float:
+    """Next-best-view information gain (rigorous, not a heuristic): the worst translation 1σ
+    (mm) of X that WOULD result if `candidate` (a hypothetical capture, corners predicted
+    under the current X) were added — by appending its residual Jacobian to the Fisher
+    information JᵀJ and re-inverting. Posegen ranks candidates by how much this DROPS the
+    worst σ vs the current solve, i.e. which pose most pins the under-observed DOF."""
+    JtJ, sigma2, prob, x = _reprojection_information(result)
+    prob1 = _Problem([candidate], board_points, K, chain,
+                     estimate_fk=prob.estimate_fk, estimate_scale=prob.estimate_scale,
+                     weights=None, mode=prob.mode)
+    Jc = _residual_jacobian(prob1, x)
+    with np.errstate(all="ignore"):
+        cov = _cov_from_info(JtJ + _clean(Jc.T @ Jc), sigma2)
+    std = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+    return float(np.max(std[3:6]) * 1000.0)   # worst translation σ in mm
 
 
 def observability(result: CalibResult) -> Dict[str, float]:
