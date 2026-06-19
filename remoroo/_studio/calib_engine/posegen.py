@@ -18,14 +18,36 @@ from .types import BoardModel
 
 
 def _board_fully_visible(T_bc: np.ndarray, T_board: np.ndarray, board: BoardModel,
-                         K: np.ndarray, wh: Tuple[int, int], margin: float = 0.0) -> bool:
+                         K: np.ndarray, wh: Tuple[int, int], margin_frac: float = 0.10,
+                         max_oblique_deg: float = 70.0) -> bool:
+    """The camera must FACE the target with slack. `margin_frac` keeps the target inside the
+    central (1 - 2*margin) of the frame — NOT at the very edge — so the nominal-hand-eye seed's
+    error can't push it out of the real image. `max_oblique_deg` rejects grazing views (target
+    seen near edge-on, where its corners are undetectable anyway)."""
     W, H = wh
     pc = transform_points(inv_T(T_bc), transform_points(T_board, board.points))
     if np.any(pc[:, 2] <= 0.1):
         return False
+    # facing check: the target's normal (its z-axis in the camera frame) vs the viewing ray to
+    # the target centre. |cos| → 1 is fronto-parallel, → 0 is edge-on.
+    normal_cam = (inv_T(T_bc) @ T_board)[:3, 2]
+    view = pc.mean(0); view = view / (np.linalg.norm(view) + 1e-9)
+    if np.degrees(np.arccos(np.clip(abs(float(normal_cam @ view)), 0.0, 1.0))) > max_oblique_deg:
+        return False
     uv = project(K, pc)
-    return bool(uv[:, 0].min() >= margin and uv[:, 0].max() < W - margin
-                and uv[:, 1].min() >= margin and uv[:, 1].max() < H - margin)
+    mx, my = margin_frac * W, margin_frac * H
+    return bool(uv[:, 0].min() >= mx and uv[:, 0].max() < W - mx
+                and uv[:, 1].min() >= my and uv[:, 1].max() < H - my)
+
+
+def _centering(T_bc: np.ndarray, T_board: np.ndarray, board: BoardModel,
+               K: np.ndarray, wh: Tuple[int, int]) -> float:
+    """1.0 when the target's centroid is at image centre, → 0 toward the edge. A centred
+    prediction has the most slack against hand-eye-seed error, so it's the SAFEST to suggest."""
+    pc = transform_points(inv_T(T_bc), transform_points(T_board, board.points))
+    cen = project(K, pc).mean(0)
+    off = float(np.linalg.norm(cen - np.array([wh[0] / 2.0, wh[1] / 2.0])) / (0.5 * min(wh)))
+    return max(0.0, 1.0 - off)
 
 
 def suggest_next_pose(
@@ -66,6 +88,14 @@ def suggest_next_pose(
     best_score = -1.0
     R_ref = (chain.fk(base) @ X_est)[:3, :3]
     lims = getattr(chain, "limits", None) or [None] * chain.n
+
+    # BEFORE a solve exists, the hand-eye seed is the URDF NOMINAL — which can be wrong by tens
+    # of degrees, so any prediction of "where the camera points" is unreliable. The one thing
+    # that is NOT seed-dependent is joint-motion MAGNITUDE: a small joint move from the operator's
+    # viewing pose physically can't swing a small marker out of frame, whatever the seed. So
+    # explore SMALL until a solve (weak_axis) refines X; then widen for orientation diversity.
+    if weak_axis is None:
+        wrist_range, base_range = wrist_range * 0.4, base_range * 0.4
 
     # Per-joint sampling range, COMPUTED from each joint's effect on the camera's VIEWING
     # DIRECTION — NOT from the joint index. A joint that mostly ROLLS the camera in place
@@ -110,6 +140,10 @@ def suggest_next_pose(
             score = diversity * (0.3 + 0.7 * align)
         else:
             score = diversity
+        # Bias toward poses that keep the target CENTRED: among equally-diverse candidates the
+        # centred one survives hand-eye-seed error, so we don't suggest the edge case that drifts
+        # the marker out of frame the moment the arm moves there.
+        score = score * (0.4 + 0.6 * _centering(T_bc, T_board_est, board, K, wh))
         if score > best_score:
             best_score, best_q = score, q
     return best_q, max(0.0, best_score)
