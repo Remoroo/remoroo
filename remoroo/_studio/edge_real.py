@@ -261,27 +261,154 @@ def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
     return out
 
 
-def motion_gen():
-    """Load a cuRobo MotionGen from the cell's robot YAML + a workspace world box."""
-    from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig  # type: ignore
-    from curobo.geom.types import WorldConfig, Cuboid  # type: ignore
+_MOTION_GEN = None     # cached cuRobo MotionGen (collision-free trajectory planning)
+_ROBOT_WORLD = None    # cached cuRobo RobotWorld (fast config-space collision queries)
 
+
+def reset_curobo_cache():
+    """Drop the cached cuRobo models so the next planning/feasibility call rebuilds the world.
+    Call whenever the obstacles or the robot model change (the world is baked into both). This
+    does NOT touch the calib service / session — calibration progress is preserved."""
+    global _MOTION_GEN, _ROBOT_WORLD
+    _MOTION_GEN = None
+    _ROBOT_WORLD = None
+
+
+def _curobo_world():
+    """The cuRobo WorldConfig the planner AND the feasibility checker SHARE: a conservative
+    workspace floor box (cell.yaml bounds) + the operator-modeled static OBSTACLES
+    (table/wall/post) as proper cuRobo cuboids — separate from the robot, the cuRobo way. One
+    builder so 'feasible' and 'planned' never disagree about where the table is."""
+    from curobo.geom.types import WorldConfig, Cuboid  # type: ignore
+    from calib_engine.curobo_cfg import build_world_cfg
     cy = load_cell_yaml()
     ws = (cy.get("workspace") or {})
-    # conservative workspace box from cell.yaml bounds + the operator-modeled static OBSTACLES
-    # (table/wall/etc.) as proper cuRobo world cuboids — separate from the robot, the cuRobo way.
-    from calib_engine.curobo_cfg import build_world_cfg
     dims = ws.get("size", [1.5, 1.5, 1.0])
     center = ws.get("center", [0.0, 0.0, dims[2] / 2 - 0.5])
     cubs = [Cuboid(name="workspace_floor", pose=[*center, 1, 0, 0, 0], dims=list(dims))]
     for nm, c in build_world_cfg(cy.get("obstacles"))["cuboid"].items():
         cubs.append(Cuboid(name=nm, pose=c["pose"], dims=c["dims"]))
-    world = WorldConfig(cuboid=cubs)
+    return WorldConfig(cuboid=cubs)
+
+
+def motion_gen():
+    """Cached cuRobo MotionGen from the cell's robot YAML + the shared obstacle world. Plans the
+    COLLISION-FREE trajectories for the supervised calibration moves (warmup is paid once)."""
+    global _MOTION_GEN
+    if _MOTION_GEN is not None:
+        return _MOTION_GEN
+    from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig  # type: ignore
     robot_yaml = str(CELL_DIR / "robot_model" / "collision_spheres.yml")
-    cfg = MotionGenConfig.load_from_robot_config(robot_yaml, world, interpolation_dt=0.02)
+    cfg = MotionGenConfig.load_from_robot_config(robot_yaml, _curobo_world(), interpolation_dt=0.02)
     mg = MotionGen(cfg)
     mg.warmup()
+    _MOTION_GEN = mg
     return mg
+
+
+def _robot_world():
+    """Cached cuRobo RobotWorld for FAST config-space collision queries — the per-candidate
+    feasibility filter behind calibration next-pose suggestion (≈32 candidates/suggestion, so it
+    must be cheap: collision distance only, NO trajectory optimization). Same robot spheres +
+    obstacle world the planner uses."""
+    global _ROBOT_WORLD
+    if _ROBOT_WORLD is not None:
+        return _ROBOT_WORLD
+    from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig  # type: ignore
+    robot_yaml = str(CELL_DIR / "robot_model" / "collision_spheres.yml")
+    cfg = RobotWorldConfig.load_from_config(robot_yaml, _curobo_world(),
+                                            collision_activation_distance=0.01)
+    _ROBOT_WORLD = RobotWorld(cfg)
+    return _ROBOT_WORLD
+
+
+class _CuroboMotion:
+    """Shared cuRobo collision checker (+ lazy joint-space planner) for the SUPERVISED
+    calibration moves — the operator's 'cuRobo for everything' choice. One instance per calib
+    service; off-robot / no-GPU it isn't built (the engine then skips filtering and direct-moves,
+    exactly as before — no regression).
+
+      feasible(q_named) -> bool          fast world+self collision check of a candidate config;
+                                         FILTERS next-pose suggestions so the agent never proposes
+                                         a pose that drives into the table.
+      plan(start, goal)  -> [dict]|None  a COLLISION-FREE joint trajectory to the accepted pose,
+                                         or None if no safe path exists (the move is then refused).
+
+    SELF-VALIDATES the collision sign against the robot's CURRENT, known-safe pose. If that reads
+    'colliding' (a sign flip, or the degenerate micro-sphere model) the FILTER disables itself
+    (allow-all) so it can never block every pose — the move-time planner stays the hard gate."""
+
+    def __init__(self):
+        rw = _robot_world()                          # raises off-robot / no GPU → caller → None
+        self.jn = list(rw.kinematics.joint_names)    # cuRobo's joint order
+        self.filter_ok = self._self_check()
+
+    def _cost(self, q_named) -> float:
+        """World+self collision cost for one config (positive ⇒ in collision). The one place the
+        version-sensitive cuRobo query lives, so the sign/threshold has a single home."""
+        import torch  # type: ignore
+        rw = _robot_world()
+        row = [float(q_named.get(n, 0.0)) for n in self.jn]
+        qt = torch.as_tensor([row], dtype=torch.float32, device=rw.tensor_args.device)
+        d_w, d_s = rw.get_world_self_collision_distance_from_joint_trajectory(qt.unsqueeze(1))
+        return float((d_w + d_s).max().item())
+
+    def _self_check(self) -> bool:
+        # the robot is sitting safely NOW → its current config MUST read collision-free; if not,
+        # the model/sign is wrong (e.g. micro-spheres) → don't trust the filter.
+        try:
+            import numpy as np  # type: ignore
+            b = get_bridge()
+            jp = ((b.get_observation().joint_positions if b is not None else None) or {})
+            q_now = {n: float(np.ravel(v)[0]) for n, v in jp.items()}
+            if not q_now:
+                return True
+            c = self._cost(q_now)
+            if c > 0.0:
+                print(f"[calib] cuRobo collision self-check FAILED (current safe pose reads "
+                      f"colliding, cost={c:.3f}) — sign/model off (degenerate spheres?). "
+                      f"Suggestion filter DISABLED; the move-time planner still gates motion.")
+                return False
+            return True
+        except Exception as e:
+            print(f"[calib] cuRobo collision self-check errored ({e}); suggestion filter DISABLED.")
+            return False
+
+    def feasible(self, q_named) -> bool:
+        if not self.filter_ok:
+            return True
+        try:
+            return self._cost(q_named) <= 0.0
+        except Exception as e:
+            print(f"[calib] feasibility query failed ({e}); allowing pose (planner backstops).")
+            return True
+
+    def plan(self, start_named, goal_named):
+        """Collision-free joint waypoints start→goal (each a name→value dict), or None if cuRobo
+        finds no safe path."""
+        import torch  # type: ignore
+        from curobo.types.robot import JointState  # type: ignore
+        from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig  # type: ignore
+        mg = motion_gen()
+        def _js(named):
+            row = [[float(named.get(n, 0.0)) for n in self.jn]]
+            return JointState.from_position(torch.tensor(row, dtype=torch.float32, device="cuda"),
+                                            joint_names=self.jn)
+        res = mg.plan_single_js(_js(start_named), _js(goal_named), MotionGenPlanConfig(max_attempts=4))
+        if not bool(res.success.item()):
+            return None
+        pos = res.get_interpolated_plan().position.detach().cpu().numpy()
+        return [dict(zip(self.jn, row.tolist())) for row in pos]
+
+
+def _calib_motion():
+    """Build (once per calib service) the shared cuRobo collision checker + planner, or None when
+    cuRobo / a GPU / the robot model isn't available (off-robot → no filter, direct moves)."""
+    try:
+        return _CuroboMotion()
+    except Exception as e:
+        print(f"[calib] cuRobo motion/collision unavailable ({e}); calibration uses direct moves.")
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -336,6 +463,7 @@ def h_build_robot(_q, body):
     spheres = body.get("spheres", []) if isinstance(body, dict) else []
     try:
         out = write_curobo_robot_yaml(body.get("urdf", ""), spheres)
+        reset_curobo_cache()   # rebuild the planner + collision checker with the new spheres
         # best-effort: validate by loading the kinematics
         approximate = True
         try:
@@ -536,7 +664,7 @@ class RealBridge:
     bundle's FK-correction has a chain to refine; joints are read in the chain's joint order."""
 
     def __init__(self, cell_bridge, chain, joint_names, target,
-                 camera_id="", arm_id="", K=None, dist=None, sdk_T_lr=None):
+                 camera_id="", arm_id="", K=None, dist=None, sdk_T_lr=None, motion=None):
         self.b = cell_bridge
         self.chain = chain
         self.joint_names = joint_names
@@ -546,6 +674,7 @@ class RealBridge:
         self.K = K
         self.dist = dist                 # optional radial-tangential coeffs (7.2)
         self._sdk_T_lr = sdk_T_lr        # optional 4x4 left->right stereo baseline (F9)
+        self._motion = motion            # shared cuRobo collision checker + planner (None off-robot)
 
     def _observation(self):
         """Per-camera observation if the cell Bridge supports `get_observation(camera=...)`
@@ -577,6 +706,36 @@ class RealBridge:
         return self.chain.fk(self.read_joints())
 
     def move_to_joints(self, joints):
+        q = [float(x) for x in joints]
+        # 'cuRobo for everything': with a world model loaded, drive a COLLISION-FREE planned path
+        # to the pose (REFUSING the move when no safe path exists) instead of a straight joint
+        # interpolation that could clip the table. Off-robot / no GPU → the direct move, unchanged.
+        if self._motion is not None:
+            self._planned_move(q)
+        else:
+            self._direct_move(q)
+
+    def _planned_move(self, q):
+        """Plan a collision-free trajectory current→q with cuRobo and follow it; refuse if cuRobo
+        finds no safe path (better a refused move than the arm driving through a modeled obstacle)."""
+        start = dict(zip(self.joint_names, [float(x) for x in self.read_joints()]))
+        goal = dict(zip(self.joint_names, [float(x) for x in q]))
+        waypoints = self._motion.plan(start, goal)
+        if waypoints is None:
+            raise RuntimeError(
+                "cuRobo found no collision-free path to the suggested pose — the move was REFUSED "
+                "(it would hit a modeled obstacle). Re-suggest a pose, or check the obstacles / "
+                "robot collision model.")
+        # follow the planned path; subsample so a per-waypoint HTTP joint move stays manageable,
+        # and always finish exactly on the goal waypoint.
+        step = max(1, len(waypoints) // 24)
+        seq = waypoints[::step]
+        if seq[-1] is not waypoints[-1]:
+            seq.append(waypoints[-1])
+        for wp in seq:
+            self._direct_move([wp[n] for n in self.joint_names])
+
+    def _direct_move(self, joints):
         q = [float(x) for x in joints]
         # Per-arm routing (the multi-arm SAFETY fix). When the step bound an arm, drive THAT
         # arm explicitly: prefer an arm-aware move, then the multi-arm primitive, then a
@@ -648,13 +807,21 @@ class RealBridge:
                            "move_tcp/move_to_point/move_cartesian/move_l) — tip-landing needs it")
 
     def feasible(self, joints):
-        """Optional cuRobo collision/in-envelope filter (7.7): if the cell Bridge exposes
-        one, suggested poses are filtered BEFORE the operator accepts; else accept all."""
+        """The next-pose collision filter (7.7), now ENGINE-driven via cuRobo: a candidate config
+        must be collision-free in cuRobo's static world (table/obstacles) AND pass the operator's
+        OPTIONAL bridge filter if primitives.py exposes one. Either gate rejecting → infeasible.
+        With neither available (off-robot, no custom filter) → allow (the move-time planner is the
+        hard gate, and there's nothing to collide with off-robot)."""
+        q = [float(x) for x in joints]
+        # 1) cuRobo world+self collision check — the 'cuRobo for everything' static-obstacle gate.
+        if self._motion is not None and not self._motion.feasible(dict(zip(self.joint_names, q))):
+            return False
+        # 2) operator's optional feasibility (custom envelope / keep-outs) from primitives.py.
         for name in ("is_joint_pose_feasible", "feasible", "plan_feasible"):
             fn = getattr(self.b, name, None)
             if callable(fn):
                 try:
-                    return bool(fn([float(x) for x in joints]))
+                    return bool(fn(q))
                 except Exception:  # noqa: BLE001
                     return True
         return True
@@ -811,6 +978,12 @@ def _calib_service():
     def chain_provider(flange):
         return urdf_io.chain_from_urdf(urdf_path, flange)[0]
 
+    # Shared cuRobo collision checker + planner for the arm-driven steps — built ONCE (warmup is
+    # slow), reused across poses. None off-robot / no GPU (the engine then skips the suggestion
+    # filter and direct-moves, unchanged). A static (world-fixed) camera never moves, so it gets
+    # no motion model.
+    motion = _calib_motion()
+
     def bridge_factory(item):
         target = targets.get(item.target_id) or default_target
         cam, arm = item.camera_link, item.arm
@@ -825,7 +998,7 @@ def _calib_service():
                               K=Kc, dist=dist, sdk_T_lr=sdk_T_lr)
         chain, names, _ = urdf_io.chain_from_urdf(urdf_path, item.flange_link)
         return RealBridge(b, chain, names, target, camera_id=cam, arm_id=arm,
-                          K=Kc, dist=dist, sdk_T_lr=sdk_T_lr)
+                          K=Kc, dist=dist, sdk_T_lr=sdk_T_lr, motion=motion)
 
     _CALIB = CalibService(urdf_path, default_target, K0, bridge_factory, chain_provider, wh=tuple(wh0),
                           calib_dir=str(CELL_DIR / "calibration"),
@@ -936,6 +1109,11 @@ def _calib_snapshot() -> dict:
         "type": "snapshot", "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
         "w": int(w), "h": int(h),
         "seen": bool(target is not None and len(ids) >= target.min_points), "n_corners": int(len(ids)),
+        # the target's FULL point count (ChArUco: (sx-1)*(sy-1) interior corners) so the live cam
+        # shows detected/expected — n/n means the WHOLE board is seen (a ChArUco's green outline
+        # connects the INTERIOR corners, one square inside the border, so it looks smaller than the
+        # physical board even at full detection; this number tells the operator it's complete).
+        "expected_corners": int(len(getattr(target, "point_xyz", []))) if target is not None else 0,
         "corners": np.asarray(uv, float).round(1).tolist(),
         "intrinsics": None if K is None else {"fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2]},
     }
@@ -948,9 +1126,18 @@ def _calib_snapshot() -> dict:
         try:
             ov = sess.predicted_overlay()
             if ov.get("ok"):
-                out.update({"predicted": ov["predicted"], "predicted_ids": ov["predicted_ids"],
-                            "drift_px": ov["drift_px"], "t_board": ov["T_board"],
-                            "x_optical": ov["X"], "phase": getattr(sess, "phase", None)})
+                phase = getattr(sess, "phase", None)
+                out.update({"t_board": ov["T_board"], "x_optical": ov["X"], "phase": phase})
+                # The amber PIXEL overlay + its drift are only meaningful where the hand-eye X is
+                # trustworthy: the seed-confirm wiggle and AFTER a solve (verify/validate). During
+                # raw pre-solve COLLECTION, X is just the rough nominal seed, so by construction the
+                # prediction sits ON the board at the seed config but slides FAR off (hundreds of px)
+                # as the arm moves to new views — which reads as "dots out of place", not as signal.
+                # Suppress it there (the green DETECTION is always correct and is all collection
+                # needs); the 3D marker (t_board/x_optical) still renders from the seed.
+                if getattr(sess, "result", None) is not None or phase in ("seed", "solving", "validate", "verify"):
+                    out.update({"predicted": ov["predicted"], "predicted_ids": ov["predicted_ids"],
+                                "drift_px": ov["drift_px"]})
         except Exception:  # noqa: BLE001
             pass
     return out
@@ -1110,6 +1297,7 @@ def h_set_obstacles(_q, body):
     cy = load_cell_yaml()
     cy["obstacles"] = list((body or {}).get("obstacles") or [])
     (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False), encoding="utf-8")
+    reset_curobo_cache()   # the obstacle world is baked into the planner + collision checker
     return {"ok": True, "obstacles": cy["obstacles"]}
 
 
