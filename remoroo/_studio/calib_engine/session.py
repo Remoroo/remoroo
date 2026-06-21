@@ -773,30 +773,45 @@ class CalibSession:
 
     # ── accept: write body->optical back to the URDF + the calibration json ──
     def accept(self, urdf_path: str, out_path: Optional[str] = None, provenance: str = "measured",
-               calib_dir: Optional[str] = None) -> dict:
+               calib_dir: Optional[str] = None, force: bool = False) -> dict:
         assert self.result is not None
         # OBSERVABILITY ACCEPT GATE: an arm-driven hand-eye is refused unless every DOF of X is
         # pinned (the fix for silently accepting 2x-translation garbage). A static camera has no
-        # hand-eye rotation coupling — its gate is held-out reprojection alone.
+        # hand-eye rotation coupling — its gate is held-out reprojection alone. `force` is the
+        # operator OVERRIDE (the "Save calibration" action): write it anyway and report the
+        # observability as a WARNING instead of refusing — saving a result is the operator's call,
+        # NOT the same as finalizing the gate.
+        warning = None
         if not self.static:
             observable = self.result.metrics.get("observable")
             if observable is None:
                 observable = self._note_observability(self.result)
             if not observable:
-                return {"type": "accept", "ok": False, "camera": self.item.camera_link,
-                        "error": "calibration is not observable — collect more rotation-diverse "
-                                 "poses (translation under-constrained)", **self._obs_json(self.result)}
+                if not force:
+                    return {"type": "accept", "ok": False, "camera": self.item.camera_link,
+                            "error": "calibration is not observable — collect more rotation-diverse "
+                                     "poses (translation under-constrained)", **self._obs_json(self.result)}
+                warning = ("saved while UNDER-OBSERVED — the translation is under-constrained; "
+                           "collect more rotation-diverse poses before relying on it")
         body_optical = inv_T(self.item.nominal_flange_body) @ self.result.T_optical
         dst = urdf_io.write_calibrated_optical(urdf_path, self.item.camera_link, body_optical,
                                                out_path=out_path, provenance=provenance)
         # Persist the CalibResult json the seed promises (so the agent + base_to_base can read
-        # each camera's X without re-running the solve).
+        # each camera's X without re-running the solve), PLUS the operator-readable hand_eye.yaml
+        # (accumulating per camera) + report.md — the named artifacts the cell + gate-check expect.
         json_path = None
         if calib_dir is not None:
             json_path = _write_calib_json(calib_dir, self.item.camera_link, self.result, provenance)
-        return {"type": "accept", "urdf": dst, "camera": self.item.camera_link,
-                "optical_frame": self.item.optical_frame, "provenance": provenance,
-                "calib_json": json_path, "body_to_optical": _T(body_optical)}
+            _write_hand_eye_summary(calib_dir, self.item.camera_link, self.item.flange_link,
+                                    self.kind, self.result.T_optical, provenance, self.result)
+        out = {"type": "accept", "ok": True, "urdf": dst, "camera": self.item.camera_link,
+               "optical_frame": self.item.optical_frame, "provenance": provenance,
+               "calib_json": json_path, "body_to_optical": _T(body_optical),
+               "X": _T(self.result.T_optical), "flange": self.item.flange_link,
+               **self._obs_json(self.result)}
+        if warning:
+            out["warning"] = warning
+        return out
 
 
 def _write_calib_json(calib_dir: str, camera: str, result: CalibResult, provenance: str) -> str:
@@ -816,6 +831,63 @@ def _write_calib_json(calib_dir: str, camera: str, result: CalibResult, provenan
         "t_lr_err_deg": result.t_lr_err_deg, "samples_used": result.samples_used,
     }, indent=2), encoding="utf-8")
     return dst
+
+
+def _write_hand_eye_summary(calib_dir: str, camera: str, flange: str, kind: str,
+                            X: np.ndarray, provenance: str, result: CalibResult) -> None:
+    """Update `calibration/hand_eye.yaml` (per-camera, ACCUMULATING across steps) + regenerate the
+    human-readable `report.md`. These are the named artifacts the cell + the Studio gate-check read.
+    Saving one camera here does NOT finalize the calibrate gate — other cameras may still follow."""
+    import time
+    try:
+        import yaml  # type: ignore
+    except Exception:  # noqa: BLE001
+        yaml = None
+    Path(calib_dir).mkdir(parents=True, exist_ok=True)
+    t = np.asarray(X, float)[:3, 3]
+    m = result.metrics or {}
+    entry = {
+        "flange": flange, "kind": kind, "provenance": provenance,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "T_cam_flange": _T(X),                       # camera optical centre in the flange frame (4x4)
+        "translation_mm": [round(float(t[i]) * 1000.0, 3) for i in range(3)],
+        "offset_mm": round(float(np.linalg.norm(t) * 1000.0), 3),
+        "board_scale": round(float(result.board_scale), 6),
+        "train_rms_px": round(float(result.residual_px), 4),
+        "samples": int(result.samples_used),
+        "observable": bool(m.get("observable", False)),
+        "worst_rot_sigma_deg": m.get("worst_rot_sigma_deg"),
+        "worst_trans_sigma_mm": m.get("worst_trans_sigma_mm"),
+    }
+    he = Path(calib_dir) / "hand_eye.yaml"
+    data: dict = {}
+    if yaml is not None and he.exists():
+        try:
+            data = yaml.safe_load(he.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            data = {}
+    cams = data.get("cameras") if isinstance(data.get("cameras"), dict) else {}
+    cams[camera] = entry
+    if yaml is not None:
+        he.write_text(yaml.safe_dump({"cameras": cams}, sort_keys=False), encoding="utf-8")
+    # regenerate the markdown report from ALL saved cameras
+    lines = ["# Calibration report", ""]
+    for cam, e in cams.items():
+        tr = e.get("translation_mm", [0, 0, 0])
+        obs = ("observable ✓" if e.get("observable") else "UNDER-OBSERVED ✗")
+        if e.get("worst_rot_sigma_deg") is not None:
+            obs += f" (worst rot σ {e['worst_rot_sigma_deg']}°, worst trans σ {e['worst_trans_sigma_mm']} mm)"
+        lines += [
+            f"## {cam}  ({e.get('kind', '?')})",
+            f"- camera optical centre vs flange `{e.get('flange', '?')}`: "
+            f"[{tr[0]}, {tr[1]}, {tr[2]}] mm  (‖offset‖ {e.get('offset_mm', '?')} mm)",
+            f"- board scale {e.get('board_scale', '?')} · train RMS {e.get('train_rms_px', '?')} px · "
+            f"{e.get('samples', '?')} samples",
+            f"- observability: {obs}",
+            f"- provenance: {e.get('provenance', '?')} · saved {e.get('saved_at', '?')}",
+            "",
+        ]
+    (Path(calib_dir) / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 class BaseToBaseSession:

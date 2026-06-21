@@ -156,8 +156,10 @@ class CalibService:
         if verb == "nudge":         return s.nudge(body.get("x_new"))
         if verb == "accept":
             out = s.accept(self.urdf_path, out_path=self.out_urdf,
-                           provenance=body.get("provenance", "measured"), calib_dir=self.calib_dir)
-            self.accepted[s.item.camera_link] = s.result   # remember X for base_to_base
+                           provenance=body.get("provenance", "measured"), calib_dir=self.calib_dir,
+                           force=bool(body.get("force", False)))
+            if out.get("ok"):
+                self.accepted[s.item.camera_link] = s.result   # remember X for base_to_base
             return out
         return {"error": f"unknown verb {verb!r}"}
 
