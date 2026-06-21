@@ -25,6 +25,23 @@ def run(bridge, cell, on_event=None):
     the arm. Raise on failure (no fake success)."""
 ```
 
+**Stream so the operator can SEE it working — this gate is otherwise blind.** The Studio
+panel renders ONLY what you emit. A scan that builds an ESDF/mesh internally but never streams
+points or status leaves the operator at a silent `0 points / 0% coverage` with no idea if it
+ran. So:
+
+- **Emit a descriptive `status` often** (every sweep hop / fused frame): *which* step
+  (`"sweep 3/12 — fusing wrist-cam depth"`), the running point count, and `coverage`. The panel
+  shows these as a live narration log.
+- **Stream `points` incrementally** as you fuse (down-sample to a few thousand for the live
+  view) — don't wait until the end. The 3D cloud must fill in *during* the scan, not after.
+- **Never finish silently with 0 points.** If a frame yields no usable depth, or masking
+  removed everything, or the arm didn't move, say so in a `status` (`"frame 4: 0 depth points —
+  camera returned no depth"`) and **raise** with that reason rather than returning a hollow
+  success. A 0-point world means the planner has no obstacles — that must be loud, not silent.
+- First thing in `run()`, emit a `status` like `"connecting to <camera> …"` so the panel shows
+  life immediately (the GPU mapper / first sweep can take seconds to warm up).
+
 > **The world is the ENVIRONMENT ONLY — subtract the arm(s).** Never fuse the
 > robot's own body into the world. cuRobo carries the arm(s) as collision
 > spheres (`robot_model.md`) and checks them for BOTH self-collision (arm vs

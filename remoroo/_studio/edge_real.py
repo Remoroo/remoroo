@@ -611,6 +611,9 @@ def _run_streaming_script(rel: str, entry_desc: str, _q):
         finally:
             q.put(SENTINEL)
 
+    # tell the operator we're alive BEFORE the script emits anything — the legibility fix so the
+    # panel isn't a silent 0/0 while the (possibly slow) GPU mapper / first sweep spins up.
+    yield {"type": "status", "message": f"{rel} loaded · bridge connected — starting…", "coverage": 0.0}
     threading.Thread(target=worker, daemon=True).start()
     while True:
         item = q.get()
@@ -1239,6 +1242,49 @@ def _pipeline_for_ui() -> dict:
             "links": links, "urdf": urdf_path, "targets": target_specs}
 
 
+def _calib_b2b_snapshot() -> dict:
+    """BOTH wrist cameras' frames (JPEG) + detection overlays for the dual-arm base-to-base step,
+    so the operator SEES each camera detect the shared board before capturing — the b2b flow was
+    blind (no images, no detection). Needs the b2b step selected + cv2 + both cameras up; degrades
+    to per-camera available:false so the panel stays honest."""
+    import base64
+    import numpy as np
+    import cv2  # type: ignore
+    svc = _calib_service()
+    b2b = getattr(svc, "b2b", None)
+    if b2b is None:
+        return {"error": "select the base-to-base step first"}
+
+    def one(bridge) -> dict:
+        try:
+            img = np.asarray(bridge.capture_image())
+        except Exception as e:  # noqa: BLE001
+            return {"available": False, "camera": getattr(bridge, "camera_id", ""), "reason": str(e)}
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if img.shape[-1] == 3 else img
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        h, w = img.shape[:2]
+        try:
+            ids, uv = bridge._detect(img)            # same detect (+ undistort) the capture uses
+        except Exception:  # noqa: BLE001
+            ids, uv = (np.empty(0, int), np.empty((0, 2)))
+        target = bridge.target
+        exp = int(len(getattr(target, "point_xyz", []))) if target is not None else 0
+        return {
+            "available": bool(ok), "camera": getattr(bridge, "camera_id", ""),
+            "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii") if ok else None,
+            "w": int(w), "h": int(h),
+            "n_corners": int(len(ids)), "expected_corners": exp,
+            "seen": bool(target is not None and len(ids) >= target.min_points),
+            "corners": np.asarray(uv, float).round(1).tolist(),
+        }
+
+    return {"type": "b2b_snapshot", "a": one(b2b.bridge_a), "b": one(b2b.bridge_b),
+            "min_corners": int(b2b.min_corners), "collected": len(b2b.obs),
+            "board_outline": _board_outline(b2b.board)}
+
+
 def _calib_handle(verb: str, body: dict) -> dict:
     # The pure-URDF reads (`pipeline`/`plan`) touch no bridge, so they don't need the lock;
     # everything else may move/capture/read the shared device, so it serialises with the live
@@ -1268,6 +1314,9 @@ def _calib_handle_locked(verb: str, body: dict) -> dict:
             return _calib_snapshot()
         if verb == "frame_image":
             return _calib_frame_image(int((body or {}).get("index", -1)))
+        if verb == "b2b_snapshot":
+            # dual-arm: BOTH wrist cameras' frames + detection, so base-to-base isn't blind.
+            return _calib_b2b_snapshot()
         return _calib_service().handle(verb, body)
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
