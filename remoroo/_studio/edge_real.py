@@ -1074,6 +1074,36 @@ def _snapshot_target_and_camera(cy: dict, cal: dict):
         return None, _first_camera(cy)
 
 
+def _board_outline(target) -> "dict | None":
+    """The physical board outline (in the TARGET frame) for the 3D target overlay, derived from
+    the target's OWN corner points — so it matches EXACTLY what the solver used, with no cv2
+    origin/aspect guessing. Returns {center:[x,y], size:[w,h], squares:[nx,ny]} in metres (a
+    ChArUco is rectangular sx≠sy, and its interior corners are inset one square from the edge, so
+    we expand the corner bbox by one square spacing each side to reach the real board edge)."""
+    import numpy as np
+    pts = getattr(target, "point_xyz", None)
+    if pts is None or len(pts) == 0:
+        return None
+    xy = np.asarray(pts, float)[:, :2]
+    mn, mx = xy.min(0), xy.max(0)
+    center = (mn + mx) / 2.0
+    ux = np.unique(np.round(xy[:, 0], 6))
+    uy = np.unique(np.round(xy[:, 1], 6))
+    nx, ny = len(ux), len(uy)
+    sx = float(np.min(np.diff(ux))) if nx > 1 else 0.0
+    sy = float(np.min(np.diff(uy))) if ny > 1 else 0.0
+    grid = str(getattr(target, "type", "")) in ("charuco", "checkerboard") and nx > 1 and ny > 1
+    if grid:
+        w = float(mx[0] - mn[0]) + 2 * sx
+        h = float(mx[1] - mn[1]) + 2 * sy
+        squares = [nx + 1, ny + 1]                # interior corner columns/rows + 1 = squares
+    else:
+        w = max(float(mx[0] - mn[0]), 1e-3)
+        h = max(float(mx[1] - mn[1]), 1e-3)
+        squares = [1, 1]
+    return {"center": [float(center[0]), float(center[1])], "size": [w, h], "squares": squares}
+
+
 def _calib_snapshot() -> dict:
     """Current camera frame (JPEG) + factory intrinsics + (when a target is configured) its
     detection overlay, for the live-cam inset. The RAW FEED shows as soon as the camera is up —
@@ -1114,6 +1144,9 @@ def _calib_snapshot() -> dict:
         # connects the INTERIOR corners, one square inside the border, so it looks smaller than the
         # physical board even at full detection; this number tells the operator it's complete).
         "expected_corners": int(len(getattr(target, "point_xyz", []))) if target is not None else 0,
+        # the board outline (target frame) so the 3D overlay draws the REAL board — correct
+        # rectangular size + checkerboard, not a guessed square plane.
+        "board_outline": _board_outline(target) if target is not None else None,
         "corners": np.asarray(uv, float).round(1).tolist(),
         "intrinsics": None if K is None else {"fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2]},
     }
