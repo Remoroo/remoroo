@@ -87,52 +87,100 @@ ignore_joints: []                         # any actuated joint deliberately NOT 
 
 Then `gate_checkpoint(gate=model)` with the authored groups for the operator to confirm.
 
-## Collision spheres → cuRobo YAML (YOURS — NO Isaac Sim)
+## Collision spheres → cuRobo YAML (YOURS — fast, NO Isaac Sim)
 
-cuRobo plans on a **sphere approximation** of the robot, not raw meshes. Generate
-spheres from the operator's resolved URDF collision meshes and write cuRobo's
-robot YAML. Stay lightweight — do not pull in Isaac Sim.
+cuRobo plans on a **sphere approximation** of the robot, not raw meshes. Fit spheres PER LINK with
+cuRobo's purpose-built `fit_spheres_to_mesh`. **Two hard-won rules (do NOT skip):**
+
+1. **Use `fit_type=SphereFitType.VOXEL`, NOT the default `MORPHIT`.** MorphIt runs ~200 optimisation
+   iterations PER LINK — on a 30-link robot on a Jetson Orin that is **~80 minutes and often times
+   out**. VOXEL is a single Warp-SDF voxel-fill: deterministic, seconds per link. Also pass
+   `compute_metrics=False` (the metrics pass is expensive). **Do NOT use `RobotBuilder`** to generate
+   spheres — it additionally computes a self-collision matrix by sampling thousands of configs (very
+   slow on edge HW) AND it **ignores the per-mesh `<mesh scale>`** (see rule 2).
+2. **Apply the URDF `<mesh scale>` to each mesh BEFORE fitting** — load-bearing. Vendor meshes are
+   often in MILLIMETRES (`scale="0.001 0.001 0.001"`). `estimate_sphere_count` and the fit read the
+   mesh bbox in metres, so an un-scaled mm mesh comes out **1000× too big** (real symptom: a ZED
+   camera link fit to a **5.2 m** sphere). Mixed units bite per-link: xArm arm meshes were already in
+   metres (sane), the ZED/holder meshes were in mm (5 m spheres). Apply each mesh's own scale.
 
 ```python
-# Adapt to your installed cuRobo version's API. The flow is version-stable:
-#   1) load each collision mesh from the operator's resolved URDF
-#   2) fit spheres per link (voxel / medial-axis fill; cap count per link)
-#   3) emit cuRobo robot YAML: kinematics + per-link `collision_spheres`,
-#      joint limits, self-collision ignore pairs, ee_link.
-import trimesh, numpy as np
+import os, trimesh, numpy as np, yaml
+import xml.etree.ElementTree as ET
+from curobo.sphere_fit import fit_spheres_to_mesh, estimate_sphere_count, SphereFitType
 
-def spheres_from_mesh(mesh_path, scale=(1.0, 1.0, 1.0), radius=0.02, max_spheres=40):
-    m = trimesh.load(mesh_path)
-    # APPLY THE URDF <mesh scale> FIRST — load-bearing. Vendor arm meshes (xArm, UR, …) are often
-    # in MILLIMETRES with scale="0.001 0.001 0.001"; if you skip this the geometry is ~1000× too
-    # small and every sphere comes out MICROSCOPIC (radii < 1 mm) → the arm has NO effective
-    # collision model and cuRobo plans straight through it. (Symptom seen on hardware: arm-link
-    # spheres at radius ~5e-5 m while camera spheres were a sane ~0.013 m.)
-    m.apply_scale(scale)
-    # Voxelize, then place a sphere at each filled cell centre — simple,
-    # deterministic, and Isaac-Sim-free. Cluster/decimate down to max_spheres.
-    vox = m.voxelized(pitch=radius).fill()
-    centers = np.asarray(vox.points)
-    return [{"center": c.tolist(), "radius": float(radius)} for c in centers]
+PKG_ROOT = "remoroo_cell"          # package://remoroo_cell/... → this dir
+CAP = 20                            # max spheres/link (planning speed); arms ~6-16, big base more
 
-# Assemble into your cuRobo RobotConfig schema, e.g.:
-#   robot_cfg.kinematics.collision_spheres = {link: [{center, radius}, ...]}
-# Then load it back into cuRobo and run the G1-style smoke plan to validate.
+def _origin_T(el):                 # <collision><origin xyz rpy> → 4x4 (link-local)
+    rpy = [float(v) for v in ((el.get("rpy") if el is not None else None) or "0 0 0").split()]
+    xyz = [float(v) for v in ((el.get("xyz") if el is not None else None) or "0 0 0").split()]
+    T = trimesh.transformations.euler_matrix(*rpy)     # URDF fixed-axis rpy (tf default 'sxyz')
+    T[:3, 3] = xyz
+    return T
+
+def _resolve(filename):            # package://remoroo_cell/meshes/x.stl → remoroo_cell/meshes/x.stl
+    if filename.startswith("package://"):
+        filename = filename[len("package://"):].split("/", 1)[1]   # drop the "<pkg>/" prefix
+    return os.path.join(PKG_ROOT, filename)
+
+def fit_link(link_el):
+    out = []
+    for col in link_el.findall("collision"):
+        geo = col.find("geometry/mesh")
+        m = None
+        if geo is not None:
+            m = trimesh.load(_resolve(geo.get("filename")), force="mesh")
+            m.apply_scale([float(s) for s in (geo.get("scale") or "1 1 1").split()])   # RULE 2 — mm→m
+        # (primitives: box/cylinder/sphere → trimesh.creation.* ; fit them too)
+        if m is None or m.is_empty: continue
+        m.apply_transform(_origin_T(col.find("origin")))     # collision origin → link frame
+        n = max(3, min(CAP, estimate_sphere_count(m)))       # bigger link → more spheres, capped
+        r = fit_spheres_to_mesh(m, num_spheres=n, fit_type=SphereFitType.VOXEL, compute_metrics=False)  # RULE 1
+        out += [{"center": c.tolist(), "radius": float(rad)}
+                for c, rad in zip(r.centers.cpu().numpy(), r.radii.cpu().numpy()) if rad > 1e-3]
+    return out
+
+root = ET.parse("remoroo_cell/robot_model/robot.urdf").getroot()
+spheres = {l.get("name"): fit_link(l) for l in root.findall("link")}
+spheres = {k: v for k, v in spheres.items() if v}            # drop links with no collision geom
 ```
 
-**Mesh units are load-bearing — read + apply the URDF `<mesh scale>`.** Each
-`<collision><geometry><mesh scale=…>` must be applied before fitting, and confirm the mesh isn't
-otherwise in millimetres. A units slip makes the spheres MICROSCOPIC and the arm un-modelled (cuRobo
-will plan through it) — or, if doubled, fills the whole world. **SANITY-CHECK before you emit
-`collision_spheres.yml`:** each arm link's spheres should have radii on the order of CENTIMETRES (a
-wrist link ~1–5 cm) and their union should envelop the link mesh; if the median radius is below a few
-millimetres the scale is wrong — fix it, don't ship it (the Studio now flags a degenerate set with a
-red "planning UNSAFE" banner and falls back to a mesh approximation, but the cuRobo model is still
-broken until you regenerate it correctly).
+**Self-collision ignore — derive it cheaply from URDF adjacency, do NOT sample.** Ignore each
+parent↔child link pair (and pairs that are always touching). That's an XML walk, not a 10k-config
+sampling job:
+```python
+ignore = {}
+for j in root.findall("joint"):
+    p, c = j.find("parent").get("link"), j.find("child").get("link")
+    ignore.setdefault(p, []).append(c); ignore.setdefault(c, []).append(p)
+```
+Then assemble + write `robot_model/collision_spheres.yml` — **exactly this structure, with PLAIN
+python floats** (the Studio's collision view reads it from here):
+```python
+robot_cfg = {"robot_cfg": {"kinematics": {
+    "urdf_path": "robot.urdf",
+    "collision_spheres": spheres,                  # {link: [{center:[x,y,z], radius:r}]}
+    "collision_link_names": list(spheres.keys()),
+    "self_collision_ignore": ignore,
+    "collision_sphere_buffer": 0.005,
+}}}
+import yaml
+yaml.safe_dump(robot_cfg, open("remoroo_cell/robot_model/collision_spheres.yml", "w"), sort_keys=False)
+```
+**Use `safe_dump`, and make every center/radius a PLAIN `float`/`list` (`.tolist()`, `float(r)`) —
+NOT numpy.** `safe_dump` REFUSES numpy types (so it's your guarantee the file is clean); a file dumped
+with `yaml.dump` of `np.float32` is full of `!!python/object` tags that the Studio (and other
+`safe_load` consumers) can't render — the spheres save to disk but show as nothing in the collision
+view. Load it back and run the G1 smoke plan to validate.
 
-Tunables (R&D): per-link radius, sphere count, self-collision ignore pairs.
-Bigger/fewer spheres are safer but more conservative — tune until the real-world
-smoke plan succeeds without phantom collisions.
+**SANITY-CHECK before you emit `collision_spheres.yml`** (this is where the failures show up): every
+link's sphere radii should be CENTIMETRES (a wrist ~1–5 cm), and the union should envelop the mesh. If
+any link's median radius is **> ~0.3 m** the scale is wrong (mm not converted) — fix it, don't ship.
+If a link's median is **< a few mm** the geometry is ~1000× too small. The Studio flags a degenerate
+set with a red "planning UNSAFE" banner, but the cuRobo model is broken until you regenerate it
+correctly. Tunables (R&D): `CAP`, `sphere_density`, ignore pairs — bigger/fewer is safer but more
+conservative; tune until the real-world smoke plan succeeds without phantom collisions.
 
 ## Preview the spheres for the operator (lightweight)
 
