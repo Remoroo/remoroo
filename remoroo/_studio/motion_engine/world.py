@@ -1,6 +1,6 @@
 """Assemble the cuRobo collision world from the cell's scan + safety envelope — PURE (no cuRobo).
 
-The world the planner avoids has two layers, both produced here as plain data the adapter turns
+The world the planner avoids has THREE layers, all produced here as plain data the adapter turns
 into V2 geometry:
 
 1. **The scanned environment** — `world/cloud.json`, the robot-masked point cloud the world-scan
@@ -9,7 +9,14 @@ into V2 geometry:
    Owning this in ONE place is a key unification: `scan.py` shrinks to "produce the masked cloud",
    and the cuRobo-world construction no longer lives ad-hoc in every cell's `scan.py`.
 
-2. **The safety envelope** — `keep_out` boxes the operator drew, plus the `workspace_bounds_m` box
+2. **The operator-modeled static obstacles** — `cell.yaml: obstacles`, the table / wall / box /
+   post the operator placed in the Studio (the ObstaclesSection writes them via /edge/obstacles/set
+   as `{name, type, dims|radius/height, pose:[x,y,z,qw,qx,qy,qz]}`). These become scene
+   cuboids/meshes so the planner avoids them — the SAME obstacles the classic path consumed via
+   `build_world_cfg`, now also feeding the unified stack. A cylinder ("post") is approximated by a
+   tight cuboid bounding box (conservative = strictly safe), matching the classic behaviour.
+
+3. **The safety envelope** — `keep_out` boxes the operator drew, plus the `workspace_bounds_m` box
    turned INTO obstacles (six thin walls around the allowed region) so the planner physically
    cannot leave the workspace. These are scene cuboids. This is how the G0.5 safety envelope
    becomes a PLANNER INPUT, not an after-the-fact check.
@@ -54,6 +61,17 @@ def _read_json(path: Path) -> Optional[dict]:
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _read_yaml(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        import yaml  # type: ignore
+
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         return None
 
@@ -112,14 +130,46 @@ def keepout_cuboids(keep_out: List[dict]) -> Dict[str, dict]:
     return out
 
 
+def obstacle_geometry(obstacles: Optional[List[dict]]) -> Dict[str, Dict[str, dict]]:
+    """The operator's `cell.yaml: obstacles` → a cuRobo scene dict (cuboids + meshes). Schema per
+    obstacle: `{name, type: cuboid|cylinder|mesh, dims|radius/height|file_path, pose}`. A cylinder
+    is approximated by a tight cuboid bounding box (dims [2r, 2r, h]) — conservative (the avoided
+    volume is slightly larger), matching `calib_engine.curobo_cfg.build_world_cfg` so the unified
+    stack and the classic path agree on where the table is."""
+    cuboid: Dict[str, dict] = {}
+    mesh: Dict[str, dict] = {}
+    for i, o in enumerate(obstacles or []):
+        name = f"obs_{i}_{str(o.get('name') or 'obs').replace(' ', '_')[:32]}"
+        pose = list(o.get("pose") or [0, 0, 0, 1, 0, 0, 0])
+        kind = str(o.get("type") or "cuboid")
+        if kind == "mesh" and o.get("file_path"):
+            mesh[name] = {"file_path": o["file_path"], "pose": pose}
+        elif kind == "cylinder":
+            r, h = float(o.get("radius", 0.05)), float(o.get("height", 0.1))
+            cuboid[name] = {"dims": [2 * r, 2 * r, h], "pose": pose}
+        else:
+            cuboid[name] = {"dims": list(o.get("dims") or [0.1, 0.1, 0.1]), "pose": pose}
+    out: Dict[str, Dict[str, dict]] = {}
+    if cuboid:
+        out["cuboid"] = cuboid
+    if mesh:
+        out["mesh"] = mesh
+    return out
+
+
 def build_scene(*, bounds_m: Optional[dict], keep_out: Optional[List[dict]],
+                obstacles: Optional[List[dict]] = None,
                 wall_bounds: bool = True) -> Dict[str, Dict[str, dict]]:
-    """The keep-out + (optional) workspace-cage cuboids as a cuRobo scene dict."""
+    """The keep-out + (optional) workspace-cage cuboids + the operator's static obstacles, as one
+    cuRobo scene dict."""
     cuboid: Dict[str, dict] = {}
     cuboid.update(keepout_cuboids(keep_out or []))
     if wall_bounds and bounds_m and bounds_m.get("min") and bounds_m.get("max"):
         cuboid.update(_box_walls(bounds_m))
-    return {"cuboid": cuboid}
+    scene: Dict[str, Dict[str, dict]] = {"cuboid": cuboid}
+    for kind, items in obstacle_geometry(obstacles).items():
+        scene.setdefault(kind, {}).update(items)
+    return {k: v for k, v in scene.items() if v}
 
 
 def load_world(cell_dir: str, *, safety: Optional[dict] = None, voxel_size: float = 0.02,
@@ -132,6 +182,9 @@ def load_world(cell_dir: str, *, safety: Optional[dict] = None, voxel_size: floa
     base = Path(cell_dir)
     points = _points_from(_read_json(base / "world" / "cloud.json"))
     scene_json = _read_json(base / "world" / "scene.json") or {}
+    # the operator's static obstacles (table/wall/box/post) live in cell.yaml (Studio writes them
+    # via /edge/obstacles/set) — the planner must avoid them, exactly like the classic path did.
+    obstacles = list((_read_yaml(base / "cell.yaml") or {}).get("obstacles") or [])
 
     bounds = None
     keep_out: List[dict] = []
@@ -143,12 +196,12 @@ def load_world(cell_dir: str, *, safety: Optional[dict] = None, voxel_size: floa
     if not keep_out:
         keep_out = list(scene_json.get("keep_out") or [])
 
-    scene = build_scene(bounds_m=bounds, keep_out=keep_out, wall_bounds=wall_bounds)
+    scene = build_scene(bounds_m=bounds, keep_out=keep_out, obstacles=obstacles, wall_bounds=wall_bounds)
     return WorldInputs(
         points=points,
         scene=scene,
         voxel_size=float(scene_json.get("voxel_m") or voxel_size),
         bounds_m=bounds,
         meta={"n_points": int(points.shape[0]), "n_keepout": len(keep_out),
-              "walls": wall_bounds and bool(bounds)},
+              "n_obstacles": len(obstacles), "walls": wall_bounds and bool(bounds)},
     )

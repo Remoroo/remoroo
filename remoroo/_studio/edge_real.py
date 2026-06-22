@@ -237,11 +237,15 @@ def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
     from calib_engine import urdf_io
     from calib_engine.curobo_cfg import build_robot_cfg
     cy = load_cell_yaml()
+    # camera_to_arm is keyed by the URDF camera LINK (what enumerate_arms looks up via a.camera),
+    # NOT the cell.yaml camera `name`. Keying by name left the lookup missing, so arms were named
+    # after their camera link ("ZEDX_Mini_1") instead of the cell.yaml arm ("arm2") — which then
+    # KeyError'd the bridge (its _arm_drivers are keyed by the cell.yaml arm name).
     cam2arm = {}
     for c in (cy.get("cameras") or []):
-        nm = str(c.get("name") or c.get("id") or "")
-        if nm and c.get("attached_to"):
-            cam2arm[nm] = str(c["attached_to"])
+        link = str(c.get("urdf_link") or c.get("name") or c.get("id") or "")
+        if link and c.get("attached_to"):
+            cam2arm[link] = str(c["attached_to"])
     arm_map = urdf_io.arm_map_dict(str(rm / "robot.urdf"), camera_to_arm=cam2arm)
     (rm / "arms.yaml").write_text(yaml.safe_dump(arm_map, sort_keys=False), encoding="utf-8")
 
@@ -1430,8 +1434,10 @@ def h_arms(_q):
         return {"base_link": "", "arms": [], "reason": "no robot.urdf yet — model the cell first"}
     from calib_engine import urdf_io
     cy = load_cell_yaml()
-    cam2arm = {str(c.get("name") or ""): str(c.get("attached_to") or "")
-               for c in (cy.get("cameras") or []) if c.get("name") and c.get("attached_to")}
+    # key by the URDF camera LINK (urdf_link), matching enumerate_arms' a.camera lookup — not the
+    # cell.yaml camera `name` (which never equals the link, so arms got mis-named after the camera).
+    cam2arm = {str(c.get("urdf_link") or c.get("name") or ""): str(c.get("attached_to") or "")
+               for c in (cy.get("cameras") or []) if (c.get("urdf_link") or c.get("name")) and c.get("attached_to")}
     try:
         return urdf_io.arm_map_dict(str(urdf), camera_to_arm=cam2arm)
     except Exception as e:  # noqa: BLE001

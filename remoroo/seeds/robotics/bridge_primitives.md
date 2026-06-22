@@ -49,12 +49,37 @@ class Observation:
     """One observation tick from real hardware."""
     rgb: Optional[np.ndarray]
     depth: Optional[np.ndarray]
-    joint_positions: Dict[str, np.ndarray]
+    joint_positions: Dict[str, np.ndarray]   # KEYED BY THE COMBINED-URDF JOINT NAME — see below
     eef_pos: Dict[str, np.ndarray]
     eef_quat: Dict[str, np.ndarray]
     gripper_qpos: Dict[str, np.ndarray]
     intrinsics: Dict[str, Any] = field(default_factory=dict)
     extrinsics: Dict[str, Any] = field(default_factory=dict)
+```
+
+> **`joint_positions` keys MUST be the combined-URDF joint names** — the Studio's live mirror, the
+> calibration engine, and the motion stack all key on them. When the cell has TWO identical arms
+> (e.g. two `library://xarm6`), the combined `robot.urdf` **uniquifies** the second arm's duplicate
+> joints with a `_1` suffix: arm-1 is `joint1..joint6`, arm-2 is `joint1_1..joint6_1`. Each arm's
+> SDK reports plain `joint1..joint6` with no namespace, so you MUST remap. **`robot_model/arms.yaml`
+> is the authoritative map** — each arm entry's `joint_names` is that arm's combined-URDF names in
+> SDK order. Build the dict from it:
+>
+> ```python
+> # arms.yaml: {arms: [{name, joint_names:[...], camera, ...}, ...]} — written by the model gate
+> arms_yaml = yaml.safe_load(open("remoroo_cell/robot_model/arms.yaml"))
+> joint_positions = {}
+> for spec in arms_yaml["arms"]:                       # spec["name"] == cell.yaml arm name
+>     angles = self._arm_drivers[spec["name"]].read_joint_positions()   # SDK order, radians
+>     joint_positions.update(dict(zip(spec["joint_names"], angles)))    # → combined-URDF names
+> ```
+>
+> If you instead report raw `joint1..joint6` for both arms they COLLIDE (one overwrites the other)
+> and the second arm never moves in the Studio — the live mirror shows "⚠ N streamed, 0 match URDF".
+> Likewise, key cameras (`get_observation(camera=...)`, `intrinsics`, `extrinsics`) by the camera's
+> **`urdf_link`** (`ZEDX_Mini`, `ZEDX_Mini_1`), not the cell.yaml camera `name` — same convention.
+
+```python
     scene: Dict[str, Any] = field(default_factory=dict)
     stamp_s: float = 0.0
     raw: Dict[str, Any] = field(default_factory=dict)

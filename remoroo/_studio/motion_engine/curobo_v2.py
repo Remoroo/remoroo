@@ -65,12 +65,15 @@ class CuroboV2Planner:
         limits = limits or {}
         self._vel_scale = float(np.clip(limits.get("velocity_scale", 1.0), 1e-3, 1.0))
 
-        # Size the collision cache for the keep-out/wall cuboids + the single scanned-cloud mesh.
-        n_cuboid = sum(len(v) for v in (world.scene or {}).values()) + 8
+        # Size the collision cache per type: keep-out/wall/obstacle cuboids, and mesh obstacles +
+        # the single scanned-cloud mesh (+ headroom so a later update_world never overflows).
+        scene = world.scene or {}
+        n_cuboid = len(scene.get("cuboid", {})) + 8
+        n_mesh = len(scene.get("mesh", {})) + 4
         cfg = MotionPlannerCfg.create(
             robot=robot_cfg,
-            scene_model=world.scene or None,
-            collision_cache={"mesh": 4, "cuboid": int(n_cuboid)},
+            scene_model=scene or None,
+            collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid)},
             max_goalset=int(max_goalset),
         )
         self.planner = MotionPlanner(cfg)

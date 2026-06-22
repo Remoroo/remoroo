@@ -236,8 +236,9 @@ def enumerate_arms(urdf_path: str, camera_to_arm: Optional[Dict[str, str]] = Non
     root is one arm; camera-bearing chains are matched first (so the wrist camera binds its arm),
     then any camera-less movable chains. `side` is a GEOMETRIC guess from the mount's lateral (Y)
     offset — the operator VERIFIES it (the live-mirror wiggle test) since a URDF can have L/R
-    swapped. `camera_to_arm` (cell.yaml cameras[].name→attached_to) names the arms; absent →
-    provisional names. Pure stdlib + the existing chain derivation; fully testable off-robot."""
+    swapped. `camera_to_arm` maps the URDF camera LINK → the cell.yaml arm name (keyed by the
+    camera's `urdf_link`, the same string `a.camera` carries — NOT the cell.yaml camera `name`);
+    absent → provisional `arm_N` names. Pure stdlib + the existing chain derivation; testable off-robot."""
     root = ET.parse(urdf_path).getroot()
     children = {j.find("child").get("link") for j in root.findall("joint") if j.find("child") is not None}
     all_links = [l.get("name") for l in root.findall("link")]
@@ -283,7 +284,10 @@ def enumerate_arms(urdf_path: str, camera_to_arm: Optional[Dict[str, str]] = Non
     cam2arm = camera_to_arm or {}
     for i, a in enumerate(arms):
         a.side = "center" if len(arms) == 1 else ("left" if ys[i] > mid else "right")
-        a.name = cam2arm.get(a.camera) or a.camera or f"arm_{i + 1}"
+        # name from the cell.yaml mapping (camera link → arm); NEVER fall back to the camera link
+        # itself (an arm named "ZEDX_Mini_1" then KeyErrors the bridge's arm drivers). A provisional
+        # arm_N is safe — the bridge keys drivers by these names, so they must be arm-ish.
+        a.name = cam2arm.get(a.camera) or f"arm_{i + 1}"
     return arms
 
 
