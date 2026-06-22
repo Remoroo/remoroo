@@ -464,6 +464,7 @@ def h_build_robot(_q, body):
     try:
         out = write_curobo_robot_yaml(body.get("urdf", ""), spheres)
         reset_curobo_cache()   # rebuild the planner + collision checker with the new spheres
+        reset_motion_stack()   # the unified motion stack bakes in the robot model too
         # best-effort: validate by loading the kinematics
         approximate = True
         try:
@@ -549,6 +550,93 @@ def sse_plan(_q):
         yield {"done": True, "result": {"ribbon": ribbon, "reached": reached, "attempts": len(targets), "incidents": 0}}
     except Exception as e:  # noqa: BLE001
         yield {"done": True, "result": {"ribbon": [], "reached": 0, "attempts": 0, "incidents": 0, "error": f"{type(e).__name__}: {e}"}}
+
+
+# --- the unified motion stack (shipped motion_engine) ----------------------
+_MOTION_STACK = None
+
+
+def reset_motion_stack():
+    """Drop the cached MotionStack so the next commission/plan rebuilds it (the robot model,
+    world, or safety changed). Paired with reset_curobo_cache()."""
+    global _MOTION_STACK
+    _MOTION_STACK = None
+
+
+def motion_stack(force: bool = False):
+    """The shipped `motion_engine.MotionStack`, built from ALL the cell artifacts (calibrated
+    URDF + collision spheres + scanned world + safety) and wired to the live bridge. This is the
+    ONE unified autonomous-motion surface; the bridge supplies state + execute_trajectory."""
+    global _MOTION_STACK
+    if _MOTION_STACK is not None and not force:
+        return _MOTION_STACK
+    from motion_engine import MotionStack  # sibling of this file in server/, like calib_engine
+
+    _MOTION_STACK = MotionStack.from_cell(str(CELL_DIR), bridge=get_bridge())
+    return _MOTION_STACK
+
+
+def sse_commission(_q):
+    """Build the unified motion stack from every prior gate's output and VERIFY one collision-free
+    plan+execute against the SCANNED world. Streams each commission step (sphere health → planner
+    build → plan → audit → executor replay); ends {done, result:<report>}. The motion is
+    operator-gated in the Studio (default_proceed=false)."""
+    import queue as _queue
+    import threading as _threading
+
+    try:
+        st = motion_stack(force=True)
+    except Exception as e:  # noqa: BLE001
+        yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
+        return
+
+    execute = (_q.get("execute", ["1"])[0] != "0")
+    q: "_queue.Queue" = _queue.Queue()
+    out: dict = {}
+
+    def run():
+        with _bridge_lock:
+            try:
+                out["report"] = st.commission(execute=execute, progress=lambda s: q.put(s))
+            except Exception as e:  # noqa: BLE001
+                out["report"] = {"ok": False, "message": f"{type(e).__name__}: {e}"}
+            finally:
+                q.put(None)
+
+    _threading.Thread(target=run, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        yield item
+    yield {"done": True, "result": out.get("report", {"ok": False, "message": "no report"})}
+
+
+def sse_plan_move(_q):
+    """Plan + execute a high-level move via the shipped stack (the demo gate exercises this).
+    GET params: tcp; mode=pose|retract; x,y,z + qw,qx,qy,qz for a pose. Streams phase, then
+    {done, result:<MoveResult>}."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
+        return
+
+    arms = st.arm_map.get("arms") or []
+    tcp = (_q.get("tcp", [None])[0]) or (arms[0]["name"] if arms else None)
+    mode = _q.get("mode", ["pose"])[0]
+    yield {"phase": "planning", "tcp": tcp, "mode": mode}
+    try:
+        with _bridge_lock:
+            if mode == "retract":
+                res = st.retract(tcp)
+            else:
+                xyz = [float(_q.get(k, [0.0])[0]) for k in ("x", "y", "z")]
+                quat = [float(_q.get(k, [d])[0]) for k, d in (("qw", 1.0), ("qx", 0.0), ("qy", 0.0), ("qz", 0.0))]
+                res = st.move_to_pose(tcp, (xyz, quat))
+        yield {"done": True, "result": res.to_dict()}
+    except Exception as e:  # noqa: BLE001
+        yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
 
 
 def _delegate_script(rel: str):
@@ -1380,6 +1468,7 @@ def h_set_obstacles(_q, body):
     cy["obstacles"] = list((body or {}).get("obstacles") or [])
     (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False), encoding="utf-8")
     reset_curobo_cache()   # the obstacle world is baked into the planner + collision checker
+    reset_motion_stack()   # …and into the unified motion stack's scene
     return {"ok": True, "obstacles": cy["obstacles"]}
 
 
@@ -1400,6 +1489,8 @@ ROUTES = {
     "/edge/scanWorld": ("sse", sse_scan),
     "/edge/record": ("sse", sse_record),
     "/edge/plan": ("sse", sse_plan),
+    "/edge/motion/commission": ("sse", sse_commission),
+    "/edge/motion/plan_move": ("sse", sse_plan_move),
 }
 
 

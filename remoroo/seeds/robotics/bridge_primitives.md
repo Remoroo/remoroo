@@ -90,7 +90,7 @@ class Bridge:
         self.safety = SafetySupervisor.from_cell(cell)  # shipped; enforces envelopes
         self._arm_drivers: Dict[str, Any] = {}          # filled in connect()
         self._cameras: Dict[str, Any] = {}              # filled in connect()
-        self._planner = None                            # cuRoboV2 motion gen
+        self._motion = None                             # motion_engine.MotionStack (commission gate)
         self._connected = False
 
     @classmethod
@@ -110,8 +110,18 @@ class Bridge:
 
     def estop(self) -> None:
         """Hard stop every arm immediately. Must be reachable at all times."""
+        self._estopped = True                  # latched; motion stack polls estop_tripped()
         for drv in self._arm_drivers.values():
             drv.emergency_stop()  # TODO map to the real SDK's halt/abort call
+
+    def _arm_for_joints(self, joint_names) -> str:
+        """Which arm owns these trajectory joints (controller routing for execute_trajectory).
+        A single-arm cell returns its one arm; multi-arm: match joint_names to the arm whose
+        cell.yaml joints they are (fan out per-arm if a coordinated plan spans several)."""
+        for a in self.cell["arms"]:
+            if set(a.get("joint_names", [])) & set(joint_names):
+                return a["name"]
+        return self.arms[0]
 
     def close(self) -> None:
         for drv in self._arm_drivers.values():
@@ -152,24 +162,38 @@ class Bridge:
         OWN frame. See calibration.md (authored pipeline + targets)."""
         ...  # TODO route to the named arm (NOT a shared side-channel)
 
+    # ---- The motion stack (SHIPPED — you do NOT write cuRobo) -------------
+    def motion(self):
+        """The unified autonomous-motion stack — `motion_engine.MotionStack`, built ONCE from
+        ALL the setup artifacts (calibrated URDF + collision spheres + scanned world + safety
+        envelope). It owns the cuRoboV2 planner; this Bridge only supplies state +
+        `execute_trajectory` (the per-arm executor). Built/verified at the COMMISSION gate; see
+        commission.md."""
+        if self._motion is None:
+            from motion_engine import MotionStack
+            self._motion = MotionStack.from_cell("remoroo_cell", bridge=self)
+        return self._motion
+
+    def execute_trajectory(self, traj, should_abort=None) -> bool:
+        """The executor seam the motion stack calls. Route the planned `Trajectory` to the right
+        arm driver(s) by `traj.joint_names`; a single-controller robot (humanoid) is one call, a
+        multi-arm cell fans out to each driver. Each driver REPLAYS the full path (arm_adapters.md).
+        The stack already audited the plan and supplies `should_abort` (the E-stop poll)."""
+        arm = self._arm_for_joints(traj.joint_names)          # owns the controller topology
+        return self._arm_drivers[arm].execute_trajectory(traj, should_abort=should_abort)
+
     def plan_and_move(self, arm: str, target_pose: np.ndarray, *, world=None) -> bool:
-        """THE Phase-8 primitive: plan a collision-free path with cuRoboV2
-        against `world` (the Phase-4 collision world), gate it through the
-        safety supervisor, then execute. Returns False if no safe plan.
-        """
-        world = world or self.load_world()
-        plan = self._planner.plan(arm, target_pose, world)  # cuRoboV2 trajopt
-        if plan is None or not self.safety.trajectory_ok(arm, plan):
-            return False
-        return self._arm_drivers[arm].execute_trajectory(plan)  # TODO adapt
+        """THE Phase-8 primitive, now a thin delegate to the shipped stack: plan a collision-free,
+        safe-by-construction trajectory and replay it. `target_pose` = (xyz, quat-wxyz) or a 7-list.
+        Returns False if no safe plan / the move aborted."""
+        return self.motion().move_to_pose(arm, target_pose).ok
+
+    def estop_tripped(self) -> bool:
+        """Has the E-stop fired? The motion stack polls this between waypoints (defensive guard)."""
+        return bool(getattr(self, "_estopped", False))
 
     def set_gripper(self, arm: str, opening: float) -> None:
         self._arm_drivers[arm].set_gripper(float(np.clip(opening, 0.0, 1.0)))  # TODO adapt
-
-    # ---- World (built in Phase 4; see world_scan.md) ---------------------
-    def load_world(self):
-        """Load the cuRobo collision world from remoroo_cell/world/."""
-        ...  # TODO load TSDF/ESDF collision world built in Phase 4
 
     # ---- Optional: bring-your-own VLA / world model ----------------------
     # @robot_sprint detects support via `.supported`. Leave as no-ops at setup;
@@ -273,7 +297,9 @@ class EpisodeWriter:
 
 - Replace every `TODO adapt` with the real SDK call (arm_adapters.md /
   camera_capture.md).
-- Wire `_planner` to cuRoboV2 (validated at G1).
+- Do **not** write cuRobo. Autonomous motion is the SHIPPED `motion_engine`
+  stack (`self.motion()`); you supply `execute_trajectory` + state + E-stop.
+  Build + verify it at the COMMISSION gate (commission.md).
 - Keep `estop()` reachable and dead-simple — it is the last line of defense.
 - The recorder lives in `remoroo_cell/capture/recorder.py` (data_capture.md);
   the Bridge just exposes `get_observation()` for it to sample.

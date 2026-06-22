@@ -42,6 +42,46 @@ ran. So:
 - First thing in `run()`, emit a `status` like `"connecting to <camera> …"` so the panel shows
   life immediately (the GPU mapper / first sweep can take seconds to warm up).
 
+**The streamed `points` are RAW back-projected depth — NEVER a reconstructed surface.** The
+single most common failure: building a TSDF/ESDF and streaming **mesh vertices** (marching cubes)
+as the cloud. On a real, sparse, noisy scan the TSDF has occupied blocks but **no clean
+zero-crossing surface**, so marching cubes returns **0 vertices → 0 points**, even though fusion
+"worked" — and a *synthetic* selftest hides it because synthetic depth makes a clean surface. So
+the viz cloud and the cuRobo collision world are SEPARATE outputs: stream raw points for the
+operator; build the ESDF/voxel world separately for the planner. Back-project masked depth
+directly — this always yields points when depth is valid:
+
+```python
+# camera pose in base: eye-in-hand = fk(joints) @ X ; static = the calibrated camera pose
+ys, xs = np.nonzero(valid_mask)            # valid pixels, robot already masked out
+z = depth[ys, xs].astype(np.float32)
+x = (xs - cx) * z / fx
+y = (ys - cy) * z / fy
+pts_cam  = np.stack([x, y, z], -1)         # (N,3) camera optical frame
+pts_base = pts_cam @ T_base_cam[:3, :3].T + T_base_cam[:3, 3]
+if len(pts_base) == 0:
+    on_event({"type": "status", "message": f"frame {i}: 0 valid depth px — skipping"})
+else:
+    on_event({"type": "points", "xyz": pts_base[::stride].tolist()})   # the Studio cloud
+# (separately: feed pts_base / depth into your cuRobo ESDF/voxel world for planning)
+```
+
+If your `points` count is 0 while fusion reports occupied blocks, you are exporting a surface —
+switch to the raw back-projection above. Do NOT gate the streamed cloud on mesh extraction.
+
+**Multi-pass scans ACCUMULATE — one pass rarely covers the cell.** The Studio runs `run()` once
+per "Scan again" and the operator keeps adding passes until the coverage looks complete. So a
+pass must ADD to the world, not replace it:
+
+- **Load the existing world first.** If `world/cloud.json` (and your cuRobo voxel/ESDF world)
+  already exists, load it and FUSE this pass's frames into it; save the UNION. A pass with no
+  existing world starts clean. This way the persisted world + the cuRobo collision world build
+  up across passes, matching what the operator sees accumulating in the 3D view.
+- **Emit only THIS pass's NEW points** via `{"type":"points","xyz":...}` (the Studio accumulates
+  them onto the cloud from earlier passes — don't re-emit the whole cloud each pass or it
+  double-counts).
+- Report cumulative `coverage` and a `status` like `"pass 2 — +3.1k points (12.4k total)"`.
+
 > **The world is the ENVIRONMENT ONLY — subtract the arm(s).** Never fuse the
 > robot's own body into the world. cuRobo carries the arm(s) as collision
 > spheres (`robot_model.md`) and checks them for BOTH self-collision (arm vs
@@ -133,29 +173,37 @@ robot from the URDF + live joints, subtract those points):
   `|depth − robot_depth| < eps`. Simplest of all: **park the arm clear of the
   camera frustum while scanning** and skip masking entirely.
 
-## Build the collision world (cuRoboV2)
+## Emit the masked environment point cloud — `world/cloud.json`
+
+`scan.py`'s ONLY job is to produce the robot-masked environment points, in the
+robot base frame. It does **not** build the cuRobo collision world — the shipped
+`motion_engine` owns that (it voxelises the cloud into a collision mesh, pairs it
+with the robot's sphere model + the safety keep-out/bounds, and feeds it to the
+cuRoboV2 planner at the COMMISSION gate). Owning the world in ONE place means every
+cell's `scan.py` is the same small thing, and the planner always pairs the same
+world with the same robot model.
 
 ```python
-# Fuse the (robot-masked) depth -> TSDF/ESDF, then hand cuRobo a collision
-# world it can plan against. Shapes follow your installed cuRobo version.
-
-def fuse_world(frames, workspace_bounds, voxel_m=0.01, joint_names=None):
+# Back-project each robot-masked frame to base-frame points and accumulate.
+def scan_to_cloud(frames, joint_names=None):
     """frames: list of (depth_m, intrinsics, cam_pose_in_base, joint_pos).
-    Returns a TSDF/ESDF clipped to the workspace box — ENVIRONMENT ONLY: each
-    frame is robot-masked (above) before integration; the arm is never fused."""
-    tsdf = TSDFVolume(workspace_bounds, voxel_m)          # nvblox / open3d / cuRobo
+    ENVIRONMENT ONLY — each frame is robot-masked (above) before back-projection;
+    the arm is never included. Returns an (N,3) array of points in the base frame."""
+    pts = []
     for depth_m, intr, cam_T_base, joint_pos in frames:
         env_depth = mask_robot_body(depth_m, intr, cam_T_base, joint_pos, joint_names)
-        tsdf.integrate(env_depth, intr, cam_T_base)
-    return tsdf
+        pts.append(backproject_to_base(env_depth, intr, cam_T_base))   # (Mi, 3)
+    return np.concatenate(pts, axis=0) if pts else np.zeros((0, 3))
 
-# Export to cuRobo's collision world (mesh / voxel / blox). The planner pairs
-# this env-only world with the robot's sphere model (robot_model.md), so the
-# arm is handled by cuRobo — not by the world. Smoke-plan to validate:
-world = tsdf_to_curobo_world(tsdf)                         # adapt to cuRobo API
-plan = planner.plan(arm="right", target_pose=safe_pose, world=world)
-assert plan is not None, "world not plannable yet — add coverage"
+# Stream points to the Studio (multi-scan accumulates across passes) AND persist:
+cloud = scan_to_cloud(frames, joint_names)
+json.dump({"points": cloud.tolist()}, open("remoroo_cell/world/cloud.json", "w"))
 ```
+
+Stream raw **back-projected points** to the Studio (`{"points": [[x,y,z],...]}`),
+NOT mesh vertices — a marching-cubes mesh of a sparse real scan is empty, which is
+why the gate showed "0 points". The collision world is built later from this cloud
+by `motion_engine`; you can sanity-check coverage in the Studio's point-cloud view.
 
 ## Queryable scene — `remoroo_cell/world/scene.json`
 

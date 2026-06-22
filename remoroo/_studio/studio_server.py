@@ -369,19 +369,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "path": str(dest / "robot_model" / "robot.urdf")})
             return
         if path == "/project/export" and self.command == "POST":
+            # OVERLAY the operator's model onto remoroo_cell/ — NEVER wipe it. The old code
+            # rmtree'd the whole cell and replaced it with the bundle, DESTROYING the agent's
+            # authored primitives.py / world/ / calibration/ (the cell-bundle data-loss bug).
+            # extractall overlays the model files in place; everything else survives.
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length)
             dest = PROJECT / "remoroo_cell"
-            tmp = Path(tempfile.mkdtemp(prefix="remoroo_cell.", dir=str(PROJECT)))
+            dest.mkdir(parents=True, exist_ok=True)
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    zf.extractall(tmp)
-                if dest.exists():
-                    shutil.rmtree(dest)
-                tmp.rename(dest)
-            finally:
-                if tmp.exists():
-                    shutil.rmtree(tmp, ignore_errors=True)
+                    zf.extractall(dest)
+            except Exception as e:  # noqa: BLE001
+                self._json({"error": f"bad cell bundle: {e}"}, 400)
+                return
             committed = git_commit(PROJECT, "remoroo_cell") if parse_qs(urlparse(self.path).query).get("commit") == ["1"] else False
             self._json({"ok": True, "path": str(dest), "committed": committed})
             return
