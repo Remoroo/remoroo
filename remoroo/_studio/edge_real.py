@@ -1480,6 +1480,61 @@ def h_set_obstacles(_q, body):
     return {"ok": True, "obstacles": cy["obstacles"]}
 
 
+def _find_collision_spheres(obj) -> dict:
+    """Find the `collision_spheres` mapping (link -> [sphere,...]) at ANY depth — the agent's file
+    may nest it under robot_cfg.kinematics, at the top level, or elsewhere."""
+    if isinstance(obj, dict):
+        cs = obj.get("collision_spheres")
+        if isinstance(cs, dict) and cs:
+            return cs
+        for v in obj.values():
+            found = _find_collision_spheres(v)
+            if found:
+                return found
+    return {}
+
+
+def h_spheres(_q):
+    """The REAL cuRobo collision spheres for the Studio's collision view — parsed HERE on the edge
+    (which owns yaml/numpy/cuRobo), NOT in the stdlib-only studio_server proxy (it has no PyYAML, so
+    `/project/spheres` returned nothing and the view fell back to the mesh approximation). Robust to
+    nesting, to `{center,radius}` AND `[x,y,z,r]` sphere forms, and to numpy-tagged dumps."""
+    import yaml  # type: ignore
+    f = CELL_DIR / "robot_model" / "collision_spheres.yml"
+    if not f.exists():
+        return {"spheres": []}
+    try:
+        text = f.read_text(encoding="utf-8")
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError:
+            data = yaml.unsafe_load(text) or {}        # local agent-written file: recover numpy tags
+        cs = _find_collision_spheres(data)
+        out, skipped = [], 0
+        for link, arr in (cs or {}).items():
+            for s in (arr or []):
+                try:
+                    if isinstance(s, dict):
+                        c, r = s.get("center"), s.get("radius")
+                    elif isinstance(s, (list, tuple)) and len(s) >= 4:
+                        c, r = s[:3], s[3]
+                    else:
+                        c = r = None
+                    if c is not None and r is not None and len(c) >= 3:
+                        out.append({"link": str(link), "center": [float(c[0]), float(c[1]), float(c[2])], "radius": float(r)})
+                    else:
+                        skipped += 1
+                except (TypeError, ValueError):
+                    skipped += 1
+        resp = {"spheres": out, "n": len(out)}
+        if not out:
+            resp["error"] = (f"no parseable spheres (found_links={len(cs)}, skipped={skipped}); expected "
+                             "link -> [{center:[x,y,z], radius:r}] or [x,y,z,r]")
+        return resp
+    except Exception as e:  # noqa: BLE001
+        return {"spheres": [], "error": f"{type(e).__name__}: {e}"}
+
+
 # route table: path -> (kind, handler). kind in {"json","json_body","sse"}
 ROUTES = {
     "/health": ("json", lambda q: {"ok": True, "edge": "real", "cell": str(CELL_DIR)}),
@@ -1493,6 +1548,7 @@ ROUTES = {
     "/edge/arms/set": ("json_body", h_set_arms),
     "/edge/obstacles": ("json", h_obstacles),
     "/edge/obstacles/set": ("json_body", h_set_obstacles),
+    "/edge/spheres": ("json", h_spheres),
     "/live/joints": ("sse", sse_live_joints),
     "/edge/scanWorld": ("sse", sse_scan),
     "/edge/record": ("sse", sse_record),
