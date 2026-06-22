@@ -1,8 +1,11 @@
 # Arm adapters — binding the Bridge to a real arm SDK (Phase 2)
 
-The Bridge (`bridge_primitives.md`) calls a small **driver** per arm. Author
-one driver per arm in `cell.yaml`, adapting the closest pattern below to the
-real SDK. Keep the surface tiny and uniform; put vendor quirks inside.
+The Bridge (`bridge_primitives.md`) calls a small **driver** per actuated unit —
+an arm, a leg, a wheel set, a pan/tilt head: same interface, keyed by the unit's
+name (which matches its `cell.yaml: groups` entry). Author one driver per
+controller, adapting the closest pattern below to the real SDK. Keep the surface
+tiny and uniform; put vendor quirks inside. (The patterns are named for arm SDKs
+because that's the common case; the contract is morphology-agnostic.)
 
 ## The driver interface the Bridge expects
 

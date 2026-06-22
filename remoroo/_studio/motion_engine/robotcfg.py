@@ -30,50 +30,51 @@ def _dedup(seq: Sequence[str]) -> List[str]:
     return out
 
 
-def active_tool_frames(arm_map: dict, active_arms: Optional[Sequence[str]] = None) -> List[str]:
-    """The ee_link of each active arm — the `tool_frames` a `GoalToolPose` can target."""
-    arms = arm_map.get("arms") or []
-    names = list(active_arms) if active_arms else [a["name"] for a in arms]
-    by_name = {a["name"]: a for a in arms}
-    return _dedup([by_name[n]["ee_link"] for n in names if n in by_name])
+def active_tool_frames(config: dict, active_groups: Optional[Sequence[str]] = None) -> List[str]:
+    """The tip_link(s) of each active group — the `tool_frames` a `GoalToolPose` can target."""
+    groups = config.get("groups") or []
+    names = list(active_groups) if active_groups else [g["name"] for g in groups]
+    by_name = {g["name"]: g for g in groups}
+    return _dedup([t for n in names if n in by_name for t in (by_name[n].get("tip_links") or [])])
 
 
 def build_v2_robot_cfg(
-    arm_map: dict,
+    config: dict,
     spheres_by_link: Dict[str, List[dict]],
     *,
-    active_arms: Optional[Sequence[str]] = None,
+    active_groups: Optional[Sequence[str]] = None,
     urdf_path: str = "robot.urdf",
     sphere_buffer: float = 0.005,
     limits: Optional[dict] = None,
     default_joint_position: Optional[Dict[str, float]] = None,
 ) -> dict:
-    """A cuRoboV2 `robot_cfg` planning the `active_arms` (default: ALL arms in the map).
+    """A cuRoboV2 `robot_cfg` planning the `active_groups` (default: ALL groups in the config).
 
-    `base_link` is the shared root; `tool_frames` = each active arm's `ee_link`;
-    `cspace.joint_names` = the union of those arms' joints; every other arm's joints are
+    `base_link` is the shared root; `tool_frames` = each active group's `tip_links`;
+    `cspace.joint_names` = the union of those groups' joints; every other group's joints are
     `lock_joints` (held, still collision). `collision_spheres` cover ALL links so locked limbs and
     the body are obstacles. `limits` (from `safety.py`) caps acceleration/jerk so the planner's
-    trajectory is dynamics-safe BY CONSTRUCTION. Raises on an empty arm map (no chain = no plan)."""
-    arms = arm_map.get("arms") or []
-    if not arms:
-        raise ValueError("arm map has no arms — cannot build a V2 robot_cfg (no kinematic chain)")
-    by_name = {a["name"]: a for a in arms}
-    active_names = list(active_arms) if active_arms else [a["name"] for a in arms]
+    trajectory is dynamics-safe BY CONSTRUCTION. Morphology-agnostic: arm/leg/wheel/head are the
+    same code path. Raises on an empty config (no chain = no plan)."""
+    groups = config.get("groups") or []
+    if not groups:
+        raise ValueError("config has no groups — cannot build a V2 robot_cfg (no kinematic chain)")
+    by_name = {g["name"]: g for g in groups}
+    active_names = list(active_groups) if active_groups else [g["name"] for g in groups]
     missing = [n for n in active_names if n not in by_name]
     if missing:
-        raise ValueError(f"unknown arm(s) {missing}; map has {list(by_name)}")
+        raise ValueError(f"unknown group(s) {missing}; config has {list(by_name)}")
 
-    base_link = arm_map.get("base_link") or arms[0]["base_link"]
-    tool_frames = _dedup([by_name[n]["ee_link"] for n in active_names])
+    base_link = config.get("base_link") or groups[0].get("base_link")
+    tool_frames = _dedup([t for n in active_names for t in (by_name[n].get("tip_links") or [])])
     planned = _dedup([j for n in active_names for j in by_name[n]["joint_names"]])
     planned_set = set(planned)
-    # everything that belongs to a NON-active arm AND isn't also an active joint → locked
+    # everything that belongs to a NON-active group AND isn't also an active joint → locked
     defaults = dict(default_joint_position or {})
     locked = {
         j: float(defaults.get(j, 0.0))
-        for a in arms if a["name"] not in active_names
-        for j in a["joint_names"] if j not in planned_set
+        for g in groups if g["name"] not in active_names
+        for j in g["joint_names"] if j not in planned_set
     }
 
     lim = limits or {}

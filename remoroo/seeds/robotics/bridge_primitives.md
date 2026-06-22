@@ -58,26 +58,29 @@ class Observation:
 ```
 
 > **`joint_positions` keys MUST be the combined-URDF joint names** — the Studio's live mirror, the
-> calibration engine, and the motion stack all key on them. When the cell has TWO identical arms
-> (e.g. two `library://xarm6`), the combined `robot.urdf` **uniquifies** the second arm's duplicate
-> joints with a `_1` suffix: arm-1 is `joint1..joint6`, arm-2 is `joint1_1..joint6_1`. Each arm's
-> SDK reports plain `joint1..joint6` with no namespace, so you MUST remap. **`robot_model/arms.yaml`
-> is the authoritative map** — each arm entry's `joint_names` is that arm's combined-URDF names in
-> SDK order. Build the dict from it:
+> calibration engine, and the motion stack all key on them. When the cell has two identical chains
+> (e.g. two `library://xarm6`, or four identical legs), the combined `robot.urdf` **uniquifies**
+> duplicate joints with a `_1`/`_2`… suffix. Each controller's SDK reports plain `joint1..joint6`
+> with no namespace, so you MUST remap. **The authored kinematic config — `cell.yaml: groups` — is
+> the authoritative map** (one entry per actuated chain, ANY kind; written at the model gate, read
+> via `calib_engine.urdf_io.robot_config`). Each group's `joint_names` is that chain's combined-URDF
+> names IN SDK ORDER. Build the dict from it:
 >
 > ```python
-> # arms.yaml: {arms: [{name, joint_names:[...], camera, ...}, ...]} — written by the model gate
-> arms_yaml = yaml.safe_load(open("remoroo_cell/robot_model/arms.yaml"))
+> from calib_engine import urdf_io
+> cfg = urdf_io.robot_config(yaml.safe_load(open("remoroo_cell/cell.yaml")),
+>                            "remoroo_cell/robot_model/robot.urdf")
 > joint_positions = {}
-> for spec in arms_yaml["arms"]:                       # spec["name"] == cell.yaml arm name
->     angles = self._arm_drivers[spec["name"]].read_joint_positions()   # SDK order, radians
->     joint_positions.update(dict(zip(spec["joint_names"], angles)))    # → combined-URDF names
+> for g in cfg["groups"]:                              # g["name"] == the group you key drivers by
+>     angles = self._drivers[g["name"]].read_joint_positions()      # SDK order, radians
+>     joint_positions.update(dict(zip(g["joint_names"], angles)))   # → combined-URDF names
 > ```
 >
-> If you instead report raw `joint1..joint6` for both arms they COLLIDE (one overwrites the other)
-> and the second arm never moves in the Studio — the live mirror shows "⚠ N streamed, 0 match URDF".
-> Likewise, key cameras (`get_observation(camera=...)`, `intrinsics`, `extrinsics`) by the camera's
-> **`urdf_link`** (`ZEDX_Mini`, `ZEDX_Mini_1`), not the cell.yaml camera `name` — same convention.
+> If you instead report raw `joint1..joint6` for both chains they COLLIDE (one overwrites the other)
+> and the second never moves in the Studio — the live mirror shows "⚠ N streamed, 0 match URDF".
+> (If ONE controller drives several groups, read it once and slice its angles across those groups'
+> `joint_names`.) Likewise, key cameras (`get_observation(camera=...)`, `intrinsics`, `extrinsics`)
+> by the camera's URDF **`link`** (the group's `cameras` entry), not the cell.yaml camera `name`.
 
 ```python
     scene: Dict[str, Any] = field(default_factory=dict)
@@ -110,10 +113,12 @@ class Bridge:
 
     def __init__(self, cell: Dict[str, Any]):
         self.cell = cell
-        self.arms: Tuple[str, ...] = tuple(a["name"] for a in cell["arms"])
-        self.bimanual = len(self.arms) > 1
+        # the actuated UNITS this bridge drives — any morphology (arms, legs, wheels, a head). Each
+        # has a controller connection; you key drivers by its name. For plain arms these are
+        # cell.yaml `arms[]`; the names MUST match the authored `cell.yaml: groups` (the model gate).
+        self.units: Tuple[str, ...] = tuple(u["name"] for u in (cell.get("arms") or cell.get("units") or []))
         self.safety = SafetySupervisor.from_cell(cell)  # shipped; enforces envelopes
-        self._arm_drivers: Dict[str, Any] = {}          # filled in connect()
+        self._drivers: Dict[str, Any] = {}          # filled in connect()
         self._cameras: Dict[str, Any] = {}              # filled in connect()
         self._motion = None                             # motion_engine.MotionStack (commission gate)
         self._connected = False
@@ -125,31 +130,33 @@ class Bridge:
 
     # ---- Lifecycle -------------------------------------------------------
     def connect(self) -> None:
-        """Open arm + camera connections. NO motion. (See arm_adapters.md /
+        """Open controller + camera connections. NO motion. (See arm_adapters.md /
         camera_capture.md for the per-vendor driver you adapt here.)"""
-        for arm in self.cell["arms"]:
-            self._arm_drivers[arm["name"]] = self._make_arm_driver(arm)  # TODO adapt
+        for u in (self.cell.get("arms") or self.cell.get("units") or []):
+            self._drivers[u["name"]] = self._make_driver(u)              # TODO adapt (any kind)
         for cam in self.cell["cameras"]:
             self._cameras[cam["name"]] = self._make_camera(cam)          # TODO adapt
         self._connected = True
 
     def estop(self) -> None:
-        """Hard stop every arm immediately. Must be reachable at all times."""
+        """Hard stop every controller immediately. Must be reachable at all times."""
         self._estopped = True                  # latched; motion stack polls estop_tripped()
-        for drv in self._arm_drivers.values():
+        for drv in self._drivers.values():
             drv.emergency_stop()  # TODO map to the real SDK's halt/abort call
 
-    def _arm_for_joints(self, joint_names) -> str:
-        """Which arm owns these trajectory joints (controller routing for execute_trajectory).
-        A single-arm cell returns its one arm; multi-arm: match joint_names to the arm whose
-        cell.yaml joints they are (fan out per-arm if a coordinated plan spans several)."""
-        for a in self.cell["arms"]:
-            if set(a.get("joint_names", [])) & set(joint_names):
-                return a["name"]
-        return self.arms[0]
+    def _group_for_joints(self, joint_names) -> str:
+        """Which driver owns these trajectory joints (controller routing for execute_trajectory).
+        Match against the AUTHORED groups (cell.yaml: groups) — the source of truth for which joints
+        belong to which chain. A coordinated plan spanning several groups fans out across drivers."""
+        from calib_engine import urdf_io
+        cfg = urdf_io.robot_config(self.cell, "remoroo_cell/robot_model/robot.urdf")
+        for g in cfg["groups"]:
+            if set(g.get("joint_names", [])) & set(joint_names):
+                return g["name"]                 # == the driver key (group name == unit name)
+        return self.units[0]
 
     def close(self) -> None:
-        for drv in self._arm_drivers.values():
+        for drv in self._drivers.values():
             try:
                 drv.disconnect()
             except Exception:
@@ -167,7 +174,7 @@ class Bridge:
         speed = self.safety.clamp_speed(speed_frac)
         if not self.safety.joints_within_limits(arm, q_target):
             return False
-        return self._arm_drivers[arm].move_joints(q_target, speed=speed)  # TODO adapt
+        return self._drivers[arm].move_joints(q_target, speed=speed)  # TODO adapt
 
     # ---- Calibration joint-move contract (the SHIPPED calib engine calls this) ----
     def move_to_joints(self, joints, arm: Optional[str] = None) -> None:
@@ -176,7 +183,7 @@ class Bridge:
         pipeline step and is LOAD-BEARING SAFETY on a multi-arm cell: drive EXACTLY that arm,
         never a shared default (passing `arm` is how the engine avoids moving the wrong arm).
         Route the supervised move:
-            self.move_joints(arm or self.arms[0], np.asarray(joints, float),
+            self.move_joints(arm or self.units[0], np.asarray(joints, float),
                              speed_frac=self.cell['safety']['max_joint_speed_frac'])
         (A single-arm cell may ignore `arm`. The engine also accepts the multi-arm
         `move_joints(arm, joints)` directly.) For calibration the engine also needs
@@ -204,8 +211,8 @@ class Bridge:
         arm driver(s) by `traj.joint_names`; a single-controller robot (humanoid) is one call, a
         multi-arm cell fans out to each driver. Each driver REPLAYS the full path (arm_adapters.md).
         The stack already audited the plan and supplies `should_abort` (the E-stop poll)."""
-        arm = self._arm_for_joints(traj.joint_names)          # owns the controller topology
-        return self._arm_drivers[arm].execute_trajectory(traj, should_abort=should_abort)
+        arm = self._group_for_joints(traj.joint_names)        # owns the controller topology
+        return self._drivers[arm].execute_trajectory(traj, should_abort=should_abort)
 
     def plan_and_move(self, arm: str, target_pose: np.ndarray, *, world=None) -> bool:
         """THE Phase-8 primitive, now a thin delegate to the shipped stack: plan a collision-free,
@@ -218,7 +225,7 @@ class Bridge:
         return bool(getattr(self, "_estopped", False))
 
     def set_gripper(self, arm: str, opening: float) -> None:
-        self._arm_drivers[arm].set_gripper(float(np.clip(opening, 0.0, 1.0)))  # TODO adapt
+        self._drivers[arm].set_gripper(float(np.clip(opening, 0.0, 1.0)))  # TODO adapt
 
     # ---- Optional: bring-your-own VLA / world model ----------------------
     # @robot_sprint detects support via `.supported`. Leave as no-ops at setup;
@@ -239,8 +246,8 @@ class Bridge:
         return AttemptVerdict(success=False, confidence=0.0, rationale="not set at setup")
 
     # ---- Per-vendor adapters (author these — see arm_adapters.md) --------
-    def _make_arm_driver(self, arm_cfg: Dict[str, Any]):
-        raise NotImplementedError("adapt to this arm's SDK; see arm_adapters.md")
+    def _make_driver(self, unit_cfg: Dict[str, Any]):
+        raise NotImplementedError("adapt to this controller's SDK (arm/leg/wheel/…); see arm_adapters.md")
 
     def _make_camera(self, cam_cfg: Dict[str, Any]):
         raise NotImplementedError("adapt to this camera's SDK; see camera_capture.md")

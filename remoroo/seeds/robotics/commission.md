@@ -36,9 +36,9 @@ construction**.
 
 ## 2. The call surface (TCP-keyed, count-agnostic)
 
-`tcp` is an arm NAME from `robot_model/arms.yaml`. The SAME calls drive 1 arm, 2
-arms, or a humanoid's many end-effectors — the stack builds (and caches) a planner
-per TCP set; nothing special-cases arm count.
+`tcp` is a group NAME from the authored `cell.yaml: groups`. The SAME calls drive 1
+arm, 2 arms, a quadruped's legs, or a humanoid's many end-effectors — the stack
+builds (and caches) a planner per group set; nothing special-cases morphology.
 
 ```python
 stack.move_to_pose("right", (xyz, quat_wxyz))      # one TCP → a pose
@@ -68,7 +68,7 @@ panel; on failure it routes back to you (fix + re-checkpoint), never a per-error
 ## Commission exit criteria (functional)
 
 - [ ] `MotionStack.from_cell` loads with no missing-artifact error (URDF, spheres,
-      arms.yaml, world, safety all present and consistent).
+      `cell.yaml: groups`, world, safety all present and consistent).
 - [ ] `sphere_health().ok` — collision spheres are in metres, not the mm degeneracy.
 - [ ] One `plan_to_pose`/`retract` returns a collision-free `Trajectory` against the
       SCANNED world (not a box), within the safety envelope.

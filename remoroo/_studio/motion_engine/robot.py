@@ -45,15 +45,23 @@ def extract_spheres(cfg: dict) -> Dict[str, List[dict]]:
     return out
 
 
-def load_arm_map(cell_dir: str) -> dict:
-    """Read `robot_model/arms.yaml` — the canonical {base_link, arms:[...]} map."""
-    p = Path(cell_dir) / "robot_model" / "arms.yaml"
-    if not p.exists():
-        raise FileNotFoundError(f"missing {p} — run the model/calibration gates first (no arm map)")
-    m = _load_yaml(p)
-    if not (m.get("arms")):
-        raise ValueError(f"{p} has no arms — the URDF produced no kinematic chain")
-    return m
+def load_robot_config(cell_dir: str) -> dict:
+    """The AUTHORED kinematic config — `cell.yaml: groups` (or `arms[]` back-compat), validated and
+    projected against the URDF via the shipped `calib_engine.urdf_io`. The SINGLE source of truth;
+    there is no derived `arms.yaml`. Returns `{groups:[{name, kind, base_link, tip_links[],
+    joint_names[], cameras[], tags}], cameras, ignore_joints}`."""
+    from calib_engine import urdf_io
+
+    base = Path(cell_dir)
+    cellp, urdf = base / "cell.yaml", base / "robot_model" / "robot.urdf"
+    if not cellp.exists():
+        raise FileNotFoundError(f"missing {cellp} — no cell description")
+    if not urdf.exists():
+        raise FileNotFoundError(f"missing {urdf} — model the cell first")
+    cfg = urdf_io.robot_config(_load_yaml(cellp), str(urdf))
+    if not cfg.get("groups"):
+        raise ValueError("no kinematic groups authored — run the model gate (cell.yaml: groups)")
+    return cfg
 
 
 def load_spheres(cell_dir: str) -> Tuple[Dict[str, List[dict]], float]:

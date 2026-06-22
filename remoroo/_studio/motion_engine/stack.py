@@ -28,7 +28,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .robot import load_arm_map, load_spheres, sphere_health
+from .robot import load_robot_config, load_spheres, sphere_health
 from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
@@ -81,10 +81,10 @@ def _default_planner_factory(robot_cfg, world, *, limits, max_goalset):
 
 
 class MotionStack:
-    def __init__(self, *, arm_map: dict, spheres: Dict[str, List[dict]], sphere_buffer: float,
+    def __init__(self, *, config: dict, spheres: Dict[str, List[dict]], sphere_buffer: float,
                  world: WorldInputs, safety: Safety, bridge=None,
                  urdf_path: str = "robot.urdf", planner_factory: Optional[PlannerFactory] = None) -> None:
-        self.arm_map = arm_map
+        self.config = config
         self.spheres = spheres
         self.sphere_buffer = sphere_buffer
         self.world = world
@@ -93,38 +93,43 @@ class MotionStack:
         self.urdf_path = urdf_path
         self._factory = planner_factory or _default_planner_factory
         self._planners: Dict[frozenset, object] = {}
-        self._arms = {a["name"]: a for a in arm_map.get("arms", [])}
+        self._groups = {g["name"]: g for g in config.get("groups", [])}
         self._limits = safety.planner_limits()
 
     # --- construction -----------------------------------------------------
     @classmethod
     def from_cell(cls, cell_dir: str, bridge=None, *, planner_factory: Optional[PlannerFactory] = None,
                   wall_bounds: bool = True) -> "MotionStack":
-        """Build from the on-disk cell: arms.yaml + collision_spheres.yml + world/ + safety."""
-        arm_map = load_arm_map(cell_dir)
+        """Build from the on-disk cell: the AUTHORED config (cell.yaml groups) + collision_spheres.yml
+        + world/ + safety."""
+        config = load_robot_config(cell_dir)
         spheres, buffer = load_spheres(cell_dir)
         safety = load_safety(cell_dir)
         world = load_world(cell_dir, safety=safety.world_kwargs(), wall_bounds=wall_bounds)
-        return cls(arm_map=arm_map, spheres=spheres, sphere_buffer=buffer, world=world,
+        return cls(config=config, spheres=spheres, sphere_buffer=buffer, world=world,
                    safety=safety, bridge=bridge, planner_factory=planner_factory)
 
-    # --- arm/TCP resolution ----------------------------------------------
-    def _arm(self, tcp: str) -> dict:
-        if tcp not in self._arms:
-            raise KeyError(f"unknown TCP/arm {tcp!r}; cell has {list(self._arms)}")
-        return self._arms[tcp]
+    # --- group/TCP resolution --------------------------------------------
+    def _group(self, tcp: str) -> dict:
+        if tcp not in self._groups:
+            raise KeyError(f"unknown group/TCP {tcp!r}; cell has {list(self._groups)}")
+        return self._groups[tcp]
 
-    def _ee(self, tcp: str) -> str:
-        return self._arm(tcp)["ee_link"]
+    def _tip(self, tcp: str) -> str:
+        """The group's primary tip link (the frame a pose targets). A group has 1+ tips."""
+        tips = self._group(tcp).get("tip_links") or []
+        if not tips:
+            raise ValueError(f"group {tcp!r} has no tip_links — nothing to drive")
+        return tips[0]
 
-    def _planner_for(self, active_arms: Sequence[str]):
-        """Get/build (and cache) the planner whose tool_frames = these arms' ee_links."""
-        for a in active_arms:
-            self._arm(a)                       # KeyError on an unknown TCP, before any build
-        key = frozenset(active_arms)
+    def _planner_for(self, active_groups: Sequence[str]):
+        """Get/build (and cache) the planner whose tool_frames = these groups' tips."""
+        for a in active_groups:
+            self._group(a)                     # KeyError on an unknown group, before any build
+        key = frozenset(active_groups)
         if key not in self._planners:
             robot_cfg = build_v2_robot_cfg(
-                self.arm_map, self.spheres, active_arms=list(active_arms),
+                self.config, self.spheres, active_groups=list(active_groups),
                 urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits)
             self._planners[key] = self._factory(robot_cfg, self.world, limits=self._limits, max_goalset=1)
         return self._planners[key]
@@ -149,7 +154,7 @@ class MotionStack:
                             vals = fn(a)
                         except TypeError:
                             vals = fn()
-                        names = self._arm(a)["joint_names"]
+                        names = self._group(a)["joint_names"]
                         out.update({n: float(v) for n, v in zip(names, np.asarray(vals, float).reshape(-1))})
                     return out
                 except Exception:
@@ -169,7 +174,7 @@ class MotionStack:
             return MoveResult(False, "no targets given")
         arms = list(targets.keys())
         planner = self._planner_for(arms)
-        goals = {self._ee(a): _norm_pose(p) for a, p in targets.items()}
+        goals = {self._tip(a): _norm_pose(p) for a, p in targets.items()}
         res = planner.plan_pose(goals, self._current_positions(arms), max_attempts=max_attempts)
         return self._finish(res, execute)
 
@@ -178,7 +183,7 @@ class MotionStack:
         """Drive one TCP through a sequence of poses (one concatenated collision-free path)."""
         planner = self._planner_for([tcp])
         legs = [_norm_pose(p) for p in poses]
-        res = planner.plan_through(self._ee(tcp), legs, self._current_positions([tcp]),
+        res = planner.plan_through(self._tip(tcp), legs, self._current_positions([tcp]),
                                    max_attempts=max_attempts)
         return self._finish(res, execute)
 
@@ -190,7 +195,7 @@ class MotionStack:
     def retract(self, tcp: Optional[str] = None, *, execute: bool = True) -> MoveResult:
         """Plan a collision-free path back to the robot's home/retract config. `tcp` selects the
         arm (default: all arms). Distinct from `move_to_joints` — this is COLLISION-FREE."""
-        arms = [tcp] if tcp else list(self._arms.keys())
+        arms = [tcp] if tcp else list(self._groups.keys())
         planner = self._planner_for(arms)
         if not hasattr(planner, "plan_retract"):
             return MoveResult(False, "planner has no retract; use move_to_joints(home) instead")
@@ -232,9 +237,9 @@ class MotionStack:
             report["message"] = "collision spheres are degenerate — refusing to move (fix the model)"
             return report
 
-        first = next(iter(self._arms), None)
-        if not step("arm_map", first is not None, arms=list(self._arms)):
-            report["message"] = "no arms in the cell — nothing to commission"
+        first = next(iter(self._groups), None)
+        if not step("groups", first is not None, groups=list(self._groups)):
+            report["message"] = "no kinematic groups in the cell — nothing to commission"
             return report
 
         emit(step="build_planner", ok=True, note="warming cuRobo (one-time)")

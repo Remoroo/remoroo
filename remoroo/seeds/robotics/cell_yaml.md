@@ -64,16 +64,30 @@ robot_model:                          # the cuRobo-ready model (assembled in Pha
 
 cameras:                              # one entry per camera
   - name: "wrist"
+    link: "wrist_cam"                # the camera body LINK in robot.urdf (the join key; set at G5)
     make: "Intel"
     model: "RealSense D435i"
     mount: "eye_in_hand"             # eye_in_hand (wrist) | static | eye_to_hand
-    attached_to: "right"             # arm name if eye_in_hand
+    attached_to: "right"             # the GROUP it rides on (arm/head/…) if eye_in_hand
     rgb: true
     depth: true                       # MUST be true for at least enough coverage
     depth_kind: "stereo_ir"           # stereo_ir | tof | structured_light | none
     resolution: [1280, 720]
     intrinsics: "factory"             # factory | calibrate | path/to/intrinsics
     serial: "unknown"
+
+groups: []                            # the AUTHORED kinematic config — filled at Phase 5/G5 by the
+                                      # model gate (you read robot.urdf and DECLARE the actuated
+                                      # chains). ONE entry per group, ANY morphology — see
+                                      # robot_model.md. Source of truth; there is no arms.yaml.
+                                      # - name: arm_left           # your stable id (bridge keys on it)
+                                      #   kind: arm                 # arm|leg|wheel|head|gripper|free
+                                      #   base_link: world          # shared planning root
+                                      #   tip_links: [left_tcp]     # end-effector/tool link(s)
+                                      #   joint_names: [l_j1, …]    # from chain_from_urdf (exact order)
+                                      #   cameras: [wrist_cam]      # URDF camera link(s) on this chain
+                                      #   tags: { side: left }      # optional advisory labels
+ignore_joints: []                     # actuated joints deliberately not in any group (rare)
 
 sensing:                              # the G0 feasibility judgement
   feasible: true

@@ -292,10 +292,166 @@ def enumerate_arms(urdf_path: str, camera_to_arm: Optional[Dict[str, str]] = Non
 
 
 def arm_map_dict(urdf_path: str, camera_to_arm: Optional[Dict[str, str]] = None) -> dict:
-    """The canonical arm map as a JSON/YAML-friendly dict (what gets written to
-    robot_model/arms.yaml and shipped to the Studio)."""
+    """LEGACY auto-discovery (kept ONLY as a bootstrap *suggestion* the agent may start from at the
+    model gate — never written to disk as truth). The canonical path is the AUTHORED config
+    (`robot_config` below): the agent reads the URDF + cell.yaml and declares the groups, asking the
+    operator when unclear. No more discover→name→side→persist guessing."""
     arms = enumerate_arms(urdf_path, camera_to_arm)
     return {"base_link": arms[0].base_link if arms else "", "arms": [a.to_dict() for a in arms]}
+
+
+# --------------------------------------------------------------------------- #
+# The AUTHORED kinematic config (morphology-agnostic). The AGENT interprets the #
+# URDF and declares `groups` in cell.yaml; deterministic code here only does    #
+# MECHANICAL work: parse raw facts, trace exact joints, and VALIDATE the        #
+# authored config against the URDF. It never decides what an "arm" is.          #
+# --------------------------------------------------------------------------- #
+def urdf_facts(urdf_path: str) -> dict:
+    """The raw kinematic graph — the agent's grounding material at the model gate. PURE parse, ZERO
+    interpretation: links (+ their visual mesh, a camera/tool hint), joints (name/type/parent/child/
+    axis/limit), the root link(s), and the movable-joint names. The agent reads THIS (exact names)
+    and decides the groups; it never invents joint names."""
+    root = ET.parse(urdf_path).getroot()
+    links = []
+    for l in root.findall("link"):
+        mesh_el = l.find("./visual/geometry/mesh")
+        links.append({"name": l.get("name"), "mesh": (mesh_el.get("filename") if mesh_el is not None else None)})
+    joints, children = [], set()
+    for j in root.findall("joint"):
+        c, p = j.find("child"), j.find("parent")
+        if c is None or p is None:
+            continue
+        children.add(c.get("link"))
+        ax = j.find("axis")
+        axis = [float(v) for v in ax.get("xyz", "0 0 1").split()] if ax is not None else [0.0, 0.0, 1.0]
+        lim = j.find("limit")
+        limit = ([float(lim.get("lower")), float(lim.get("upper"))]
+                 if lim is not None and lim.get("lower") is not None and lim.get("upper") is not None else None)
+        joints.append({"name": j.get("name"), "type": j.get("type"), "parent": p.get("link"),
+                       "child": c.get("link"), "axis": axis, "limit": limit})
+    link_names = [l["name"] for l in links]
+    return {
+        "links": links,
+        "joints": joints,
+        "roots": [n for n in link_names if n not in children],
+        "movable_joints": [j["name"] for j in joints if j["type"] not in ("fixed",)],
+    }
+
+
+def _camera_link_for_arm(cell: dict) -> Dict[str, str]:
+    """legacy arms[] → its camera URDF link, from cell.yaml cameras[] (attached_to/owner + link).
+    Link order: explicit `link`/`urdf_link`, else the camera `name` (older cells named the camera
+    after its URDF link)."""
+    out: Dict[str, str] = {}
+    for c in (cell.get("cameras") or []):
+        owner = str(c.get("attached_to") or c.get("owner") or "")
+        link = str(c.get("link") or c.get("urdf_link") or c.get("name") or "")
+        if owner and link:
+            out.setdefault(owner, link)
+    return out
+
+
+def _promote_arms(cell: dict, urdf_path: str) -> List[dict]:
+    """BACK-COMPAT: legacy `arms[]` → `groups` of kind=arm. Names come straight from cell.yaml
+    (authoritative — no guessing); joints/base/tip are TRACED from the URDF via the arm's camera
+    flange (or its first movable tip). So an existing dual-xarm cell needs no rewrite."""
+    cam_for = _camera_link_for_arm(cell)
+    have_urdf = Path(urdf_path).exists()
+    root = ET.parse(urdf_path).getroot() if have_urdf else None
+    # the SHARED planning root (all groups plan in one frame); the chain's own mount is incidental.
+    roots = urdf_facts(urdf_path)["roots"] if have_urdf else []
+    shared_root = roots[0] if roots else ""
+    groups: List[dict] = []
+    for a in (cell.get("arms") or []):
+        name = str(a.get("name") or "")
+        cam = cam_for.get(name)
+        joints, tips, cams = [], [], []
+        if cam and root is not None:
+            try:
+                flange = find_flange_link(urdf_path, cam)
+                _, joints, _ = chain_from_urdf(urdf_path, flange)
+                tips = [_ee_below(root, flange)]
+                cams = [cam]
+            except (ValueError, ET.ParseError):
+                pass
+        groups.append({"name": name, "kind": "arm", "base_link": shared_root, "tip_links": tips,
+                       "joint_names": list(joints), "cameras": cams, "tags": {}})
+    return groups
+
+
+def robot_config(cell: dict, urdf_path: str) -> dict:
+    """The AUTHORED kinematic config consumers read: the agent's `cell.yaml.groups` verbatim, or —
+    back-compat — `arms[]` promoted to kind=arm groups. PURE (cell already parsed). This is the
+    single source of truth; nothing re-derives or 'enriches' it. Shape:
+        {groups: [{name, kind, base_link, tip_links[], joint_names[], cameras[], tags}],
+         cameras: [...], ignore_joints: [...]}"""
+    groups = cell.get("groups")
+    if not groups:
+        groups = _promote_arms(cell, urdf_path)
+    return {"groups": list(groups or []), "cameras": list(cell.get("cameras") or []),
+            "ignore_joints": list(cell.get("ignore_joints") or [])}
+
+
+def validate_robot_config(config: dict, urdf_path: str) -> List[str]:
+    """Check the AUTHORED config against the URDF — VALIDATION, not inference. Catches an agent
+    mistake (a hallucinated joint, a tip that isn't in the URDF, a joint in two groups, an
+    unassigned actuator) IN THE GATE, not on the robot. STRICT: every movable joint must be in some
+    group OR in `ignore_joints`. Returns a list of human-readable errors ([] == valid)."""
+    facts = urdf_facts(urdf_path)
+    link_names = {l["name"] for l in facts["links"]}
+    joint_names = {j["name"] for j in facts["joints"]}
+    movable = set(facts["movable_joints"])
+    errors: List[str] = []
+    groups = config.get("groups") or []
+    if not groups:
+        errors.append("no groups declared — the model gate must author at least one kinematic group")
+
+    owner: Dict[str, str] = {}
+    for g in groups:
+        gname = str(g.get("name") or "")
+        if not gname:
+            errors.append("a group has no name")
+        if g.get("base_link") and g["base_link"] not in link_names:
+            errors.append(f"group {gname!r}: base_link {g['base_link']!r} is not a URDF link")
+        for t in (g.get("tip_links") or []):
+            if t not in link_names:
+                errors.append(f"group {gname!r}: tip_link {t!r} is not a URDF link")
+        for cl in (g.get("cameras") or []):
+            if cl not in link_names:
+                errors.append(f"group {gname!r}: camera link {cl!r} is not a URDF link")
+        for jn in (g.get("joint_names") or []):
+            if jn not in joint_names:
+                errors.append(f"group {gname!r}: joint {jn!r} is not a URDF joint")
+            elif jn not in movable:
+                errors.append(f"group {gname!r}: joint {jn!r} is fixed (not actuated)")
+            if jn in owner:
+                errors.append(f"joint {jn!r} is assigned to two groups ({owner[jn]!r} and {gname!r})")
+            else:
+                owner[jn] = gname
+        # the declared joints must actually be the chain that drives each tip
+        for t in (g.get("tip_links") or []):
+            if t not in link_names:
+                continue
+            try:
+                _, traced, _ = chain_from_urdf(urdf_path, t)
+            except (ValueError, ET.ParseError) as e:
+                errors.append(f"group {gname!r}: tip {t!r} has no valid kinematic chain ({e})")
+                continue
+            missing = [j for j in traced if j not in set(g.get("joint_names") or [])]
+            if missing:
+                errors.append(f"group {gname!r}: tip {t!r} is driven by joints {missing} missing from joint_names")
+
+    for c in (config.get("cameras") or []):
+        link = str(c.get("link") or c.get("urdf_link") or "")
+        if link and link not in link_names:
+            errors.append(f"camera {c.get('name', '?')!r}: link {link!r} is not a URDF link")
+
+    ignored = set(config.get("ignore_joints") or [])
+    unassigned = sorted(movable - set(owner) - ignored)
+    if unassigned:
+        errors.append(f"{len(unassigned)} actuated joint(s) not in any group and not in ignore_joints: "
+                      f"{unassigned[:8]}{' …' if len(unassigned) > 8 else ''}")
+    return errors
 
 
 def read_nominal_optical(urdf_path: str, camera_link: str) -> np.ndarray:

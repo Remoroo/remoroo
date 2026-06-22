@@ -16,10 +16,76 @@ So at Phase 5:
    Sanity-check only: it loads, and FK at a known joint config lands where the
    live TCP is (within the calibration residual). If it's wrong, hand it back to
    the operator with a `gate_checkpoint` note; do not "fix" the geometry yourself.
-3. **Sphere-fit it (this part is yours)** and **(dual-arm)** fold in the
+3. **AUTHOR THE KINEMATIC CONFIG** (the core of this gate — see below): read the
+   URDF and DECLARE the robot's actuated `groups` in `cell.yaml`. YOU are the
+   generalizer — there is no auto-discovery to lean on. Ask the operator whenever
+   the URDF is ambiguous.
+4. **Sphere-fit it (this part is yours)** and **(dual-arm)** fold in the
    base-to-base transform that *calibration* computed (see `calibration.md`) — the
    operator placed the arms approximately in the editor; calibration gives the
    precise `arm0→arm1` transform that cuRobo uses alongside the URDF.
+
+## Author the kinematic config — `cell.yaml: groups` (the heart of G5)
+
+A robot is ANY morphology: one arm, two arms, an arm + a gantry, a humanoid (arms
++ legs + head), a quadruped, a wheeled base. There is **no deterministic
+discovery** of "arms" — **you read the URDF and declare its actuated GROUPS.** A
+group is one named, actuated kinematic chain. This declaration is the single
+source of truth every later stage reads (motion planning, calibration, the
+bridge, the Studio); nothing re-derives or "guesses" it.
+
+**Use the mechanical helpers — never hand-invent names.** The shipped
+`calib_engine.urdf_io` gives you exact, parse-only facts so you interpret real
+structure, not hallucinated strings:
+
+```python
+from calib_engine import urdf_io
+facts = urdf_io.urdf_facts("remoroo_cell/robot_model/robot.urdf")
+#   facts["links"]   -> [{name, mesh}]            (mesh filename hints cameras/tools)
+#   facts["joints"]  -> [{name, type, parent, child, axis, limit}]
+#   facts["roots"]   -> [link]  (the shared base frame; usually one)
+#   facts["movable_joints"] -> [name]  (every actuated joint — ALL must be placed)
+# For each end-effector/tool tip you identify, get its EXACT joint chain:
+_, joint_names, _ = urdf_io.chain_from_urdf("…/robot.urdf", tip_link)   # base→tip order
+```
+
+Then write `cell.yaml`:
+
+```yaml
+groups:                                   # one per actuated chain — ANY kind
+  - name: arm_left                        # YOUR stable id; the bridge keys drivers by it
+    kind: arm                             # arm | leg | wheel | head | gripper | torso | free  (a ROLE TAG)
+    base_link: world                      # the shared planning root (facts["roots"][0])
+    tip_links: [left_tcp]                 # end-effector/tool link(s) — a LIST (a hand, a foot, a mount)
+    joint_names: [l_j1, l_j2, l_j3, l_j4, l_j5, l_j6]   # from chain_from_urdf — exact, in order
+    cameras: [left_wrist_cam]             # URDF camera link(s) rigidly on this chain (if any)
+    tags: { side: left }                  # OPTIONAL advisory labels — never structural
+  # … a leg, a wheel, a head: the SAME shape, different kind/tips/joints
+cameras:                                  # add the URDF `link` to each camera (the join key)
+  - name: left_wrist_cam
+    link: left_wrist_cam                  # the camera body link IN THE URDF
+    mount: eye_in_hand
+    owner: arm_left
+ignore_joints: []                         # any actuated joint deliberately NOT in a group (rare)
+```
+
+**Rules (these are what make it robust):**
+- **Trace joints, never guess them** — `joint_names` come from `chain_from_urdf(tip)`, in order.
+  The bridge reports joint states in this exact order; a wrong order silently mis-drives the robot.
+- **Read the morphology, never assume it** — count groups from the URDF, not from "it's probably
+  dual-arm". A leg/wheel/head is just a group with a different `kind` and tip.
+- **ASK when the URDF is ambiguous** (`ask_human`/`gate_checkpoint`), never guess: which physical
+  side a chain is, whether a link is a real tool tip or just a flange, a chain's role. Physical
+  identity (left vs right in the room) is OPERATOR ground truth — confirm it via the Studio model
+  gate's "verify by motion" (wiggle one limb → it shows which modeled group moved → operator labels).
+- **Every actuated joint must land somewhere** — in a group or in `ignore_joints`. The shipped
+  `urdf_io.validate_robot_config(config, urdf)` enforces this and that every name/tip exists and no
+  joint is in two groups; run it before you checkpoint, and FIX what it reports (a mistake here
+  fails in the gate, not on the robot).
+- **Back-compat:** a legacy `arms:` list still works — each entry is read as a `kind: arm` group with
+  joints traced from its camera flange. Prefer authoring `groups:` for anything that isn't plain arms.
+
+Then `gate_checkpoint(gate=model)` with the authored groups for the operator to confirm.
 
 ## Collision spheres → cuRobo YAML (YOURS — NO Isaac Sim)
 
@@ -98,16 +164,21 @@ reuses these spheres to mask the arm out of each depth frame before fusion.
 ## `remoroo_cell/robot_model/` outputs
 
 ```text
+cell.yaml                        # gains `groups:` — the AUTHORED kinematic config (source of truth) ← YOURS
 robot_model/
   robot.urdf                     # the OPERATOR's exported URDF (you read it; you do not author it)
   collision_spheres.yml          # cuRobo robot config (spheres + limits + ignore pairs)  ← YOURS
   spheres_preview.png            # desk visualization shown to the operator                ← YOURS
   report.md                      # sphere counts, base_to_base used, FK check              ← YOURS
 ```
+There is NO `arms.yaml` — the kinematic config is the authored `cell.yaml: groups`, computed by no
+one but you and confirmed by the operator, so it never drifts.
 
 ## Acceptance (part of G5)
 
 - The operator's `robot.urdf` is present; FK matches the live arm within the
   calibration residual (if not, hand back to the operator — do not edit geometry).
+- `cell.yaml: groups` authored from the URDF and `urdf_io.validate_robot_config` returns NO errors
+  (every joint placed, every name/tip real); operator confirmed the groups (+ physical labels).
 - cuRobo loads the robot YAML and the G1-style smoke plan still succeeds.
 - Spheres previewed and operator-confirmed to envelop the real geometry.

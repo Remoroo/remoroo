@@ -214,14 +214,33 @@ def toolchain_status() -> list[dict]:
     return items
 
 
+def _groups_as_arm_map(cfg: dict) -> dict:
+    """Shim the AUTHORED config's `groups` into the `{base_link, arms:[{name, ee_link, joint_names,
+    base_link, side}]}` shape `calib_engine.curobo_cfg.build_robot_cfg` expects (so calibration's
+    classic motion_gen keeps working). ee_link = the group's first tip; side = its `side` tag."""
+    groups = cfg.get("groups") or []
+    base = (groups[0].get("base_link") if groups else "") or ""
+    arms = [{
+        "name": g.get("name"),
+        "ee_link": (g.get("tip_links") or [""])[0],
+        "joint_names": list(g.get("joint_names") or []),
+        "base_link": g.get("base_link") or base,
+        "side": (g.get("tags") or {}).get("side", ""),
+    } for g in groups if g.get("joint_names")]
+    return {"base_link": base, "arms": arms}
+
+
 # --------------------------------------------------------------------------- #
 # cuRobo helpers (researched API: MotionGenConfig.load_from_robot_config, etc.) #
 # --------------------------------------------------------------------------- #
 def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
-    """Write a cuRobo robot config YAML embedding the studio's collision spheres
-    (cuRobo plans on spheres, not meshes; we avoid Isaac Sim per the seed). Spheres
-    arrive as [{link, center:[x,y,z], radius}] from the studio (approxSpheres)."""
+    """Write `robot.urdf` + the cuRobo `collision_spheres.yml` (the sphere model calibration's
+    motion_gen reads). The KINEMATIC config is NOT written here — it is the AUTHORED `cell.yaml:
+    groups` (the single source of truth), read on demand via `urdf_io.robot_config`. No `arms.yaml`,
+    no per-arm cfg files, no name reverse-mapping."""
     import yaml  # type: ignore
+    from calib_engine import urdf_io
+    from calib_engine.curobo_cfg import build_robot_cfg
 
     rm = CELL_DIR / "robot_model"
     rm.mkdir(parents=True, exist_ok=True)
@@ -231,34 +250,14 @@ def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
     for s in spheres:
         by_link.setdefault(s["link"], []).append({"center": list(s["center"]), "radius": float(s["radius"])})
 
-    # The CANONICAL ARM MAP (urdf-derived + cell.yaml arm names) — the single source of truth the
-    # old config lacked. Written to arms.yaml; per-arm cuRobo robot_cfg (base_link, ee_link, the
-    # arm's cspace joints, the other arm LOCKED) so the planner finally has a kinematic chain.
-    from calib_engine import urdf_io
-    from calib_engine.curobo_cfg import build_robot_cfg
-    cy = load_cell_yaml()
-    # camera_to_arm is keyed by the URDF camera LINK (what enumerate_arms looks up via a.camera),
-    # NOT the cell.yaml camera `name`. Keying by name left the lookup missing, so arms were named
-    # after their camera link ("ZEDX_Mini_1") instead of the cell.yaml arm ("arm2") — which then
-    # KeyError'd the bridge (its _arm_drivers are keyed by the cell.yaml arm name).
-    cam2arm = {}
-    for c in (cy.get("cameras") or []):
-        link = str(c.get("urdf_link") or c.get("name") or c.get("id") or "")
-        if link and c.get("attached_to"):
-            cam2arm[link] = str(c["attached_to"])
-    arm_map = urdf_io.arm_map_dict(str(rm / "robot.urdf"), camera_to_arm=cam2arm)
-    (rm / "arms.yaml").write_text(yaml.safe_dump(arm_map, sort_keys=False), encoding="utf-8")
-
+    cfg = urdf_io.robot_config(load_cell_yaml(), str(rm / "robot.urdf"))   # authored groups (or arms[] back-compat)
+    arm_map = _groups_as_arm_map(cfg)
     out = rm / "collision_spheres.yml"
     if arm_map["arms"]:
-        for a in arm_map["arms"]:
-            cfg = build_robot_cfg(arm_map, by_link, plan_arm=a["name"], urdf_path="robot.urdf")
-            safe = str(a["name"]).replace("/", "_")
-            (rm / f"robot_cfg_{safe}.yml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-        # default config = the first arm (back-compat for single-arm motion_gen)
+        # classic robot_cfg for the DEFAULT group (base/ee/cspace + others locked) — calibration motion.
         first = build_robot_cfg(arm_map, by_link, plan_arm=arm_map["arms"][0]["name"], urdf_path="robot.urdf")
         out.write_text(yaml.safe_dump(first, sort_keys=False), encoding="utf-8")
-    else:  # no arms derived (degenerate URDF) — spheres-only, loud
+    else:  # no kinematic groups yet (URDF modeled but groups not authored) — spheres-only, loud
         out.write_text(yaml.safe_dump({"robot_cfg": {"kinematics": {
             "urdf_path": "robot.urdf", "collision_spheres": by_link,
             "collision_sphere_buffer": 0.005}}}, sort_keys=False), encoding="utf-8")
@@ -1415,50 +1414,53 @@ def _calib_handle_locked(verb: str, body: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Canonical arm map + static obstacles (the multi-arm model the Studio + cuRobo #
-# share). arms.yaml is the source of truth; obstacles live in cell.yaml.        #
+# The AUTHORED kinematic config (the morphology-agnostic model the Studio + the #
+# engine share) + static obstacles. The config is `cell.yaml: groups` — authored #
+# at the model gate, validated against the URDF, served live. No arms.yaml.      #
 # --------------------------------------------------------------------------- #
 def h_arms(_q):
-    """The canonical arm map for the Studio: read `robot_model/arms.yaml` if built (the
-    operator-verified sides), else derive it fresh from the URDF + cell.yaml camera→arm names."""
-    import yaml  # type: ignore
-    rm = CELL_DIR / "robot_model"
-    f = rm / "arms.yaml"
-    if f.exists():
-        try:
-            return yaml.safe_load(f.read_text(encoding="utf-8")) or {"base_link": "", "arms": []}
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"{type(e).__name__}: {e}", "arms": []}
-    urdf = rm / "robot.urdf"
-    if not urdf.exists():
-        return {"base_link": "", "arms": [], "reason": "no robot.urdf yet — model the cell first"}
+    """Serve the AUTHORED kinematic config (groups) for the Studio: `cell.yaml.groups` (or `arms[]`
+    back-compat), VALIDATED against the URDF. No derivation, no `arms.yaml` — computed on demand from
+    the single source of truth, so it cannot drift. `errors` flags any agent mistake to surface."""
     from calib_engine import urdf_io
+    rm = CELL_DIR / "robot_model"
+    urdf = rm / "robot.urdf"
     cy = load_cell_yaml()
-    # key by the URDF camera LINK (urdf_link), matching enumerate_arms' a.camera lookup — not the
-    # cell.yaml camera `name` (which never equals the link, so arms got mis-named after the camera).
-    cam2arm = {str(c.get("urdf_link") or c.get("name") or ""): str(c.get("attached_to") or "")
-               for c in (cy.get("cameras") or []) if (c.get("urdf_link") or c.get("name")) and c.get("attached_to")}
+    if not urdf.exists():
+        return {"base_link": "", "groups": [], "reason": "no robot.urdf yet — model the cell first"}
     try:
-        return urdf_io.arm_map_dict(str(urdf), camera_to_arm=cam2arm)
+        cfg = urdf_io.robot_config(cy, str(urdf))
+        errors = urdf_io.validate_robot_config(cfg, str(urdf))
+        base = (cfg["groups"][0].get("base_link") if cfg["groups"] else "") or ""
+        return {"base_link": base, "groups": cfg["groups"], "cameras": cfg["cameras"],
+                "source": ("authored" if cy.get("groups") else "arms_promoted" if cy.get("arms") else "empty"),
+                "errors": errors}
     except Exception as e:  # noqa: BLE001
-        return {"error": f"{type(e).__name__}: {e}", "arms": []}
+        return {"error": f"{type(e).__name__}: {e}", "groups": []}
 
 
 def h_set_arms(_q, body):
-    """Persist operator-verified arm sides to arms.yaml (the live-mirror wiggle result). `sides`
-    is {arm_name: 'left'|'right'}. Sides drive the per-arm cuRobo cfg + the Studio labels."""
+    """Persist the operator's confirmed group labels (the verify-by-motion result) into
+    `cell.yaml.groups` — the source of truth. Body: `{labels: {group: {side: 'left', …}}}` (or legacy
+    `{sides: {group: 'left'}}`). Materialises the authored groups into cell.yaml on confirm, so the
+    config is deliberate + confirmed, never re-derived."""
     import yaml  # type: ignore
-    m = h_arms(None)
-    if isinstance(m, dict) and m.get("error"):
-        return m
+    from calib_engine import urdf_io
+    urdf = CELL_DIR / "robot_model" / "robot.urdf"
+    cy = load_cell_yaml()
+    cfg = urdf_io.robot_config(cy, str(urdf)) if urdf.exists() else {"groups": list(cy.get("groups") or [])}
+    groups = cfg["groups"]
+    labels = (body or {}).get("labels") or {}
     sides = (body or {}).get("sides") or {}
-    for a in m.get("arms", []):
-        if a.get("name") in sides:
-            a["side"] = str(sides[a["name"]])
-    rm = CELL_DIR / "robot_model"
-    rm.mkdir(parents=True, exist_ok=True)
-    (rm / "arms.yaml").write_text(yaml.safe_dump(m, sort_keys=False), encoding="utf-8")
-    return {"ok": True, "arms": m.get("arms", [])}
+    for g in groups:
+        nm = g.get("name")
+        if isinstance(labels.get(nm), dict):
+            g.setdefault("tags", {}).update(labels[nm])
+        if nm in sides:
+            g.setdefault("tags", {})["side"] = str(sides[nm])
+    cy["groups"] = groups
+    (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False), encoding="utf-8")
+    return {"ok": True, "groups": groups}
 
 
 def h_obstacles(_q):
