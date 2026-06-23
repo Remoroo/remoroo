@@ -270,8 +270,11 @@ class MotionStack:
             # the robot penetrates: a point may sit at the far edge of its cell, so the occupancy
             # mesh extends up to a FULL `voxel_size` toward the robot beyond the point — plus the
             # sphere buffer + collision activation distance (~1cm). Mask radius+this, generously.
+            # A point can sit a FULL voxel from its cell edge AND the cell is a solid cube, so the
+            # occupancy mesh can reach ~2·voxel past the point; add the sphere buffer + activation.
+            # Floor at 4cm so a thin residual-robot shell (seen at ~2.5cm) is always cleared.
             voxel = float(getattr(self.world, "voxel_size", 0.02))
-            margin = voxel + float(self.sphere_buffer) + 0.015
+            margin = max(0.04, 2.0 * voxel + float(self.sphere_buffer) + 0.02)
             masked, n = mask_robot_points(self.world.points, sph, margin=margin)
             if n > 0:
                 self.world = replace(self.world, points=masked,
@@ -578,9 +581,11 @@ class MotionStack:
                     rep["cloud_points_within_2cm_of_robot"] = inside
                     # DEBUG: what the self-mask WOULD remove right now, vs what actually persisted —
                     # exposes a finalize-flow / seed-timing bug (mask ran at a different config).
-                    mm = float(getattr(self.world, "voxel_size", 0.02)) + float(self.sphere_buffer) + 0.015
+                    voxel = float(getattr(self.world, "voxel_size", 0.02))
+                    mm = max(0.04, 2.0 * voxel + float(self.sphere_buffer) + 0.02)
                     _, n_would = mask_robot_points(self.world.points, sph, margin=mm)
                     rep["mask_check"] = {
+                        "voxel_size_m": round(voxel, 4), "sphere_buffer_m": round(float(self.sphere_buffer), 4),
                         "margin_m": round(mm, 4), "n_would_remove_now": int(n_would),
                         "n_robot_masked_persisted": self.world.meta.get("n_robot_masked"),
                         "world_finalized": self._world_finalized,
