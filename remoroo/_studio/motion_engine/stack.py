@@ -245,12 +245,16 @@ class MotionStack:
         return ig
 
     def _robot_cfg_for(self, active_groups: Sequence[str]) -> dict:
-        """The cuRobo robot_cfg dict for these groups (active cspace + the generated self-collision
-        ignore). Shared by `_planner_for` and the diagnostic's self-collision-OFF probe."""
+        """The cuRobo robot_cfg dict for these groups. The cspace DEFAULT (retract / null-space
+        target) is the CURRENT robot config, not zeros — so when we drive one limb's TCP over the
+        full cspace (lock_joints: None), the un-driven limbs are HELD at their real pose instead of
+        being pulled toward zero (which can swing them into the world). Shared by `_planner_for` and
+        the diagnostic probes so they all see the same held configuration."""
         return build_v2_robot_cfg(
             self.config, self.spheres, active_groups=list(active_groups),
             urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits,
-            self_collision_ignore=self._self_collision_ignore(), actuated_joints=self._actuated)
+            self_collision_ignore=self._self_collision_ignore(), actuated_joints=self._actuated,
+            default_joint_position=self._seed_positions())
 
     def _self_mask_world(self, planner) -> bool:
         """ONE-TIME: drop cloud points inside the robot's own collision spheres (at the current seed),
