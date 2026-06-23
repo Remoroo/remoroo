@@ -287,6 +287,22 @@ class MotionStack:
                     return {}
         return {}
 
+    def _seed_positions(self) -> Dict[str, float]:
+        """The CURRENT joints of the WHOLE robot (every group), to seed the plan start. SAFETY-
+        CRITICAL now that we drive ALL joints (no lock_joints): if the un-goaled limbs were left at
+        the default 0.0, the plan would command them to fly home. Prefer the bridge's full
+        `get_observation().joint_positions` (covers grippers too), falling back to per-group reads."""
+        if self.bridge is None:
+            return {}
+        try:
+            obs = self.bridge.get_observation()
+            jp = getattr(obs, "joint_positions", None)
+            if jp:
+                return {str(n): float(v) for n, v in dict(jp).items()}
+        except Exception:  # noqa: BLE001
+            pass
+        return self._current_positions(list(self._groups.keys()))
+
     # --- the verbs --------------------------------------------------------
     def move_to_pose(self, tcp: str, pose, *, execute: bool = True, max_attempts: int = 3) -> MoveResult:
         """Plan ONE end-effector (`tcp`) to `pose` and (default) execute it."""
@@ -301,7 +317,7 @@ class MotionStack:
         arms = list(targets.keys())
         planner = self._planner_for(arms)
         goals = {self._tip(a): _norm_pose(p) for a, p in targets.items()}
-        res = planner.plan_pose(goals, self._current_positions(arms), max_attempts=max_attempts)
+        res = planner.plan_pose(goals, self._seed_positions(), max_attempts=max_attempts)
         return self._finish(res, execute)
 
     def move_through_poses(self, tcp: str, poses: Sequence[object], *, execute: bool = True,
@@ -309,7 +325,7 @@ class MotionStack:
         """Drive one TCP through a sequence of poses (one concatenated collision-free path)."""
         planner = self._planner_for([tcp])
         legs = [_norm_pose(p) for p in poses]
-        res = planner.plan_through(self._tip(tcp), legs, self._current_positions([tcp]),
+        res = planner.plan_through(self._tip(tcp), legs, self._seed_positions(),
                                    max_attempts=max_attempts)
         return self._finish(res, execute)
 
@@ -320,7 +336,7 @@ class MotionStack:
         planner = self._planner_for([tcp])
         if not hasattr(planner, "current_tool_pose"):
             return None
-        return planner.current_tool_pose(self._tip(tcp), self._current_positions([tcp]))
+        return planner.current_tool_pose(self._tip(tcp), self._seed_positions())
 
     def _orientation_candidates(self, tcp: str, orientation: Optional[Sequence[float]]) -> List[List[float]]:
         """Orientations to TRY at a reach point. An explicit `orientation` is used as-is; otherwise
@@ -437,7 +453,7 @@ class MotionStack:
                       "locked": list((kin.get("lock_joints") or {}).keys()),
                       "n_collision_links": len(kin.get("collision_link_names") or [])}
         rep["structure"] = self._validate_structure(kin)
-        start = self._current_positions([tcp])
+        start = self._seed_positions()
         tip = self._tip(tcp)
 
         # Canonical IK on a NO-COLLISION probe (locked cfg) — isolates KINEMATICS from collision.
@@ -501,7 +517,7 @@ class MotionStack:
             rep["error"] = "no kinematic groups in the cell"
             return rep
         planner = self._planner_for([tcp])     # also triggers self-collision ignore generation
-        start = self._current_positions([tcp])
+        start = self._seed_positions()
 
         ig = self._ignore_full or {}
         rep["self_collision"] = {
@@ -629,7 +645,7 @@ class MotionStack:
         planner = self._planner_for(arms)
         if not hasattr(planner, "plan_retract"):
             return MoveResult(False, "planner has no retract; use move_to_joints(home) instead")
-        res = planner.plan_retract(self._current_positions(arms))
+        res = planner.plan_retract(self._seed_positions())
         return self._finish(res, execute)
 
     def move_to_joints(self, joints: Sequence[float], arm: Optional[str] = None) -> MoveResult:

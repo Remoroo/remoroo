@@ -69,16 +69,16 @@ def build_v2_robot_cfg(
 
     base_link = config.get("base_link") or groups[0].get("base_link")
     tool_frames = _dedup([t for n in active_names for t in (by_name[n].get("tip_links") or [])])
-    # cuRobo convention (cf. franka.yml): `cspace.joint_names` = ALL independent actuated joints;
-    # `lock_joints` holds the INACTIVE ones; cuRobo derives the ACTIVE set as joint_names MINUS
-    # lock_joints. The full set is the URDF's actuated joints (so a gripper's `drive_joint`, in the
-    # URDF but in NO group, gets LOCKED — not left dangling → cuRobo "'drive_joint' is not in list").
-    # Fall back to the declared group joints when the URDF list isn't available (tests/off-GPU).
-    active_set = {j for n in active_names for j in by_name[n]["joint_names"]}
+    # cuRobo convention (cf. dual_ur10e.yml / franka.yml): `cspace.joint_names` = ALL independent
+    # actuated joints, and the planner drives every one of them. We DO NOT lock the inactive limbs:
+    # cuRobo's V2 dict-loader mishandles locking a whole sub-chain (validated head-to-head — IK fails
+    # with our lock_joints, succeeds with lock_joints=None), exactly as `dual_ur10e.yml` ships with
+    # `lock_joints: null`. The ACTIVE groups are driven by the `GoalToolPose`; cuRobo's minimal-motion
+    # cost keeps the un-goaled limbs near their seed. Listing every actuated joint in cspace also
+    # avoids the loader's "'drive_joint' is not in list" (a gripper joint in the URDF but no group).
     group_joints = [j for g in groups for j in g["joint_names"]]
     all_joints = _dedup(list(actuated_joints or []) + group_joints)   # URDF actuated ∪ declared
     defaults = dict(default_joint_position or {})
-    locked = {j: float(defaults.get(j, 0.0)) for j in all_joints if j not in active_set}
 
     lim = limits or {}
     cspace = {
@@ -107,7 +107,7 @@ def build_v2_robot_cfg(
                 # (the loader path does NOT auto-generate it — without it every config self-collides).
                 "self_collision_buffer": {},
                 "self_collision_ignore": dict(self_collision_ignore or {}),
-                "lock_joints": locked or None,
+                "lock_joints": None,   # see above — locking a sub-chain breaks V2 IK; drive all joints
                 "cspace": cspace,
             }
         }
