@@ -33,7 +33,7 @@ from .robot import actuated_joints, load_robot_config, load_spheres, neighbor_ig
 from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
-from .world import WorldInputs, load_world
+from .world import WorldInputs, load_world, mask_robot_points
 
 # a pose: (position xyz [m], quaternion wxyz). Helpers below also accept a 7-list or a dict.
 Pose = Tuple[Sequence[float], Sequence[float]]
