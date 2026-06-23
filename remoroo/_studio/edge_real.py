@@ -789,6 +789,25 @@ def h_motion_world(_q):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def h_world_collision_at_seed(_q):
+    """cuRobo's DIRECT world-collision verdict at the seed (no IK) + analytic cross-check. GET params:
+    tcp, cloud_only (default 1)."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    groups = st.group_names
+    tcp = (_q.get("tcp", [None])[0]) or (groups[0] if groups else None)
+    cloud_only = (_q.get("cloud_only", ["1"])[0] != "0")
+    try:
+        with _bridge_lock:
+            rep = st.world_collision_at_seed(tcp, cloud_only=cloud_only)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "tcp": tcp}
+    rep["ok"] = True
+    return rep
+
+
 def h_world_alignment(_q):
     """Is the scanned cloud in the SAME frame as the robot + is the seed applied? GET param: tcp."""
     try:
@@ -1769,6 +1788,7 @@ ROUTES = {
     "/edge/motion/verify_start": ("json", h_verify_start),
     "/edge/motion/world": ("json", h_motion_world),
     "/edge/motion/world_alignment": ("json", h_world_alignment),
+    "/edge/motion/world_collision_at_seed": ("json", h_world_collision_at_seed),
 }
 
 

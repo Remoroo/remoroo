@@ -618,6 +618,54 @@ class MotionStack:
                               "base frame). Investigate the hand-eye X used by world-scan.")
         return rep
 
+    def world_collision_at_seed(self, tcp: Optional[str] = None, *, cloud_only: bool = True) -> dict:
+        """GROUND TRUTH + CROSS-CHECK: ask cuRobo's collision checker DIRECTLY (no IK) whether the
+        robot penetrates the world at the seed config, then for each sphere cuRobo flags, compute the
+        ANALYTIC nearest-cloud clearance. If cuRobo says penetrating but the analytic clearance is
+        large → what we hand cuRobo (spheres/cloud/frame) differs from what we debug. If they agree →
+        the geometry really collides and we trust it."""
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"tcp": tcp, "cloud_only": cloud_only}
+        if tcp is None:
+            rep["error"] = "no groups"
+            return rep
+        seed = self._seed_positions()
+        rep["seed_n_joints"] = len(seed)
+        try:
+            from dataclasses import replace
+            from .curobo_v2 import CuroboV2Planner
+            world = replace(self.world, scene={}) if cloud_only else self.world
+            rep["world"] = {"n_points": int(world.n_points),
+                            "n_cuboids": sum(len(v) for v in (world.scene or {}).values()),
+                            "voxel_size": float(world.voxel_size)}
+            probe = CuroboV2Planner(self._robot_cfg_for([tcp]), world, limits=self._limits,
+                                    max_goalset=1, warmup=False, self_collision_check=False)
+            info = probe.world_sphere_collision(seed)
+            rep.update(info)
+            if info.get("penetrating_spheres") and world.n_points:
+                pts = np.asarray(world.points, dtype=float).reshape(-1, 3)
+                cross = []
+                for s in info["penetrating_spheres"][:8]:
+                    c = np.asarray(s["xyz"], dtype=float)
+                    nearest = float(np.sqrt(((pts - c) ** 2).sum(axis=1)).min()) - float(s["r"])
+                    cross.append({"sphere_xyz": s["xyz"], "sphere_r": s["r"], "curobo_cost": s["cost"],
+                                  "analytic_nearest_cloud_clearance_m": round(nearest, 4)})
+                rep["cross_check"] = cross
+                worst = min(c["analytic_nearest_cloud_clearance_m"] for c in cross)
+                rep["verdict"] = (
+                    "AGREE — cuRobo's penetrating spheres ARE near the cloud (analytic clearance ≤ a few cm). "
+                    "The geometry genuinely collides; trust the mask/clearance path."
+                    if worst < 0.03 else
+                    f"MISMATCH — cuRobo flags spheres as penetrating but the nearest cloud point is {round(worst*100,1)}cm "
+                    "away analytically. What we give cuRobo ≠ what we debug: different spheres/cloud/FRAME. "
+                    "Likely the cloud mesh pose or the sphere frame inside cuRobo.")
+            else:
+                rep["verdict"] = ("cuRobo reports NO world penetration at the seed config → the start is clear; the "
+                                  "ik_check failure is the IK SOLUTION moving joints into the world, not the start.")
+        except Exception as e:  # noqa: BLE001
+            rep["error"] = f"{type(e).__name__}: {e}"
+        return rep
+
     def _world_without(self, names: Sequence[str]):
         """A copy of the live world with the named cuboids removed (for ablation/verification)."""
         from dataclasses import replace

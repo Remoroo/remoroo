@@ -225,6 +225,38 @@ class CuroboV2Planner:
                 "active_joints": list(self.planner.joint_names), "fk_position": [float(x) for x in base_pos],
                 "checks": checks}
 
+    def world_sphere_collision(self, start_positions: Optional[Dict[str, float]] = None) -> dict:
+        """GROUND TRUTH: cuRobo's OWN world-collision verdict at the EXACT given config (NO IK, no
+        optimisation). FK the config → robot_spheres, then call the planner's scene_collision_checker
+        exactly as the trajopt cost does (`get_sphere_distance`, activation_distance=0 = pure
+        penetration). Reports the raw per-sphere cost + the WORLD-frame positions of the penetrating
+        spheres, so we can compare what cuRobo sees vs our analytic mask and the cloud directly."""
+        import torch
+        from curobo._src.geom.collision.buffer_collision import CollisionBuffer
+
+        js = self._start_js(start_positions)
+        state = self.planner.compute_kinematics(js)
+        sph = state.robot_spheres                       # [B, H, n, 4]
+        shape = sph.shape
+        dev = self.planner.device_cfg
+        buf = CollisionBuffer.from_shape(shape, dev)
+        weight = torch.ones((1,), device=sph.device, dtype=sph.dtype)
+        activation = torch.zeros((1,), device=sph.device, dtype=sph.dtype)   # 0 = exact penetration
+        dist = self.planner.scene_collision_checker.get_sphere_distance(
+            state, buf, weight, activation_distance=activation)
+        d = dist.detach().cpu().numpy().reshape(-1)
+        a = sph.detach().cpu().numpy().reshape(-1, 4)
+        hot = [i for i in range(len(d)) if d[i] > 0][:25]
+        return {
+            "n_spheres": int(shape[2]),
+            "raw_cost": {"min": round(float(d.min()), 5), "max": round(float(d.max()), 5),
+                         "n_positive": int((d > 0).sum()), "n_negative": int((d < 0).sum())},
+            "n_penetrating": int((d > 0).sum()),
+            "penetrating_spheres": [{"xyz": [round(float(x), 3) for x in a[i, :3]],
+                                     "r": round(float(a[i, 3]), 3), "cost": round(float(d[i]), 4)}
+                                    for i in hot],
+        }
+
     def joint_limits(self) -> Dict[str, Tuple[float, float]]:
         """{joint: (min, max)} position limits over the planner's active joints — to catch a START
         config that's outside limits (a non-self-collision reason planning finds nothing)."""
