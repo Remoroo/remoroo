@@ -44,6 +44,28 @@ class PlanResult:
     total_time: float = 0.0
 
 
+def _ensure_warp_torch() -> None:
+    """cuRoboV2's GPU kernels shuttle tensors via NVIDIA Warp's torch interop — the TOP-LEVEL
+    `wp.from_torch`/`wp.device_from_torch` (warp >= 1.0 exposes these directly; there is NO
+    `warp.torch` submodule — importing one raises ModuleNotFoundError on current warp). A
+    missing/mismatched warp-lang surfaces as a cryptic 'module warp has no attribute ...' DEEP inside
+    planner build. Validate the interop is present here; if absent, raise an ACTIONABLE error pointing
+    at the toolchain (G1) fix on the robot PC — not a config problem with the cell."""
+    try:
+        import torch  # noqa: F401
+        import warp as wp
+        if not hasattr(wp, "from_torch"):
+            raise AttributeError("warp has no top-level from_torch (warp-lang too old or broken interop)")
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "cuRoboV2 needs NVIDIA Warp's torch interop (wp.from_torch), which is unavailable "
+            f"({type(e).__name__}: {e}). This is a TOOLCHAIN issue on the robot PC, not the cell: "
+            "reinstall a cuRoboV2-compatible warp-lang (>= 1.0.0) built against the same torch+CUDA. "
+            "Verify with:  python -c \"import torch, warp as wp; wp.init(); "
+            "print(wp.from_torch(torch.zeros(1, device='cuda')))\""
+        ) from e
+
+
 class CuroboV2Planner:
     """A warmed cuRoboV2 MotionPlanner for one TCP set, built from the cell's artifacts."""
 
@@ -58,6 +80,7 @@ class CuroboV2Planner:
         warmup: bool = True,
     ) -> None:
         import torch  # noqa: F401  (lazy GPU import; presence validated by the toolchain gate)
+        _ensure_warp_torch()                       # force-load Warp's torch interop or fail CLEARLY
         from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
         from curobo.scene import Scene, Mesh
 

@@ -579,6 +579,29 @@ def motion_stack(force: bool = False):
     return _MOTION_STACK
 
 
+def _preload_warp() -> None:
+    """Initialise NVIDIA Warp ON THE MAIN THREAD before any worker thread builds cuRobo, and verify
+    its torch interop is present. cuRoboV2 uses the TOP-LEVEL `wp.from_torch`/`wp.device_from_torch`
+    (warp >= 1.0 exposes these directly — there is NO `warp.torch` submodule to import; importing one
+    raises ModuleNotFoundError on current warp). We mirror the exact sequence that works in a plain
+    shell (`import torch, warp; wp.init(); wp.from_torch(...)`) so this CANNOT spuriously fail on a
+    healthy rig. Raises a clear, actionable error only if Warp's torch interop is genuinely missing
+    (a toolchain / G1 issue), never for a cell-config problem."""
+    try:
+        import torch  # noqa: F401
+        import warp as wp
+        wp.init()
+        if not hasattr(wp, "from_torch"):
+            raise AttributeError("warp has no top-level from_torch (warp-lang too old or broken interop)")
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "cuRoboV2 needs NVIDIA Warp's torch interop (wp.from_torch), which is unavailable "
+            f"({type(e).__name__}: {e}). This is a TOOLCHAIN issue on the robot PC: install a "
+            "cuRoboV2-compatible warp-lang (>= 1.0.0) for this torch+CUDA. Verify with: "
+            "python -c \"import torch, warp as wp; wp.init(); print(wp.from_torch(torch.zeros(1, device='cuda')))\""
+        ) from e
+
+
 def sse_commission(_q):
     """Build the unified motion stack from every prior gate's output and VERIFY one collision-free
     plan+execute against the SCANNED world. Streams each commission step (sphere health → planner
@@ -588,6 +611,7 @@ def sse_commission(_q):
     import threading as _threading
 
     try:
+        _preload_warp()                 # MAIN THREAD — load warp.torch before the build worker
         st = motion_stack(force=True)
     except Exception as e:  # noqa: BLE001
         yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
@@ -620,6 +644,7 @@ def sse_plan_move(_q):
     GET params: tcp; mode=pose|retract; x,y,z + qw,qx,qy,qz for a pose. Streams phase, then
     {done, result:<MoveResult>}."""
     try:
+        _preload_warp()                 # MAIN THREAD — load warp.torch before any build worker
         st = motion_stack()
     except Exception as e:  # noqa: BLE001
         yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
