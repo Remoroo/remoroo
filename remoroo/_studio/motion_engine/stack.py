@@ -402,7 +402,7 @@ class MotionStack:
         try:
             from calib_engine import urdf_io
             facts = urdf_io.urdf_facts(self.urdf_path)
-            links = set(facts.get("links") or [])
+            links = {l["name"] for l in facts.get("links") or []}      # urdf_facts links are DICTS
             joints = {j["name"] for j in facts.get("joints", [])}
             out["n_urdf_links"], out["n_urdf_joints"] = len(links), len(joints)
             if kin.get("base_link") not in links:
@@ -437,26 +437,52 @@ class MotionStack:
                       "locked": list((kin.get("lock_joints") or {}).keys()),
                       "n_collision_links": len(kin.get("collision_link_names") or [])}
         rep["structure"] = self._validate_structure(kin)
-        try:
-            planner = self._planner_for([tcp])
-            rep["ik"] = (planner.ik_check(self._tip(tcp), self._current_positions([tcp]))
-                         if hasattr(planner, "ik_check") else {"error": "planner has no ik_check"})
-        except Exception as e:  # noqa: BLE001
-            rep["ik"] = {"error": f"{type(e).__name__}: {e}"}
+        start = self._current_positions([tcp])
+        tip = self._tip(tcp)
 
-        ik0 = ((rep.get("ik", {}).get("checks", {}) or {}).get("0cm", {}) or {}).get("success")
+        # Canonical IK on a NO-COLLISION probe (locked cfg) — isolates KINEMATICS from collision.
+        rep["ik_no_collision"] = self._ik_probe(self._robot_cfg_for([tcp]), tip, start)
+        ik0 = ((rep["ik_no_collision"].get("checks", {}) or {}).get("0cm", {}) or {}).get("success")
+
+        # If the locked cfg's kinematics can't even re-solve the current pose, test with lock_joints
+        # REMOVED (all joints active) — the decisive test for whether OUR lock_joints (V2 dict-loader)
+        # is the bug, just like self_collision_ignore was.
+        if ik0 is False:
+            nolock = self._robot_cfg_for([tcp])
+            nolock["robot_cfg"]["kinematics"]["lock_joints"] = None
+            rep["ik_no_collision_no_lock"] = self._ik_probe(nolock, tip, start)
+
+        nolock0 = ((rep.get("ik_no_collision_no_lock", {}).get("checks", {}) or {}).get("0cm", {}) or {}).get("success")
         struct_bad = bool(rep["structure"].get("errors"))
         if struct_bad:
             rep["verdict"] = f"CONFIG BROKEN (structure): {rep['structure']['errors']}"
         elif ik0 is True:
-            rep["verdict"] = ("CONFIG OK: cuRobo IK re-solves the exact current pose. If plan_pose still "
-                              "fails, the bug is OUR goal/plan path (GoalToolPose / use_implicit_goal / trajopt), NOT the cfg.")
-        elif ik0 is False:
-            rep["verdict"] = ("CONFIG BROKEN: cuRobo's OWN IK can't re-solve the EXACT current tool pose — "
-                              "a base_link / tool_frame / cspace / quaternion mismatch. THIS is the root cause.")
+            rep["verdict"] = ("KINEMATICS OK: cuRobo's canonical IK re-solves the current pose with collision "
+                              "OFF. So the cfg is kinematically fine — the failure is COLLISION (world/self), or "
+                              "OUR plan path (_goal builds GoalToolPose by hand vs from_poses). Not the kinematics.")
+        elif ik0 is False and nolock0 is True:
+            rep["verdict"] = ("LOCK_JOINTS IS THE BUG: with lock_joints REMOVED, cuRobo IK solves the current "
+                              "pose; with our lock_joints it CANNOT. The V2 dict-loader mishandles our lock spec "
+                              "(same class as the self_collision_ignore gap). Fix build_v2_robot_cfg's lock — "
+                              "generically, for any morphology.")
+        elif ik0 is False and nolock0 is False:
+            rep["verdict"] = ("DEEPER KINEMATIC BUG: IK fails even with NO locks and NO collision → base_link / "
+                              "tool_frame / cspace / quaternion. See cfg + ik_no_collision_no_lock.")
         else:
-            rep["verdict"] = "IK check did not run — see ik.error."
+            rep["verdict"] = "IK probe did not run — see ik_no_collision.error."
         return rep
+
+    def _ik_probe(self, robot_cfg: dict, tip: str, start: Dict[str, float]) -> dict:
+        """Build a throwaway NO-COLLISION planner from `robot_cfg` and run cuRobo's canonical IK
+        round-trip on it — pure kinematics, no world, no self-collision. GPU; guarded."""
+        try:
+            from .curobo_v2 import CuroboV2Planner
+            from .world import WorldInputs
+            p = CuroboV2Planner(robot_cfg, WorldInputs(points=np.zeros((0, 3)), scene={}),
+                                limits=self._limits, max_goalset=1, warmup=False, self_collision_check=False)
+            return p.ik_check(tip, start)
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
 
     def diagnose_motion(self, tcp: Optional[str] = None, xyz: Optional[Sequence[float]] = None) -> dict:
         """Honest, decisive collision diagnosis for 'no collision-free trajectory'. Plans the SAME
