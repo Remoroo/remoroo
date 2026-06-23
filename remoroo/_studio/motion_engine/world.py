@@ -96,11 +96,23 @@ def _points_from(obj) -> np.ndarray:
     return a[:, :3]
 
 
+def _xyz(v) -> Optional[List[float]]:
+    """A `[x,y,z]` of floats, or None if `v` isn't a usable 3-vector (so a malformed/free-text
+    safety entry is skipped, never crashing the motion stack with a KeyError/ValueError)."""
+    if not isinstance(v, (list, tuple)) or len(v) < 3:
+        return None
+    try:
+        return [float(v[0]), float(v[1]), float(v[2])]
+    except (TypeError, ValueError):
+        return None
+
+
 def _box_walls(bounds: dict, name: str = "ws") -> Dict[str, dict]:
     """Six thin cuboids hugging the faces of the workspace box → the planner can't leave it.
     pose is cuRobo's `[x,y,z,qw,qx,qy,qz]` (centre + identity orientation)."""
-    lo = [float(v) for v in bounds["min"]]
-    hi = [float(v) for v in bounds["max"]]
+    lo, hi = _xyz((bounds or {}).get("min")), _xyz((bounds or {}).get("max"))
+    if lo is None or hi is None:
+        return {}
     c = [(lo[i] + hi[i]) / 2 for i in range(3)]
     size = [hi[i] - lo[i] for i in range(3)]
     walls: Dict[str, dict] = {}
@@ -118,11 +130,17 @@ def _box_walls(bounds: dict, name: str = "ws") -> Dict[str, dict]:
 
 
 def keepout_cuboids(keep_out: List[dict]) -> Dict[str, dict]:
-    """`keep_out: [{min,max,note}]` → named cuboid obstacles (axis-aligned boxes)."""
+    """`keep_out: [{min,max,note}]` → named cuboid obstacles (axis-aligned boxes). TOLERANT: an
+    entry that isn't a `{min,max}` box (e.g. a free-text keep-out the operator typed at G0.5, or a
+    partially-authored dict) is SKIPPED, not crashed — a bad safety entry must not take down the
+    whole commission."""
     out: Dict[str, dict] = {}
     for i, k in enumerate(keep_out or []):
-        lo = [float(v) for v in k["min"]]
-        hi = [float(v) for v in k["max"]]
+        if not isinstance(k, dict):
+            continue
+        lo, hi = _xyz(k.get("min")), _xyz(k.get("max"))
+        if lo is None or hi is None:
+            continue
         c = [(lo[j] + hi[j]) / 2 for j in range(3)]
         dims = [max(1e-3, hi[j] - lo[j]) for j in range(3)]
         name = str(k.get("note") or f"keepout_{i}").replace(" ", "_")[:40]
