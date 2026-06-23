@@ -67,27 +67,24 @@ def build_v2_robot_cfg(
 
     base_link = config.get("base_link") or groups[0].get("base_link")
     tool_frames = _dedup([t for n in active_names for t in (by_name[n].get("tip_links") or [])])
-    planned = _dedup([j for n in active_names for j in by_name[n]["joint_names"]])
-    planned_set = set(planned)
-    # everything that belongs to a NON-active group AND isn't also an active joint → locked
+    # cuRobo convention (cf. franka.yml): `cspace.joint_names` = ALL actuated joints; `lock_joints`
+    # holds the INACTIVE ones; cuRobo derives the ACTIVE set as joint_names MINUS lock_joints. Sizing
+    # the cspace to only the active subset (and locking joints that aren't IN the cspace) left cuRobo
+    # with a malformed cspace → 'NoneType' object has no attribute 'copy' at planner build.
+    all_joints = _dedup([j for g in groups for j in g["joint_names"]])
+    active_set = {j for n in active_names for j in by_name[n]["joint_names"]}
     defaults = dict(default_joint_position or {})
-    locked = {
-        j: float(defaults.get(j, 0.0))
-        for g in groups if g["name"] not in active_names
-        for j in g["joint_names"] if j not in planned_set
-    }
+    locked = {j: float(defaults.get(j, 0.0)) for j in all_joints if j not in active_set}
 
     lim = limits or {}
     cspace = {
-        "joint_names": planned,
-        "default_joint_position": [float(defaults.get(j, 0.0)) for j in planned],
-        "null_space_weight": [1.0] * len(planned),
-        "cspace_distance_weight": [1.0] * len(planned),
+        "joint_names": all_joints,
+        "default_joint_position": [float(defaults.get(j, 0.0)) for j in all_joints],
+        "null_space_weight": [1.0] * len(all_joints),
+        "cspace_distance_weight": [1.0] * len(all_joints),
         "max_acceleration": float(lim.get("max_acceleration", 15.0)),
         "max_jerk": float(lim.get("max_jerk", 500.0)),
     }
-    if lim.get("max_velocity") is not None:
-        cspace["max_velocity"] = float(lim["max_velocity"])
 
     return {
         "robot_cfg": {
