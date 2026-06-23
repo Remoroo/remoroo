@@ -530,6 +530,57 @@ class MotionStack:
         except Exception as e:  # noqa: BLE001
             return {"error": f"{type(e).__name__}: {e}"}
 
+    def world_alignment(self, tcp: Optional[str] = None) -> dict:
+        """Is the scanned CLOUD in the SAME frame as the ROBOT, and is the seed actually applied?
+        Reports the robot-spheres bbox (FK at the seed) vs the cloud bbox, the min clearance between
+        them, and whether the bridge's joint NAMES match the planner's (a mismatch ⇒ the seed is
+        ignored ⇒ the robot is modelled at the DEFAULT config, misaligned with the scan ⇒ cuRobo
+        collides while a point-vs-sphere mask finds nothing)."""
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"tcp": tcp}
+        if tcp is None:
+            rep["error"] = "no groups"
+            return rep
+        planner = self._planner_for([tcp])
+        seed = self._seed_positions()
+        pj = list(getattr(planner, "joint_names", []) or [])
+        matched = [n for n in pj if n in seed]
+        rep["seed"] = {"n_read": len(seed), "names_sample": list(seed.keys())[:14],
+                       "values_sample": {k: round(float(v), 3) for k, v in list(seed.items())[:8]}}
+        rep["planner_joint_names"] = pj
+        rep["seed_matches_planner"] = {"matched": matched, "n_matched": len(matched),
+                                       "n_planner": len(pj),
+                                       "applied": len(matched) > 0 and len(matched) == len(pj)}
+        if hasattr(planner, "robot_spheres"):
+            try:
+                sph = planner.robot_spheres(seed)
+                rep["robot_spheres_bbox"] = _bbox(sph[:, :3])
+                rep["n_robot_spheres"] = int(len(sph))
+                pts = np.asarray(self.world.points, dtype=float).reshape(-1, 3)
+                rep["cloud_bbox"] = _bbox(pts) if len(pts) else None
+                rep["n_cloud_points"] = int(len(pts))
+                if len(pts) and len(sph):
+                    mind, inside = 1e9, 0
+                    for s in sph:
+                        near = np.sqrt(((pts - s[:3]) ** 2).sum(axis=1)) - float(s[3])
+                        mind = min(mind, float(near.min()))
+                        inside += int((near < 0.02).sum())
+                    rep["cloud_to_robot_min_clearance_m"] = round(mind, 4)
+                    rep["cloud_points_within_2cm_of_robot"] = inside
+            except Exception as e:  # noqa: BLE001
+                rep["robot_spheres_error"] = f"{type(e).__name__}: {e}"
+        rep["verdict"] = (
+            "SEED NOT APPLIED — bridge joint names don't match the planner's, so the robot is modelled at "
+            "the DEFAULT config, misaligned with the live scan → cuRobo collides though the real robot is "
+            "elsewhere. Fix _seed_positions name mapping."
+            if not rep["seed_matches_planner"]["applied"] else
+            ("CLOUD FAR FROM ROBOT (>2cm) yet cuRobo collides → FRAME MISMATCH: the cloud isn't in the robot "
+             "base frame (world-scan calibration/origin). Re-express the cloud in the base frame."
+             if rep.get("cloud_to_robot_min_clearance_m", -1) > 0.02 else
+             "cloud overlaps the robot in-frame (min clearance ≤ 2cm) — alignment looks OK; the mask margin "
+             "or the voxel inflation is the gap."))
+        return rep
+
     def _world_without(self, names: Sequence[str]):
         """A copy of the live world with the named cuboids removed (for ablation/verification)."""
         from dataclasses import replace

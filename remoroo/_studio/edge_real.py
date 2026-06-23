@@ -789,6 +789,23 @@ def h_motion_world(_q):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def h_world_alignment(_q):
+    """Is the scanned cloud in the SAME frame as the robot + is the seed applied? GET param: tcp."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    groups = st.group_names
+    tcp = (_q.get("tcp", [None])[0]) or (groups[0] if groups else None)
+    try:
+        with _bridge_lock:
+            rep = st.world_alignment(tcp)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "tcp": tcp}
+    rep["ok"] = True
+    return rep
+
+
 def h_verify_start(_q):
     """RIGOROUS verification that the robot's START config is inside a world obstacle (and which one),
     via cuRobo IK + per-obstacle ablation. GET param: tcp."""
@@ -1751,6 +1768,7 @@ ROUTES = {
     "/edge/motion/validate_config": ("json", h_validate_config),
     "/edge/motion/verify_start": ("json", h_verify_start),
     "/edge/motion/world": ("json", h_motion_world),
+    "/edge/motion/world_alignment": ("json", h_world_alignment),
 }
 
 
