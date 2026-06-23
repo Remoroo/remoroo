@@ -29,7 +29,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .robot import load_robot_config, load_spheres, sphere_health
+from .robot import load_robot_config, load_spheres, neighbor_ignore, sphere_health
 from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
@@ -96,6 +96,8 @@ class MotionStack:
         self._planners: Dict[frozenset, object] = {}
         self._groups = {g["name"]: g for g in config.get("groups", [])}
         self._limits = safety.planner_limits()
+        # parent↔child adjacency so cuRobo ignores always-touching links (the loader doesn't auto-gen)
+        self._self_ignore = neighbor_ignore(urdf_path)
 
     # --- construction -----------------------------------------------------
     @classmethod
@@ -134,7 +136,8 @@ class MotionStack:
         if key not in self._planners:
             robot_cfg = build_v2_robot_cfg(
                 self.config, self.spheres, active_groups=list(active_groups),
-                urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits)
+                urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits,
+                self_collision_ignore=self._self_ignore)
             self._planners[key] = self._factory(robot_cfg, self.world, limits=self._limits, max_goalset=1)
         return self._planners[key]
 

@@ -77,6 +77,27 @@ def load_spheres(cell_dir: str) -> Tuple[Dict[str, List[dict]], float]:
     return spheres, buffer
 
 
+def neighbor_ignore(urdf_path: str) -> Dict[str, List[str]]:
+    """Adjacent-link self-collision ignore map `{link: [neighbours]}` from the URDF. Parent↔child
+    links always overlap at their shared joint, so cuRobo MUST ignore those pairs or every config
+    self-collides. cuRobo's `RobotCfg.create` (the dict/loader path we use) does NOT auto-generate
+    this (only the RobotBuilder path does) and `.keys()`s it unconditionally — so we provide it, or
+    planner build crashes with 'NoneType' object has no attribute 'keys'."""
+    from calib_engine import urdf_io
+
+    try:
+        facts = urdf_io.urdf_facts(urdf_path)
+    except Exception:  # noqa: BLE001 — never block the build on a URDF parse hiccup
+        return {}
+    ignore: Dict[str, List[str]] = {}
+    for j in facts.get("joints", []):
+        p, c = j.get("parent"), j.get("child")
+        if p and c:
+            ignore.setdefault(p, []).append(c)
+            ignore.setdefault(c, []).append(p)
+    return ignore
+
+
 def normalise_kinematics(kin: dict) -> dict:
     """Strip classic-only keys V2 rejects; return a shallow copy safe to merge into a V2 cfg."""
     return {k: v for k, v in dict(kin).items() if k not in _CLASSIC_ONLY_KEYS}

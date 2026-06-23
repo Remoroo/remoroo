@@ -47,6 +47,7 @@ def build_v2_robot_cfg(
     sphere_buffer: float = 0.005,
     limits: Optional[dict] = None,
     default_joint_position: Optional[Dict[str, float]] = None,
+    self_collision_ignore: Optional[Dict[str, List[str]]] = None,
 ) -> dict:
     """A cuRoboV2 `robot_cfg` planning the `active_groups` (default: ALL groups in the config).
 
@@ -96,11 +97,13 @@ def build_v2_robot_cfg(
                 "collision_link_names": list(spheres_by_link.keys()) or None,
                 "collision_spheres": spheres_by_link,
                 "collision_sphere_buffer": float(sphere_buffer),
-                # cuRobo's KinematicsLoaderCfg.self_collision_buffer DEFAULTS TO None and is
-                # `.copy()`d UNCONDITIONALLY when building the collision model → 'NoneType' object
-                # has no attribute 'copy' at planner build. Provide an explicit (empty) per-link
-                # buffer so it never sees None; adjacency is handled by the auto neighbor-ignore.
+                # Both default to None in cuRobo's loader and are accessed UNCONDITIONALLY when
+                # building the collision model (`self_collision_buffer.copy()`,
+                # `self_collision_ignore.keys()`), so a missing field crashes planner build. Provide
+                # both explicitly: an empty per-link buffer, and the parent↔child ADJACENCY ignore
+                # (the loader path does NOT auto-generate it — without it every config self-collides).
                 "self_collision_buffer": {},
+                "self_collision_ignore": dict(self_collision_ignore or {}),
                 "lock_joints": locked or None,
                 "cspace": cspace,
             }
