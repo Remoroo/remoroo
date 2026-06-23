@@ -766,6 +766,29 @@ def h_validate_config(_q):
     return rep
 
 
+def h_motion_world(_q):
+    """The CANONICAL collision world cuRobo plans against — the SAME world the clearance UI shows +
+    clears: the cropped + SELF-MASKED cloud + every cuboid (obstacles, workspace cage, keep-out).
+    Serving it finalizes the self-mask once (then cached). Returns {points, cuboids, voxel_size, meta}."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        groups = st.group_names
+        if groups:
+            with _bridge_lock:
+                st._planner_for([groups[0]])           # finalize (self-mask the cloud) once
+        w = st.world
+        import numpy as _np
+        pts = _np.asarray(w.points, dtype=float).reshape(-1, 3) if w.n_points else _np.zeros((0, 3))
+        return {"ok": True, "n_points": int(w.n_points), "voxel_size": float(w.voxel_size),
+                "points": pts.tolist(), "cuboids": w.scene.get("cuboid") or {},
+                "meta": w.meta, "world_warn": getattr(st, "_world_warn", None)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def h_verify_start(_q):
     """RIGOROUS verification that the robot's START config is inside a world obstacle (and which one),
     via cuRobo IK + per-obstacle ablation. GET param: tcp."""
@@ -1727,6 +1750,7 @@ ROUTES = {
     "/edge/motion/diagnose": ("json", h_diagnose_motion),
     "/edge/motion/validate_config": ("json", h_validate_config),
     "/edge/motion/verify_start": ("json", h_verify_start),
+    "/edge/motion/world": ("json", h_motion_world),
 }
 
 

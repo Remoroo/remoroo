@@ -117,6 +117,26 @@ def crop_cloud(points: np.ndarray, bounds: Optional[dict], *, margin: float = 0.
     return a[keep][:, :3]
 
 
+def mask_robot_points(points: np.ndarray, spheres, *, margin: float = 0.01):
+    """Drop cloud points INSIDE the robot's own collision spheres (+margin) — the robot must never be
+    in its OWN collision cloud. World-scan masks the robot per depth-frame, but that leaks; this is
+    the hard guarantee at world-build. `spheres` is `[[x,y,z,r], …]` in the BASE frame at the robot's
+    current config (from the adapter's GPU FK). Returns (kept_points, n_removed)."""
+    a = np.asarray(points, dtype=float)
+    if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] < 3:
+        return (a.reshape(-1, 3) if a.size else np.zeros((0, 3), dtype=float)), 0
+    sph = np.asarray(spheres, dtype=float).reshape(-1, 4)
+    sph = sph[sph[:, 3] > 0]                                   # active spheres only
+    if sph.size == 0:
+        return a[:, :3], 0
+    p = a[:, :3]
+    keep = np.ones(p.shape[0], dtype=bool)
+    for s in sph:
+        rr = (float(s[3]) + margin) ** 2
+        keep &= ((p - s[:3]) ** 2).sum(axis=1) > rr           # outside this sphere (+margin)
+    return p[keep], int((~keep).sum())
+
+
 def _xyz(v) -> Optional[List[float]]:
     """A `[x,y,z]` of floats, or None if `v` isn't a usable 3-vector (so a malformed/free-text
     safety entry is skipped, never crashing the motion stack with a KeyError/ValueError)."""

@@ -181,6 +181,8 @@ class MotionStack:
         self._self_ignore = neighbor_ignore(urdf_path)
         self._ignore_full: Optional[dict] = None      # cached generated matrix
         self._ignore_warn: Optional[str] = None       # why generation fell back, if it did
+        self._world_finalized = False                 # has the cloud been self-masked yet?
+        self._world_warn: Optional[str] = None        # why the self-mask didn't run, if it didn't
         # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace; the
         # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
         self._actuated = actuated_joints(urdf_path)
@@ -250,14 +252,42 @@ class MotionStack:
             urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits,
             self_collision_ignore=self._self_collision_ignore(), actuated_joints=self._actuated)
 
+    def _self_mask_world(self, planner) -> bool:
+        """ONE-TIME: drop cloud points inside the robot's own collision spheres (at the current seed),
+        so the robot is born collision-free against the cloud. Updates `self.world` — the CANONICAL
+        world the planner AND the Studio clearance/`/edge/motion/world` share. Returns True if it
+        removed points (so the caller REBUILDS the planner from the masked world — we don't trust
+        update_world to replace the baked cloud mesh). The world we clear == the world cuRobo loads."""
+        if self._world_finalized:
+            return False
+        self._world_finalized = True
+        if self.world.n_points == 0 or not hasattr(planner, "robot_spheres"):
+            return False
+        try:
+            from dataclasses import replace
+            sph = planner.robot_spheres(self._seed_positions())
+            margin = float(self.sphere_buffer) + float(getattr(self.world, "voxel_size", 0.01))
+            masked, n = mask_robot_points(self.world.points, sph, margin=margin)
+            if n > 0:
+                self.world = replace(self.world, points=masked,
+                                     meta={**self.world.meta, "n_robot_masked": int(n)})
+                return True
+        except Exception as e:  # noqa: BLE001
+            self._world_warn = f"cloud self-mask failed: {type(e).__name__}: {e}"
+        return False
+
     def _planner_for(self, active_groups: Sequence[str]):
         """Get/build (and cache) the planner whose tool_frames = these groups' tips."""
         for a in active_groups:
             self._group(a)                     # KeyError on an unknown group, before any build
         key = frozenset(active_groups)
         if key not in self._planners:
-            robot_cfg = self._robot_cfg_for(active_groups)
-            self._planners[key] = self._factory(robot_cfg, self.world, limits=self._limits, max_goalset=1)
+            planner = self._factory(self._robot_cfg_for(active_groups), self.world,
+                                    limits=self._limits, max_goalset=1)
+            if self._self_mask_world(planner):     # masked the cloud → rebuild from the masked world
+                planner = self._factory(self._robot_cfg_for(active_groups), self.world,
+                                        limits=self._limits, max_goalset=1)
+            self._planners[key] = planner
         return self._planners[key]
 
     # --- health -----------------------------------------------------------
@@ -519,6 +549,10 @@ class MotionStack:
             rep["error"] = "no kinematic groups in the cell"
             return rep
         tip = self._tip(tcp)
+        try:
+            self._planner_for([tcp])        # finalize the canonical world (self-mask) so we verify the REAL world
+        except Exception:  # noqa: BLE001
+            pass
         start = self._seed_positions()
         import gc
 
