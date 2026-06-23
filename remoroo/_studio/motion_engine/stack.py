@@ -175,8 +175,12 @@ class MotionStack:
         self._planners: Dict[frozenset, object] = {}
         self._groups = {g["name"]: g for g in config.get("groups", [])}
         self._limits = safety.planner_limits()
-        # parent↔child adjacency so cuRobo ignores always-touching links (the loader doesn't auto-gen)
+        # parent↔child adjacency so cuRobo ignores always-touching links (the loader doesn't auto-gen).
+        # This is the FALLBACK; `_self_collision_ignore()` upgrades it with cuRobo's default-config
+        # generation (the link-pairs that overlap at rest — grippers, dual-arm bases) on first build.
         self._self_ignore = neighbor_ignore(urdf_path)
+        self._ignore_full: Optional[dict] = None      # cached generated matrix
+        self._ignore_warn: Optional[str] = None       # why generation fell back, if it did
         # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace; the
         # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
         self._actuated = actuated_joints(urdf_path)
@@ -216,6 +220,28 @@ class MotionStack:
             raise ValueError(f"group {tcp!r} has no tip_links — nothing to drive")
         return tips[0]
 
+    def _self_collision_ignore(self) -> dict:
+        """The self-collision ignore matrix, generated ONCE via cuRobo's RobotBuilder (parent↔child
+        PLUS link-pairs that overlap at the default config — the step the dict-loader path skips,
+        without which by-design-touching links phantom-collide and nothing plans). Falls back to the
+        parent↔child adjacency if generation fails (e.g. off-GPU), recording why in `_ignore_warn`."""
+        if self._ignore_full is not None:
+            return self._ignore_full
+        ig = {k: list(v) for k, v in (self._self_ignore or {}).items()}
+        try:
+            from .curobo_v2 import generate_self_collision_ignore
+            tips = [t for g in self._groups.values() for t in (g.get("tip_links") or [])]
+            full = generate_self_collision_ignore(self.urdf_path, self.spheres, tool_frames=tips or None)
+            if full:
+                ig = full
+            else:
+                self._ignore_warn = "cuRobo generated an empty ignore matrix; using parent↔child only"
+        except Exception as e:  # noqa: BLE001 — never block a build on generation; fall back loudly
+            self._ignore_warn = (f"self-collision ignore generation failed ({type(e).__name__}: {e}); "
+                                 "using parent↔child only — phantom self-collisions may block planning")
+        self._ignore_full = ig
+        return ig
+
     def _planner_for(self, active_groups: Sequence[str]):
         """Get/build (and cache) the planner whose tool_frames = these groups' tips."""
         for a in active_groups:
@@ -225,7 +251,7 @@ class MotionStack:
             robot_cfg = build_v2_robot_cfg(
                 self.config, self.spheres, active_groups=list(active_groups),
                 urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits,
-                self_collision_ignore=self._self_ignore, actuated_joints=self._actuated)
+                self_collision_ignore=self._self_collision_ignore(), actuated_joints=self._actuated)
             self._planners[key] = self._factory(robot_cfg, self.world, limits=self._limits, max_goalset=1)
         return self._planners[key]
 
@@ -380,8 +406,16 @@ class MotionStack:
         if tcp is None:
             rep["error"] = "no kinematic groups in the cell"
             return rep
-        planner = self._planner_for([tcp])
+        planner = self._planner_for([tcp])     # also triggers self-collision ignore generation
         start = self._current_positions([tcp])
+
+        ig = self._ignore_full or {}
+        rep["self_collision"] = {
+            "ignore_links": len(ig),
+            "ignore_pairs": sum(len(v) for v in ig.values()),
+            "generated_by_curobo": self._ignore_warn is None,
+            "warn": self._ignore_warn,
+        }
 
         w = self.world
         cuboids = {name: {"dims": [round(float(d), 3) for d in (b.get("dims") or [])],

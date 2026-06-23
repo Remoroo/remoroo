@@ -66,6 +66,26 @@ def _ensure_warp_torch() -> None:
         ) from e
 
 
+def generate_self_collision_ignore(urdf_path: str, spheres_by_link: dict,
+                                   *, tool_frames: Optional[Sequence[str]] = None) -> dict:
+    """Generate the COMPLETE self-collision ignore matrix via cuRobo's own RobotBuilder.
+
+    The dict-loader path we build through only gets parent↔child adjacency; cuRobo's RobotBuilder
+    additionally runs `_check_default_joint_configuration_collisions` — it FKs the default config and
+    ignores every link-pair whose spheres OVERLAP at rest. Without that step, links that touch by
+    design (gripper fingers, the two arms' bases, adjacent wrist links) read as PERMANENT collisions
+    and nothing plans. We feed our already-fitted spheres in (no refit) and return the full matrix;
+    those by-design pairs collide at ~every config, so the default-config check catches them while
+    leaving real, config-dependent self-collisions intact. GPU — call on the robot PC."""
+    from curobo._src.robot.builder.builder_robot import RobotBuilder
+
+    rb = RobotBuilder(str(urdf_path), tool_frames=list(tool_frames) if tool_frames else None)
+    rb._collision_spheres = {k: list(v) for k, v in spheres_by_link.items()}   # inject, don't refit
+    # prune_collisions=False → skip the 1000-sample never-collide pruning (an optimisation); keep the
+    # neighbour + default-config-collision matrix, which is what fixes the phantom collisions.
+    return dict(rb.compute_collision_matrix(prune_collisions=False) or {})
+
+
 class CuroboV2Planner:
     """A warmed cuRoboV2 MotionPlanner for one TCP set, built from the cell's artifacts."""
 
