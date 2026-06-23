@@ -395,6 +395,69 @@ class MotionStack:
                         return out
         return out
 
+    def _validate_structure(self, kin: dict) -> dict:
+        """Every base_link / tool_frame / cspace joint / collision link in our cfg MUST exist in the
+        URDF — a typo or stale name is a silent config bug. Pure parse, no GPU."""
+        out: dict = {"errors": []}
+        try:
+            from calib_engine import urdf_io
+            facts = urdf_io.urdf_facts(self.urdf_path)
+            links = set(facts.get("links") or [])
+            joints = {j["name"] for j in facts.get("joints", [])}
+            out["n_urdf_links"], out["n_urdf_joints"] = len(links), len(joints)
+            if kin.get("base_link") not in links:
+                out["errors"].append(f"base_link {kin.get('base_link')!r} not in URDF links")
+            for t in kin.get("tool_frames") or []:
+                if t not in links:
+                    out["errors"].append(f"tool_frame {t!r} not in URDF links")
+            for j in kin["cspace"]["joint_names"]:
+                if j not in joints:
+                    out["errors"].append(f"cspace joint {j!r} not in URDF joints")
+            for cl in (kin.get("collision_link_names") or []):
+                if cl not in links:
+                    out["errors"].append(f"collision_link {cl!r} not in URDF links")
+        except Exception as e:  # noqa: BLE001
+            out["errors"].append(f"urdf_facts failed: {type(e).__name__}: {e}")
+        return out
+
+    def validate_config(self, tcp: Optional[str] = None) -> dict:
+        """SOLID check that our cuRobo robot_cfg is correct — structure + cuRobo's CANONICAL IK
+        round-trip (not our plan path). The decisive field is `ik.checks['0cm'].success`: cuRobo MUST
+        re-solve the EXACT current tool pose; if it can't, the cfg/kinematics is broken (base_link /
+        tool_frame / cspace / quaternion), not reach or collision."""
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"tcp": tcp}
+        if tcp is None:
+            rep["error"] = "no kinematic groups in the cell"
+            return rep
+        kin = self._robot_cfg_for([tcp])["robot_cfg"]["kinematics"]
+        rep["cfg"] = {"base_link": kin.get("base_link"), "tool_frames": kin.get("tool_frames"),
+                      "tip_used": self._tip(tcp), "n_cspace_joints": len(kin["cspace"]["joint_names"]),
+                      "cspace_joints": kin["cspace"]["joint_names"], "n_locked": len(kin.get("lock_joints") or {}),
+                      "locked": list((kin.get("lock_joints") or {}).keys()),
+                      "n_collision_links": len(kin.get("collision_link_names") or [])}
+        rep["structure"] = self._validate_structure(kin)
+        try:
+            planner = self._planner_for([tcp])
+            rep["ik"] = (planner.ik_check(self._tip(tcp), self._current_positions([tcp]))
+                         if hasattr(planner, "ik_check") else {"error": "planner has no ik_check"})
+        except Exception as e:  # noqa: BLE001
+            rep["ik"] = {"error": f"{type(e).__name__}: {e}"}
+
+        ik0 = ((rep.get("ik", {}).get("checks", {}) or {}).get("0cm", {}) or {}).get("success")
+        struct_bad = bool(rep["structure"].get("errors"))
+        if struct_bad:
+            rep["verdict"] = f"CONFIG BROKEN (structure): {rep['structure']['errors']}"
+        elif ik0 is True:
+            rep["verdict"] = ("CONFIG OK: cuRobo IK re-solves the exact current pose. If plan_pose still "
+                              "fails, the bug is OUR goal/plan path (GoalToolPose / use_implicit_goal / trajopt), NOT the cfg.")
+        elif ik0 is False:
+            rep["verdict"] = ("CONFIG BROKEN: cuRobo's OWN IK can't re-solve the EXACT current tool pose — "
+                              "a base_link / tool_frame / cspace / quaternion mismatch. THIS is the root cause.")
+        else:
+            rep["verdict"] = "IK check did not run — see ik.error."
+        return rep
+
     def diagnose_motion(self, tcp: Optional[str] = None, xyz: Optional[Sequence[float]] = None) -> dict:
         """Honest, decisive collision diagnosis for 'no collision-free trajectory'. Plans the SAME
         small move WITH the world and WITHOUT it, and reports what the START config's spheres overlap:
@@ -470,23 +533,42 @@ class MotionStack:
             except Exception as e:  # noqa: BLE001
                 rep["limits"] = {"error": f"{type(e).__name__}: {e}"}
 
-        # DECISIVE probe: plan the SAME move with NO world AND NO self-collision. Separates a
-        # remaining self-collision problem (→ plans now) from joint-limits / IK reach (→ still fails).
+        # DECISIVE probe: with NO world AND NO self-collision, can cuRobo's IK reach a SET of poses?
+        # The key one is `current(0cm)` — the EXACT current TCP pose, which the current config trivially
+        # solves; if even THAT fails, the robot_cfg/IK is misconfigured (frame/tool/cspace), NOT a
+        # reach problem. If 0cm works but offsets fail, the arm is near full extension/singularity and
+        # only SOME directions are reachable (so the auto +z target was just a bad pick).
         rep["plan_no_world_no_selfcoll"] = {"ok": None, "message": "probe not run"}
+        rep["ik_reach_no_world_no_selfcoll"] = {}
         try:
             from .curobo_v2 import CuroboV2Planner
             from .world import WorldInputs
+            tip = self._tip(tcp)
+            cx, cy, cz = (cur[0] if cur else [xyz[0], xyz[1], xyz[2] - 0.05])
+            offsets = {
+                "current(0cm)": [cx, cy, cz],
+                "+z5cm": [cx, cy, cz + 0.05], "-z5cm": [cx, cy, cz - 0.05],
+                "+x5cm": [cx + 0.05, cy, cz], "-x5cm": [cx - 0.05, cy, cz],
+                "+y5cm": [cx, cy + 0.05, cz], "-y5cm": [cx, cy - 0.05, cz],
+                "halfway_to_base": [cx * 0.5, cy * 0.5, cz * 0.5],
+            }
             empty = WorldInputs(points=np.zeros((0, 3)), scene={})
             probe = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
                                     max_goalset=1, warmup=False, self_collision_check=False)
-            pr = probe.plan_pose({self._tip(tcp): (xyz, quat)}, start)
-            rep["plan_no_world_no_selfcoll"] = {"ok": bool(pr.success), "message": pr.message}
+            reach = {}
+            for label, p in offsets.items():
+                reach[label] = bool(probe.plan_pose({tip: (p, quat)}, start).success)
+            rep["ik_reach_no_world_no_selfcoll"] = reach
+            rep["plan_no_world_no_selfcoll"] = {"ok": reach.get("current(0cm)"),
+                                                "message": f"IK reach by offset: {reach}"}
         except Exception as e:  # noqa: BLE001
             rep["plan_no_world_no_selfcoll"] = {"ok": None, "message": f"probe failed: {type(e).__name__}: {e}"}
 
         a = rep["plan_with_world"]["ok"]
         b = rep["plan_without_world"]["ok"]
-        c = rep["plan_no_world_no_selfcoll"]["ok"]
+        reach = rep.get("ik_reach_no_world_no_selfcoll") or {}
+        c0 = reach.get("current(0cm)")
+        any_offset = any(v for k, v in reach.items() if k != "current(0cm)")
         viol = rep.get("limits", {}).get("violations") or {}
         if a:
             rep["verdict"] = "OK with the world — the earlier failure was a different target/TCP, not the world."
@@ -496,15 +578,21 @@ class MotionStack:
         elif viol:
             rep["verdict"] = (f"JOINT LIMITS: the START config is outside limits on {list(viol)} — fix the "
                               "limits (URDF/safety) or the start read; no trajectory can be valid.")
-        elif c:
-            rep["verdict"] = ("SELF-COLLISION (still): with self-collision turned OFF the SAME move plans, "
-                              "so the generated ignore matrix is STILL missing pairs — the spheres overlap "
-                              "more than the default-config check caught. Next: widen the ignore / fix spheres.")
-        elif c is False:
-            rep["verdict"] = ("NOT self-collision and NOT the world: fails even with BOTH off → IK REACH "
-                              "(target unreachable for this TCP) or a degenerate start. Try a nearer point / the other TCP.")
+        elif c0 is False:
+            rep["verdict"] = ("ROBOT CFG / IK BROKEN: with world + self-collision BOTH off, IK can't even "
+                              "re-solve the EXACT current TCP pose — which the current config trivially "
+                              "satisfies. That points at a robot_cfg/IK mismatch (base_link / tool_frame / "
+                              "cspace / quaternion convention), NOT reach. See ik_reach_no_world_no_selfcoll.")
+        elif c0 and not any_offset:
+            rep["verdict"] = ("NEAR SINGULARITY / FULL EXTENSION: only the exact current pose IK-solves; "
+                              "every ±5cm offset is unreachable for this TCP. Place a target toward the "
+                              "workspace centre / base, not at the arm's current reach edge.")
+        elif c0:
+            rep["verdict"] = ("IK IS FINE: the current pose AND some offsets reach — the auto +z target was "
+                              "just out of reach/singular. Re-run the COMMISSION (its multi-direction + "
+                              "multi-orientation search picks a reachable move), or place a point toward the workspace.")
         else:
-            rep["verdict"] = ("inconclusive — the self-collision-off probe didn't run (see "
+            rep["verdict"] = ("inconclusive — the IK-reach probe didn't run (see "
                               "plan_no_world_no_selfcoll.message); likely GPU memory or a build error.")
         return rep
 

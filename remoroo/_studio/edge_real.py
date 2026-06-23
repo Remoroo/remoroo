@@ -747,6 +747,25 @@ def h_suggest_targets(_q):
                         else "no reachable collision-free point found near the current pose")}
 
 
+def h_validate_config(_q):
+    """SOLID robot_cfg validation: structure (links/joints exist in URDF) + cuRobo's CANONICAL IK
+    round-trip (ik.checks['0cm'] MUST succeed). Says whether the cfg is right or which field is
+    wrong. GET param: tcp."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    groups = st.group_names
+    tcp = (_q.get("tcp", [None])[0]) or (groups[0] if groups else None)
+    try:
+        with _bridge_lock:
+            rep = st.validate_config(tcp)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "tcp": tcp}
+    rep["ok"] = True
+    return rep
+
+
 def h_diagnose_motion(_q):
     """Decisive collision diagnosis for 'no collision-free trajectory': plans the SAME small move WITH
     vs WITHOUT the world and reports what the start config overlaps — so we KNOW if it's world
@@ -1688,6 +1707,7 @@ ROUTES = {
     "/edge/motion/tcp_pose": ("json", h_tcp_pose),
     "/edge/motion/suggest_targets": ("json", h_suggest_targets),
     "/edge/motion/diagnose": ("json", h_diagnose_motion),
+    "/edge/motion/validate_config": ("json", h_validate_config),
 }
 
 

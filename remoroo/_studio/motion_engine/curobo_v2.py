@@ -193,6 +193,38 @@ class CuroboV2Planner:
         """Re-apply the full scene (restores after `clear_world`)."""
         self.planner.update_world(self._full_scene(world or self._world))
 
+    def ik_check(self, tool_frame: str, start_positions: Optional[Dict[str, float]] = None,
+                 offsets: Optional[Dict[str, Sequence[float]]] = None) -> dict:
+        """cuRobo's CANONICAL IK round-trip (from getting_started/inverse_kinematics.py), bypassing
+        our `_goal`/`plan_pose`: FK the current config → its tool pose, then `ik_solver.solve_pose`
+        via `GoalToolPose.from_poses` to that SAME pose (offset 0) + small offsets, keeping the FK
+        quaternion. Offset-0 MUST succeed (the current config solves it) — if it doesn't, the
+        robot_cfg/kinematics is broken, full stop. If offset-0 succeeds here but our `plan_pose`
+        fails, the bug is in OUR goal construction, not the config. Pure IK (no trajopt, no world)."""
+        import torch  # noqa: F401
+        from curobo.types import GoalToolPose, Pose
+
+        js = self._start_js(start_positions)
+        kin = self.planner.compute_kinematics(js)
+        pose = kin.tool_poses.get_link_pose(tool_frame)
+        base_pos = pose.position.detach().cpu().numpy().reshape(-1)[:3]
+        offs = offsets or {"0cm": [0, 0, 0], "+z5cm": [0, 0, 0.05], "-z5cm": [0, 0, -0.05],
+                           "+x5cm": [0.05, 0, 0], "-x5cm": [-0.05, 0, 0],
+                           "+y5cm": [0, 0.05, 0], "-y5cm": [0, -0.05, 0]}
+        checks: dict = {}
+        ik = self.planner.ik_solver
+        for label, d in offs.items():
+            new_pos = pose.position.clone()
+            new_pos[..., 0] += float(d[0]); new_pos[..., 1] += float(d[1]); new_pos[..., 2] += float(d[2])
+            gp = Pose(position=new_pos, quaternion=pose.quaternion.clone())
+            res = ik.solve_pose(GoalToolPose.from_poses({tool_frame: gp}, num_goalset=1))
+            pe = getattr(res, "position_error", None)
+            checks[label] = {"success": bool(res.success.any()),
+                             "pos_err_mm": (round(float(pe.min()) * 1000, 2) if pe is not None else None)}
+        return {"tool_frame": tool_frame, "planner_tool_frames": list(self.planner.tool_frames),
+                "active_joints": list(self.planner.joint_names), "fk_position": [float(x) for x in base_pos],
+                "checks": checks}
+
     def joint_limits(self) -> Dict[str, Tuple[float, float]]:
         """{joint: (min, max)} position limits over the planner's active joints — to catch a START
         config that's outside limits (a non-self-collision reason planning finds nothing)."""
