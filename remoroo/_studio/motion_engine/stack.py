@@ -134,6 +134,12 @@ class MotionStack:
                    safety=safety, bridge=bridge, urdf_path=urdf_path, planner_factory=planner_factory)
 
     # --- group/TCP resolution --------------------------------------------
+    @property
+    def group_names(self) -> List[str]:
+        """The kinematic group / TCP names in this cell — morphology-agnostic (arms, legs, wheels,
+        a humanoid's many). The default TCP for a verb is `group_names[0]`."""
+        return list(self._groups)
+
     def _group(self, tcp: str) -> dict:
         if tcp not in self._groups:
             raise KeyError(f"unknown group/TCP {tcp!r}; cell has {list(self._groups)}")

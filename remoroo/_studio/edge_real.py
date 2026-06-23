@@ -667,8 +667,8 @@ def sse_plan_move(_q):
         yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
         return
 
-    arms = st.arm_map.get("arms") or []
-    tcp = (_q.get("tcp", [None])[0]) or (arms[0]["name"] if arms else None)
+    groups = st.group_names
+    tcp = (_q.get("tcp", [None])[0]) or (groups[0] if groups else None)
     mode = _q.get("mode", ["point"])[0]
     execute = (_q.get("execute", ["1"])[0] != "0")
     yield {"phase": "planning", "tcp": tcp, "mode": mode, "execute": execute}
@@ -696,8 +696,8 @@ def h_tcp_pose(_q):
         st = motion_stack()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    arms = st.arm_map.get("arms") or []
-    tcp = (_q.get("tcp", [None])[0]) or (arms[0]["name"] if arms else None)
+    groups = st.group_names
+    tcp = (_q.get("tcp", [None])[0]) or (groups[0] if groups else None)
     if not tcp:
         return {"ok": False, "error": "no TCP/group available"}
     try:
@@ -719,8 +719,8 @@ def h_suggest_targets(_q):
         st = motion_stack()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    arms = st.arm_map.get("arms") or []
-    tcp = (_q.get("tcp", [None])[0]) or (arms[0]["name"] if arms else None)
+    groups = st.group_names
+    tcp = (_q.get("tcp", [None])[0]) or (groups[0] if groups else None)
     if not tcp:
         return {"ok": False, "error": "no TCP/group available"}
     try:
