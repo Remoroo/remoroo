@@ -96,6 +96,11 @@ def build_v2_robot_cfg(
                 "collision_link_names": list(spheres_by_link.keys()) or None,
                 "collision_spheres": spheres_by_link,
                 "collision_sphere_buffer": float(sphere_buffer),
+                # cuRobo's KinematicsLoaderCfg.self_collision_buffer DEFAULTS TO None and is
+                # `.copy()`d UNCONDITIONALLY when building the collision model → 'NoneType' object
+                # has no attribute 'copy' at planner build. Provide an explicit (empty) per-link
+                # buffer so it never sees None; adjacency is handled by the auto neighbor-ignore.
+                "self_collision_buffer": {},
                 "lock_joints": locked or None,
                 "cspace": cspace,
             }
