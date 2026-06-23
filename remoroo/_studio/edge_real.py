@@ -500,13 +500,23 @@ def sse_live_joints(_q):
         return
     t0 = time.time()
     while True:
+        # NON-BLOCKING: a heavy motion op (commission / diagnose / planner build + self-collision
+        # generation) holds _bridge_lock for tens of seconds. Blocking here would freeze the mirror;
+        # instead we skip the poll and keep the last pose (the frontend only updates on frames that
+        # CARRY `joints`). Likewise on a read error we OMIT `joints` so the mirror holds the last
+        # real pose instead of snapping to the default (a transient xArm hiccup must not reset it).
+        if not _bridge_lock.acquire(blocking=False):
+            time.sleep(0.1)
+            continue
         try:
-            with _bridge_lock:                 # take turns with the calibration verbs (G14)
-                obs = b.get_observation()
+            obs = b.get_observation()
             joints = {name: _joint_value(val) for name, val in (obs.joint_positions or {}).items()}
-            yield {"t": time.time() - t0, "joints": joints}
+            frame = {"t": time.time() - t0, "joints": joints}
         except Exception as e:  # noqa: BLE001
-            yield {"t": time.time() - t0, "joints": {}, "error": str(e)}
+            frame = {"t": time.time() - t0, "error": str(e)}      # no `joints` → mirror keeps last pose
+        finally:
+            _bridge_lock.release()
+        yield frame
         time.sleep(0.05)  # ~20 Hz
 
 

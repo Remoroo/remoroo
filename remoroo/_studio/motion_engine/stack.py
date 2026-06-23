@@ -242,16 +242,21 @@ class MotionStack:
         self._ignore_full = ig
         return ig
 
+    def _robot_cfg_for(self, active_groups: Sequence[str]) -> dict:
+        """The cuRobo robot_cfg dict for these groups (active cspace + the generated self-collision
+        ignore). Shared by `_planner_for` and the diagnostic's self-collision-OFF probe."""
+        return build_v2_robot_cfg(
+            self.config, self.spheres, active_groups=list(active_groups),
+            urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits,
+            self_collision_ignore=self._self_collision_ignore(), actuated_joints=self._actuated)
+
     def _planner_for(self, active_groups: Sequence[str]):
         """Get/build (and cache) the planner whose tool_frames = these groups' tips."""
         for a in active_groups:
             self._group(a)                     # KeyError on an unknown group, before any build
         key = frozenset(active_groups)
         if key not in self._planners:
-            robot_cfg = build_v2_robot_cfg(
-                self.config, self.spheres, active_groups=list(active_groups),
-                urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits,
-                self_collision_ignore=self._self_collision_ignore(), actuated_joints=self._actuated)
+            robot_cfg = self._robot_cfg_for(active_groups)
             self._planners[key] = self._factory(robot_cfg, self.world, limits=self._limits, max_goalset=1)
         return self._planners[key]
 
@@ -421,7 +426,8 @@ class MotionStack:
         cuboids = {name: {"dims": [round(float(d), 3) for d in (b.get("dims") or [])],
                           "center": [round(float(x), 3) for x in (b.get("pose") or [0, 0, 0])[:3]]}
                    for name, b in (w.scene.get("cuboid") or {}).items()}
-        rep["world"] = {"n_points": int(w.n_points), "voxel_size": float(w.voxel_size),
+        rep["world"] = {"n_points": int(w.n_points), "n_points_raw": w.meta.get("n_points_raw"),
+                        "voxel_size": float(w.voxel_size),
                         "cloud_bbox": _bbox(w.points) if w.n_points else None,
                         "n_cuboids": len(cuboids), "cuboids": cuboids}
 
@@ -453,20 +459,53 @@ class MotionStack:
         else:
             rep["plan_without_world"] = {"ok": None, "message": "planner cannot toggle the world"}
 
+        # joint-limits check: is the START config itself outside the planner's limits?
+        if hasattr(planner, "joint_limits"):
+            try:
+                lim = planner.joint_limits()
+                viol = {j: {"q": round(float(start[j]), 4), "limit": [round(lo, 4), round(hi, 4)]}
+                        for j, (lo, hi) in lim.items()
+                        if j in start and not (lo - 1e-3 <= start[j] <= hi + 1e-3)}
+                rep["limits"] = {"n_joints": len(lim), "violations": viol}
+            except Exception as e:  # noqa: BLE001
+                rep["limits"] = {"error": f"{type(e).__name__}: {e}"}
+
+        # DECISIVE probe: plan the SAME move with NO world AND NO self-collision. Separates a
+        # remaining self-collision problem (→ plans now) from joint-limits / IK reach (→ still fails).
+        rep["plan_no_world_no_selfcoll"] = {"ok": None, "message": "probe not run"}
+        try:
+            from .curobo_v2 import CuroboV2Planner
+            from .world import WorldInputs
+            empty = WorldInputs(points=np.zeros((0, 3)), scene={})
+            probe = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
+                                    max_goalset=1, warmup=False, self_collision_check=False)
+            pr = probe.plan_pose({self._tip(tcp): (xyz, quat)}, start)
+            rep["plan_no_world_no_selfcoll"] = {"ok": bool(pr.success), "message": pr.message}
+        except Exception as e:  # noqa: BLE001
+            rep["plan_no_world_no_selfcoll"] = {"ok": None, "message": f"probe failed: {type(e).__name__}: {e}"}
+
         a = rep["plan_with_world"]["ok"]
         b = rep["plan_without_world"]["ok"]
+        c = rep["plan_no_world_no_selfcoll"]["ok"]
+        viol = rep.get("limits", {}).get("violations") or {}
         if a:
             rep["verdict"] = "OK with the world — the earlier failure was a different target/TCP, not the world."
         elif b:
-            rep["verdict"] = ("WORLD BLOCKS IT: the SAME move plans once the world is removed. The start "
-                              "config or path collides with the scanned cloud / an obstacle box. See "
-                              "start.in_cuboid (which box) and world.cloud_bbox vs start.spheres_bbox.")
-        elif b is False:
-            rep["verdict"] = ("NOT THE WORLD: it fails even with the world removed → SELF-COLLISION "
-                              "(self_collision_ignore too sparse), JOINT LIMITS, or IK reach. Next stop: "
-                              "the self-collision ignore matrix.")
+            rep["verdict"] = ("WORLD BLOCKS IT: the SAME move plans once the world is removed — start/path "
+                              "collides with the scanned cloud / an obstacle box (see start.in_cuboid).")
+        elif viol:
+            rep["verdict"] = (f"JOINT LIMITS: the START config is outside limits on {list(viol)} — fix the "
+                              "limits (URDF/safety) or the start read; no trajectory can be valid.")
+        elif c:
+            rep["verdict"] = ("SELF-COLLISION (still): with self-collision turned OFF the SAME move plans, "
+                              "so the generated ignore matrix is STILL missing pairs — the spheres overlap "
+                              "more than the default-config check caught. Next: widen the ignore / fix spheres.")
+        elif c is False:
+            rep["verdict"] = ("NOT self-collision and NOT the world: fails even with BOTH off → IK REACH "
+                              "(target unreachable for this TCP) or a degenerate start. Try a nearer point / the other TCP.")
         else:
-            rep["verdict"] = "inconclusive (planner could not toggle the world)"
+            rep["verdict"] = ("inconclusive — the self-collision-off probe didn't run (see "
+                              "plan_no_world_no_selfcoll.message); likely GPU memory or a build error.")
         return rep
 
     def retract(self, tcp: Optional[str] = None, *, execute: bool = True) -> MoveResult:

@@ -96,6 +96,27 @@ def _points_from(obj) -> np.ndarray:
     return a[:, :3]
 
 
+def crop_cloud(points: np.ndarray, bounds: Optional[dict], *, margin: float = 0.15,
+               reach: float = 1.5) -> np.ndarray:
+    """Keep only the cloud the robot could actually collide with: drop NaN/inf, then crop to the
+    workspace box (+margin) — obstacles OUTSIDE the cage can't be reached, so they're pure noise that
+    bloats the collision world. Falls back to a ±`reach` m box around the base when no bounds exist.
+    A raw room scan (300k+ pts spanning metres, incl. floor/walls/outliers) becomes a tight,
+    workspace-local cloud — fewer phantom obstacles and a far smaller mesh/voxel grid."""
+    a = np.asarray(points, dtype=float)
+    if a.ndim != 2 or a.shape[1] < 3 or a.shape[0] == 0:
+        return a.reshape(-1, 3) if a.size else np.zeros((0, 3), dtype=float)
+    a = a[np.isfinite(a).all(axis=1)]
+    lo_b, hi_b = _xyz((bounds or {}).get("min")), _xyz((bounds or {}).get("max"))
+    if lo_b is not None and hi_b is not None:
+        lo = np.array(lo_b, dtype=float) - margin
+        hi = np.array(hi_b, dtype=float) + margin
+    else:
+        lo, hi = np.full(3, -reach), np.full(3, reach)
+    keep = np.all((a[:, :3] >= lo) & (a[:, :3] <= hi), axis=1)
+    return a[keep][:, :3]
+
+
 def _xyz(v) -> Optional[List[float]]:
     """A `[x,y,z]` of floats, or None if `v` isn't a usable 3-vector (so a malformed/free-text
     safety entry is skipped, never crashing the motion stack with a KeyError/ValueError)."""
@@ -214,12 +235,16 @@ def load_world(cell_dir: str, *, safety: Optional[dict] = None, voxel_size: floa
     if not keep_out:
         keep_out = list(scene_json.get("keep_out") or [])
 
+    # Crop the scan to what the robot can actually reach — a raw room scan is mostly unreachable
+    # floor/walls/outliers that only bloat the collision world (and the from_pointcloud mesh).
+    n_raw = int(points.shape[0])
+    points = crop_cloud(points, bounds)
     scene = build_scene(bounds_m=bounds, keep_out=keep_out, obstacles=obstacles, wall_bounds=wall_bounds)
     return WorldInputs(
         points=points,
         scene=scene,
         voxel_size=float(scene_json.get("voxel_m") or voxel_size),
         bounds_m=bounds,
-        meta={"n_points": int(points.shape[0]), "n_keepout": len(keep_out),
+        meta={"n_points": int(points.shape[0]), "n_points_raw": n_raw, "n_keepout": len(keep_out),
               "n_obstacles": len(obstacles), "walls": wall_bounds and bool(bounds)},
     )

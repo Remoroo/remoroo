@@ -66,6 +66,42 @@ def _ensure_warp_torch() -> None:
         ) from e
 
 
+def _tensor_min(x) -> Optional[float]:
+    """The smallest FINITE value of a torch tensor (or None) — for reporting best pose error."""
+    try:
+        import torch
+        if x is None:
+            return None
+        t = x.detach().float().reshape(-1)
+        t = t[torch.isfinite(t)]
+        return float(t.min()) if t.numel() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _plan_failure_message(result, *, home: bool = False) -> str:
+    """cuRobo's ACTUAL failure reason, not a generic string. In `_plan_pose_single`/`plan_cspace`,
+    `result is None` means the IK stage never found a reachable, collision-free GOAL config; a result
+    whose `success` is all-False means IK found a goal but TRAJOPT couldn't connect start→goal. We
+    surface which stage failed (+ the best position/rotation error when present) so the operator/agent
+    sees reach-vs-path-vs-collision instead of 'no collision-free trajectory'."""
+    goal = "home (cspace default)" if home else "the target pose"
+    if result is None:
+        return ("IK stage failed — cuRobo found NO reachable, collision-free goal configuration for "
+                f"{goal} in any attempt: out of reach for this arm, or the goal config itself "
+                "self-collides / hits the world.")
+    pe, re_ = _tensor_min(getattr(result, "position_error", None)), _tensor_min(getattr(result, "rotation_error", None))
+    bits = []
+    if pe is not None:
+        bits.append(f"best position error {pe * 1000:.0f} mm")
+    if re_ is not None:
+        bits.append(f"rotation error {re_:.3f} rad")
+    extra = (" (" + ", ".join(bits) + ")") if bits else ""
+    return ("trajopt stage failed — a goal config exists but cuRobo found no collision-free, "
+            f"dynamically-feasible path from the start to {goal}{extra}: the start or an intermediate "
+            "waypoint collides, or the path can't meet the velocity/accel limits.")
+
+
 def generate_self_collision_ignore(urdf_path: str, spheres_by_link: dict,
                                    *, tool_frames: Optional[Sequence[str]] = None) -> dict:
     """Generate the COMPLETE self-collision ignore matrix via cuRobo's own RobotBuilder.
@@ -98,6 +134,7 @@ class CuroboV2Planner:
         max_goalset: int = 1,
         device: str = "cuda",
         warmup: bool = True,
+        self_collision_check: bool = True,
     ) -> None:
         import torch  # noqa: F401  (lazy GPU import; presence validated by the toolchain gate)
         _ensure_warp_torch()                       # force-load Warp's torch interop or fail CLEARLY
@@ -117,6 +154,7 @@ class CuroboV2Planner:
             scene_model=scene or None,
             collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid)},
             max_goalset=int(max_goalset),
+            self_collision_check=bool(self_collision_check),   # False = diagnostic probe (isolate self-collision)
         )
         self.planner = MotionPlanner(cfg)
         if warmup:
@@ -154,6 +192,14 @@ class CuroboV2Planner:
     def set_world(self, world: Optional[WorldInputs] = None) -> None:
         """Re-apply the full scene (restores after `clear_world`)."""
         self.planner.update_world(self._full_scene(world or self._world))
+
+    def joint_limits(self) -> Dict[str, Tuple[float, float]]:
+        """{joint: (min, max)} position limits over the planner's active joints — to catch a START
+        config that's outside limits (a non-self-collision reason planning finds nothing)."""
+        jl = self.planner.kinematics.get_joint_limits()
+        pos = jl.position.detach().cpu().numpy()        # [2, dof] = (min, max)
+        names = self.joint_names
+        return {n: (float(pos[0, i]), float(pos[1, i])) for i, n in enumerate(names)}
 
     def robot_spheres(self, start_positions: Optional[Dict[str, float]] = None) -> np.ndarray:
         """The robot's ACTIVE collision spheres (x,y,z,r) at the current/given config — FK output.
@@ -230,7 +276,7 @@ class CuroboV2Planner:
         except Exception as e:  # a planner exception is a failure to surface, not a crash
             return PlanResult(False, None, f"plan_pose raised: {e}")
         if result is None or not bool(result.success.any()):
-            return PlanResult(False, None, "planning failed — no collision-free trajectory found")
+            return PlanResult(False, None, _plan_failure_message(result))
         traj = self._to_trajectory(result.get_interpolated_plan())
         return PlanResult(True, traj, "ok", float(getattr(result, "total_time", traj.duration)))
 
@@ -268,7 +314,7 @@ class CuroboV2Planner:
         except Exception as e:
             return PlanResult(False, None, f"plan_cspace raised: {e}")
         if result is None or not bool(result.success.any()):
-            return PlanResult(False, None, "retract planning failed — no collision-free path home")
+            return PlanResult(False, None, _plan_failure_message(result, home=True))
         traj = self._to_trajectory(result.interpolated_trajectory)
         return PlanResult(True, traj, "ok", traj.duration)
 
