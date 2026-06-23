@@ -279,20 +279,19 @@ class CuroboV2Planner:
         return JointState.from_position(t, joint_names=list(names))
 
     def _goal(self, goals: Dict[str, Goal]):
-        """Build a GoalToolPose for the requested {ee_link: (xyz, wxyz)} — `num_links == len(frames)`."""
+        """Build a GoalToolPose for {ee_link: (xyz, wxyz)} via cuRobo's CANONICAL `from_poses` — the
+        same path `ik_check`/the IK example use and that the validator PROVED works. (We used to hand-
+        assemble the [B,H,L,G,*] tensors; `from_poses` does the link ordering + goalset shaping so a
+        subtle mismatch can't slip in.) Multi-TCP falls straight out: one Pose per ee_link."""
+        from curobo.types import GoalToolPose, Pose
         import torch
-        from curobo.types import GoalToolPose
 
-        frames = list(goals.keys())
-        n = len(frames)
-        pos = torch.zeros(1, 1, n, 1, 3, device=self._device, dtype=torch.float32)
-        quat = torch.zeros(1, 1, n, 1, 4, device=self._device, dtype=torch.float32)
-        for i, f in enumerate(frames):
-            p, qn = goals[f]
-            pos[0, 0, i, 0, :] = torch.tensor(list(p)[:3], device=self._device, dtype=torch.float32)
-            qn = list(qn)[:4]
-            quat[0, 0, i, 0, :] = torch.tensor(qn, device=self._device, dtype=torch.float32)
-        return GoalToolPose(tool_frames=frames, position=pos, quaternion=quat)
+        pose_dict = {}
+        for f, (p, qn) in goals.items():
+            pos = torch.tensor([list(p)[:3]], device=self._device, dtype=torch.float32)
+            quat = torch.tensor([list(qn)[:4]], device=self._device, dtype=torch.float32)
+            pose_dict[f] = Pose(position=pos, quaternion=quat)
+        return GoalToolPose.from_poses(pose_dict, num_goalset=1)
 
     def plan_pose(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]] = None,
                   *, max_attempts: int = 3) -> PlanResult:
