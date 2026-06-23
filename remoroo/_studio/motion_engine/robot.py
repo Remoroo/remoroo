@@ -77,6 +77,19 @@ def load_spheres(cell_dir: str) -> Tuple[Dict[str, List[dict]], float]:
     return spheres, buffer
 
 
+def actuated_joints(urdf_path: str) -> List[str]:
+    """Every INDEPENDENT actuated joint in the URDF (non-fixed, non-mimic) — including ones not in
+    any group (e.g. a gripper's `drive_joint`). cuRobo expects ALL of these in the robot cspace
+    (driven or LOCKED); a joint it finds in the URDF but not in our list crashes the build with
+    `'<joint>' is not in list`. Mimic finger joints are excluded — they follow their driver."""
+    from calib_engine import urdf_io
+
+    try:
+        return list(urdf_io.urdf_facts(urdf_path).get("actuated_joints") or [])
+    except Exception:  # noqa: BLE001 — never block the build on a URDF parse hiccup
+        return []
+
+
 def neighbor_ignore(urdf_path: str) -> Dict[str, List[str]]:
     """Adjacent-link self-collision ignore map `{link: [neighbours]}` from the URDF. Parent↔child
     links always overlap at their shared joint, so cuRobo MUST ignore those pairs or every config

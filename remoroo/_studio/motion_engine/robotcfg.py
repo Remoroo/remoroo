@@ -48,6 +48,7 @@ def build_v2_robot_cfg(
     limits: Optional[dict] = None,
     default_joint_position: Optional[Dict[str, float]] = None,
     self_collision_ignore: Optional[Dict[str, List[str]]] = None,
+    actuated_joints: Optional[Sequence[str]] = None,
 ) -> dict:
     """A cuRoboV2 `robot_cfg` planning the `active_groups` (default: ALL groups in the config).
 
@@ -68,12 +69,14 @@ def build_v2_robot_cfg(
 
     base_link = config.get("base_link") or groups[0].get("base_link")
     tool_frames = _dedup([t for n in active_names for t in (by_name[n].get("tip_links") or [])])
-    # cuRobo convention (cf. franka.yml): `cspace.joint_names` = ALL actuated joints; `lock_joints`
-    # holds the INACTIVE ones; cuRobo derives the ACTIVE set as joint_names MINUS lock_joints. Sizing
-    # the cspace to only the active subset (and locking joints that aren't IN the cspace) left cuRobo
-    # with a malformed cspace → 'NoneType' object has no attribute 'copy' at planner build.
-    all_joints = _dedup([j for g in groups for j in g["joint_names"]])
+    # cuRobo convention (cf. franka.yml): `cspace.joint_names` = ALL independent actuated joints;
+    # `lock_joints` holds the INACTIVE ones; cuRobo derives the ACTIVE set as joint_names MINUS
+    # lock_joints. The full set is the URDF's actuated joints (so a gripper's `drive_joint`, in the
+    # URDF but in NO group, gets LOCKED — not left dangling → cuRobo "'drive_joint' is not in list").
+    # Fall back to the declared group joints when the URDF list isn't available (tests/off-GPU).
     active_set = {j for n in active_names for j in by_name[n]["joint_names"]}
+    group_joints = [j for g in groups for j in g["joint_names"]]
+    all_joints = _dedup(list(actuated_joints or []) + group_joints)   # URDF actuated ∪ declared
     defaults = dict(default_joint_position or {})
     locked = {j: float(defaults.get(j, 0.0)) for j in all_joints if j not in active_set}
 

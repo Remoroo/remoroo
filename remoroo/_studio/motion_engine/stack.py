@@ -29,7 +29,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .robot import load_robot_config, load_spheres, neighbor_ignore, sphere_health
+from .robot import actuated_joints, load_robot_config, load_spheres, neighbor_ignore, sphere_health
 from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
@@ -98,6 +98,9 @@ class MotionStack:
         self._limits = safety.planner_limits()
         # parent↔child adjacency so cuRobo ignores always-touching links (the loader doesn't auto-gen)
         self._self_ignore = neighbor_ignore(urdf_path)
+        # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace; the
+        # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
+        self._actuated = actuated_joints(urdf_path)
 
     # --- construction -----------------------------------------------------
     @classmethod
@@ -137,7 +140,7 @@ class MotionStack:
             robot_cfg = build_v2_robot_cfg(
                 self.config, self.spheres, active_groups=list(active_groups),
                 urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits,
-                self_collision_ignore=self._self_ignore)
+                self_collision_ignore=self._self_ignore, actuated_joints=self._actuated)
             self._planners[key] = self._factory(robot_cfg, self.world, limits=self._limits, max_goalset=1)
         return self._planners[key]
 

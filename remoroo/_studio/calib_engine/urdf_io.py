@@ -327,14 +327,20 @@ def urdf_facts(urdf_path: str) -> dict:
         lim = j.find("limit")
         limit = ([float(lim.get("lower")), float(lim.get("upper"))]
                  if lim is not None and lim.get("lower") is not None and lim.get("upper") is not None else None)
+        mimic_el = j.find("mimic")
         joints.append({"name": j.get("name"), "type": j.get("type"), "parent": p.get("link"),
-                       "child": c.get("link"), "axis": axis, "limit": limit})
+                       "child": c.get("link"), "axis": axis, "limit": limit,
+                       "mimic": (mimic_el.get("joint") if mimic_el is not None else None)})
     link_names = [l["name"] for l in links]
+    movable = [j for j in joints if j["type"] not in ("fixed",)]
     return {
         "links": links,
         "joints": joints,
         "roots": [n for n in link_names if n not in children],
-        "movable_joints": [j["name"] for j in joints if j["type"] not in ("fixed",)],
+        "movable_joints": [j["name"] for j in movable],
+        # INDEPENDENT actuated joints = movable minus mimics (which are slaved to a driver joint).
+        # These are the joints cuRobo expects in the robot cspace (active or locked); mimics follow.
+        "actuated_joints": [j["name"] for j in movable if not j["mimic"]],
     }
 
 
@@ -400,7 +406,10 @@ def validate_robot_config(config: dict, urdf_path: str) -> List[str]:
     facts = urdf_facts(urdf_path)
     link_names = {l["name"] for l in facts["links"]}
     joint_names = {j["name"] for j in facts["joints"]}
-    movable = set(facts["movable_joints"])
+    # the "must be placed" set is the INDEPENDENT actuated joints (mimic fingers follow their driver,
+    # so they're never assigned to a group). A gripper's `drive_joint` is actuated → must be in a
+    # group or `ignore_joints`.
+    movable = set(facts["actuated_joints"])
     errors: List[str] = []
     groups = config.get("groups") or []
     if not groups:
