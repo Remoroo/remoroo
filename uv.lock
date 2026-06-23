@@ -598,7 +598,7 @@ wheels = [
 
 [[package]]
 name = "remoroo"
-version = "0.10.21"
+version = "0.10.23"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },
