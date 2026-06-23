@@ -766,6 +766,24 @@ def h_validate_config(_q):
     return rep
 
 
+def h_verify_start(_q):
+    """RIGOROUS verification that the robot's START config is inside a world obstacle (and which one),
+    via cuRobo IK + per-obstacle ablation. GET param: tcp."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    groups = st.group_names
+    tcp = (_q.get("tcp", [None])[0]) or (groups[0] if groups else None)
+    try:
+        with _bridge_lock:
+            rep = st.verify_start_collision(tcp)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "tcp": tcp}
+    rep["ok"] = True
+    return rep
+
+
 def h_diagnose_motion(_q):
     """Decisive collision diagnosis for 'no collision-free trajectory': plans the SAME small move WITH
     vs WITHOUT the world and reports what the start config overlaps — so we KNOW if it's world
@@ -1708,6 +1726,7 @@ ROUTES = {
     "/edge/motion/suggest_targets": ("json", h_suggest_targets),
     "/edge/motion/diagnose": ("json", h_diagnose_motion),
     "/edge/motion/validate_config": ("json", h_validate_config),
+    "/edge/motion/verify_start": ("json", h_verify_start),
 }
 
 

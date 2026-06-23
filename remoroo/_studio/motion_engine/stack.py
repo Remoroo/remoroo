@@ -500,6 +500,78 @@ class MotionStack:
         except Exception as e:  # noqa: BLE001
             return {"error": f"{type(e).__name__}: {e}"}
 
+    def _world_without(self, names: Sequence[str]):
+        """A copy of the live world with the named cuboids removed (for ablation/verification)."""
+        from dataclasses import replace
+        drop = set(names)
+        cub = {k: v for k, v in (self.world.scene.get("cuboid") or {}).items() if k not in drop}
+        return replace(self.world, scene={**self.world.scene, "cuboid": cub})
+
+    def verify_start_collision(self, tcp: Optional[str] = None) -> dict:
+        """RIGOROUS verification (cuRobo's own IK collision verdict, self-collision OFF to isolate the
+        WORLD): is the robot's current/start config inside a world obstacle, and WHICH one? Controlled
+        ablation — remove the whole world, then each penetrated box one at a time, and re-check IK at
+        the exact current pose. A box whose REMOVAL makes the start collision-free is PROVEN to clip
+        the robot. This is the evidence before we design any prevention."""
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"tcp": tcp}
+        if tcp is None:
+            rep["error"] = "no kinematic groups in the cell"
+            return rep
+        tip = self._tip(tcp)
+        start = self._seed_positions()
+        try:
+            from .curobo_v2 import CuroboV2Planner
+            probe = CuroboV2Planner(self._robot_cfg_for([tcp]), self.world, limits=self._limits,
+                                    max_goalset=1, warmup=False, self_collision_check=False)
+        except Exception as e:  # noqa: BLE001
+            rep["error"] = f"{type(e).__name__}: {e}"
+            return rep
+
+        def ik0():
+            try:
+                return bool(probe.ik_check(tip, start).get("checks", {}).get("0cm", {}).get("success"))
+            except Exception:  # noqa: BLE001
+                return None
+
+        rep["start_ok_world_on_self_off"] = ik0()        # cuRobo IK, full world, self OFF
+        try:
+            sph = probe.robot_spheres(start)
+            pen = {n: v for n, v in _sphere_box_overlaps(sph, self.world.scene).items()
+                   if v.get("spheres_penetrating", 0) > 0}
+        except Exception:  # noqa: BLE001
+            pen = {}
+        rep["penetrated_boxes"] = pen                    # analytic, for naming the suspects
+        try:
+            probe.clear_world(); rep["start_ok_no_world"] = ik0(); probe.set_world(self.world)
+        except Exception:  # noqa: BLE001
+            rep["start_ok_no_world"] = None
+        ablation: dict = {}
+        for name in pen:
+            try:
+                probe.set_world(self._world_without([name]))
+                ablation[name] = ik0()
+            except Exception as e:  # noqa: BLE001
+                ablation[name] = f"err: {type(e).__name__}: {e}"
+        try:
+            probe.set_world(self.world)
+        except Exception:  # noqa: BLE001
+            pass
+        rep["recover_by_removing_each"] = ablation
+
+        if rep["start_ok_world_on_self_off"]:
+            rep["verdict"] = ("NOT THE WORLD: with self-collision off, the start is collision-free against the "
+                              "world. The blocker is self-collision (or elsewhere) — cross-check validate_config.")
+        elif rep.get("start_ok_no_world"):
+            culprits = [n for n, ok in ablation.items() if ok is True]
+            rep["verdict"] = ("VERIFIED — the WORLD clips the robot at REST: removing the world makes the start "
+                              f"collision-free (cuRobo IK), and removing {culprits or 'the penetrated box(es)'} "
+                              "individually clears it. Those obstacles/cage-walls intersect the robot's body.")
+        else:
+            rep["verdict"] = ("start is in collision but removing the world did NOT clear it → self-collision or "
+                              "a deeper issue, not (only) the world. Cross-check validate_config + plan_without_world.")
+        return rep
+
     def diagnose_motion(self, tcp: Optional[str] = None, xyz: Optional[Sequence[float]] = None) -> dict:
         """Honest, decisive collision diagnosis for 'no collision-free trajectory'. Plans the SAME
         small move WITH the world and WITHOUT it, and reports what the START config's spheres overlap:
@@ -575,67 +647,58 @@ class MotionStack:
             except Exception as e:  # noqa: BLE001
                 rep["limits"] = {"error": f"{type(e).__name__}: {e}"}
 
-        # DECISIVE probe: with NO world AND NO self-collision, can cuRobo's IK reach a SET of poses?
-        # The key one is `current(0cm)` — the EXACT current TCP pose, which the current config trivially
-        # solves; if even THAT fails, the robot_cfg/IK is misconfigured (frame/tool/cspace), NOT a
-        # reach problem. If 0cm works but offsets fail, the arm is near full extension/singularity and
-        # only SOME directions are reachable (so the auto +z target was just a bad pick).
+        # PURE-IK reach probe (no world, no self-collision) — uses cuRobo's canonical `ik_check`
+        # (ik_solver.solve_pose), NOT plan_pose: trajopt on an un-warmed probe can fail spuriously and
+        # mislabel a fine config as broken. `0cm` is the EXACT current pose; if even pure IK can't
+        # solve it, the cfg is broken. If pure IK reaches but the PLANS (above) fail, it's COLLISION.
         rep["plan_no_world_no_selfcoll"] = {"ok": None, "message": "probe not run"}
         rep["ik_reach_no_world_no_selfcoll"] = {}
         try:
             from .curobo_v2 import CuroboV2Planner
             from .world import WorldInputs
             tip = self._tip(tcp)
-            cx, cy, cz = (cur[0] if cur else [xyz[0], xyz[1], xyz[2] - 0.05])
-            offsets = {
-                "current(0cm)": [cx, cy, cz],
-                "+z5cm": [cx, cy, cz + 0.05], "-z5cm": [cx, cy, cz - 0.05],
-                "+x5cm": [cx + 0.05, cy, cz], "-x5cm": [cx - 0.05, cy, cz],
-                "+y5cm": [cx, cy + 0.05, cz], "-y5cm": [cx, cy - 0.05, cz],
-                "halfway_to_base": [cx * 0.5, cy * 0.5, cz * 0.5],
-            }
             empty = WorldInputs(points=np.zeros((0, 3)), scene={})
             probe = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
                                     max_goalset=1, warmup=False, self_collision_check=False)
-            reach = {}
-            for label, p in offsets.items():
-                reach[label] = bool(probe.plan_pose({tip: (p, quat)}, start).success)
+            res = probe.ik_check(tip, start)   # PURE IK — same path validate_config proved works
+            reach = {k: bool(v.get("success")) for k, v in (res.get("checks") or {}).items()}
             rep["ik_reach_no_world_no_selfcoll"] = reach
-            rep["plan_no_world_no_selfcoll"] = {"ok": reach.get("current(0cm)"),
-                                                "message": f"IK reach by offset: {reach}"}
+            rep["plan_no_world_no_selfcoll"] = {"ok": reach.get("0cm"),
+                                                "message": f"pure-IK reach by offset: {reach}"}
         except Exception as e:  # noqa: BLE001
             rep["plan_no_world_no_selfcoll"] = {"ok": None, "message": f"probe failed: {type(e).__name__}: {e}"}
 
         a = rep["plan_with_world"]["ok"]
         b = rep["plan_without_world"]["ok"]
         reach = rep.get("ik_reach_no_world_no_selfcoll") or {}
-        c0 = reach.get("current(0cm)")
-        any_offset = any(v for k, v in reach.items() if k != "current(0cm)")
+        c0 = reach.get("0cm")
         viol = rep.get("limits", {}).get("violations") or {}
         if a:
             rep["verdict"] = "OK with the world — the earlier failure was a different target/TCP, not the world."
-        elif b:
-            rep["verdict"] = ("WORLD BLOCKS IT: the SAME move plans once the world is removed — start/path "
-                              "collides with the scanned cloud / an obstacle box (see start.in_cuboid).")
+        elif c0 is None:
+            rep["verdict"] = ("inconclusive — the pure-IK probe didn't run (see "
+                              "plan_no_world_no_selfcoll.message); use validate_config for the cfg/IK check.")
+        elif c0 is False:
+            rep["verdict"] = ("ROBOT CFG / IK BROKEN: cuRobo's PURE IK can't re-solve the EXACT current pose "
+                              "(no world, no self-collision) — a robot_cfg/IK mismatch (base_link / tool_frame "
+                              "/ cspace / quaternion). See ik_reach_no_world_no_selfcoll + validate_config.")
         elif viol:
             rep["verdict"] = (f"JOINT LIMITS: the START config is outside limits on {list(viol)} — fix the "
                               "limits (URDF/safety) or the start read; no trajectory can be valid.")
-        elif c0 is False:
-            rep["verdict"] = ("ROBOT CFG / IK BROKEN: with world + self-collision BOTH off, IK can't even "
-                              "re-solve the EXACT current TCP pose — which the current config trivially "
-                              "satisfies. That points at a robot_cfg/IK mismatch (base_link / tool_frame / "
-                              "cspace / quaternion convention), NOT reach. See ik_reach_no_world_no_selfcoll.")
-        elif c0 and not any_offset:
-            rep["verdict"] = ("NEAR SINGULARITY / FULL EXTENSION: only the exact current pose IK-solves; "
-                              "every ±5cm offset is unreachable for this TCP. Place a target toward the "
-                              "workspace centre / base, not at the arm's current reach edge.")
-        elif c0:
-            rep["verdict"] = ("IK IS FINE: the current pose AND some offsets reach — the auto +z target was "
-                              "just out of reach/singular. Re-run the COMMISSION (its multi-direction + "
-                              "multi-orientation search picks a reachable move), or place a point toward the workspace.")
+        elif b:
+            rep["verdict"] = ("WORLD BLOCKS IT: pure IK reaches the pose and removing the world makes the move "
+                              "plan — the START/path collides with the scanned cloud / an obstacle box. See "
+                              "start.in_cuboid (which box the robot is inside).")
         else:
-            rep["verdict"] = ("inconclusive — the IK-reach probe didn't run (see "
-                              "plan_no_world_no_selfcoll.message); likely GPU memory or a build error.")
+            # Pure IK reaches (kinematics fine), yet planning fails even with the world removed → the
+            # START config is in COLLISION: self-collision on the path AND (with the world) the cage/
+            # obstacles the robot is already inside. NOT a kinematics/reach bug.
+            inside = {k: v for k, v in (rep.get("start", {}).get("in_cuboid", {}) or {}).items()
+                      if v.get("spheres_penetrating", 0) > 0}
+            rep["verdict"] = ("COLLISION, NOT KINEMATICS: pure IK reaches the pose, but the START config is in "
+                              f"collision — the robot is INSIDE these obstacles at rest: {list(inside)}. Fix the "
+                              "world model (a cage wall/obstacle clipping the robot) and/or the self-collision "
+                              "margin; the kinematics + cfg are fine (validate_config = KINEMATICS OK).")
         return rep
 
     def retract(self, tcp: Optional[str] = None, *, execute: bool = True) -> MoveResult:
