@@ -86,6 +86,70 @@ def _unit(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
     return (v[0] / n, v[1] / n, v[2] / n)
 
 
+def _bbox(pts) -> Optional[dict]:
+    a = np.asarray(pts, dtype=float)
+    if a.size == 0:
+        return None
+    a = a.reshape(-1, a.shape[-1])
+    return {"min": [round(float(x), 3) for x in a[:, :3].min(0)],
+            "max": [round(float(x), 3) for x in a[:, :3].max(0)]}
+
+
+def _sphere_box_overlaps(spheres, scene: dict) -> dict:
+    """For each axis-aligned obstacle cuboid, how many of the robot's spheres PENETRATE it, and the
+    min clearance (sphere-surface → box, negative = inside). Box yaw is ignored (table/walls are
+    axis-aligned) — a fast, honest first read of 'is this config inside an obstacle'."""
+    out: dict = {}
+    sph = np.asarray(spheres, dtype=float)
+    if sph.size == 0:
+        return out
+    for name, box in (scene.get("cuboid") or {}).items():
+        pose = box.get("pose") or [0, 0, 0, 1, 0, 0, 0]
+        c = np.asarray(pose[:3], dtype=float)
+        half = np.asarray(box.get("dims") or [0, 0, 0], dtype=float) / 2.0
+        lo, hi = c - half, c + half
+        n, mind = 0, 1e9
+        for s in sph:
+            p, r = s[:3], float(s[3])
+            d = np.maximum(np.maximum(lo - p, p - hi), 0.0)   # per-axis outside distance
+            dist = float(np.linalg.norm(d)) - r
+            mind = min(mind, dist)
+            if dist < 0:
+                n += 1
+        out[name] = {"spheres_penetrating": int(n), "min_clearance_m": round(mind, 4)}
+    return out
+
+
+def _quat_mul(a: Sequence[float], b: Sequence[float]) -> List[float]:
+    """Hamilton product of two wxyz quaternions."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return [
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ]
+
+
+def _axis_quat(axis: Tuple[float, float, float], deg: float) -> List[float]:
+    """A wxyz rotation quaternion about `axis` by `deg` degrees."""
+    import math
+    r = math.radians(deg) / 2.0
+    c, s = math.cos(r), math.sin(r)
+    return [c, s * axis[0], s * axis[1], s * axis[2]]
+
+
+# When reaching a PLACED point we don't care about the exact tool orientation — cuRoboV2 (a35a708)
+# has no position-only goal, so we offer the current orientation plus a few rotations of it and take
+# the first that's reachable + collision-free. Generic (no tool-convention assumption): yaw flips +
+# a couple of pitch/roll quarter-turns are enough to free an otherwise-feasible point.
+_ORIENTATION_DELTAS: List[Tuple[Tuple[float, float, float], float]] = [
+    ((0, 0, 1), 90), ((0, 0, 1), -90), ((0, 0, 1), 180),
+    ((0, 1, 0), 90), ((0, 1, 0), -90), ((1, 0, 0), 90),
+]
+
+
 # Candidate directions on a sphere around the current TCP — the 6 axes + 8 cube diagonals — used by
 # `find_free_targets` to probe where the arm can move. Up-first so the nearest safe lift is offered
 # before lateral/down options.
@@ -227,17 +291,34 @@ class MotionStack:
             return None
         return planner.current_tool_pose(self._tip(tcp), self._current_positions([tcp]))
 
+    def _orientation_candidates(self, tcp: str, orientation: Optional[Sequence[float]]) -> List[List[float]]:
+        """Orientations to TRY at a reach point. An explicit `orientation` is used as-is; otherwise
+        the current TCP orientation FIRST (smallest wrist motion), then rotations of it — so a point
+        that's reachable with SOME orientation isn't rejected just because the live one doesn't fit."""
+        if orientation is not None:
+            return [list(orientation)[:4]]
+        cur = self.current_tool_pose(tcp)
+        q0 = list(cur[1])[:4] if cur else [1.0, 0.0, 0.0, 0.0]
+        return [q0] + [_quat_mul(q0, _axis_quat(ax, deg)) for ax, deg in _ORIENTATION_DELTAS]
+
     def plan_to_point(self, tcp: str, xyz: Sequence[float], *, orientation: Optional[Sequence[float]] = None,
                       execute: bool = True, max_attempts: int = 3) -> MoveResult:
-        """Plan a collision-free move so `tcp` reaches the 3D point `xyz`. By default KEEPS the
-        current TCP orientation (FK of the live config) — far more reachable + collision-free than a
-        forced identity orientation. Pass `orientation` (wxyz) to override. This is the keystone the
-        operator's target gizmo (stage 1) and the agent's chosen point (stage 2) both call."""
-        if orientation is None:
-            cur = self.current_tool_pose(tcp)
-            orientation = cur[1] if cur else [1.0, 0.0, 0.0, 0.0]
-        return self.move_to_pose(tcp, (list(xyz)[:3], list(orientation)[:4]),
-                                 execute=execute, max_attempts=max_attempts)
+        """Plan a collision-free move so `tcp` reaches the 3D point `xyz`. Reaching a POINT cares about
+        position, not the exact tool orientation, so we try the current orientation then a few rotated
+        fallbacks (cuRoboV2 a35a708 has no position-only goal) and take the first reachable, collision-
+        free one. Pass `orientation` (wxyz) to PIN it. The keystone the operator's target gizmo (stage
+        1), the agent's chosen point (stage 2), and the commission verification all call."""
+        xyz = list(xyz)[:3]
+        last = MoveResult(False, "that point isn't reachable + collision-free for this TCP in any tried "
+                                 "orientation — move it closer / pick another TCP")
+        for q in self._orientation_candidates(tcp, orientation):
+            mv = self.move_to_pose(tcp, (xyz, q), execute=False, max_attempts=max_attempts)
+            if mv.ok and mv.trajectory is not None:
+                if not execute:
+                    return mv
+                return self.move_to_pose(tcp, (xyz, q), execute=True, max_attempts=max_attempts)
+            last = mv
+        return last
 
     def safe_demo_move(self, tcp: str, *, execute: bool = True, deltas_m: Sequence[float] = (0.06, 0.10),
                        max_attempts: int = 2) -> Tuple[MoveResult, Optional[List[float]]]:
@@ -282,6 +363,77 @@ class MotionStack:
                     if len(out) >= n:
                         return out
         return out
+
+    def diagnose_motion(self, tcp: Optional[str] = None, xyz: Optional[Sequence[float]] = None) -> dict:
+        """Honest, decisive collision diagnosis for 'no collision-free trajectory'. Plans the SAME
+        small move WITH the world and WITHOUT it, and reports what the START config's spheres overlap:
+
+          • succeeds with the world           → the earlier failure was a different target/TCP.
+          • fails WITH world, ok WITHOUT world → the WORLD blocks it (start/path collides with the
+            scanned cloud or an obstacle box). `start.in_cuboid` + `world.cloud_bbox` say which.
+          • fails BOTH                         → NOT the world: self-collision (the self_collision_ignore
+            matrix is too sparse → phantom collisions), joint limits, or IK.
+
+        Read-only (execute=False); restores the world after the no-world probe."""
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"tcp": tcp}
+        if tcp is None:
+            rep["error"] = "no kinematic groups in the cell"
+            return rep
+        planner = self._planner_for([tcp])
+        start = self._current_positions([tcp])
+
+        w = self.world
+        cuboids = {name: {"dims": [round(float(d), 3) for d in (b.get("dims") or [])],
+                          "center": [round(float(x), 3) for x in (b.get("pose") or [0, 0, 0])[:3]]}
+                   for name, b in (w.scene.get("cuboid") or {}).items()}
+        rep["world"] = {"n_points": int(w.n_points), "voxel_size": float(w.voxel_size),
+                        "cloud_bbox": _bbox(w.points) if w.n_points else None,
+                        "n_cuboids": len(cuboids), "cuboids": cuboids}
+
+        if hasattr(planner, "robot_spheres"):
+            try:
+                sph = planner.robot_spheres(start)
+                rep["start"] = {"n_spheres": int(len(sph)), "spheres_bbox": _bbox(sph[:, :3]),
+                                "in_cuboid": _sphere_box_overlaps(sph, w.scene)}
+            except Exception as e:  # noqa: BLE001
+                rep["start"] = {"error": f"{type(e).__name__}: {e}"}
+
+        cur = self.current_tool_pose(tcp)
+        if xyz is None:
+            xyz = [cur[0][0], cur[0][1], cur[0][2] + 0.05] if cur else [0.3, 0.0, 0.4]
+        quat = cur[1] if cur else [1.0, 0.0, 0.0, 0.0]
+        xyz = [float(v) for v in list(xyz)[:3]]
+        rep["target"] = [round(v, 3) for v in xyz]
+
+        with_w = self.move_to_pose(tcp, (xyz, quat), execute=False)
+        rep["plan_with_world"] = {"ok": with_w.ok, "message": with_w.message}
+
+        if hasattr(planner, "clear_world") and hasattr(planner, "set_world"):
+            try:
+                planner.clear_world()
+                no_w = self.move_to_pose(tcp, (xyz, quat), execute=False)
+                rep["plan_without_world"] = {"ok": no_w.ok, "message": no_w.message}
+            finally:
+                planner.set_world(self.world)
+        else:
+            rep["plan_without_world"] = {"ok": None, "message": "planner cannot toggle the world"}
+
+        a = rep["plan_with_world"]["ok"]
+        b = rep["plan_without_world"]["ok"]
+        if a:
+            rep["verdict"] = "OK with the world — the earlier failure was a different target/TCP, not the world."
+        elif b:
+            rep["verdict"] = ("WORLD BLOCKS IT: the SAME move plans once the world is removed. The start "
+                              "config or path collides with the scanned cloud / an obstacle box. See "
+                              "start.in_cuboid (which box) and world.cloud_bbox vs start.spheres_bbox.")
+        elif b is False:
+            rep["verdict"] = ("NOT THE WORLD: it fails even with the world removed → SELF-COLLISION "
+                              "(self_collision_ignore too sparse), JOINT LIMITS, or IK reach. Next stop: "
+                              "the self-collision ignore matrix.")
+        else:
+            rep["verdict"] = "inconclusive (planner could not toggle the world)"
+        return rep
 
     def retract(self, tcp: Optional[str] = None, *, execute: bool = True) -> MoveResult:
         """Plan a collision-free path back to the robot's home/retract config. `tcp` selects the

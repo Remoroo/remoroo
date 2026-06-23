@@ -737,6 +737,31 @@ def h_suggest_targets(_q):
                         else "no reachable collision-free point found near the current pose")}
 
 
+def h_diagnose_motion(_q):
+    """Decisive collision diagnosis for 'no collision-free trajectory': plans the SAME small move WITH
+    vs WITHOUT the world and reports what the start config overlaps — so we KNOW if it's world
+    collision, self-collision, or reach, instead of guessing. GET params: tcp, optional x,y,z."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    groups = st.group_names
+    tcp = (_q.get("tcp", [None])[0]) or (groups[0] if groups else None)
+    xyz = None
+    if all(k in _q for k in ("x", "y", "z")):
+        try:
+            xyz = [float(_q.get(k, ["0"])[0]) for k in ("x", "y", "z")]
+        except (TypeError, ValueError):
+            xyz = None
+    try:
+        with _bridge_lock:
+            rep = st.diagnose_motion(tcp, xyz)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "tcp": tcp}
+    rep["ok"] = True
+    return rep
+
+
 def _delegate_script(rel: str):
     """Return a callable from an agent-authored script if present (e.g.
     calibration/collect_poses.py:run), else None."""
@@ -1652,6 +1677,7 @@ ROUTES = {
     "/edge/motion/plan_move": ("sse", sse_plan_move),
     "/edge/motion/tcp_pose": ("json", h_tcp_pose),
     "/edge/motion/suggest_targets": ("json", h_suggest_targets),
+    "/edge/motion/diagnose": ("json", h_diagnose_motion),
 }
 
 

@@ -82,7 +82,6 @@ class CuroboV2Planner:
         import torch  # noqa: F401  (lazy GPU import; presence validated by the toolchain gate)
         _ensure_warp_torch()                       # force-load Warp's torch interop or fail CLEARLY
         from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
-        from curobo.scene import Scene, Mesh
 
         self._device = device
         limits = limits or {}
@@ -103,7 +102,20 @@ class CuroboV2Planner:
         if warmup:
             self.planner.warmup(enable_graph=True, num_warmup_iterations=5)
 
-        # Fuse the scanned environment: keep-out/wall cuboids + the cloud-as-mesh, one world update.
+        # Fuse the scanned environment (keep-out/wall cuboids + the cloud-as-mesh) into the live
+        # world via update_world — symmetric with set_world/clear_world, which the motion diagnostic
+        # uses to A/B the SAME move with and without the world (isolating world-collision from
+        # self-collision/IK).
+        self._world = world
+        self.planner.update_world(self._full_scene(world))
+
+        self._interp_dt = float(self.planner.trajopt_solver.config.interpolation_dt)
+
+    # --- world (live, toggleable for the diagnostic) ----------------------
+    def _full_scene(self, world: WorldInputs):
+        """The complete collision scene: keep-out/wall/obstacle cuboids + the scanned cloud-as-mesh."""
+        from curobo.scene import Scene, Mesh
+
         scene = Scene.create(world.scene) if world.scene else Scene()
         if world.n_points > 0:
             scene.add_obstacle(Mesh.from_pointcloud(
@@ -111,9 +123,26 @@ class CuroboV2Planner:
                 pitch=float(world.voxel_size),
                 name="scanned_world",
             ))
-            self.planner.update_world(scene)
+        return scene
 
-        self._interp_dt = float(self.planner.trajopt_solver.config.interpolation_dt)
+    def clear_world(self) -> None:
+        """Drop ALL obstacles (empty world). Diagnostic only — restore with `set_world`."""
+        from curobo.scene import Scene
+
+        self.planner.update_world(Scene())
+
+    def set_world(self, world: Optional[WorldInputs] = None) -> None:
+        """Re-apply the full scene (restores after `clear_world`)."""
+        self.planner.update_world(self._full_scene(world or self._world))
+
+    def robot_spheres(self, start_positions: Optional[Dict[str, float]] = None) -> np.ndarray:
+        """The robot's ACTIVE collision spheres (x,y,z,r) at the current/given config — FK output.
+        cuRobo disables spheres with a negative radius, so those are filtered out. Used to see whether
+        a config sits inside an obstacle box (the start-in-collision diagnosis)."""
+        js = self._start_js(start_positions)
+        state = self.planner.compute_kinematics(js)
+        a = state.robot_spheres.detach().cpu().numpy().reshape(-1, 4)
+        return a[a[:, 3] > 0]
 
     # --- introspection ----------------------------------------------------
     @property
