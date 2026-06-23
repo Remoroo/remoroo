@@ -520,56 +520,61 @@ class MotionStack:
             return rep
         tip = self._tip(tcp)
         start = self._seed_positions()
-        try:
-            from .curobo_v2 import CuroboV2Planner
-            probe = CuroboV2Planner(self._robot_cfg_for([tcp]), self.world, limits=self._limits,
+        import gc
+
+        def check(world, want_pen=False):
+            """Build a FRESH no-self probe with `world` (clear_world is unreliable — cuRobo bakes
+            scene_model at build, so we rebuild), return (ik0_success, penetrated_boxes|None)."""
+            try:
+                from .curobo_v2 import CuroboV2Planner
+                p = CuroboV2Planner(self._robot_cfg_for([tcp]), world, limits=self._limits,
                                     max_goalset=1, warmup=False, self_collision_check=False)
-        except Exception as e:  # noqa: BLE001
-            rep["error"] = f"{type(e).__name__}: {e}"
-            return rep
-
-        def ik0():
-            try:
-                return bool(probe.ik_check(tip, start).get("checks", {}).get("0cm", {}).get("success"))
-            except Exception:  # noqa: BLE001
-                return None
-
-        rep["start_ok_world_on_self_off"] = ik0()        # cuRobo IK, full world, self OFF
-        try:
-            sph = probe.robot_spheres(start)
-            pen = {n: v for n, v in _sphere_box_overlaps(sph, self.world.scene).items()
-                   if v.get("spheres_penetrating", 0) > 0}
-        except Exception:  # noqa: BLE001
-            pen = {}
-        rep["penetrated_boxes"] = pen                    # analytic, for naming the suspects
-        try:
-            probe.clear_world(); rep["start_ok_no_world"] = ik0(); probe.set_world(self.world)
-        except Exception:  # noqa: BLE001
-            rep["start_ok_no_world"] = None
-        ablation: dict = {}
-        for name in pen:
-            try:
-                probe.set_world(self._world_without([name]))
-                ablation[name] = ik0()
+                ok = bool(p.ik_check(tip, start).get("checks", {}).get("0cm", {}).get("success"))
+                pen = None
+                if want_pen and hasattr(p, "robot_spheres"):
+                    sph = p.robot_spheres(start)
+                    pen = {n: v for n, v in _sphere_box_overlaps(sph, world.scene).items()
+                           if v.get("spheres_penetrating", 0) > 0}
+                del p
+                gc.collect()
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+                return ok, pen
             except Exception as e:  # noqa: BLE001
-                ablation[name] = f"err: {type(e).__name__}: {e}"
-        try:
-            probe.set_world(self.world)
-        except Exception:  # noqa: BLE001
-            pass
-        rep["recover_by_removing_each"] = ablation
+                return f"err: {type(e).__name__}: {e}", None
 
-        if rep["start_ok_world_on_self_off"]:
-            rep["verdict"] = ("NOT THE WORLD: with self-collision off, the start is collision-free against the "
-                              "world. The blocker is self-collision (or elsewhere) — cross-check validate_config.")
-        elif rep.get("start_ok_no_world"):
-            culprits = [n for n, ok in ablation.items() if ok is True]
-            rep["verdict"] = ("VERIFIED — the WORLD clips the robot at REST: removing the world makes the start "
-                              f"collision-free (cuRobo IK), and removing {culprits or 'the penetrated box(es)'} "
-                              "individually clears it. Those obstacles/cage-walls intersect the robot's body.")
+        full_ok, pen = check(self.world, want_pen=True)
+        rep["start_ok_full_world"] = full_ok
+        rep["penetrated_boxes"] = pen or {}
+
+        from .world import WorldInputs
+        rep["start_ok_no_world"], _ = check(WorldInputs(points=np.zeros((0, 3)), scene={}))
+
+        ablation: dict = {}
+        names = list((pen or {}).keys())
+        if names:
+            ablation["__all_penetrated_removed__"], _ = check(self._world_without(names))
+            for name in names:                          # attribute: which single box clears it
+                ablation[name], _ = check(self._world_without([name]))
+        rep["recover_by_removing"] = ablation
+
+        if full_ok is True:
+            rep["verdict"] = ("NOT THE WORLD: with self-collision off, the start is already collision-free "
+                              "against the full world. The blocker is self-collision — cross-check validate_config.")
+        elif rep["start_ok_no_world"] is True:
+            solo = [n for n, ok in ablation.items() if ok is True and n != "__all_penetrated_removed__"]
+            rep["verdict"] = ("VERIFIED — the WORLD clips the robot at REST: with an EMPTY world the start is "
+                              "collision-free (cuRobo IK, self off), but with the world it is not. Box(es) whose "
+                              f"removal clears the start: {solo or names}. Those intersect the robot's body.")
+        elif rep["start_ok_no_world"] is False:
+            rep["verdict"] = ("NOT (only) THE WORLD: the start is in collision even with an EMPTY world (self off) "
+                              "— that's kinematics/cfg, cross-check validate_config (it should say KINEMATICS OK; "
+                              "if so, this verify path has a build issue).")
         else:
-            rep["verdict"] = ("start is in collision but removing the world did NOT clear it → self-collision or "
-                              "a deeper issue, not (only) the world. Cross-check validate_config + plan_without_world.")
+            rep["verdict"] = "inconclusive — a probe build errored; see start_ok_* fields."
         return rep
 
     def diagnose_motion(self, tcp: Optional[str] = None, xyz: Optional[Sequence[float]] = None) -> dict:
