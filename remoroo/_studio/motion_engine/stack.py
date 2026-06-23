@@ -266,7 +266,12 @@ class MotionStack:
         try:
             from dataclasses import replace
             sph = planner.robot_spheres(self._seed_positions())
-            margin = float(self.sphere_buffer) + float(getattr(self.world, "voxel_size", 0.01))
+            # Cover cuRobo's EFFECTIVE collision footprint so a point can't survive as a voxel that
+            # the robot penetrates: a point may sit at the far edge of its cell, so the occupancy
+            # mesh extends up to a FULL `voxel_size` toward the robot beyond the point — plus the
+            # sphere buffer + collision activation distance (~1cm). Mask radius+this, generously.
+            voxel = float(getattr(self.world, "voxel_size", 0.02))
+            margin = voxel + float(self.sphere_buffer) + 0.015
             masked, n = mask_robot_points(self.world.points, sph, margin=margin)
             if n > 0:
                 self.world = replace(self.world, points=masked,
@@ -548,9 +553,13 @@ class MotionStack:
         rep["seed"] = {"n_read": len(seed), "names_sample": list(seed.keys())[:14],
                        "values_sample": {k: round(float(v), 3) for k, v in list(seed.items())[:8]}}
         rep["planner_joint_names"] = pj
+        # APPLIED = every joint the bridge reports matched a planner joint (the planner may have a few
+        # MORE, e.g. gripper drive_joints the bridge doesn't report — those correctly default).
+        applied = len(seed) > 0 and len(matched) == len(seed)
         rep["seed_matches_planner"] = {"matched": matched, "n_matched": len(matched),
-                                       "n_planner": len(pj),
-                                       "applied": len(matched) > 0 and len(matched) == len(pj)}
+                                       "n_planner": len(pj), "n_seed": len(seed),
+                                       "unmatched_planner_joints": [n for n in pj if n not in seed],
+                                       "applied": applied}
         if hasattr(planner, "robot_spheres"):
             try:
                 sph = planner.robot_spheres(seed)
@@ -569,16 +578,26 @@ class MotionStack:
                     rep["cloud_points_within_2cm_of_robot"] = inside
             except Exception as e:  # noqa: BLE001
                 rep["robot_spheres_error"] = f"{type(e).__name__}: {e}"
-        rep["verdict"] = (
-            "SEED NOT APPLIED — bridge joint names don't match the planner's, so the robot is modelled at "
-            "the DEFAULT config, misaligned with the live scan → cuRobo collides though the real robot is "
-            "elsewhere. Fix _seed_positions name mapping."
-            if not rep["seed_matches_planner"]["applied"] else
-            ("CLOUD FAR FROM ROBOT (>2cm) yet cuRobo collides → FRAME MISMATCH: the cloud isn't in the robot "
-             "base frame (world-scan calibration/origin). Re-express the cloud in the base frame."
-             if rep.get("cloud_to_robot_min_clearance_m", -1) > 0.02 else
-             "cloud overlaps the robot in-frame (min clearance ≤ 2cm) — alignment looks OK; the mask margin "
-             "or the voxel inflation is the gap."))
+        clr = rep.get("cloud_to_robot_min_clearance_m")
+        voxel = float(getattr(self.world, "voxel_size", 0.02))
+        if not rep["seed_matches_planner"]["applied"]:
+            rep["verdict"] = ("SEED NOT APPLIED — the bridge reports joints the planner doesn't know (or vice "
+                              "versa), so the robot is modelled at the wrong config. Fix _seed_positions / the "
+                              "bridge joint names.")
+        elif clr is None:
+            rep["verdict"] = "no cloud or no spheres — nothing to align."
+        elif clr < 0:
+            rep["verdict"] = ("ROBOT INSIDE THE CLOUD (negative clearance) — residual robot points the scan "
+                              "didn't mask. The world-build self-mask removes these.")
+        elif clr <= voxel + 0.04:
+            rep["verdict"] = (f"RESIDUAL-ROBOT SHELL: the cloud sits {round(clr*100,1)}cm off the robot — within "
+                              f"cuRobo's VOXEL-INFLATED footprint (each point → a {round(voxel*100)}cm cube, so the "
+                              "occupancy mesh reaches the robot). NOT a frame error. The self-mask margin now "
+                              "covers voxel+buffer+activation, so these get removed.")
+        else:
+            rep["verdict"] = (f"CLOUD {round(clr*100,1)}cm OFF THE ROBOT yet cuRobo collides — too far for voxel "
+                              "inflation → suspect a FRAME/CALIBRATION offset (the scan isn't truly in the robot "
+                              "base frame). Investigate the hand-eye X used by world-scan.")
         return rep
 
     def _world_without(self, names: Sequence[str]):
