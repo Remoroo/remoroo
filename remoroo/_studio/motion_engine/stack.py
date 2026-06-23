@@ -576,6 +576,15 @@ class MotionStack:
                         inside += int((near < 0.02).sum())
                     rep["cloud_to_robot_min_clearance_m"] = round(mind, 4)
                     rep["cloud_points_within_2cm_of_robot"] = inside
+                    # DEBUG: what the self-mask WOULD remove right now, vs what actually persisted —
+                    # exposes a finalize-flow / seed-timing bug (mask ran at a different config).
+                    mm = float(getattr(self.world, "voxel_size", 0.02)) + float(self.sphere_buffer) + 0.015
+                    _, n_would = mask_robot_points(self.world.points, sph, margin=mm)
+                    rep["mask_check"] = {
+                        "margin_m": round(mm, 4), "n_would_remove_now": int(n_would),
+                        "n_robot_masked_persisted": self.world.meta.get("n_robot_masked"),
+                        "world_finalized": self._world_finalized,
+                        "n_planners_built": len(self._planners)}
             except Exception as e:  # noqa: BLE001
                 rep["robot_spheres_error"] = f"{type(e).__name__}: {e}"
         clr = rep.get("cloud_to_robot_min_clearance_m")
