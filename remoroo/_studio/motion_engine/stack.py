@@ -550,31 +550,33 @@ class MotionStack:
         rep["start_ok_full_world"] = full_ok
         rep["penetrated_boxes"] = pen or {}
 
+        from dataclasses import replace
         from .world import WorldInputs
         rep["start_ok_no_world"], _ = check(WorldInputs(points=np.zeros((0, 3)), scene={}))
+        # ISOLATE cloud vs cuboids (collision is monotonic, so each ablation is decisive):
+        rep["start_ok_no_cloud"], _ = check(replace(self.world, points=np.zeros((0, 3))))   # cuboids only
+        rep["start_ok_no_cuboids"], _ = check(replace(self.world, scene={}))                 # cloud only
 
-        ablation: dict = {}
-        names = list((pen or {}).keys())
-        if names:
-            ablation["__all_penetrated_removed__"], _ = check(self._world_without(names))
-            for name in names:                          # attribute: which single box clears it
-                ablation[name], _ = check(self._world_without([name]))
-        rep["recover_by_removing"] = ablation
-
+        nc = rep["start_ok_no_cloud"]        # True ⇒ cuboids ALONE are fine ⇒ the CLOUD blocks
+        ncu = rep["start_ok_no_cuboids"]     # True ⇒ cloud ALONE is fine ⇒ the CUBOIDS block
         if full_ok is True:
-            rep["verdict"] = ("NOT THE WORLD: with self-collision off, the start is already collision-free "
-                              "against the full world. The blocker is self-collision — cross-check validate_config.")
-        elif rep["start_ok_no_world"] is True:
-            solo = [n for n, ok in ablation.items() if ok is True and n != "__all_penetrated_removed__"]
-            rep["verdict"] = ("VERIFIED — the WORLD clips the robot at REST: with an EMPTY world the start is "
-                              "collision-free (cuRobo IK, self off), but with the world it is not. Box(es) whose "
-                              f"removal clears the start: {solo or names}. Those intersect the robot's body.")
-        elif rep["start_ok_no_world"] is False:
-            rep["verdict"] = ("NOT (only) THE WORLD: the start is in collision even with an EMPTY world (self off) "
-                              "— that's kinematics/cfg, cross-check validate_config (it should say KINEMATICS OK; "
-                              "if so, this verify path has a build issue).")
+            rep["verdict"] = ("NOT THE WORLD: with self-collision off the start is already collision-free against "
+                              "the full world. The blocker is self-collision — cross-check validate_config.")
+        elif rep["start_ok_no_world"] is not True:
+            rep["verdict"] = ("start in collision even with an EMPTY world (self off) → kinematics/cfg or the seed; "
+                              "validate_config says KINEMATICS OK, so suspect _seed_positions. Inconclusive here.")
+        elif nc is True and ncu is not True:
+            rep["verdict"] = ("VERIFIED — the SCANNED CLOUD clips the robot at rest: removing the cloud clears the "
+                              "start; the cuboids alone don't. The world-scan didn't fully MASK the robot, so the "
+                              "robot's own body is in the cloud → it collides with itself-as-environment. Fix the "
+                              "scan masking / crop the cloud away from the robot's volume.")
+        elif ncu is True and nc is not True:
+            rep["verdict"] = ("VERIFIED — the CUBOIDS clip the robot at rest: removing them clears the start; the "
+                              "cloud alone doesn't. A cage wall / obstacle box intersects the robot (e.g. ws_zlo "
+                              "floor at z=0, or obs_1_wall). Fix the safety bounds / obstacle placement.")
         else:
-            rep["verdict"] = "inconclusive — a probe build errored; see start_ok_* fields."
+            rep["verdict"] = ("BOTH the cloud AND the cuboids clip the robot independently (each removal alone "
+                              "doesn't clear it). Fix both: the scan masking AND the offending cage/obstacle box.")
         return rep
 
     def diagnose_motion(self, tcp: Optional[str] = None, xyz: Optional[Sequence[float]] = None) -> dict:
