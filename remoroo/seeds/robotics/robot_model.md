@@ -7,6 +7,18 @@ camera mounts + frames, and for dual-arm the second arm's placement). Your job
 is to **consume** their exported URDF and turn it into the cuRobo collision
 model the planner needs.
 
+> **ONE URDF — `remoroo_cell/robot_model/robot.urdf` is the SINGLE SOURCE OF TRUTH.**
+> The Studio loads it, the operator edits it, calibration writes the optical
+> frames back INTO it, and the planner (`motion_engine` / cuRobo) reads it. **Do
+> NOT create a parallel/"resolved" URDF (`robot_resolved.urdf`, `robot_model/resolved/…`)
+> and treat it as the model** — that silently diverges from what the Studio shows
+> and what calibration updates. You do NOT need one: cuRobo parses `robot.urdf`
+> with `load_meshes=False` (kinematics only — the `package://…` mesh refs are never
+> loaded), and for sphere-fitting you resolve each mesh path in-memory (see the
+> sphere section). If you ever write a scratch URDF for a one-off tool, keep it in
+> `/tmp`, never under `robot_model/`, and never point cell.yaml / the spheres /
+> the planner at it.
+
 So at Phase 5:
 
 1. **Hand off the model gate and WAIT.** Issue `gate_checkpoint(gate=model)`. The

@@ -24,6 +24,7 @@ stack hands over the whole `Trajectory` and a `should_abort` poll; it never send
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -106,8 +107,11 @@ class MotionStack:
         spheres, buffer = load_spheres(cell_dir)
         safety = load_safety(cell_dir)
         world = load_world(cell_dir, safety=safety.world_kwargs(), wall_bounds=wall_bounds)
+        # ABSOLUTE path — cuRobo resolves a relative `urdf_path` against its OWN content/assets dir
+        # (the "curobo/content/assets/robot.urdf is not a file" failure), never the cell.
+        urdf_path = str((Path(cell_dir) / "robot_model" / "robot.urdf").resolve())
         return cls(config=config, spheres=spheres, sphere_buffer=buffer, world=world,
-                   safety=safety, bridge=bridge, planner_factory=planner_factory)
+                   safety=safety, bridge=bridge, urdf_path=urdf_path, planner_factory=planner_factory)
 
     # --- group/TCP resolution --------------------------------------------
     def _group(self, tcp: str) -> dict:
