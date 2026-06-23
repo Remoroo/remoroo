@@ -81,6 +81,21 @@ def _default_planner_factory(robot_cfg, world, *, limits, max_goalset):
     return CuroboV2Planner(robot_cfg, world, limits=limits, max_goalset=max_goalset)
 
 
+def _unit(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    n = (v[0] ** 2 + v[1] ** 2 + v[2] ** 2) ** 0.5 or 1.0
+    return (v[0] / n, v[1] / n, v[2] / n)
+
+
+# Candidate directions on a sphere around the current TCP — the 6 axes + 8 cube diagonals — used by
+# `find_free_targets` to probe where the arm can move. Up-first so the nearest safe lift is offered
+# before lateral/down options.
+_SPHERE_DIRS: List[Tuple[float, float, float]] = [
+    (0, 0, 1), (0, 0, -1), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0),
+    _unit((1, 1, 1)), _unit((1, 1, -1)), _unit((1, -1, 1)), _unit((1, -1, -1)),
+    _unit((-1, 1, 1)), _unit((-1, 1, -1)), _unit((-1, -1, 1)), _unit((-1, -1, -1)),
+]
+
+
 class MotionStack:
     def __init__(self, *, config: dict, spheres: Dict[str, List[dict]], sphere_buffer: float,
                  world: WorldInputs, safety: Safety, bridge=None,
@@ -197,10 +212,70 @@ class MotionStack:
                                    max_attempts=max_attempts)
         return self._finish(res, execute)
 
-    def plan_to_point(self, tcp: str, xyz: Sequence[float], *, execute: bool = True) -> MoveResult:
-        """Convenience: reach a 3D point with a nominal (identity) orientation. Use `move_to_pose`
-        when orientation matters."""
-        return self.move_to_pose(tcp, (list(xyz)[:3], [1.0, 0.0, 0.0, 0.0]), execute=execute)
+    def current_tool_pose(self, tcp: str) -> object:
+        """The live (xyz, wxyz) of `tcp`'s tool frame in the base frame — FK of the current joints.
+        Lets the Studio spawn a target gizmo at the real TCP and lets `plan_to_point` keep the
+        current orientation. Empty/None if the planner can't FK (e.g. a non-cuRobo test factory)."""
+        planner = self._planner_for([tcp])
+        if not hasattr(planner, "current_tool_pose"):
+            return None
+        return planner.current_tool_pose(self._tip(tcp), self._current_positions([tcp]))
+
+    def plan_to_point(self, tcp: str, xyz: Sequence[float], *, orientation: Optional[Sequence[float]] = None,
+                      execute: bool = True, max_attempts: int = 3) -> MoveResult:
+        """Plan a collision-free move so `tcp` reaches the 3D point `xyz`. By default KEEPS the
+        current TCP orientation (FK of the live config) — far more reachable + collision-free than a
+        forced identity orientation. Pass `orientation` (wxyz) to override. This is the keystone the
+        operator's target gizmo (stage 1) and the agent's chosen point (stage 2) both call."""
+        if orientation is None:
+            cur = self.current_tool_pose(tcp)
+            orientation = cur[1] if cur else [1.0, 0.0, 0.0, 0.0]
+        return self.move_to_pose(tcp, (list(xyz)[:3], list(orientation)[:4]),
+                                 execute=execute, max_attempts=max_attempts)
+
+    def safe_demo_move(self, tcp: str, *, execute: bool = True, deltas_m: Sequence[float] = (0.06, 0.10),
+                       max_attempts: int = 2) -> Tuple[MoveResult, Optional[List[float]]]:
+        """Auto-find ONE small collision-free move from the CURRENT pose: offset the live TCP a few cm
+        along each axis (up first, then lateral, then down), keeping orientation, and return the first
+        that cuRobo can plan. A legible default verification that needs no operator input and avoids
+        the colliding home — and a deterministic floor under stage 2's agent target search. Returns
+        (result, chosen_point) so the caller/UI can show WHERE it moved."""
+        cur = self.current_tool_pose(tcp)
+        if not cur:
+            return MoveResult(False, "planner cannot FK the current pose — cannot pick a safe demo move"), None
+        pos, quat = cur
+        dirs = [(0, 0, 1), (0, 0, -1), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+        for d in deltas_m:
+            for ux, uy, uz in dirs:
+                tgt = [pos[0] + ux * d, pos[1] + uy * d, pos[2] + uz * d]
+                mv = self.move_to_pose(tcp, (tgt, quat), execute=False, max_attempts=max_attempts)
+                if mv.ok and mv.trajectory is not None:
+                    return (self.plan_to_point(tcp, tgt, orientation=quat, execute=execute) if execute else mv), tgt
+        return MoveResult(False, "no small collision-free move found from the current pose — the arm "
+                                 "may be boxed in by the world/obstacles"), None
+
+    def find_free_targets(self, tcp: str, *, n: int = 8, radii: Sequence[float] = (0.10, 0.18),
+                          max_attempts: int = 1) -> List[dict]:
+        """REMOROO reads the space: sample candidate points around the current TCP (on a sphere, at
+        each radius) and return those cuRobo can actually PLAN to — collision-free against the fused
+        world, keeping the current orientation. The caller (the Studio 'suggest points' button, or
+        the agent in stage 2) chooses among them; the operator can still nudge before any motion.
+        Returns up to `n` dicts `{point:[x,y,z], radius, distance, trajectory}` nearest-first."""
+        cur = self.current_tool_pose(tcp)
+        if not cur:
+            return []
+        pos, quat = cur
+        out: List[dict] = []
+        for r in radii:
+            for d in _SPHERE_DIRS:
+                tgt = [float(pos[i] + d[i] * r) for i in range(3)]
+                mv = self.move_to_pose(tcp, (tgt, quat), execute=False, max_attempts=max_attempts)
+                if mv.ok and mv.trajectory is not None:
+                    out.append({"point": tgt, "radius": float(r), "distance": float(r),
+                                "trajectory": mv.trajectory.summary()})
+                    if len(out) >= n:
+                        return out
+        return out
 
     def retract(self, tcp: Optional[str] = None, *, execute: bool = True) -> MoveResult:
         """Plan a collision-free path back to the robot's home/retract config. `tcp` selects the
@@ -225,10 +300,16 @@ class MotionStack:
             return MoveResult(False, f"move_to_joints failed: {e}")
 
     # --- commission self-test --------------------------------------------
-    def commission(self, *, execute: bool = True, progress: Optional[Callable[[dict], None]] = None) -> dict:
+    def commission(self, *, execute: bool = True, progress: Optional[Callable[[dict], None]] = None,
+                   target: Optional[Sequence[float]] = None, tcp: Optional[str] = None) -> dict:
         """Build the stack and VERIFY the end-to-end chain once: spheres healthy → planner builds →
         ONE collision-free plan → trajectory → (optionally) the per-arm executor replays it. This
-        is what the new commission gate runs so G8 exercises a PROVEN stack, not an assumed one."""
+        is what the new commission gate runs so G8 exercises a PROVEN stack, not an assumed one.
+
+        The verification move is a REACHABLE target, never the cspace home (which is commonly inside
+        the table): if the operator/agent passed a 3D `target` point we plan `tcp` there (keeping its
+        current orientation); otherwise `safe_demo_move` auto-finds a small collision-free nudge from
+        the live pose. Both prove the same fused stack with a legible, supervised motion."""
         def emit(**kw):
             if progress:
                 progress(kw)
@@ -247,7 +328,7 @@ class MotionStack:
             report["message"] = "collision spheres are degenerate — refusing to move (fix the model)"
             return report
 
-        first = next(iter(self._groups), None)
+        first = tcp or next(iter(self._groups), None)
         if not step("groups", first is not None, groups=list(self._groups)):
             report["message"] = "no kinematic groups in the cell — nothing to commission"
             return report
@@ -261,11 +342,17 @@ class MotionStack:
             report["message"] = f"planner build failed: {e}"
             return report
 
-        emit(step="plan_move", ok=True, note="planning a safe verification move")
-        mv = self.retract(first, execute=execute)
-        step("plan_move", mv.ok, message=mv.message, executed=mv.executed,
+        if target is not None:
+            emit(step="plan_move", ok=True, note=f"planning to the chosen point {list(target)[:3]}")
+            mv = self.plan_to_point(first, list(target)[:3], execute=execute)
+            chosen = list(target)[:3]
+        else:
+            emit(step="plan_move", ok=True, note="auto-finding a small collision-free move from the live pose")
+            mv, chosen = self.safe_demo_move(first, execute=execute)
+        step("plan_move", mv.ok, tcp=first, target=chosen, message=mv.message, executed=mv.executed,
              trajectory=(mv.trajectory.summary() if mv.trajectory else None), audit=mv.audit)
         report["ok"] = mv.ok
+        report["target"] = chosen
         report["message"] = "commissioned — the motion stack is proven end-to-end" if mv.ok else mv.message
         report["move"] = mv.to_dict()
         return report

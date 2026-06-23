@@ -124,6 +124,18 @@ class CuroboV2Planner:
     def joint_names(self) -> List[str]:
         return list(self.planner.joint_names)
 
+    def current_tool_pose(self, tool_frame: str,
+                          start_positions: Optional[Dict[str, float]] = None) -> Goal:
+        """FK the current (or given) config → `tool_frame`'s pose `(xyz, wxyz)` in the planner's base
+        frame. Used to plan a point move that KEEPS the current orientation (far more reachable than a
+        forced identity orientation), and to seed a target gizmo at the live TCP."""
+        js = self._start_js(start_positions)
+        state = self.planner.compute_kinematics(js)
+        pose = state.tool_poses.get_link_pose(tool_frame)
+        pos = pose.position.detach().cpu().numpy().reshape(-1)
+        quat = pose.quaternion.detach().cpu().numpy().reshape(-1)
+        return [float(v) for v in pos[:3]], [float(v) for v in quat[:4]]
+
     # --- planning ---------------------------------------------------------
     def _start_js(self, start_positions: Optional[Dict[str, float]]):
         """A JointState over the planner's active joints; missing joints take the robot default."""

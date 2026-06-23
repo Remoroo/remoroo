@@ -606,7 +606,11 @@ def sse_commission(_q):
     """Build the unified motion stack from every prior gate's output and VERIFY one collision-free
     plan+execute against the SCANNED world. Streams each commission step (sphere health → planner
     build → plan → audit → executor replay); ends {done, result:<report>}. The motion is
-    operator-gated in the Studio (default_proceed=false)."""
+    operator-gated in the Studio (default_proceed=false).
+
+    The verification move is a REACHABLE target, never the cspace home (commonly inside the table):
+    pass `tcp` + `x,y,z` to plan to an operator/agent-chosen point (keeping current orientation),
+    else the stack auto-finds a small collision-free nudge from the live pose."""
     import queue as _queue
     import threading as _threading
 
@@ -618,13 +622,21 @@ def sse_commission(_q):
         return
 
     execute = (_q.get("execute", ["1"])[0] != "0")
+    tcp = (_q.get("tcp", [None])[0]) or None
+    target = None
+    if all(k in _q for k in ("x", "y", "z")):
+        try:
+            target = [float(_q.get(k, ["0"])[0]) for k in ("x", "y", "z")]
+        except (TypeError, ValueError):
+            target = None
     q: "_queue.Queue" = _queue.Queue()
     out: dict = {}
 
     def run():
         with _bridge_lock:
             try:
-                out["report"] = st.commission(execute=execute, progress=lambda s: q.put(s))
+                out["report"] = st.commission(execute=execute, target=target, tcp=tcp,
+                                               progress=lambda s: q.put(s))
             except Exception as e:  # noqa: BLE001
                 out["report"] = {"ok": False, "message": f"{type(e).__name__}: {e}"}
             finally:
@@ -640,9 +652,14 @@ def sse_commission(_q):
 
 
 def sse_plan_move(_q):
-    """Plan + execute a high-level move via the shipped stack (the demo gate exercises this).
-    GET params: tcp; mode=pose|retract; x,y,z + qw,qx,qy,qz for a pose. Streams phase, then
-    {done, result:<MoveResult>}."""
+    """Plan + execute a high-level move via the shipped stack (the demo gate + the operator's target
+    gizmo exercise this). GET params:
+      tcp     — group name (default: first)
+      mode    — point | pose | retract   (default: point)
+      x,y,z   — target position (point/pose)
+      qw..qz  — orientation (pose only; OMIT to KEEP the current TCP orientation — far more reachable)
+      execute — '0' = plan-only preview (no motion), '1' = plan + supervised execute (default)
+    Streams phase, then {done, result:<MoveResult>}."""
     try:
         _preload_warp()                 # MAIN THREAD — load warp.torch before any build worker
         st = motion_stack()
@@ -652,19 +669,72 @@ def sse_plan_move(_q):
 
     arms = st.arm_map.get("arms") or []
     tcp = (_q.get("tcp", [None])[0]) or (arms[0]["name"] if arms else None)
-    mode = _q.get("mode", ["pose"])[0]
-    yield {"phase": "planning", "tcp": tcp, "mode": mode}
+    mode = _q.get("mode", ["point"])[0]
+    execute = (_q.get("execute", ["1"])[0] != "0")
+    yield {"phase": "planning", "tcp": tcp, "mode": mode, "execute": execute}
     try:
         with _bridge_lock:
             if mode == "retract":
-                res = st.retract(tcp)
-            else:
-                xyz = [float(_q.get(k, [0.0])[0]) for k in ("x", "y", "z")]
-                quat = [float(_q.get(k, [d])[0]) for k, d in (("qw", 1.0), ("qx", 0.0), ("qy", 0.0), ("qz", 0.0))]
-                res = st.move_to_pose(tcp, (xyz, quat))
+                res = st.retract(tcp, execute=execute)
+            elif mode == "pose" and any(k in _q for k in ("qw", "qx", "qy", "qz")):
+                xyz = [float(_q.get(k, ["0"])[0]) for k in ("x", "y", "z")]
+                quat = [float(_q.get(k, [str(d)])[0]) for k, d in (("qw", 1.0), ("qx", 0.0), ("qy", 0.0), ("qz", 0.0))]
+                res = st.move_to_pose(tcp, (xyz, quat), execute=execute)
+            else:  # 'point' (or 'pose' without a quat): reach the point, KEEP current orientation
+                xyz = [float(_q.get(k, ["0"])[0]) for k in ("x", "y", "z")]
+                res = st.plan_to_point(tcp, xyz, execute=execute)
         yield {"done": True, "result": res.to_dict()}
     except Exception as e:  # noqa: BLE001
         yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
+
+
+def h_tcp_pose(_q):
+    """The live pose of a TCP's tool frame in the base frame — FK of the current joints. The Studio
+    spawns the target gizmo HERE so the operator drags from the real tool position. GET param: tcp
+    (default: first group). Returns {ok, tcp, position:[x,y,z], quaternion:[w,x,y,z]}."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    arms = st.arm_map.get("arms") or []
+    tcp = (_q.get("tcp", [None])[0]) or (arms[0]["name"] if arms else None)
+    if not tcp:
+        return {"ok": False, "error": "no TCP/group available"}
+    try:
+        with _bridge_lock:
+            pose = st.current_tool_pose(tcp)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "tcp": tcp}
+    if not pose:
+        return {"ok": False, "error": "planner could not FK the current pose", "tcp": tcp}
+    return {"ok": True, "tcp": tcp, "position": list(pose[0]), "quaternion": list(pose[1])}
+
+
+def h_suggest_targets(_q):
+    """STAGE 2 — remoroo reads the space: return reachable, collision-free points the TCP can move to
+    (cuRobo plans each, keeping orientation). The Studio 'suggest points' button and the agent both
+    consume this to propose a target the operator then confirms/nudges. GET params: tcp, n (default
+    8). Returns {ok, tcp, targets:[{point,radius,distance,trajectory}]}."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    arms = st.arm_map.get("arms") or []
+    tcp = (_q.get("tcp", [None])[0]) or (arms[0]["name"] if arms else None)
+    if not tcp:
+        return {"ok": False, "error": "no TCP/group available"}
+    try:
+        n = max(1, min(24, int(_q.get("n", ["8"])[0])))
+    except (TypeError, ValueError):
+        n = 8
+    try:
+        with _bridge_lock:
+            targets = st.find_free_targets(tcp, n=n)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "tcp": tcp}
+    return {"ok": True, "tcp": tcp, "targets": targets,
+            "message": (f"{len(targets)} reachable point(s)" if targets
+                        else "no reachable collision-free point found near the current pose")}
 
 
 def _delegate_script(rel: str):
@@ -1580,6 +1650,8 @@ ROUTES = {
     "/edge/plan": ("sse", sse_plan),
     "/edge/motion/commission": ("sse", sse_commission),
     "/edge/motion/plan_move": ("sse", sse_plan_move),
+    "/edge/motion/tcp_pose": ("json", h_tcp_pose),
+    "/edge/motion/suggest_targets": ("json", h_suggest_targets),
 }
 
 
