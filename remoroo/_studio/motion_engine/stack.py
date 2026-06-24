@@ -199,6 +199,7 @@ class MotionStack:
         # LIVE volumetric world (cuRobo Mapper → ESDF). Injectable factory so the wiring tests off-GPU.
         self._mapper_factory = mapper_factory
         self._mapper = None
+        self._grid_meta: dict = {}                     # last ESDF grid extent/center (for legibility)
         self._live_voxels: np.ndarray = np.zeros((0, 4), dtype=float)
         # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace; the
         # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
@@ -314,6 +315,30 @@ class MotionStack:
         return False
 
     # --- LIVE volumetric world (cuRobo Mapper → ESDF) --------------------
+    def _scene_extent(self, frames, tcp: str, *, margin: float = 0.25, stride: int = 10):
+        """The extent of the SCENE the cameras see (depth with the ROBOT's own points removed), for
+        sizing the ESDF grid so the real object is INSIDE it. We back-project each frame and drop the
+        points within a sphere of the robot (the same rule the segmenter uses), then take the robust
+        bbox of what's LEFT. Returns (extent, center) or None when the cameras see only the robot."""
+        from . import debug_probe as dp
+        planner = self._planner_for([tcp])
+        spheres = (planner.robot_spheres(self._seed_positions())
+                   if hasattr(planner, "robot_spheres") else np.zeros((0, 4)))
+        kept = []
+        for f in frames:
+            cloud = dp.backproject_to_base(f.depth, f.intrinsics, f.cam_pose_in_base, stride=stride)
+            k, _, _ = dp.split_cloud(cloud, spheres)
+            if len(k):
+                kept.append(k)
+        if not kept:
+            return None
+        P = np.concatenate(kept, axis=0)
+        lo = np.percentile(P, 1.0, axis=0)
+        hi = np.percentile(P, 99.0, axis=0)
+        ext = tuple(float(max(0.3, (hi[i] - lo[i]) + 2 * margin)) for i in range(3))
+        ctr = tuple(float((hi[i] + lo[i]) / 2) for i in range(3))
+        return ext, ctr
+
     def update_world_live(self, frames, tcp: Optional[str] = None) -> dict:
         """Refresh the LIVE collision world from N camera depth frames (ANY rig — the agent's
         commission pipeline calls this each cycle). cuRobo does the heavy lifting: each frame is
@@ -329,14 +354,18 @@ class MotionStack:
             return {"ok": False, "message": "planner has no live/voxel world support"}
         if self._mapper is None:
             robot_cfg = self._robot_cfg_for([tcp])
-            # The mapped VOLUME = the depth ACTUALLY observed this build (data-derived, NOT a workspace
-            # box or robot reach) UNIONED with the modeled obstacles, so input 2 is never dropped when
-            # it falls outside the camera's view. The ESDF resolution adapts so the grid is bounded at
-            # any scale.
-            ext, ctr = union_extent(observed_extent(frames), obstacle_bboxes(self.world.scene))
+            # Size the grid to the SCENE — the depth with the ROBOT REMOVED — NOT the raw depth. A
+            # wrist (eye-in-hand) camera's CLOSE robot pixels dominate the raw depth (~98%), so a raw
+            # extent centres the grid on the robot and the real OBJECT falls OUTSIDE the grid: it gets
+            # integrated but CLIPPED → 0 occupied voxels (the empty-ESDF bug). Union with the modeled
+            # obstacles so they're always covered too.
+            scene = self._scene_extent(frames, tcp)
+            ext, ctr = union_extent(scene or observed_extent(frames), obstacle_bboxes(self.world.scene))
             esdf_vs, voxel_sz = esdf_resolution(ext)
             self._mapper = (self._mapper_factory or _default_mapper_factory)(
                 ext, ctr, robot_cfg, esdf_vs, voxel_sz)
+            self._grid_meta = {"extent": [round(v, 3) for v in ext], "center": [round(v, 3) for v in ctr],
+                               "esdf_voxel_size": round(float(esdf_vs), 4), "from_scene": scene is not None}
         self._mapper.reset()
         q = self._seed_positions()                 # the live config the robot is masked at
         total_px, n_masked = 0, 0
@@ -384,7 +413,8 @@ class MotionStack:
         out = {"ok": True, "n_frames": len(frames), "n_robot_pixels_masked": n_masked,
                "total_pixels": total_px, "mask_fraction": frac, "n_voxels": int(len(self._live_voxels)),
                "n_live_voxels": int(n_live), "n_obstacle_voxels": int(len(self._live_voxels) - n_live),
-               "segmenter_joints": len(seg_names), "seed_joints_matched": n_matched}
+               "segmenter_joints": len(seg_names), "seed_joints_matched": n_matched,
+               "grid": dict(self._grid_meta)}
         if warnings:
             out["warnings"] = warnings
         return out

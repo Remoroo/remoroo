@@ -944,6 +944,44 @@ def h_debug_world(_q):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def sse_esdf_live(_q):
+    """LIVE world stream: every ~`period`s, REBUILD the ESDF from the cameras and stream its occupied
+    voxel centres (+ the mask stats), so the Studio shows the collision world the planner sees AND it
+    STAYS ALIVE — it updates as the arm/scene moves (jog the arm and watch it fill). This also keeps
+    the PLANNER's live world fresh (update_world_live applies the ESDF). Capped (`max_iters`) so a
+    forgotten tab doesn't pin the GPU/bridge forever; the operator toggles it off when done."""
+    import time as _t
+    import numpy as _np
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        yield {"done": True, "result": {"ok": False, "error": f"{type(e).__name__}: {e}"}}
+        return
+    b = get_bridge()
+    period = max(0.4, float((_q.get("period", ["1.2"])[0]) or 1.2))
+    max_iters = int((_q.get("max_iters", ["1200"])[0]) or 1200)
+    for i in range(max_iters):
+        rec: dict = {"frame": i}
+        try:
+            with _bridge_lock:
+                frames, reasons = (_live_frames(st, b) if b is not None else ([], []))
+                if frames:
+                    wr = st.update_world_live(frames)
+                    for k in ("n_voxels", "n_live_voxels", "n_obstacle_voxels", "mask_fraction",
+                              "n_robot_pixels_masked"):
+                        rec[k] = wr.get(k)
+                rec["n_cams"] = sum(1 for r in (reasons or []) if r.get("ok"))
+                rec["cam_why"] = next((r.get("why") for r in (reasons or []) if not r.get("ok")), None)
+                v = _np.asarray(st.esdf_voxels(), dtype=float).reshape(-1, 3)
+                rec["voxels"] = v.tolist()
+                rec["voxel_size"] = float(st.esdf_voxel_size())
+        except Exception as e:  # noqa: BLE001 — never kill the stream on one bad cycle
+            rec["error"] = f"{type(e).__name__}: {e}"
+        yield rec
+        _t.sleep(period)
+    yield {"done": True, "result": {"ok": True, "frames": max_iters}}
+
+
 def h_debug_dump(_q):
     """FULL live-world debug — SAVE (cell/debug/*.npz + *.json) + SHOW (returns the clouds for the
     Studio): camera poses, the RAW per-camera clouds, the robot-mask split (kept vs masked), the robot
@@ -2163,6 +2201,7 @@ ROUTES = {
     "/edge/motion/verify_start": ("json", h_verify_start),
     "/edge/motion/world": ("json", h_motion_world),
     "/edge/motion/esdf": ("json", h_motion_esdf),
+    "/edge/motion/esdf_live": ("sse", sse_esdf_live),
     "/edge/motion/debug_world": ("json", h_debug_world),
     "/edge/motion/debug_dump": ("json", h_debug_dump),
     "/edge/motion/diagnose_plan": ("json", h_diagnose_plan),
