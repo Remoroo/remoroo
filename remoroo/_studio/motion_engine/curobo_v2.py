@@ -34,6 +34,29 @@ from .world import WorldInputs
 Goal = Tuple[Sequence[float], Sequence[float]]
 
 
+def _collision_report(d_world: np.ndarray, spheres: np.ndarray, collision_free: bool) -> dict:
+    """Format a born-collision report from cuRobo's PER-SPHERE world-collision distance `d_world`
+    (>0 = penetrating, as cuRobo's collision cost returns) and the FK `spheres` (n,4 = x,y,z,r), plus
+    the canonical `collision_free` verdict from `RobotCollisionChecker.validate`. Pure numpy → the
+    report shape is unit-tested off-GPU; the cuRobo calls that fill it are rig-validated."""
+    d = np.asarray(d_world, dtype=float).reshape(-1)
+    a = np.asarray(spheres, dtype=float).reshape(-1, 4)
+    n = min(len(d), len(a))
+    d, a = d[:n], a[:n]
+    hot = [i for i in range(n) if d[i] > 0][:25]
+    return {
+        "collision_free": bool(collision_free),
+        "n_spheres": int(n),
+        "raw_cost": {"min": round(float(d.min()), 5) if n else 0.0,
+                     "max": round(float(d.max()), 5) if n else 0.0,
+                     "n_positive": int((d > 0).sum()), "n_negative": int((d < 0).sum())},
+        "n_penetrating": int((d > 0).sum()),
+        "penetrating_spheres": [{"xyz": [round(float(x), 3) for x in a[i, :3]],
+                                 "r": round(float(a[i, 3]), 3), "cost": round(float(d[i]), 4)}
+                                for i in hot],
+    }
+
+
 @dataclass
 class PlanResult:
     """What the adapter returns; the stack never sees a torch tensor."""
@@ -122,6 +145,131 @@ def generate_self_collision_ignore(urdf_path: str, spheres_by_link: dict,
     return dict(rb.compute_collision_matrix(prune_collisions=False) or {})
 
 
+class CuroboMapper:
+    """The LIVE perception subsystem, built ENTIRELY from cuRoboV2's tested-on-robots components — we
+    only wire them. The ONE place that imports cuRobo perception. Camera-count / morphology-agnostic:
+    `integrate(frame, joint_positions)` once per camera (any resolution), then `compute_esdf`.
+
+      depth cleaning → `curobo.perception.FilterDepth`     (nan / flying-pixel / bilateral)
+      robot masking  → `curobo.perception.RobotSegmenter`  (depth→cloud, base frame, distance to the
+                        robot's LIVE collision spheres → zero the robot pixels)
+      TSDF→ESDF map  → `curobo.perception.Mapper`          (+ `fuse_static` for the modeled cuboids)
+
+    Imports are LAZY so this module still loads off-GPU."""
+
+    def __init__(self, extent_m: Sequence[float], center: Sequence[float] = (0.0, 0.0, 0.0), *,
+                 robot_cfg: Optional[dict] = None, voxel_size: float = 0.02,
+                 esdf_voxel_size: float = 0.03, segment_distance: float = 0.05,
+                 device: str = "cuda") -> None:
+        from curobo.perception import Mapper, MapperCfg, RobotSegmenter
+
+        self._device = device
+        self._voxel_size = float(voxel_size)
+        self._mapper = Mapper(MapperCfg(
+            extent_meters_xyz=tuple(float(v) for v in extent_m),
+            grid_center=tuple(float(v) for v in center),
+            voxel_size=self._voxel_size,
+            esdf_voxel_size=float(esdf_voxel_size),
+            truncation_distance=self._voxel_size * 4.0,
+            enable_static=True,          # allocate the static channel so fuse_static (modeled cuboids) lands
+            device=device,
+        ))
+        # The segmenter masks the robot from each depth frame at its live config — cuRobo's own,
+        # CUDA-graphed, batched. Built from the SAME robot cfg the planner uses (the inner dict under
+        # "robot_cfg" carries the "kinematics" key RobotSegmenter expects).
+        self._segmenter = None
+        if robot_cfg is not None:
+            kin = robot_cfg.get("robot_cfg", robot_cfg)
+            self._segmenter = RobotSegmenter.from_robot_file(kin, distance_threshold=float(segment_distance))
+        self._voxelgrid = None
+        self._depth_filter = None        # built lazily per image shape
+
+    def reset(self) -> None:
+        self._mapper.reset()
+        self._voxelgrid = None
+
+    def _observation(self, depth: np.ndarray, intrinsics: np.ndarray,
+                     cam_pose_in_base: Tuple[Sequence[float], Sequence[float]]):
+        """Build a batched (1,H,W) cuRobo CameraObservation in the robot base frame."""
+        import torch
+        from curobo.types import CameraObservation, Pose
+
+        d = np.asarray(depth, dtype=np.float32)
+        h, w = d.shape
+        dimg = torch.as_tensor(np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0),
+                               device=self._device).view(1, h, w)
+        intr = torch.as_tensor(np.asarray(intrinsics, dtype=np.float32), device=self._device).view(1, 3, 3)
+        pos = torch.as_tensor(np.asarray(cam_pose_in_base[0], dtype=np.float32), device=self._device).view(1, 3)
+        quat = torch.as_tensor(np.asarray(cam_pose_in_base[1], dtype=np.float32), device=self._device).view(1, 4)
+        return CameraObservation(depth_image=dimg, intrinsics=intr, pose=Pose(position=pos, quaternion=quat))
+
+    def integrate(self, depth: np.ndarray, intrinsics: np.ndarray,
+                  cam_pose_in_base: Tuple[Sequence[float], Sequence[float]],
+                  joint_positions: Optional[Dict[str, float]] = None) -> int:
+        """Fuse ONE camera into the TSDF: clean depth (FilterDepth) → mask the robot at `joint_positions`
+        (RobotSegmenter) → integrate. Returns the number of masked (robot) pixels. `cam_pose_in_base`
+        is the camera pose in the robot base frame (the calibration output)."""
+        from curobo.perception import FilterDepth
+        from curobo.types import JointState
+
+        obs = self._observation(depth, intrinsics, cam_pose_in_base)
+        h, w = obs.depth_image.shape[-2], obs.depth_image.shape[-1]
+        if self._depth_filter is None:
+            self._depth_filter = FilterDepth(image_shape=(h, w))
+        filtered, _ = self._depth_filter(obs.depth_image.unsqueeze(0))
+        obs.depth_image = filtered[0]
+
+        n_masked = 0
+        if self._segmenter is not None and joint_positions is not None:
+            names = list(self._segmenter.kinematics.joint_names)
+            q = self._segmenter_q([float(joint_positions.get(n, 0.0)) for n in names])
+            js = JointState.from_position(q, joint_names=names)
+            mask, filtered_image = self._segmenter.get_robot_mask(obs, js)
+            obs.depth_image = filtered_image       # robot pixels zeroed by cuRobo
+            n_masked = int(mask.sum().item())
+        self._mapper.integrate(camera_observation=obs)
+        return n_masked
+
+    def _segmenter_q(self, vals):
+        import torch
+        return torch.as_tensor(np.asarray(vals, dtype=np.float32), device=self._device).view(1, -1)
+
+    def fuse_static(self, scene) -> None:
+        """Stamp the modeled cuboids (table/wall/cage) into the SAME TSDF (cuRobo combines the static
+        channel with the live depth via min()), so the planner sees ONE canonical world. `scene` is a
+        public cuRobo Scene (SceneCfg); we tensorize it to SceneData for the mapper. No-op when empty."""
+        import torch
+        from curobo.types import DeviceCfg
+        from curobo.scene import SceneData
+
+        if scene is None or not getattr(scene, "cuboid", None):
+            return
+        device_cfg = DeviceCfg(device=torch.device(self._device), dtype=torch.float32)
+        self._mapper.update_static_obstacles(SceneData.from_scene_cfg(scene, device_cfg))
+
+    def compute_esdf(self):
+        """Compute the ESDF and return cuRobo's `VoxelGrid` (signed distance field for collision)."""
+        self._voxelgrid = self._mapper.compute_esdf()
+        return self._voxelgrid
+
+    def occupied_voxels(self) -> np.ndarray:
+        """Occupied voxel centres `[N, 3]` (x, y, z) in the base frame — for the Studio render. Uses
+        cuRobo's tested `extract_occupied_voxels` (surface + inside), not a raw grid threshold."""
+        occ = self._mapper.extract_occupied_voxels(surface_only=False)
+        if len(occ) == 0:
+            return np.zeros((0, 3), dtype=float)
+        return occ.centers.detach().cpu().numpy().reshape(-1, 3)
+
+    @property
+    def voxelgrid(self):
+        return self._voxelgrid
+
+
+def make_mapper(extent_m, center=(0.0, 0.0, 0.0), *, robot_cfg=None, **kw) -> "CuroboMapper":
+    """The real mapper factory (injected into `MotionStack`); a test passes a fake instead."""
+    return CuroboMapper(extent_m, center, robot_cfg=robot_cfg, **kw)
+
+
 class CuroboV2Planner:
     """A warmed cuRoboV2 MotionPlanner for one TCP set, built from the cell's artifacts."""
 
@@ -152,7 +300,7 @@ class CuroboV2Planner:
         cfg = MotionPlannerCfg.create(
             robot=robot_cfg,
             scene_model=scene or None,
-            collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid)},
+            collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid), "voxel": 1},   # +voxel slot for the live ESDF
             max_goalset=int(max_goalset),
             self_collision_check=bool(self_collision_check),   # False = diagnostic probe (isolate self-collision)
         )
@@ -165,9 +313,38 @@ class CuroboV2Planner:
         # uses to A/B the SAME move with and without the world (isolating world-collision from
         # self-collision/IK).
         self._world = world
+        self._robot_cfg = robot_cfg            # kept so link_pose can FK any URDF link (camera frames)
+        self._fk = None
         self.planner.update_world(self._full_scene(world))
 
         self._interp_dt = float(self.planner.trajopt_solver.config.interpolation_dt)
+
+    # --- forward kinematics for ANY link (e.g. a camera's calibrated optical frame) --------
+    def link_pose(self, link: str, start_positions: Optional[Dict[str, float]] = None):
+        """FK ANY URDF link → its pose `(xyz, wxyz)` in the base frame at the given (or zero) config.
+        Used to resolve a camera's calibrated optical-frame pose for the live map (eye-in-hand: at the
+        LIVE joints; static: the same fixed result). Isolated from planning: a FK-only kinematics that
+        tracks ALL links (tool_frames=None), so adding camera frames never perturbs the goal logic."""
+        import torch
+        from curobo.types import DeviceCfg, JointState
+
+        if self._fk is None:
+            import copy
+            from curobo._src.types.robot import RobotCfg
+            from curobo._src.robot.kinematics.kinematics import Kinematics
+
+            kin_dict = copy.deepcopy(self._robot_cfg.get("robot_cfg", self._robot_cfg))
+            kin_dict.get("kinematics", {}).pop("tool_frames", None)     # None → track every link
+            rc = RobotCfg.create(kin_dict, device_cfg=DeviceCfg(device=torch.device(self._device),
+                                                                dtype=torch.float32))
+            self._fk = Kinematics(rc.kinematics)
+        names = list(self._fk.joint_names)
+        q = torch.as_tensor([float((start_positions or {}).get(n, 0.0)) for n in names],
+                            dtype=torch.float32, device=self._device).view(1, -1)
+        pose = self._fk.get_link_poses(q, [link])
+        pos = pose.position.detach().cpu().numpy().reshape(-1)
+        quat = pose.quaternion.detach().cpu().numpy().reshape(-1)
+        return [float(v) for v in pos[:3]], [float(v) for v in quat[:4]]
 
     # --- world (live, toggleable for the diagnostic) ----------------------
     def _full_scene(self, world: WorldInputs):
@@ -192,6 +369,22 @@ class CuroboV2Planner:
     def set_world(self, world: Optional[WorldInputs] = None) -> None:
         """Re-apply the full scene (restores after `clear_world`)."""
         self.planner.update_world(self._full_scene(world or self._world))
+
+    def update_voxel_world(self, voxelgrid) -> None:
+        """LIVE world: the planner's collision = the ESDF `voxelgrid`. This is the ONE canonical world
+        — the modeled cuboids (table/wall/cage) are already fused INTO the map (via the mapper's
+        `update_static_obstacles`, combined with live depth by min()), so the scene is just the voxel
+        grid (matching cuRobo's `Scene(voxel=[vg])` live pipeline). No cloud mesh."""
+        from curobo.scene import Scene
+
+        self.planner.update_world(Scene(voxel=[voxelgrid]))
+
+    @property
+    def modeled_scene(self):
+        """The modeled cuboids (table/wall/cage) as a cuRobo Scene, for fusing into the live map."""
+        from curobo.scene import Scene
+
+        return Scene.create(self._world.scene) if (self._world and self._world.scene) else None
 
     def ik_check(self, tool_frame: str, start_positions: Optional[Dict[str, float]] = None,
                  offsets: Optional[Dict[str, Sequence[float]]] = None) -> dict:
@@ -225,37 +418,53 @@ class CuroboV2Planner:
                 "active_joints": list(self.planner.joint_names), "fk_position": [float(x) for x in base_pos],
                 "checks": checks}
 
-    def world_sphere_collision(self, start_positions: Optional[Dict[str, float]] = None) -> dict:
-        """GROUND TRUTH: cuRobo's OWN world-collision verdict at the EXACT given config (NO IK, no
-        optimisation). FK the config → robot_spheres, then call the planner's scene_collision_checker
-        exactly as the trajopt cost does (`get_sphere_distance`, activation_distance=0 = pure
-        penetration). Reports the raw per-sphere cost + the WORLD-frame positions of the penetrating
-        spheres, so we can compare what cuRobo sees vs our analytic mask and the cloud directly."""
-        import torch
-        from curobo._src.geom.collision.buffer_collision import CollisionBuffer
+    def _collision_checker(self):
+        """A PUBLIC, tested `RobotCollisionChecker` over THIS planner's world — built once, lazily.
+        cuRobo's supported born-collision API (validate / per-sphere distance / sample); we no longer
+        reach into `scene_collision_checker.get_sphere_distance` with a hand-built CollisionBuffer."""
+        if getattr(self, "_coll_checker", None) is None:
+            import torch
+            from curobo.collision_checking import RobotCollisionChecker, RobotCollisionCheckerCfg
+            from curobo.types import DeviceCfg
 
-        js = self._start_js(start_positions)
-        state = self.planner.compute_kinematics(js)
-        sph = state.robot_spheres                       # [B, H, n, 4]
-        shape = sph.shape
-        dev = self.planner.device_cfg
-        buf = CollisionBuffer.from_shape(shape, dev)
-        weight = torch.ones((1,), device=sph.device, dtype=sph.dtype)
-        activation = torch.zeros((1,), device=sph.device, dtype=sph.dtype)   # 0 = exact penetration
-        dist = self.planner.scene_collision_checker.get_sphere_distance(
-            state, buf, weight, activation_distance=activation)
-        d = dist.detach().cpu().numpy().reshape(-1)
-        a = sph.detach().cpu().numpy().reshape(-1, 4)
-        hot = [i for i in range(len(d)) if d[i] > 0][:25]
-        return {
-            "n_spheres": int(shape[2]),
-            "raw_cost": {"min": round(float(d.min()), 5), "max": round(float(d.max()), 5),
-                         "n_positive": int((d > 0).sum()), "n_negative": int((d < 0).sum())},
-            "n_penetrating": int((d > 0).sum()),
-            "penetrating_spheres": [{"xyz": [round(float(x), 3) for x in a[i, :3]],
-                                     "r": round(float(a[i, 3]), 3), "cost": round(float(d[i]), 4)}
-                                    for i in hot],
-        }
+            scene = self._world.scene or None
+            n_cub = len((scene or {}).get("cuboid", {})) + 8
+            n_mesh = len((scene or {}).get("mesh", {})) + 4
+            cfg = RobotCollisionCheckerCfg.load_from_config(
+                robot_config=self._robot_cfg, scene_model=scene,
+                device_cfg=DeviceCfg(device=torch.device(self._device), dtype=torch.float32),
+                n_cuboids=int(n_cub), n_meshes=int(n_mesh),
+                collision_activation_distance=0.0)          # 0 = exact penetration verdict
+            self._coll_checker = RobotCollisionChecker(cfg)
+        return self._coll_checker
+
+    def _q_bhd(self, start_positions: Optional[Dict[str, float]]):
+        """Active-joint config as a `[1, 1, dof]` tensor (the [batch, horizon, dof] the collision
+        checker expects), in the planner's joint order."""
+        import torch
+        names = list(self.planner.joint_names)
+        vals = [float((start_positions or {}).get(n, 0.0)) for n in names]
+        return torch.as_tensor(vals, dtype=torch.float32, device=self._device).view(1, 1, -1)
+
+    def world_sphere_collision(self, start_positions: Optional[Dict[str, float]] = None) -> dict:
+        """GROUND TRUTH via cuRobo's PUBLIC `RobotCollisionChecker` at the EXACT given config (NO IK):
+        `validate` is the canonical born-collision verdict (world+self+bounds); `get_collision_distance`
+        gives the per-sphere world penetration so we can still see WHICH spheres + WHERE. Reports the
+        raw per-sphere cost + the world-frame positions of the penetrating spheres + `collision_free`."""
+        checker = self._collision_checker()
+        q = self._q_bhd(start_positions)
+        valid = bool(checker.validate(q).view(-1)[0].item())
+        state = checker.get_kinematics(q)
+        d = checker.get_collision_distance(state).detach().cpu().numpy()
+        sph = state.robot_spheres.detach().cpu().numpy().reshape(-1, 4)
+        return _collision_report(d, sph, collision_free=valid)
+
+    def free_config(self, n: int = 1) -> np.ndarray:
+        """cuRobo's tested rejection sampler → up to `n` collision-free, in-bounds configs `[k, dof]`
+        (world+self+bounds), in the planner's joint order. A grounded source of a known-safe config
+        (e.g. a retract seed) — never a hand-guessed 'home' that may sit in the table."""
+        q = self._collision_checker().sample(int(n), mask_valid=True)
+        return q.detach().cpu().numpy().reshape(-1, len(self.planner.joint_names))
 
     def joint_limits(self) -> Dict[str, Tuple[float, float]]:
         """{joint: (min, max)} position limits over the planner's active joints — to catch a START

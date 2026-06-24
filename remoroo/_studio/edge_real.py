@@ -642,11 +642,20 @@ def sse_commission(_q):
     q: "_queue.Queue" = _queue.Queue()
     out: dict = {}
 
+    b = get_bridge()
+
+    def frames():
+        """The LIVE volumetric world from THIS cell's cameras (general; [] → modeled cuboids only)."""
+        try:
+            return _live_frames(st, b) if b is not None else []
+        except Exception:  # noqa: BLE001 — never let a camera hiccup abort the commission
+            return []
+
     def run():
         with _bridge_lock:
             try:
                 out["report"] = st.commission(execute=execute, target=target, tcp=tcp,
-                                               progress=lambda s: q.put(s))
+                                               frames=frames, progress=lambda s: q.put(s))
             except Exception as e:  # noqa: BLE001
                 out["report"] = {"ok": False, "message": f"{type(e).__name__}: {e}"}
             finally:
@@ -787,6 +796,67 @@ def h_motion_world(_q):
                 "meta": w.meta, "world_warn": getattr(st, "_world_warn", None)}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def h_motion_esdf(_q):
+    """The LIVE volumetric collision world — occupied voxel CENTRES of the cuRoboV2 ESDF the stack
+    last built from the cameras (`stack.esdf_voxels()`). The Studio renders these as the live world.
+    Returns {ok, n_voxels, voxels:[[x,y,z],...], bbox}. Empty until a commission/live build runs."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        import numpy as _np
+        v = _np.asarray(st.esdf_voxels(), dtype=float).reshape(-1, 3)
+        bbox = ([v[:, i].min() for i in range(3)] + [v[:, i].max() for i in range(3)]) if len(v) else None
+        return {"ok": True, "n_voxels": int(len(v)), "voxels": v.tolist(), "bbox": bbox}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _obs_depth(obs):
+    """Metric depth (H,W float) from a bridge observation, tolerant of the field name the cell's
+    Bridge uses (`depth_m` preferred, then `depth` / `depth_image`). None if the cell exposes no
+    depth (then the live world falls back to the modeled cuboids only)."""
+    import numpy as _np
+    for attr in ("depth_m", "depth", "depth_image"):
+        d = getattr(obs, attr, None)
+        if d is not None:
+            a = _np.asarray(d, dtype=float)
+            if a.ndim == 2 and a.size > 0:
+                return a
+    return None
+
+
+def _live_frames(st, b):
+    """Build one `DepthFrame` per cell camera from the BRIDGE's per-camera observation (general — it
+    relies only on the bridge contract the agent fulfils: depth + intrinsics per camera) and the
+    camera's calibrated optical-frame pose via `stack.link_pose`. Camera/morphology-agnostic. Returns
+    [] when no camera exposes depth, so commission gracefully plans against the modeled cuboids."""
+    from motion_engine import DepthFrame
+    frames = []
+    cams = load_cell_yaml().get("cameras") or []
+    for cam in cams:
+        name = cam.get("name") or cam.get("link") or ""
+        link = cam.get("link") or name
+        try:
+            obs = b.get_observation(camera=name)
+        except TypeError:
+            obs = b.get_observation()
+        except Exception:  # noqa: BLE001
+            continue
+        depth = _obs_depth(obs)
+        K, _wh = _intrinsics_from_bridge(b, name)
+        if depth is None or K is None:
+            continue
+        # the calibrated optical frame (calibration writes it as a child of the camera link); FK it
+        # at the LIVE joints (eye-in-hand) — fixed result for a static camera.
+        pose = st.link_pose(f"{link}_optical_frame") or st.link_pose(link)
+        if pose is None:
+            continue
+        frames.append(DepthFrame(depth=depth, intrinsics=K, cam_pose_in_base=pose, name=name))
+    return frames
 
 
 def h_world_collision_at_seed(_q):
@@ -1787,6 +1857,7 @@ ROUTES = {
     "/edge/motion/validate_config": ("json", h_validate_config),
     "/edge/motion/verify_start": ("json", h_verify_start),
     "/edge/motion/world": ("json", h_motion_world),
+    "/edge/motion/esdf": ("json", h_motion_esdf),
     "/edge/motion/world_alignment": ("json", h_world_alignment),
     "/edge/motion/world_collision_at_seed": ("json", h_world_collision_at_seed),
 }

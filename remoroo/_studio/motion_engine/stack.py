@@ -34,6 +34,7 @@ from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
 from .world import WorldInputs, load_world, mask_robot_points
+from .live_world import workspace_extent
 
 # a pose: (position xyz [m], quaternion wxyz). Helpers below also accept a 7-list or a dict.
 Pose = Tuple[Sequence[float], Sequence[float]]
@@ -79,6 +80,14 @@ def _default_planner_factory(robot_cfg, world, *, limits, max_goalset):
     from .curobo_v2 import CuroboV2Planner
 
     return CuroboV2Planner(robot_cfg, world, limits=limits, max_goalset=max_goalset)
+
+
+def _default_mapper_factory(extent_m, center, robot_cfg):
+    """The real mapper factory: build the GPU cuRobo perception subsystem (Mapper + RobotSegmenter +
+    FilterDepth) from the SAME robot cfg the planner uses. Lazy import keeps the stack off-GPU."""
+    from .curobo_v2 import make_mapper
+
+    return make_mapper(extent_m, center, robot_cfg=robot_cfg)
 
 
 def _unit(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
@@ -163,7 +172,8 @@ _SPHERE_DIRS: List[Tuple[float, float, float]] = [
 class MotionStack:
     def __init__(self, *, config: dict, spheres: Dict[str, List[dict]], sphere_buffer: float,
                  world: WorldInputs, safety: Safety, bridge=None,
-                 urdf_path: str = "robot.urdf", planner_factory: Optional[PlannerFactory] = None) -> None:
+                 urdf_path: str = "robot.urdf", planner_factory: Optional[PlannerFactory] = None,
+                 mapper_factory=None) -> None:
         self.config = config
         self.spheres = spheres
         self.sphere_buffer = sphere_buffer
@@ -183,6 +193,10 @@ class MotionStack:
         self._ignore_warn: Optional[str] = None       # why generation fell back, if it did
         self._world_finalized = False                 # has the cloud been self-masked yet?
         self._world_warn: Optional[str] = None        # why the self-mask didn't run, if it didn't
+        # LIVE volumetric world (cuRobo Mapper → ESDF). Injectable factory so the wiring tests off-GPU.
+        self._mapper_factory = mapper_factory
+        self._mapper = None
+        self._live_voxels: np.ndarray = np.zeros((0, 4), dtype=float)
         # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace; the
         # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
         self._actuated = actuated_joints(urdf_path)
@@ -280,13 +294,77 @@ class MotionStack:
             voxel = float(getattr(self.world, "voxel_size", 0.02))
             margin = max(0.04, 2.0 * voxel + float(self.sphere_buffer) + 0.02)
             masked, n = mask_robot_points(self.world.points, sph, margin=margin)
-            if n > 0:
+            # The robot is MOUNTED in the scan: the occupancy mesh of the surface it's bolted to
+            # ENCLOSES the base (cuRobo reads the base as deep-inside, even with the near points
+            # masked). Drop the cloud BELOW the robot's lowest sphere — the mount/floor the robot
+            # can't move into (the cage floor + table cuboid already bound it). This OPENS the
+            # enclosure so the base reads as outside.
+            import numpy as _np
+            base_z = float((_np.asarray(sph, dtype=float)[:, 2] - _np.asarray(sph, dtype=float)[:, 3]).min())
+            before = len(masked)
+            masked = masked[masked[:, 2] > base_z - 0.005]
+            n_below = before - len(masked)
+            n_total = int(n) + int(n_below)
+            if n_total > 0:
                 self.world = replace(self.world, points=masked,
-                                     meta={**self.world.meta, "n_robot_masked": int(n)})
+                                     meta={**self.world.meta, "n_robot_masked": int(n),
+                                           "n_below_base_cropped": int(n_below),
+                                           "base_floor_z": round(base_z, 4)})
                 return True
         except Exception as e:  # noqa: BLE001
             self._world_warn = f"cloud self-mask failed: {type(e).__name__}: {e}"
         return False
+
+    # --- LIVE volumetric world (cuRobo Mapper → ESDF) --------------------
+    def update_world_live(self, frames, tcp: Optional[str] = None) -> dict:
+        """Refresh the LIVE collision world from N camera depth frames (ANY rig — the agent's
+        commission pipeline calls this each cycle). cuRobo does the heavy lifting: each frame is
+        cleaned (`FilterDepth`) and robot-MASKED at the live config (`RobotSegmenter`, so the robot is
+        never in its own world — the bug the stored cloud kept hitting), fused into the `Mapper`; the
+        modeled cuboids (table/wall/cage) are stamped into the SAME map; the ESDF is computed and
+        applied to the planner. The stored cloud is unused — the collision world IS this one map."""
+        tcp = tcp or next(iter(self._groups), None)
+        if tcp is None:
+            return {"ok": False, "message": "no kinematic groups"}
+        planner = self._planner_for([tcp])
+        if not hasattr(planner, "update_voxel_world"):
+            return {"ok": False, "message": "planner has no live/voxel world support"}
+        if self._mapper is None:
+            bounds = getattr(self.safety, "bounds_m", None) or self.world.bounds_m
+            ext, ctr = workspace_extent(bounds)
+            robot_cfg = self._robot_cfg_for([tcp])
+            self._mapper = (self._mapper_factory or _default_mapper_factory)(ext, ctr, robot_cfg)
+        self._mapper.reset()
+        q = self._seed_positions()                 # the live config the robot is masked at
+        n_masked = 0
+        for f in frames:
+            n_masked += int(self._mapper.integrate(f.depth, f.intrinsics, f.cam_pose_in_base, q) or 0)
+        if hasattr(self._mapper, "fuse_static"):   # one canonical world: live depth + modeled cuboids
+            self._mapper.fuse_static(getattr(planner, "modeled_scene", None))
+        voxelgrid = self._mapper.compute_esdf()
+        planner.update_voxel_world(voxelgrid)
+        self._live_voxels = np.asarray(self._mapper.occupied_voxels(), dtype=float).reshape(-1, 3)
+        return {"ok": True, "n_frames": len(frames), "n_robot_pixels_masked": n_masked,
+                "n_voxels": int(len(self._live_voxels))}
+
+    def esdf_voxels(self) -> np.ndarray:
+        """The current live world's occupied voxel centres `[N, 3]` (x, y, z) in the base frame — the
+        Studio renders these as the live collision world."""
+        return self._live_voxels
+
+    def link_pose(self, link: str, joints: Optional[Dict[str, float]] = None,
+                  tcp: Optional[str] = None):
+        """FK ANY URDF link → `(xyz, wxyz)` in the base frame at the given (or live) config. The
+        general helper the agent's commission pipeline uses to resolve each camera's calibrated
+        optical-frame pose for `update_world_live` (eye-in-hand: at the live joints; static: fixed).
+        Returns None if the planner can't FK (a non-cuRobo test factory without link_pose)."""
+        tcp = tcp or next(iter(self._groups), None)
+        if tcp is None:
+            return None
+        planner = self._planner_for([tcp])
+        if not hasattr(planner, "link_pose"):
+            return None
+        return planner.link_pose(link, joints if joints is not None else self._seed_positions())
 
     def _planner_for(self, active_groups: Sequence[str]):
         """Get/build (and cache) the planner whose tool_frames = these groups' tips."""
@@ -694,12 +772,15 @@ class MotionStack:
 
         def check(world, want_pen=False):
             """Build a FRESH no-self probe with `world` (clear_world is unreliable — cuRobo bakes
-            scene_model at build, so we rebuild), return (ik0_success, penetrated_boxes|None)."""
+            scene_model at build, so we rebuild), return (world_collision_free, penetrated_boxes|None).
+            The verdict is cuRobo's PUBLIC RobotCollisionChecker per-sphere WORLD distance (via
+            world_sphere_collision) — world-only (n_penetrating), so this stays a clean WORLD-vs-self
+            isolation (we don't use the full `validate`, which also folds in self-collision)."""
             try:
                 from .curobo_v2 import CuroboV2Planner
                 p = CuroboV2Planner(self._robot_cfg_for([tcp]), world, limits=self._limits,
                                     max_goalset=1, warmup=False, self_collision_check=False)
-                ok = bool(p.ik_check(tip, start).get("checks", {}).get("0cm", {}).get("success"))
+                ok = (int(p.world_sphere_collision(start).get("n_penetrating", 0)) == 0)
                 pen = None
                 if want_pen and hasattr(p, "robot_spheres"):
                     sph = p.robot_spheres(start)
@@ -902,15 +983,19 @@ class MotionStack:
 
     # --- commission self-test --------------------------------------------
     def commission(self, *, execute: bool = True, progress: Optional[Callable[[dict], None]] = None,
-                   target: Optional[Sequence[float]] = None, tcp: Optional[str] = None) -> dict:
+                   target: Optional[Sequence[float]] = None, tcp: Optional[str] = None,
+                   frames: Optional[Callable[[], Sequence]] = None) -> dict:
         """Build the stack and VERIFY the end-to-end chain once: spheres healthy → planner builds →
-        ONE collision-free plan → trajectory → (optionally) the per-arm executor replays it. This
-        is what the new commission gate runs so G8 exercises a PROVEN stack, not an assumed one.
+        the LIVE collision world is built from the cameras → ONE collision-free plan → trajectory →
+        (optionally) the per-arm executor replays it. This is what the commission gate runs so G8
+        exercises a PROVEN stack, not an assumed one.
 
-        The verification move is a REACHABLE target, never the cspace home (which is commonly inside
-        the table): if the operator/agent passed a 3D `target` point we plan `tcp` there (keeping its
-        current orientation); otherwise `safe_demo_move` auto-finds a small collision-free nudge from
-        the live pose. Both prove the same fused stack with a legible, supervised motion."""
+        `frames` is a callable returning the per-camera `DepthFrame`s (the agent's rig-specific grab —
+        see commission.md); when given, the verify plans against the LIVE ESDF (robot auto-masked,
+        modeled cuboids fused) rather than just the modeled cuboids. The verification move is a
+        REACHABLE target, never the cspace home (commonly inside the table): an explicit 3D `target`
+        is planned (keeping the current orientation); otherwise `safe_demo_move` auto-finds a small
+        collision-free nudge from the live pose. Both prove the same fused stack, supervised."""
         def emit(**kw):
             if progress:
                 progress(kw)
@@ -942,6 +1027,23 @@ class MotionStack:
             step("build_planner", False, error=str(e))
             report["message"] = f"planner build failed: {e}"
             return report
+
+        # Build the LIVE volumetric world from the cameras (robot masked, cuboids fused) — the move
+        # plans against THIS map. Skipped (modeled cuboids only) when no `frames` provider is wired,
+        # or when it yields no frames (a cell with no live depth — graceful, not an error).
+        live = list(frames() or []) if frames is not None else None
+        if live:
+            emit(step="build_world", ok=True, note="building the live ESDF from the cameras")
+            try:
+                wr = self.update_world_live(live, tcp=first)
+                report["world"] = wr
+                if not step("build_world", wr.get("ok", False), **{k: v for k, v in wr.items() if k != "ok"}):
+                    report["message"] = wr.get("message", "live world build failed")
+                    return report
+            except Exception as e:  # noqa: BLE001
+                step("build_world", False, error=str(e))
+                report["message"] = f"live world build failed: {e}"
+                return report
 
         if target is not None:
             emit(step="plan_move", ok=True, note=f"planning to the chosen point {list(target)[:3]}")
