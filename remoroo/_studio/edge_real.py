@@ -885,6 +885,29 @@ def _obs_depth(obs):
     return None
 
 
+def _grab_observation(b, keys):
+    """One bridge observation via the FIRST camera key it accepts. Keys are tried in CONTRACT order
+    (the URDF link — what calibration binds and the bridge keys `_cameras` on — before the friendly
+    cell.yaml name). Tolerant of a single-cam bridge that ignores `camera=` (TypeError → no-arg) and
+    of a multi-cam bridge that raises on an unknown key (KeyError/NameError → next key). Returns
+    (observation, used_key) so intrinsics are read with the SAME key the depth came from."""
+    for key in keys:
+        try:
+            obs = b.get_observation(camera=key)
+            if obs is not None:
+                return obs, key
+        except TypeError:                       # bridge ignores camera= (single-cam)
+            try:
+                obs = b.get_observation()
+                if obs is not None:
+                    return obs, ""
+            except Exception:  # noqa: BLE001
+                return None, None
+        except Exception:  # noqa: BLE001 — unknown key for THIS bridge; try the next
+            continue
+    return None, None
+
+
 def _live_frames(st, b):
     """Build one `DepthFrame` per cell camera from the BRIDGE's per-camera observation (general — it
     relies only on the bridge contract the agent fulfils: depth + intrinsics per camera) and the
@@ -902,13 +925,18 @@ def _live_frames(st, b):
     for cam in cams:
         name = cam.get("name") or cam.get("link") or ""
         link = cam.get("link") or name
+        # CONTRACT order: the URDF link is the camera key calibration + the bridge use; the friendly
+        # name is only a fallback. (Passing the name where the bridge keys by link silently drops the
+        # camera — the first live-commission gap we hit on the bimanual ZED cell.)
+        keys = [k for k in (link, name) if k]
         try:
-            try:
-                obs = b.get_observation(camera=name)
-            except TypeError:
-                obs = b.get_observation()
+            obs, used_key = _grab_observation(b, keys)
+            if obs is None:
+                reasons.append({"camera": name, "ok": False,
+                                "why": f"bridge get_observation returned nothing for camera keys {keys}"})
+                continue
             depth = _obs_depth(obs)
-            K, _wh = _intrinsics_from_bridge(b, name)
+            K, _wh = _intrinsics_from_bridge(b, used_key if used_key is not None else "")
             if depth is None:
                 reasons.append({"camera": name, "ok": False,
                                 "why": "bridge observation exposes no depth (depth_m/depth/depth_image) — the agent's "

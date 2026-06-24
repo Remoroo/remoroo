@@ -305,10 +305,18 @@ class CuroboV2Planner:
         scene = world.scene or {}
         n_cuboid = len(scene.get("cuboid", {})) + 8
         n_mesh = len(scene.get("mesh", {})) + 4
+        # The live-ESDF voxel slot MUST be a DICT {layers, dims, voxel_size}, NOT an int: cuRobo's
+        # SceneData.create_cache does `voxel_cache.get("layers", ...)`, so an int crashes planner build
+        # with "'int' object has no attribute 'get'". `layers: 1` is the real requirement — the live
+        # grid is referenced directly at update_world (create_from_voxel_grids, max_n==1), so these
+        # dims are a placeholder; we size them from the workspace (matching the mapper) for safety.
+        from .live_world import workspace_extent
+        _ext, _ = workspace_extent(getattr(world, "bounds_m", None))
+        voxel_cache = {"layers": 1, "dims": [float(e) for e in _ext], "voxel_size": 0.03}
         cfg = MotionPlannerCfg.create(
             robot=robot_cfg,
             scene_model=scene or None,
-            collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid), "voxel": 1},   # +voxel slot for the live ESDF
+            collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid), "voxel": voxel_cache},
             max_goalset=int(max_goalset),
             self_collision_check=bool(self_collision_check),   # False = diagnostic probe (isolate self-collision)
         )
