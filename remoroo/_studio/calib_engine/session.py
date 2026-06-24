@@ -939,7 +939,8 @@ class BaseToBaseSession:
         return {"type": "b2b_solve", "T_base_to_base": _T(self.result),
                 "captures": len(self.obs), "consensus_deg": round(float(spread), 3)}
 
-    def accept(self, calib_dir: str) -> dict:
+    def accept(self, calib_dir: str, urdf_path: Optional[str] = None,
+               out_path: Optional[str] = None) -> dict:
         import json
         assert self.result is not None
         Path(calib_dir).mkdir(parents=True, exist_ok=True)
@@ -949,4 +950,15 @@ class BaseToBaseSession:
             "arm_a": self.item.partner_camera, "arm_b": self.item.secondary_camera,
             "captures": len(self.obs),
         }, indent=2), encoding="utf-8")
-        return {"type": "b2b_accept", "path": dst, "T_base_to_base": _T(self.result)}
+        # BAKE it into the URDF too: place arm B's base at its CALIBRATED pose relative to arm A, so the
+        # motion planner's two arms are in their true relative pose (the JSON alone is consumed nowhere).
+        urdf = out_path or urdf_path
+        baked = None
+        if urdf:
+            try:
+                from .bake import apply_base_to_base
+                baked = apply_base_to_base(urdf, self.item.partner_camera, self.item.secondary_camera,
+                                           self.result)
+            except Exception as e:  # noqa: BLE001 — never block the save on the URDF write; report it
+                baked = {"error": f"{type(e).__name__}: {e}"}
+        return {"type": "b2b_accept", "path": dst, "T_base_to_base": _T(self.result), "urdf": baked}

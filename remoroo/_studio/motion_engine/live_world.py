@@ -116,6 +116,38 @@ def esdf_resolution(extent: Sequence[float], *, axis_voxels: int = ESDF_AXIS_VOX
     return esdf_vs, max(esdf_vs / 2.0, 0.005)
 
 
+def obstacle_bboxes(scene) -> list:
+    """Axis-aligned `(lo, hi)` bounds of each MODELED cuboid (`center ± dims/2`). Rotation is ignored
+    (a slightly loose box) — used only to GROW the ESDF grid so the modeled obstacles are never dropped
+    from the fused map. Pure data."""
+    out = []
+    for b in ((scene or {}).get("cuboid") or {}).values():
+        pose = list(b.get("pose") or [0, 0, 0])
+        c = [float(v) for v in (pose[:3] + [0, 0, 0])[:3]]
+        d = [float(v) for v in (list(b.get("dims") or [0.1, 0.1, 0.1]) + [0.1, 0.1, 0.1])[:3]]
+        out.append(([c[i] - d[i] / 2 for i in range(3)], [c[i] + d[i] / 2 for i in range(3)]))
+    return out
+
+
+def union_extent(observed, bboxes, *, fallback=((1.0, 1.0, 1.0), (0.0, 0.0, 0.0)),
+                 margin: float = 0.1):
+    """Grow the observed-depth `(extent, center)` to ALSO contain `bboxes` (a list of `(lo, hi)`), so
+    the modeled obstacles (input 2) are ALWAYS inside the fused ESDF grid — an obstacle the camera
+    can't see (the whole reason it's modeled) must not be dropped because it fell outside the depth
+    bbox. Returns `(extent, center)`; `fallback` when there's neither depth nor an obstacle."""
+    boxes = list(bboxes or [])
+    if observed is not None:
+        ext, ctr = observed
+        boxes.append(([ctr[i] - ext[i] / 2 for i in range(3)], [ctr[i] + ext[i] / 2 for i in range(3)]))
+    if not boxes:
+        return fallback
+    lo = [min(b[0][i] for b in boxes) for i in range(3)]
+    hi = [max(b[1][i] for b in boxes) for i in range(3)]
+    extent = tuple(max(0.3, (hi[i] - lo[i]) + 2 * margin) for i in range(3))
+    center = tuple((hi[i] + lo[i]) / 2 for i in range(3))
+    return extent, center
+
+
 def workspace_extent(bounds_m: dict | None, *, default: float = 1.0,
                      pad: float = 0.3) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
     """LEGACY fallback only (used when there's no live depth at all). The live world's extent comes

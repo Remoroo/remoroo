@@ -34,7 +34,7 @@ from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
 from .world import WorldInputs, load_world, mask_robot_points
-from .live_world import observed_extent, esdf_resolution
+from .live_world import observed_extent, esdf_resolution, union_extent, obstacle_bboxes
 
 # a pose: (position xyz [m], quaternion wxyz). Helpers below also accept a 7-list or a dict.
 Pose = Tuple[Sequence[float], Sequence[float]]
@@ -322,10 +322,11 @@ class MotionStack:
             return {"ok": False, "message": "planner has no live/voxel world support"}
         if self._mapper is None:
             robot_cfg = self._robot_cfg_for([tcp])
-            # The mapped VOLUME = the depth ACTUALLY observed this build (data-derived), NOT a
-            # workspace box or robot reach; the ESDF resolution adapts so it's bounded at any scale.
-            oe = observed_extent(frames)
-            ext, ctr = oe if oe is not None else ((1.0, 1.0, 1.0), (0.0, 0.0, 0.0))
+            # The mapped VOLUME = the depth ACTUALLY observed this build (data-derived, NOT a workspace
+            # box or robot reach) UNIONED with the modeled obstacles, so input 2 is never dropped when
+            # it falls outside the camera's view. The ESDF resolution adapts so the grid is bounded at
+            # any scale.
+            ext, ctr = union_extent(observed_extent(frames), obstacle_bboxes(self.world.scene))
             esdf_vs, voxel_sz = esdf_resolution(ext)
             self._mapper = (self._mapper_factory or _default_mapper_factory)(
                 ext, ctr, robot_cfg, esdf_vs, voxel_sz)

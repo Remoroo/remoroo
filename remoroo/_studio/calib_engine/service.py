@@ -123,7 +123,7 @@ class CalibService:
                 return {"error": "select the base_to_base item first"}
             if verb == "b2b_capture":  return self.b2b.capture()
             if verb == "b2b_solve":    return self.b2b.solve()
-            return self.b2b.accept(self.calib_dir or ".")
+            return self.b2b.accept(self.calib_dir or ".", urdf_path=self.urdf_path, out_path=self.out_urdf)
 
         s = self.session
         if s is None:
