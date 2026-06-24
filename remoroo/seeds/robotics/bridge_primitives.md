@@ -163,9 +163,27 @@ class Bridge:
                 pass
 
     # ---- Sensing ---------------------------------------------------------
-    def get_observation(self) -> Observation:
-        """Synchronized proprio + camera snapshot. See camera_capture.md."""
-        ...  # TODO read joint states + grab frames; stamp with a monotonic clock
+    def read_joint_positions(self) -> Dict[str, float]:
+        """FAST, STATE-ONLY joint read — {combined-URDF joint name: radians}, NO camera grab. The edge
+        runs ONE background poller that samples THIS ~30 Hz and caches it; the Studio live mirror, the
+        planner seed, and the live world all read that cache (never the bridge directly), so the robot
+        pose stays REAL-TIME even while the live world / a plan runs. Must be cheap (just the SDK joint
+        query) — do NOT grab depth here. Same combined-URDF keys as get_observation (see the remap
+        above). If you omit this, the poller falls back to get_observation() (which grabs the camera =
+        slow); implement it.
+            q = {}
+            for g in self._groups:                       # combined-URDF names, SDK order
+                q.update(dict(zip(g["joint_names"], self._drivers[g["name"]].read_joint_positions())))
+            return q
+        """
+        ...  # TODO joints only — no camera
+
+    def get_observation(self, camera: Optional[str] = None) -> Observation:
+        """Synchronized proprio + camera snapshot. `get_observation(camera=<urdf_link>)` grabs THAT
+        camera's depth/intrinsics (the live world / calibration call this per camera). `get_observation()`
+        with no camera should stay LIGHT (state, default frame). For real-time JOINTS the edge uses
+        read_joint_positions() above, not this. See camera_capture.md."""
+        ...  # TODO read joint states (+ the requested camera's frames); stamp with a monotonic clock
 
     # ---- Control (all motion is supervised) ------------------------------
     def move_joints(self, arm: str, q_target: np.ndarray, *, speed_frac: Optional[float] = None) -> bool:

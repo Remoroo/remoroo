@@ -339,7 +339,7 @@ class MotionStack:
         ctr = tuple(float((hi[i] + lo[i]) / 2) for i in range(3))
         return ext, ctr
 
-    def update_world_live(self, frames, tcp: Optional[str] = None) -> dict:
+    def update_world_live(self, frames, tcp: Optional[str] = None, seed: Optional[dict] = None) -> dict:
         """Refresh the LIVE collision world from N camera depth frames (ANY rig — the agent's
         commission pipeline calls this each cycle). cuRobo does the heavy lifting: each frame is
         cleaned (`FilterDepth`) and robot-MASKED at the live config (`RobotSegmenter`, so the robot is
@@ -367,7 +367,10 @@ class MotionStack:
             self._grid_meta = {"extent": [round(v, 3) for v in ext], "center": [round(v, 3) for v in ctr],
                                "esdf_voxel_size": round(float(esdf_vs), 4), "from_scene": scene is not None}
         self._mapper.reset()
-        q = self._seed_positions()                 # the live config the robot is masked at
+        # The live config the robot is masked at. PREFER a seed handed in by the caller (the live-world
+        # stream reads the joints ONCE under the bridge lock, then builds the ESDF OFF the lock so the
+        # joint mirror isn't starved) — only hit the bridge ourselves when none was given.
+        q = seed if seed is not None else self._seed_positions()
         total_px, n_masked = 0, 0
         for f in frames:
             n_masked += int(self._mapper.integrate(f.depth, f.intrinsics, f.cam_pose_in_base, q) or 0)
@@ -378,27 +381,6 @@ class MotionStack:
         planner.update_voxel_world(voxelgrid)
         self._live_voxels = np.asarray(self._mapper.occupied_voxels(), dtype=float).reshape(-1, 3)
 
-        # GROUND TRUTH side-by-side: OUR masking (the one that keeps the object GREEN in the debug view)
-        # vs cuRobo's RobotSegmenter (`n_masked` above). If `our_mask_fraction` ≪ `mask_fraction`, the
-        # segmenter is over-masking (the bug); if they AGREE, the object isn't surviving masking at all
-        # and it's the grid/occupancy. Cheap (subsampled). No more guessing — measure.
-        ours: dict = {}
-        try:
-            from . import debug_probe as dp
-            sph = (planner.robot_spheres(q) if hasattr(planner, "robot_spheres") else np.zeros((0, 4)))
-            ok = om = 0
-            kept_pts = []
-            for f in frames:
-                c = dp.backproject_to_base(f.depth, f.intrinsics, f.cam_pose_in_base, stride=12)
-                k, m, _ = dp.split_cloud(c, sph)
-                ok += int(len(k)); om += int(len(m))
-                if len(k):
-                    kept_pts.append(k)
-            kb = dp.bbox(np.concatenate(kept_pts, 0)) if kept_pts else None
-            ours = {"our_kept_pts": ok, "our_masked_pts": om,
-                    "our_mask_fraction": round(om / max(1, ok + om), 3), "our_kept_bbox": kb}
-        except Exception as e:  # noqa: BLE001
-            ours = {"our_mask_error": f"{type(e).__name__}: {e}"}
 
         # MASKING SANITY — the robot is masked from the depth at the joints we hand the segmenter. If
         # the segmenter's joint NAMES don't match the seed, every missing joint silently defaults to
@@ -436,7 +418,7 @@ class MotionStack:
                "total_pixels": total_px, "mask_fraction": frac, "n_voxels": int(len(self._live_voxels)),
                "n_live_voxels": int(n_live), "n_obstacle_voxels": int(len(self._live_voxels) - n_live),
                "segmenter_joints": len(seg_names), "seed_joints_matched": n_matched,
-               "grid": dict(self._grid_meta), **ours}
+               "grid": dict(self._grid_meta)}
         if warnings:
             out["warnings"] = warnings
         return out
@@ -634,6 +616,16 @@ class MotionStack:
         `get_observation().joint_positions` (covers grippers too), falling back to per-group reads."""
         if self.bridge is None:
             return {}
+        # FAST state-only read first (no camera grab): the planner seed must not pay for a depth grab.
+        # The bridge's `read_joint_positions()` (combined-URDF keys) when present; else get_observation.
+        fast = getattr(self.bridge, "read_joint_positions", None)
+        if callable(fast):
+            try:
+                jp = fast()
+                if isinstance(jp, dict) and jp:
+                    return {str(n): float(v) for n, v in jp.items()}
+            except Exception:  # noqa: BLE001
+                pass
         try:
             obs = self.bridge.get_observation()
             jp = getattr(obs, "joint_positions", None)
