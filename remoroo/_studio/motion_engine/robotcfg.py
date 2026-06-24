@@ -88,6 +88,12 @@ def build_v2_robot_cfg(
         "cspace_distance_weight": [1.0] * len(all_joints),
         "max_acceleration": float(lim.get("max_acceleration", 15.0)),
         "max_jerk": float(lim.get("max_jerk", 500.0)),
+        # SLOW VIA THE PLANNER, not post-hoc. cuRobo scales the velocity/accel LIMITS (CSpaceParams)
+        # so TrajOpt plans a SMOOTH slow trajectory, interpolated natively at ~25 ms. The old path
+        # stretched a full-speed plan's `dt` instead, which coarsened the replay to a few Hz (jerky).
+        # The operator's setup speed IS the planner's velocity_scale.
+        "velocity_scale": float(lim.get("velocity_scale", 1.0)),
+        "acceleration_scale": float(lim.get("acceleration_scale", 1.0)),
     }
 
     return {

@@ -788,21 +788,15 @@ class CuroboV2Planner:
 
     # --- trajectory conversion -------------------------------------------
     def _to_trajectory(self, interp) -> Trajectory:
-        """V2 interpolated plan → the SDK-agnostic `Trajectory` (numpy). Applies the safety speed
-        scale as an exact TIME DILATION: the path is unchanged (still collision-free), replayed at
-        a larger `dt` so velocity/accel scale down — the operator's slow setup speed, realised
-        without re-planning."""
+        """V2 interpolated plan → the SDK-agnostic `Trajectory` (numpy). cuRobo already interpolated it
+        at `interpolation_dt` (~25 ms) AND planned it at the operator's setup speed (the cspace
+        `velocity_scale`/`acceleration_scale`), so it is SMOOTH and slow NATIVELY — a fine, dense
+        cadence the bridge streams. We do NOT stretch `dt` post-hoc: that kept cuRobo's few coarse
+        knots and replayed them at a few Hz, which is the visible jerk."""
         pos = self._np2d(interp.position)
         names = list(getattr(interp, "joint_names", None) or self.planner.joint_names)
         dt = float(getattr(interp, "dt", None) or self._interp_dt)
-        vel = None
-        if getattr(interp, "velocity", None) is not None:
-            vel = self._np2d(interp.velocity)
-
-        if self._vel_scale < 0.999:
-            dt = dt / self._vel_scale          # replay slower
-            if vel is not None:
-                vel = vel * self._vel_scale    # feed-forward consistent with the slower cadence
+        vel = self._np2d(interp.velocity) if getattr(interp, "velocity", None) is not None else None
         return Trajectory(names, pos, dt, velocities=vel,
                           meta={"interp_dt": self._interp_dt, "vel_scale": self._vel_scale})
 
