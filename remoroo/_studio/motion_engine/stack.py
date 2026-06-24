@@ -378,6 +378,28 @@ class MotionStack:
         planner.update_voxel_world(voxelgrid)
         self._live_voxels = np.asarray(self._mapper.occupied_voxels(), dtype=float).reshape(-1, 3)
 
+        # GROUND TRUTH side-by-side: OUR masking (the one that keeps the object GREEN in the debug view)
+        # vs cuRobo's RobotSegmenter (`n_masked` above). If `our_mask_fraction` ≪ `mask_fraction`, the
+        # segmenter is over-masking (the bug); if they AGREE, the object isn't surviving masking at all
+        # and it's the grid/occupancy. Cheap (subsampled). No more guessing — measure.
+        ours: dict = {}
+        try:
+            from . import debug_probe as dp
+            sph = (planner.robot_spheres(q) if hasattr(planner, "robot_spheres") else np.zeros((0, 4)))
+            ok = om = 0
+            kept_pts = []
+            for f in frames:
+                c = dp.backproject_to_base(f.depth, f.intrinsics, f.cam_pose_in_base, stride=12)
+                k, m, _ = dp.split_cloud(c, sph)
+                ok += int(len(k)); om += int(len(m))
+                if len(k):
+                    kept_pts.append(k)
+            kb = dp.bbox(np.concatenate(kept_pts, 0)) if kept_pts else None
+            ours = {"our_kept_pts": ok, "our_masked_pts": om,
+                    "our_mask_fraction": round(om / max(1, ok + om), 3), "our_kept_bbox": kb}
+        except Exception as e:  # noqa: BLE001
+            ours = {"our_mask_error": f"{type(e).__name__}: {e}"}
+
         # MASKING SANITY — the robot is masked from the depth at the joints we hand the segmenter. If
         # the segmenter's joint NAMES don't match the seed, every missing joint silently defaults to
         # 0.0 → the robot is masked at the ZERO pose, in the wrong place, so its OWN body survives as
@@ -414,7 +436,7 @@ class MotionStack:
                "total_pixels": total_px, "mask_fraction": frac, "n_voxels": int(len(self._live_voxels)),
                "n_live_voxels": int(n_live), "n_obstacle_voxels": int(len(self._live_voxels) - n_live),
                "segmenter_joints": len(seg_names), "seed_joints_matched": n_matched,
-               "grid": dict(self._grid_meta)}
+               "grid": dict(self._grid_meta), **ours}
         if warnings:
             out["warnings"] = warnings
         return out
