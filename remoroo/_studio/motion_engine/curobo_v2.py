@@ -241,8 +241,10 @@ class CuroboMapper:
         self._ensure_mapper(h, w)        # build the Mapper now that we know the image size
         if self._depth_filter is None:
             self._depth_filter = FilterDepth(image_shape=(h, w))
-        filtered, _ = self._depth_filter(obs.depth_image.unsqueeze(0))
-        obs.depth_image = filtered[0]
+        # `obs.depth_image` is already (1,H,W) = (num_cameras=1, H, W) — exactly the (B,H,W)
+        # FilterDepth wants. (The cuRobo example unsqueezes because ITS per-frame depth is 2D (H,W).)
+        filtered, _ = self._depth_filter(obs.depth_image)
+        obs.depth_image = filtered
 
         n_masked = 0
         if self._segmenter is not None and joint_positions is not None:
