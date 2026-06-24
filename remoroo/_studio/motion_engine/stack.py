@@ -331,21 +331,79 @@ class MotionStack:
                 ext, ctr, robot_cfg, esdf_vs, voxel_sz)
         self._mapper.reset()
         q = self._seed_positions()                 # the live config the robot is masked at
-        n_masked = 0
+        total_px, n_masked = 0, 0
         for f in frames:
             n_masked += int(self._mapper.integrate(f.depth, f.intrinsics, f.cam_pose_in_base, q) or 0)
+            total_px += int(np.asarray(f.depth).size)
         if hasattr(self._mapper, "fuse_static"):   # one canonical world: live depth + modeled cuboids
             self._mapper.fuse_static(getattr(planner, "modeled_scene", None))
         voxelgrid = self._mapper.compute_esdf()
         planner.update_voxel_world(voxelgrid)
         self._live_voxels = np.asarray(self._mapper.occupied_voxels(), dtype=float).reshape(-1, 3)
-        return {"ok": True, "n_frames": len(frames), "n_robot_pixels_masked": n_masked,
-                "n_voxels": int(len(self._live_voxels))}
+
+        # MASKING SANITY — the robot is masked from the depth at the joints we hand the segmenter. If
+        # the segmenter's joint NAMES don't match the seed, every missing joint silently defaults to
+        # 0.0 → the robot is masked at the ZERO pose, in the wrong place, so its OWN body survives as
+        # world voxels: the arm gets voxelised, the start is born in collision, and NOTHING plans. We
+        # surface the mask fraction + the seed↔segmenter name match so this is visible at the gate
+        # (a 96%-masked image or 0/N matched joints is the smoking gun), not a silent mystery.
+        seg_names = list(getattr(self._mapper, "segmenter_joint_names", []) or [])
+        n_matched = sum(1 for n in seg_names if n in q)
+        frac = round(n_masked / total_px, 3) if total_px else 0.0
+        warnings: List[str] = []
+        if seg_names and n_matched < len(seg_names):
+            warnings.append(f"seed↔segmenter joint mismatch: only {n_matched}/{len(seg_names)} of the "
+                            "robot-mask joints are in the live config — the robot is masked at the WRONG "
+                            "pose (missing joints default to 0), so its own body is voxelised. Fix the "
+                            "bridge joint names / the seed (get_observation joint_positions).")
+        if frac > 0.85:
+            warnings.append(f"{round(frac * 100)}% of depth masked as robot — implausibly high: the mask "
+                            "is misplaced (wrong config, or the camera extrinsics/calibration are off), "
+                            "voxelising the arm itself rather than the scene.")
+        out = {"ok": True, "n_frames": len(frames), "n_robot_pixels_masked": n_masked,
+               "total_pixels": total_px, "mask_fraction": frac, "n_voxels": int(len(self._live_voxels)),
+               "segmenter_joints": len(seg_names), "seed_joints_matched": n_matched}
+        if warnings:
+            out["warnings"] = warnings
+        return out
 
     def esdf_voxels(self) -> np.ndarray:
         """The current live world's occupied voxel centres `[N, 3]` (x, y, z) in the base frame — the
         Studio renders these as the live collision world."""
         return self._live_voxels
+
+    def esdf_voxel_size(self) -> float:
+        """The live ESDF voxel edge length (m), so the Studio sizes the debug cubes at the planner's
+        TRUE resolution. Falls back to a nominal 0.03 m before any live build."""
+        m = self._mapper
+        return float(getattr(m, "esdf_voxel_size", 0.03) or 0.03) if m is not None else 0.03
+
+    # --- debug world: EXACTLY what the planner avoids, as inspectable geometry ----------------
+    def debug_world(self) -> dict:
+        """The EXACT collision world the planner clears, as plain geometry for render/inspection:
+        the live ESDF occupied voxels (which ALREADY include the fused static obstacles) + the modeled
+        cuboids. The ONE source of truth for 'what got into the planner' — used to SEE why the start is
+        born in collision (the occupied volume sitting on the arm) instead of guessing on the rig."""
+        vox = np.asarray(self.esdf_voxels(), dtype=float).reshape(-1, 3)
+        cuboids = [{"name": name, "dims": list(b.get("dims") or [0.1, 0.1, 0.1]),
+                    "pose": list(b.get("pose") or [0, 0, 0, 1, 0, 0, 0])}
+                   for name, b in (self.world.scene.get("cuboid") or {}).items()]
+        return {"voxels": vox, "voxel_size": self.esdf_voxel_size(), "cuboids": cuboids,
+                "n_voxels": int(len(vox)), "n_cuboids": len(cuboids)}
+
+    def save_debug_world(self, path: str) -> dict:
+        """Write `debug_world()` to a binary STL at `path` — a cube per occupied ESDF voxel + an
+        oriented box per modeled cuboid — for offline inspection (MeshLab/Blender). Same geometry the
+        Studio renders live; this is the saveable artifact the operator asked for."""
+        from pathlib import Path as _P
+        from .debug_world import world_stl_bytes
+        d = self.debug_world()
+        data = world_stl_bytes(d["voxels"], d["voxel_size"], d["cuboids"])
+        _P(path).parent.mkdir(parents=True, exist_ok=True)
+        _P(path).write_bytes(data)
+        return {"ok": True, "path": str(path), "n_voxels": d["n_voxels"], "n_cuboids": d["n_cuboids"],
+                "voxel_size": d["voxel_size"], "n_triangles": (d["n_voxels"] + d["n_cuboids"]) * 12,
+                "bytes": len(data)}
 
     def reset_cuda_graph(self) -> None:
         """Reset every warm planner's CUDA graphs — hygiene before a repeatable run that reuses the
@@ -983,6 +1041,53 @@ class MotionStack:
         except Exception as e:
             return MoveResult(False, f"move_to_joints failed: {e}")
 
+    def _world_blocks_exit(self, tcp: str, *, delta: float = 0.05) -> dict:
+        """DECISIVE born-in-collision test against the planner's ACTUAL world (the live ESDF when the
+        cameras have run, else the modeled obstacles) — using ONLY the rig-proven plan path, so it can
+        never drift from what the planner really sees (unlike a parallel collision checker, which holds
+        the modeled scene only and would pass even with the robot buried in live voxels).
+
+        Try a tiny nudge from the current pose along each axis WITH the world; if none plan, ablate the
+        world (`clear_world`) and retry. If the SAME nudge plans with the world cleared but not with it,
+        the START is born inside the live world (the robot can't even leave it) → THE reason every move
+        fails. If it fails even cleared, it's self-collision / kinematics / joint-limits, not the world.
+        `set_world()` restores the live ESDF (it's tracked), so the world is intact afterwards."""
+        planner = self._planner_for([tcp])
+        cur = self.current_tool_pose(tcp)
+        if not cur:
+            return {"born_in_collision": None, "verdict": "planner cannot FK the current pose"}
+        pos, quat = cur
+        dirs = [(0, 0, 1), (0, 0, -1), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+
+        def any_plans() -> bool:
+            for ux, uy, uz in dirs:
+                tgt = [pos[0] + ux * delta, pos[1] + uy * delta, pos[2] + uz * delta]
+                if self.move_to_pose(tcp, (tgt, quat), execute=False, max_attempts=1).ok:
+                    return True
+            return False
+
+        if any_plans():
+            return {"born_in_collision": False, "verdict": "the start can move within the live world"}
+        if not (hasattr(planner, "clear_world") and hasattr(planner, "set_world")):
+            return {"born_in_collision": None,
+                    "verdict": "no tiny move plans, and the planner can't ablate the world to localise it"}
+        try:
+            planner.clear_world()
+            cleared_ok = any_plans()
+        finally:
+            planner.set_world()                      # restore the LIVE ESDF (tracked), not the modeled scene
+        if cleared_ok:
+            return {"born_in_collision": True,
+                    "verdict": ("BORN IN COLLISION against the LIVE world: the same nudge plans with the "
+                                "world cleared but not with it — the start config is inside/surrounded by "
+                                "the live ESDF, so the planner can't leave it. This is why every move "
+                                "fails. Suspect the live-world build (the robot mask at the wrong pose, or "
+                                "the camera extrinsics), voxelising the arm — see build_world.warnings.")}
+        return {"born_in_collision": False,
+                "verdict": ("NOT the world: no tiny move plans even with the world cleared → self-collision "
+                            "(ignore matrix too sparse), joint-limits, or kinematics at the start — not the "
+                            "ESDF. Cross-check validate_config / diagnose_motion.")}
+
     # --- commission self-test --------------------------------------------
     def commission(self, *, execute: bool = True, progress: Optional[Callable[[dict], None]] = None,
                    target: Optional[Sequence[float]] = None, tcp: Optional[str] = None,
@@ -1055,18 +1160,33 @@ class MotionStack:
         # a different fault — don't masquerade as a world problem.
         try:
             planner = self._planner_for([first])
+            # (a) MODELED-obstacle born check (cuRobo's RobotCollisionChecker) — catches the robot born
+            # inside a table/wall/box at rest. This checker sees the modeled scene ONLY, not the live
+            # ESDF, so a clear verdict here is necessary but NOT sufficient when cameras have run.
             if hasattr(planner, "world_sphere_collision"):
                 wc = planner.world_sphere_collision(self._seed_positions())
                 report["start_collision"] = wc
                 n_pen = int(wc.get("n_penetrating", 0))
                 msg = (None if n_pen == 0 else
-                       f"{n_pen} collision sphere(s) already penetrate the static world at the start — the "
-                       "robot is BORN in collision, so planning can't begin. Fix the obstacle / cage wall / "
-                       "safety-bounds (e.g. a floor at z=0) that clips it — not the target.")
+                       f"{n_pen} collision sphere(s) already penetrate a MODELED obstacle at the start — the "
+                       "robot is BORN in collision, so planning can't begin. Fix the obstacle/wall placement "
+                       "(or the seed) that clips it — not the target.")
                 if not step("start_collision", n_pen == 0, n_penetrating=n_pen,
                             penetrating=wc.get("penetrating_spheres"), collision_free=wc.get("collision_free"),
                             message=msg):
                     report["message"] = msg
+                    return report
+            # (b) LIVE-world born check — the one that actually catches "start ✓ / every move ✗". The
+            # modeled checker above is blind to the live ESDF, so when cameras have run we ABLATE the
+            # planner's real world via the plan path: if the robot can't make any tiny move WITH the
+            # live world but can with it cleared, it's born inside the live voxels (the real failure).
+            if getattr(planner, "has_live_world", False):
+                be = self._world_blocks_exit(first)
+                report["start_collision_live"] = be
+                if not step("start_collision", be.get("born_in_collision") is not True,
+                            born_in_collision=be.get("born_in_collision"), message=be.get("verdict"),
+                            world="live ESDF"):
+                    report["message"] = be.get("verdict")
                     return report
         except Exception as e:  # noqa: BLE001 — never let the pre-check itself abort commission
             step("start_collision", True, warn=f"start-collision check skipped: {type(e).__name__}: {e}")

@@ -866,7 +866,29 @@ def h_motion_esdf(_q):
         import numpy as _np
         v = _np.asarray(st.esdf_voxels(), dtype=float).reshape(-1, 3)
         bbox = ([v[:, i].min() for i in range(3)] + [v[:, i].max() for i in range(3)]) if len(v) else None
-        return {"ok": True, "n_voxels": int(len(v)), "voxels": v.tolist(), "bbox": bbox}
+        vs = float(st.esdf_voxel_size()) if hasattr(st, "esdf_voxel_size") else 0.03
+        return {"ok": True, "n_voxels": int(len(v)), "voxels": v.tolist(), "bbox": bbox, "voxel_size": vs}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def h_debug_world(_q):
+    """SAVE + return the planner's collision world (the live ESDF occupied voxels + the modeled
+    cuboids) as a binary STL — 'the world that gets into the planner', for offline inspection
+    (MeshLab/Blender) and a one-click download. Writes <cell>/debug/planner_world.stl and returns the
+    counts + base64 STL so the Studio can save it without SSH. The live in-stage cubes (/edge/motion/
+    esdf) show the SAME world; this is the saveable artifact."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        import base64
+        out_path = str(Path(CELL_DIR) / "debug" / "planner_world.stl")
+        info = st.save_debug_world(out_path)
+        with open(out_path, "rb") as f:
+            info["stl_base64"] = base64.b64encode(f.read()).decode("ascii")
+        return info
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -1973,6 +1995,7 @@ ROUTES = {
     "/edge/motion/verify_start": ("json", h_verify_start),
     "/edge/motion/world": ("json", h_motion_world),
     "/edge/motion/esdf": ("json", h_motion_esdf),
+    "/edge/motion/debug_world": ("json", h_debug_world),
     "/edge/motion/world_alignment": ("json", h_world_alignment),
     "/edge/motion/world_collision_at_seed": ("json", h_world_collision_at_seed),
 }

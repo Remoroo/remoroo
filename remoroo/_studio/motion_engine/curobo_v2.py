@@ -301,6 +301,25 @@ class CuroboMapper:
     def voxelgrid(self):
         return self._voxelgrid
 
+    @property
+    def esdf_voxel_size(self) -> float:
+        """The ESDF voxel edge length (m) — sizes the debug cubes so the Studio renders the planner's
+        occupied world at its TRUE resolution (not nominal dots)."""
+        return float(self._esdf_voxel_size)
+
+    @property
+    def segmenter_joint_names(self) -> List[str]:
+        """The joint names the RobotSegmenter masks the robot at. The live config we hand `integrate`
+        MUST cover these — a name mismatch silently defaults the missing joints to 0.0, masking the
+        robot at the ZERO pose (its real body then survives as world voxels). The stack cross-checks
+        these against the seed to flag that failure at the gate."""
+        if self._segmenter is None:
+            return []
+        try:
+            return list(self._segmenter.kinematics.joint_names)
+        except Exception:  # noqa: BLE001
+            return []
+
 
 def make_mapper(extent_m, center=(0.0, 0.0, 0.0), *, robot_cfg=None, **kw) -> "CuroboMapper":
     """The real mapper factory (injected into `MotionStack`); a test passes a fake instead."""
@@ -362,6 +381,8 @@ class CuroboV2Planner:
         self._world = world
         self._robot_cfg = robot_cfg            # kept so link_pose can FK any URDF link (camera frames)
         self._fk_cache: Dict[str, object] = {}  # per-link FK kinematics (None = link not in URDF)
+        self._live_voxelgrid = None            # the live ESDF (input 1); set by update_voxel_world
+        self._live_active = False              # is the planner's CURRENT world the live ESDF?
         self.planner.update_world(self._full_scene(world))
 
         self._interp_dt = float(self.planner.trajopt_solver.config.interpolation_dt)
@@ -424,22 +445,45 @@ class CuroboV2Planner:
         return Scene.create(world.scene) if world.scene else Scene()
 
     def clear_world(self) -> None:
-        """Drop ALL obstacles (empty world). Diagnostic only — restore with `set_world`."""
+        """Drop ALL obstacles (empty world). Diagnostic ONLY (the born-collision ablation) — restore
+        with `set_world`, which puts back whichever world was active (the live ESDF, or the modeled
+        obstacles). Leaves `_live_active`/`_live_voxelgrid` intact so the restore is faithful."""
         from curobo.scene import Scene
 
         self.planner.update_world(Scene())
 
     def set_world(self, world: Optional[WorldInputs] = None) -> None:
-        """Re-apply the full scene (restores after `clear_world`)."""
-        self.planner.update_world(self._full_scene(world or self._world))
+        """Restore the planner's REAL collision world after a diagnostic `clear_world`. With NO arg:
+        if the live ESDF is active (the cameras have run) restore THAT (input 1⊕2) — NOT the modeled-
+        only scene, which would silently drop the live depth and make a post-ablation plan UNSAFE.
+        With an explicit `world`: an operator obstacle hot-swap — apply the modeled scene and drop the
+        live flag (the next `update_world_live` re-fuses + re-applies the ESDF)."""
+        from curobo.scene import Scene
+
+        if world is not None:
+            self._world = world
+            self._live_active = False          # explicit modeled-scene swap supersedes the live grid
+        if self._live_active and self._live_voxelgrid is not None:
+            self.planner.update_world(Scene(voxel=[self._live_voxelgrid]))
+        else:
+            self.planner.update_world(self._full_scene(self._world))
+
+    @property
+    def has_live_world(self) -> bool:
+        """Is the planner's current collision world the live ESDF (cameras have run)? The born-collision
+        check uses this to know it must test against the LIVE world, not the modeled-obstacle checker."""
+        return bool(self._live_active and self._live_voxelgrid is not None)
 
     def update_voxel_world(self, voxelgrid) -> None:
         """LIVE world: the planner's collision = the ESDF `voxelgrid` — the ONE canonical world holding
         BOTH inputs (input 1 = live depth, input 2 = the modeled obstacles fused in via the mapper's
         `update_static_obstacles`, combined by min()). The scene is just the voxel grid (cuRobo's
-        `Scene(voxel=[vg])` live pipeline). Nothing else — no cloud mesh, no cage, no zones."""
+        `Scene(voxel=[vg])` live pipeline). Nothing else — no cloud mesh, no cage, no zones. Tracked so
+        a diagnostic `clear_world`→`set_world` restores the ESDF (not the stale modeled scene)."""
         from curobo.scene import Scene
 
+        self._live_voxelgrid = voxelgrid
+        self._live_active = True
         self.planner.update_world(Scene(voxel=[voxelgrid]))
 
     @property
@@ -521,7 +565,12 @@ class CuroboV2Planner:
         state = checker.get_kinematics(q)
         d = checker.get_collision_distance(state).detach().cpu().numpy()
         sph = state.robot_spheres.detach().cpu().numpy().reshape(-1, 4)
-        return _collision_report(d, sph, collision_free=valid)
+        rep = _collision_report(d, sph, collision_free=valid)
+        # IMPORTANT: this checker holds the MODELED obstacles only (input 2) — it does NOT see the live
+        # ESDF (input 1). So a "clear" verdict here does NOT mean clear of the live world the planner
+        # actually plans against; the stack runs a plan-ablation (`_world_blocks_exit`) for that.
+        rep["checker_world"] = "modeled-obstacles-only (NOT the live ESDF)"
+        return rep
 
     def free_config(self, n: int = 1) -> np.ndarray:
         """cuRobo's tested rejection sampler → up to `n` collision-free, in-bounds configs `[k, dof]`
