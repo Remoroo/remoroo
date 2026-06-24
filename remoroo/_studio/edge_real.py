@@ -982,6 +982,32 @@ def h_debug_dump(_q):
     return rep
 
 
+def h_diagnose_plan(_q):
+    """DECISIVE ablation for 'no collision-free move' once the world is ruled out: SELF-collision at the
+    start? target reachable (pure IK)? joints in limits? does removing self-collision unblock it? Names
+    the cause. `?fast=1` skips the warm plan-without-self probe (the slow part)."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    tcp = (_q.get("tcp", [None])[0]) or None
+    fast = (_q.get("fast", ["0"])[0] == "1")
+    try:
+        with _bridge_lock:
+            rep = st.diagnose_plan(tcp, test_plan_no_self=not fast)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-600:]}
+    rep["ok"] = True
+    print("\n===== PLAN DIAGNOSIS =====")
+    print(f"  start_self_collision_free={rep.get('start_self_collision_free')}  "
+          f"ik_reach={rep.get('ik_reach')}  limit_violations={list(rep.get('joint_limit_violations') or {})}")
+    print(f"  self_collision_ignore={rep.get('self_collision_ignore')}")
+    print(f"  plan_no_self_no_world={rep.get('plan_no_self_no_world')}")
+    print(f"  VERDICT: {rep.get('verdict')}\n==========================\n")
+    return rep
+
+
 def h_calib_bake(_q):
     """APPLY SAVED CALIBRATION → URDF: re-bake every artifact in `calibration/` (per-camera optical
     frames + the base_to_base inter-arm transform) into `robot_model/robot.urdf`, then drop the planner
@@ -2133,6 +2159,7 @@ ROUTES = {
     "/edge/motion/esdf": ("json", h_motion_esdf),
     "/edge/motion/debug_world": ("json", h_debug_world),
     "/edge/motion/debug_dump": ("json", h_debug_dump),
+    "/edge/motion/diagnose_plan": ("json", h_diagnose_plan),
     "/edge/calib/bake": ("json", h_calib_bake),
     "/edge/motion/world_alignment": ("json", h_world_alignment),
     "/edge/motion/world_collision_at_seed": ("json", h_world_collision_at_seed),

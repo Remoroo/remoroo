@@ -1189,6 +1189,82 @@ class MotionStack:
                             "(ignore matrix too sparse), joint-limits, or kinematics at the start — not the "
                             "ESDF. Cross-check validate_config / diagnose_motion.")}
 
+    def diagnose_plan(self, tcp: Optional[str] = None, *, delta: float = 0.05,
+                      test_plan_no_self: bool = True) -> dict:
+        """DECISIVE ablation for 'no collision-free move' once the WORLD is ruled out — the exact tests
+        to run instead of guessing: (1) is the START config SELF-colliding (empty world, so a non-free
+        verdict = self/bounds, not world)? (2) is the target REACHABLE by pure IK (no world, no self)?
+        (3) are the seed joints within LIMITS? (4) does removing SELF-COLLISION (+ empty world) let the
+        same nudge plan? Names the cause. Read-only; builds throwaway probes (no warm planner touched)."""
+        from .curobo_v2 import CuroboV2Planner
+        from .world import WorldInputs
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"tcp": tcp, "delta": delta}
+        if tcp is None:
+            rep["error"] = "no kinematic groups"
+            return rep
+        tip = self._tip(tcp)
+        seed = self._seed_positions()
+        cur = self.current_tool_pose(tcp)
+        pos, quat = (cur if cur else ([0.3, 0.0, 0.4], [1.0, 0.0, 0.0, 0.0]))
+        tgt = [pos[0], pos[1], pos[2] + delta]                  # a small lift — the easiest safe move
+        rep["target"] = [round(float(v), 3) for v in tgt]
+        empty = WorldInputs(scene={})
+        try:
+            probe = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
+                                    max_goalset=1, warmup=False, self_collision_check=True)
+            sc = probe.world_sphere_collision(seed)            # empty world ⇒ collision_free = self+bounds
+            rep["start_self_collision_free"] = sc.get("collision_free")
+            rep["n_world_penetrating"] = sc.get("n_penetrating")
+            ik = probe.ik_check(tip, seed)
+            rep["ik_reach"] = {k: bool(v.get("success")) for k, v in (ik.get("checks") or {}).items()}
+            lim = probe.joint_limits()
+            rep["joint_limit_violations"] = {
+                j: {"q": round(float(seed[j]), 4), "limit": [round(lo, 4), round(hi, 4)]}
+                for j, (lo, hi) in lim.items()
+                if j in seed and not (lo - 1e-3 <= seed[j] <= hi + 1e-3)}
+        except Exception as e:  # noqa: BLE001
+            rep["probe_error"] = f"{type(e).__name__}: {e}"
+        ig = self._self_collision_ignore()
+        rep["self_collision_ignore"] = {"n_links": len(ig), "n_pairs": sum(len(v) for v in ig.values()),
+                                        "generated_by_curobo": self._ignore_warn is None, "warn": self._ignore_warn}
+        if test_plan_no_self:                                   # the confirmatory plan (needs warmup)
+            try:
+                pn = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
+                                     max_goalset=1, warmup=True, self_collision_check=False)
+                r = pn.plan_pose({tip: (tgt, quat)}, seed, max_attempts=3)
+                rep["plan_no_self_no_world"] = {"ok": bool(r.success), "message": r.message}
+            except Exception as e:  # noqa: BLE001
+                rep["plan_no_self_no_world"] = {"ok": None, "message": f"{type(e).__name__}: {e}"}
+
+        ssf = rep.get("start_self_collision_free")
+        ik0 = (rep.get("ik_reach") or {}).get("0cm")
+        viol = rep.get("joint_limit_violations") or {}
+        pns = (rep.get("plan_no_self_no_world") or {}).get("ok")
+        if ik0 is False:
+            rep["verdict"] = ("KINEMATICS/CFG BROKEN: pure IK can't re-solve the current pose with NO world and "
+                              "NO self-collision — a robot_cfg/IK fault (base_link/tool_frame/cspace/quaternion), "
+                              "not collision. See validate_config.")
+        elif viol:
+            rep["verdict"] = (f"JOINT LIMITS: the seed is outside limits on {list(viol)} — no trajectory can be "
+                              "valid. Fix the limits (URDF/safety) or the seed read.")
+        elif ssf is False:
+            rep["verdict"] = ("SELF-COLLISION at the START config: with an EMPTY world the robot is still 'in "
+                              "collision', so its own spheres overlap at rest (or bounds). Likely the self-collision "
+                              "IGNORE matrix is too sparse for this (bimanual) robot — by-design-touching links "
+                              "phantom-collide — or two limbs genuinely overlap at the seed."
+                              + (" CONFIRMED: the nudge plans with self-collision OFF." if pns else ""))
+        elif pns is True:
+            rep["verdict"] = ("SELF-COLLISION on the PATH: the nudge plans with self-collision OFF (and the start "
+                              "isn't world- or self-colliding) → a sphere/ignore-matrix is too aggressive along the "
+                              "motion. Loosen the offending pair or the sphere.")
+        elif pns is False:
+            rep["verdict"] = ("NOT collision: even with self-collision OFF and an EMPTY world the nudge won't plan → "
+                              "kinematics/IK/dynamics, not collision. Cross-check ik_reach + limits + validate_config.")
+        else:
+            rep["verdict"] = "inconclusive — read the fields (ik_reach, start_self_collision_free, limits)."
+        return rep
+
     # --- commission self-test --------------------------------------------
     def commission(self, *, execute: bool = True, progress: Optional[Callable[[dict], None]] = None,
                    target: Optional[Sequence[float]] = None, tcp: Optional[str] = None,
@@ -1268,13 +1344,22 @@ class MotionStack:
                 wc = planner.world_sphere_collision(self._seed_positions())
                 report["start_collision"] = wc
                 n_pen = int(wc.get("n_penetrating", 0))
-                msg = (None if n_pen == 0 else
-                       f"{n_pen} collision sphere(s) already penetrate a MODELED obstacle at the start — the "
-                       "robot is BORN in collision, so planning can't begin. Fix the obstacle/wall placement "
-                       "(or the seed) that clips it — not the target.")
-                if not step("start_collision", n_pen == 0, n_penetrating=n_pen,
-                            penetrating=wc.get("penetrating_spheres"), collision_free=wc.get("collision_free"),
-                            message=msg):
+                free = wc.get("collision_free")     # validate() folds in SELF-collision + bounds, not just world
+                ok = (n_pen == 0 and free is not False)
+                if n_pen > 0:
+                    msg = (f"{n_pen} collision sphere(s) penetrate a MODELED obstacle at the start — the robot "
+                           "is BORN in collision. Fix the obstacle/wall placement (or the seed) — not the target.")
+                elif free is False:
+                    msg = ("the robot is BORN in collision with NO world obstacle penetrating → it's SELF-"
+                           "COLLISION (the robot's own spheres overlap at this config) or a joint-limit/bounds "
+                           "violation, so planning can't begin. Most likely the self-collision IGNORE matrix is "
+                           "too sparse for this robot (by-design-touching links phantom-collide) or two limbs "
+                           "overlap at the seed. Run the plan diagnosis to confirm.")
+                else:
+                    msg = None
+                if not step("start_collision", ok, n_penetrating=n_pen, collision_free=free,
+                            penetrating=wc.get("penetrating_spheres"),
+                            self_or_bounds=(n_pen == 0 and free is False), message=msg):
                     report["message"] = msg
                     return report
             # (b) LIVE-world born check — the one that actually catches "start ✓ / every move ✗". The
