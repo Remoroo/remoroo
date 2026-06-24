@@ -361,8 +361,22 @@ class MotionStack:
             warnings.append(f"{round(frac * 100)}% of depth masked as robot — implausibly high: the mask "
                             "is misplaced (wrong config, or the camera extrinsics/calibration are off), "
                             "voxelising the arm itself rather than the scene.")
+        # SPLIT live-depth vs modeled-obstacle voxels so "is the camera contributing anything?" is
+        # answerable: count occupied voxels NOT inside any modeled obstacle AABB (+1 voxel margin) =
+        # the LIVE depth's contribution. n_live_voxels≈0 with frames present ⇒ the depth is masked away
+        # / invalid (see camera_inputs valid_frac), not a render bug.
+        n_live = self._live_voxels.shape[0]
+        boxes = obstacle_bboxes(self.world.scene)
+        if boxes and n_live:
+            m = esdf_vs + 1e-6
+            inside = np.zeros(n_live, dtype=bool)
+            for lo, hi in boxes:
+                lo = np.asarray(lo) - m; hi = np.asarray(hi) + m
+                inside |= np.all((self._live_voxels >= lo) & (self._live_voxels <= hi), axis=1)
+            n_live = int((~inside).sum())
         out = {"ok": True, "n_frames": len(frames), "n_robot_pixels_masked": n_masked,
                "total_pixels": total_px, "mask_fraction": frac, "n_voxels": int(len(self._live_voxels)),
+               "n_live_voxels": int(n_live), "n_obstacle_voxels": int(len(self._live_voxels) - n_live),
                "segmenter_joints": len(seg_names), "seed_joints_matched": n_matched}
         if warnings:
             out["warnings"] = warnings
@@ -391,6 +405,81 @@ class MotionStack:
                    for name, b in (self.world.scene.get("cuboid") or {}).items()]
         return {"voxels": vox, "voxel_size": self.esdf_voxel_size(), "cuboids": cuboids,
                 "n_voxels": int(len(vox)), "n_cuboids": len(cuboids)}
+
+    def debug_dump(self, frames, *, tcp: Optional[str] = None, save_dir: Optional[str] = None,
+                   stride: int = 6, max_points: int = 6000, seg_dist: float = 0.05) -> dict:
+        """COMPLETE, transparent live-world debug — SAVE + SHOW everything, before vs after masking:
+        camera poses, the RAW back-projected clouds (is the cloud on the real scene? → is the camera
+        pose right?), what the robot mask KEEPS vs REMOVES (does masking eat the scene?), the robot
+        collision spheres at the seed, the world voxels + modeled obstacles, and the born-collision
+        verdict. Saves a `.npz` (full clouds) + `.json` (summary) to `save_dir`; returns subsampled
+        clouds for the Studio to render. The split uses the SAME sphere rule the segmenter applies,
+        done transparently here so it's inspectable (no opaque GPU mask)."""
+        from . import debug_probe as dp
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"tcp": tcp, "seg_dist": float(seg_dist)}
+        if tcp is None:
+            rep["error"] = "no kinematic groups"
+            return rep
+        planner = self._planner_for([tcp])
+        seed = self._seed_positions()
+        rep["seed"] = {"n_joints": len(seed),
+                       "joints": {k: round(float(v), 4) for k, v in seed.items()}}
+        spheres = np.zeros((0, 4))
+        if hasattr(planner, "robot_spheres"):
+            try:
+                spheres = np.asarray(planner.robot_spheres(seed), float).reshape(-1, 4)
+            except Exception as e:  # noqa: BLE001
+                rep["spheres_error"] = f"{type(e).__name__}: {e}"
+        rep["n_spheres"] = int(len(spheres))
+        rep["spheres_bbox"] = dp.bbox(spheres[:, :3]) if spheres.size else None
+        rep["spheres"] = spheres.round(4).tolist()        # [x,y,z,r] — small; the Studio renders them
+        save: dict = {"spheres": spheres} if spheres.size else {}
+        cams = []
+        for i, f in enumerate(frames):
+            cloud = dp.backproject_to_base(f.depth, f.intrinsics, f.cam_pose_in_base, stride=stride)
+            kept, masked, _ = dp.split_cloud(cloud, spheres, seg_dist=seg_dist)
+            p, q = f.cam_pose_in_base
+            a = np.asarray(f.depth, float)
+            valid = np.isfinite(a) & (a > 1e-3)
+            cams.append({
+                "name": f.name, "pose_xyz": [round(float(v), 4) for v in list(p)[:3]],
+                "pose_wxyz": [round(float(v), 4) for v in list(q)[:4]],
+                "depth_hw": list(a.shape), "valid_frac": round(float(valid.mean()), 3) if a.size else 0.0,
+                "n_points": int(len(cloud)), "n_kept": int(len(kept)), "n_masked": int(len(masked)),
+                "cloud_bbox": dp.bbox(cloud), "kept_bbox": dp.bbox(kept),
+                "raw": dp.subsample(cloud, max_points).round(4).tolist(),
+                "kept": dp.subsample(kept, max_points).round(4).tolist(),
+                "masked": dp.subsample(masked, max_points).round(4).tolist()})
+            save[f"cam{i}_{f.name}_raw"] = cloud
+            save[f"cam{i}_{f.name}_kept"] = kept
+            save[f"cam{i}_{f.name}_masked"] = masked
+        rep["cameras"] = cams
+        vox = np.asarray(self.esdf_voxels(), float).reshape(-1, 3)
+        rep["world"] = {"n_voxels": int(len(vox)), "voxel_size": self.esdf_voxel_size(),
+                        "voxels_bbox": dp.bbox(vox),
+                        "obstacles": [{"name": n, "dims": b.get("dims"), "pose": b.get("pose")}
+                                      for n, b in (self.world.scene.get("cuboid") or {}).items()]}
+        if vox.size:
+            save["voxels"] = vox
+        if hasattr(planner, "world_sphere_collision"):
+            try:
+                rep["start_collision"] = planner.world_sphere_collision(seed)
+            except Exception as e:  # noqa: BLE001
+                rep["start_collision_error"] = f"{type(e).__name__}: {e}"
+        if save_dir:
+            import json
+            from pathlib import Path as _P
+            d = _P(save_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(str(d / "debug_clouds.npz"),
+                                **{k: np.asarray(v, float) for k, v in save.items()})
+            summary = {k: v for k, v in rep.items() if k != "cameras"}
+            summary["cameras"] = [{kk: vv for kk, vv in c.items() if kk not in ("raw", "kept", "masked")}
+                                  for c in cams]
+            (d / "debug_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            rep["saved"] = {"npz": str(d / "debug_clouds.npz"), "json": str(d / "debug_summary.json")}
+        return rep
 
     def save_debug_world(self, path: str) -> dict:
         """Write `debug_world()` to a binary STL at `path` — a cube per occupied ESDF voxel + an

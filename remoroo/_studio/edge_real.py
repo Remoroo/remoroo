@@ -944,6 +944,43 @@ def h_debug_world(_q):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def h_debug_dump(_q):
+    """FULL live-world debug — SAVE (cell/debug/*.npz + *.json) + SHOW (returns the clouds for the
+    Studio): camera poses, the RAW per-camera clouds, the robot-mask split (kept vs masked), the robot
+    collision spheres at the seed, the world voxels + obstacles, and the born-collision verdict. Also
+    PRINTS a concise before/after table to the edge console. The scientific 'is the cloud on the real
+    scene, and does masking eat it?' view."""
+    try:
+        st = motion_stack()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    b = get_bridge()
+    try:
+        with _bridge_lock:
+            frames, reasons = (_live_frames(st, b) if b is not None else ([], []))
+            rep = st.debug_dump(frames, save_dir=str(CELL_DIR / "debug"))
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-600:]}
+    rep["ok"] = True
+    rep["camera_inputs"] = reasons
+    # PRINTS — the operator asked for on-desk debug too. One honest line per camera + the verdict.
+    print("\n===== COMMISSION DEBUG DUMP =====")
+    print(f"seed joints: {rep.get('seed', {}).get('n_joints')}  robot spheres: {rep.get('n_spheres')}  "
+          f"spheres bbox: {rep.get('spheres_bbox')}")
+    for c in rep.get("cameras", []):
+        print(f"  cam {c['name']}: pose xyz={c['pose_xyz']} wxyz={c['pose_wxyz']}  "
+              f"valid_depth={c['valid_frac']*100:.0f}%  points={c['n_points']}  "
+              f"KEPT(world)={c['n_kept']}  MASKED(robot)={c['n_masked']}  cloud_bbox={c['cloud_bbox']}")
+    w = rep.get("world", {})
+    print(f"  world: {w.get('n_voxels')} voxels @ {w.get('voxel_size')} m  bbox={w.get('voxels_bbox')}  "
+          f"obstacles={len(w.get('obstacles') or [])}")
+    sc = rep.get("start_collision", {})
+    print(f"  start_collision: free={sc.get('collision_free')}  penetrating={sc.get('n_penetrating')}")
+    print(f"  SAVED → {rep.get('saved')}\n=================================\n")
+    return rep
+
+
 def h_calib_bake(_q):
     """APPLY SAVED CALIBRATION → URDF: re-bake every artifact in `calibration/` (per-camera optical
     frames + the base_to_base inter-arm transform) into `robot_model/robot.urdf`, then drop the planner
@@ -1001,6 +1038,22 @@ def _grab_observation(b, keys):
     return None, None
 
 
+def _np_depth_stats(depth) -> dict:
+    """Valid-depth fraction + metric range for one camera's depth — the honest read on whether the
+    bridge is returning usable metric depth (vs mostly-invalid, which masks as 'robot') and in the
+    right units (a max of ~1500 instead of ~1.5 means millimetres)."""
+    import numpy as _np
+    a = _np.asarray(depth, dtype=float)
+    valid = _np.isfinite(a) & (a > 1e-3)
+    n = int(valid.sum())
+    if n == 0:
+        return {"valid_frac": 0.0, "depth_min_m": None, "depth_max_m": None, "depth_median_m": None}
+    v = a[valid]
+    return {"valid_frac": round(n / a.size, 3),
+            "depth_min_m": round(float(v.min()), 3), "depth_max_m": round(float(v.max()), 3),
+            "depth_median_m": round(float(_np.median(v)), 3)}
+
+
 def _live_frames(st, b):
     """Build one `DepthFrame` per cell camera from the BRIDGE's per-camera observation (general — it
     relies only on the bridge contract the agent fulfils: depth + intrinsics per camera) and the
@@ -1053,7 +1106,12 @@ def _live_frames(st, b):
                                        "preserves the optical frame. Refusing the un-calibrated body link."})
                 continue
             frames.append(DepthFrame(depth=depth, intrinsics=K, cam_pose_in_base=pose, name=name))
-            reasons.append({"camera": name, "ok": True, "depth_hw": list(depth.shape)})
+            # DEPTH VALIDITY — the decisive number when 'robot px masked' is implausibly high: a zero/
+            # invalid depth pixel back-projects to the camera origin (on the wrist) → within the segment
+            # distance of the robot → masked AS robot. So a low valid fraction reads as '96% robot' and
+            # the live world is empty. Surface valid% + the depth scale (catches metres-vs-mm too).
+            a = _np_depth_stats(depth)
+            reasons.append({"camera": name, "ok": True, "depth_hw": list(depth.shape), **a})
         except Exception as e:  # noqa: BLE001
             reasons.append({"camera": name, "ok": False, "why": f"{type(e).__name__}: {e}"})
     return frames, reasons
@@ -2073,6 +2131,7 @@ ROUTES = {
     "/edge/motion/world": ("json", h_motion_world),
     "/edge/motion/esdf": ("json", h_motion_esdf),
     "/edge/motion/debug_world": ("json", h_debug_world),
+    "/edge/motion/debug_dump": ("json", h_debug_dump),
     "/edge/calib/bake": ("json", h_calib_bake),
     "/edge/motion/world_alignment": ("json", h_world_alignment),
     "/edge/motion/world_collision_at_seed": ("json", h_world_collision_at_seed),
