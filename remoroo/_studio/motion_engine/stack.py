@@ -368,7 +368,7 @@ class MotionStack:
         n_live = self._live_voxels.shape[0]
         boxes = obstacle_bboxes(self.world.scene)
         if boxes and n_live:
-            m = esdf_vs + 1e-6
+            m = self.esdf_voxel_size() + 1e-6      # mapper voxel size (esdf_vs is unset on a reused mapper)
             inside = np.zeros(n_live, dtype=bool)
             for lo, hi in boxes:
                 lo = np.asarray(lo) - m; hi = np.asarray(hi) + m
@@ -407,7 +407,8 @@ class MotionStack:
                 "n_voxels": int(len(vox)), "n_cuboids": len(cuboids)}
 
     def debug_dump(self, frames, *, tcp: Optional[str] = None, save_dir: Optional[str] = None,
-                   stride: int = 6, max_points: int = 6000, seg_dist: float = 0.05) -> dict:
+                   stride: int = 6, max_points: int = 6000, seg_dist: float = 0.05,
+                   offend_dist: float = 0.03) -> dict:
         """COMPLETE, transparent live-world debug — SAVE + SHOW everything, before vs after masking:
         camera poses, the RAW back-projected clouds (is the cloud on the real scene? → is the camera
         pose right?), what the robot mask KEEPS vs REMOVES (does masking eat the scene?), the robot
@@ -439,6 +440,13 @@ class MotionStack:
         for i, f in enumerate(frames):
             cloud = dp.backproject_to_base(f.depth, f.intrinsics, f.cam_pose_in_base, stride=stride)
             kept, masked, _ = dp.split_cloud(cloud, spheres, seg_dist=seg_dist)
+            # OFFENDING = kept world points that are STILL within `offend_dist` of a robot sphere
+            # surface (incl. inside, negative) — the ones that survive masking yet sit on/in the robot,
+            # i.e. the born-collision culprits. If many, the robot SPHERES don't match where the robot
+            # really is (mask/extrinsic/base-to-base) OR masking is under-clearing. Shown LARGE +
+            # see-through so even points buried inside the robot are visible.
+            d_kept = dp.nearest_sphere_signed_distance(kept, spheres)
+            offending = kept[d_kept < float(offend_dist)] if (kept.size and spheres.size) else np.zeros((0, 3))
             p, q = f.cam_pose_in_base
             a = np.asarray(f.depth, float)
             valid = np.isfinite(a) & (a > 1e-3)
@@ -447,13 +455,16 @@ class MotionStack:
                 "pose_wxyz": [round(float(v), 4) for v in list(q)[:4]],
                 "depth_hw": list(a.shape), "valid_frac": round(float(valid.mean()), 3) if a.size else 0.0,
                 "n_points": int(len(cloud)), "n_kept": int(len(kept)), "n_masked": int(len(masked)),
-                "cloud_bbox": dp.bbox(cloud), "kept_bbox": dp.bbox(kept),
+                "n_offending": int(len(offending)),
+                "cloud_bbox": dp.bbox(cloud), "kept_bbox": dp.bbox(kept), "offending_bbox": dp.bbox(offending),
                 "raw": dp.subsample(cloud, max_points).round(4).tolist(),
                 "kept": dp.subsample(kept, max_points).round(4).tolist(),
-                "masked": dp.subsample(masked, max_points).round(4).tolist()})
+                "masked": dp.subsample(masked, max_points).round(4).tolist(),
+                "offending": dp.subsample(offending, max_points).round(4).tolist()})
             save[f"cam{i}_{f.name}_raw"] = cloud
             save[f"cam{i}_{f.name}_kept"] = kept
             save[f"cam{i}_{f.name}_masked"] = masked
+            save[f"cam{i}_{f.name}_offending"] = offending
         rep["cameras"] = cams
         vox = np.asarray(self.esdf_voxels(), float).reshape(-1, 3)
         rep["world"] = {"n_voxels": int(len(vox)), "voxel_size": self.esdf_voxel_size(),

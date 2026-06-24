@@ -971,7 +971,8 @@ def h_debug_dump(_q):
     for c in rep.get("cameras", []):
         print(f"  cam {c['name']}: pose xyz={c['pose_xyz']} wxyz={c['pose_wxyz']}  "
               f"valid_depth={c['valid_frac']*100:.0f}%  points={c['n_points']}  "
-              f"KEPT(world)={c['n_kept']}  MASKED(robot)={c['n_masked']}  cloud_bbox={c['cloud_bbox']}")
+              f"KEPT(world)={c['n_kept']}  MASKED(robot)={c['n_masked']}  "
+              f"OFFENDING(near robot)={c['n_offending']}  cloud_bbox={c['cloud_bbox']}")
     w = rep.get("world", {})
     print(f"  world: {w.get('n_voxels')} voxels @ {w.get('voxel_size')} m  bbox={w.get('voxels_bbox')}  "
           f"obstacles={len(w.get('obstacles') or [])}")
