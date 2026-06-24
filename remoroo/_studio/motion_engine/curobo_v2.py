@@ -330,37 +330,56 @@ class CuroboV2Planner:
         # self-collision/IK).
         self._world = world
         self._robot_cfg = robot_cfg            # kept so link_pose can FK any URDF link (camera frames)
-        self._fk = None
+        self._fk_cache: Dict[str, object] = {}  # per-link FK kinematics (None = link not in URDF)
         self.planner.update_world(self._full_scene(world))
 
         self._interp_dt = float(self.planner.trajopt_solver.config.interpolation_dt)
 
     # --- forward kinematics for ANY link (e.g. a camera's calibrated optical frame) --------
+    def _fk_for(self, link: str):
+        """A cached FK-only `Kinematics` that TRACKS `link` as a tool_frame. cuRobo REQUIRES
+        `tool_frames` to be specified ("tool_frames must be specified") — we cannot 'track all links'
+        by popping it — so we add the requested link to the cfg's tool_frames. Returns None when the
+        link isn't a real URDF link (so `link_pose` can fall back, e.g. `<cam>_optical_frame`→`<cam>`)."""
+        if link not in self._fk_cache:
+            self._fk_cache[link] = None
+            try:
+                import copy
+                import torch
+                from curobo._src.types.robot import RobotCfg
+                from curobo._src.robot.kinematics.kinematics import Kinematics
+                from curobo.types import DeviceCfg
+
+                kin_dict = copy.deepcopy(self._robot_cfg.get("robot_cfg", self._robot_cfg))
+                kin = kin_dict.setdefault("kinematics", {})
+                tf = list(kin.get("tool_frames") or [])
+                kin["tool_frames"] = tf + ([link] if link not in tf else [])    # FK target = a tracked frame
+                rc = RobotCfg.create(kin_dict, device_cfg=DeviceCfg(device=torch.device(self._device),
+                                                                    dtype=torch.float32))
+                self._fk_cache[link] = Kinematics(rc.kinematics)
+            except Exception:  # noqa: BLE001 — link not in URDF / cfg rejected it → caller falls back
+                self._fk_cache[link] = None
+        return self._fk_cache[link]
+
     def link_pose(self, link: str, start_positions: Optional[Dict[str, float]] = None):
-        """FK ANY URDF link → its pose `(xyz, wxyz)` in the base frame at the given (or zero) config.
-        Used to resolve a camera's calibrated optical-frame pose for the live map (eye-in-hand: at the
-        LIVE joints; static: the same fixed result). Isolated from planning: a FK-only kinematics that
-        tracks ALL links (tool_frames=None), so adding camera frames never perturbs the goal logic."""
+        """FK a URDF link → its pose `(xyz, wxyz)` in the base frame at the given (or zero) config.
+        Resolves a camera's calibrated optical-frame pose for the live map (eye-in-hand: at the LIVE
+        joints; static: fixed). Returns None if `link` isn't in the URDF, so the caller can fall back."""
         import torch
-        from curobo.types import DeviceCfg, JointState
 
-        if self._fk is None:
-            import copy
-            from curobo._src.types.robot import RobotCfg
-            from curobo._src.robot.kinematics.kinematics import Kinematics
-
-            kin_dict = copy.deepcopy(self._robot_cfg.get("robot_cfg", self._robot_cfg))
-            kin_dict.get("kinematics", {}).pop("tool_frames", None)     # None → track every link
-            rc = RobotCfg.create(kin_dict, device_cfg=DeviceCfg(device=torch.device(self._device),
-                                                                dtype=torch.float32))
-            self._fk = Kinematics(rc.kinematics)
-        names = list(self._fk.joint_names)
-        q = torch.as_tensor([float((start_positions or {}).get(n, 0.0)) for n in names],
-                            dtype=torch.float32, device=self._device).view(1, -1)
-        pose = self._fk.get_link_poses(q, [link])
-        pos = pose.position.detach().cpu().numpy().reshape(-1)
-        quat = pose.quaternion.detach().cpu().numpy().reshape(-1)
-        return [float(v) for v in pos[:3]], [float(v) for v in quat[:4]]
+        fk = self._fk_for(link)
+        if fk is None:
+            return None
+        try:
+            names = list(fk.joint_names)
+            q = torch.as_tensor([float((start_positions or {}).get(n, 0.0)) for n in names],
+                                dtype=torch.float32, device=self._device).view(1, -1)
+            pose = fk.get_link_poses(q, [link])
+            pos = pose.position.detach().cpu().numpy().reshape(-1)
+            quat = pose.quaternion.detach().cpu().numpy().reshape(-1)
+            return [float(v) for v in pos[:3]], [float(v) for v in quat[:4]]
+        except Exception:  # noqa: BLE001 — FK failed for this link → caller falls back
+            return None
 
     # --- world (live, toggleable for the diagnostic) ----------------------
     def _full_scene(self, world: WorldInputs):
