@@ -560,8 +560,18 @@ def sse_live_joints(_q):
             time.sleep(0.1)
             continue
         try:
-            obs = b.get_observation()
-            joints = {name: _joint_value(val) for name, val in (obs.joint_positions or {}).items()}
+            # JOINTS-ONLY read — the mirror needs the robot's POSE, not depth. Coupling it to
+            # get_observation()'s depth grab means a slow/dead camera FREEZES the joint preview (the ZED
+            # hiccup that took the mirror down). Prefer the bridge's light read_joint_positions() (no
+            # camera); fall back to get_observation() only if the cell doesn't expose it. This is the
+            # SAME on-demand, mirror-open-only loop (no background thread) — it just stops grabbing depth.
+            jp = None
+            fast = getattr(b, "read_joint_positions", None)
+            if callable(fast):
+                jp = fast()
+            if not (isinstance(jp, dict) and jp):
+                jp = getattr(b.get_observation(), "joint_positions", None)
+            joints = {name: _joint_value(val) for name, val in (jp or {}).items()}
             frame = {"t": time.time() - t0, "joints": joints}
         except Exception as e:  # noqa: BLE001
             frame = {"t": time.time() - t0, "error": str(e)}      # no `joints` → mirror keeps last pose
@@ -633,6 +643,14 @@ def motion_stack(force: bool = False):
     ONE unified autonomous-motion surface; the bridge supplies state + execute_trajectory."""
     global _MOTION_STACK
     if _MOTION_STACK is not None and not force:
+        # HEAL a stale bridge binding. The stack is cached for the whole bring-up, but the bridge
+        # may have been DOWN when it was first built — primitives.py is authored late (G2), or the
+        # robot/camera wasn't reachable yet — in which case `bridge=None` was frozen into the stack
+        # and every execute returns "no bridge.execute_trajectory" FOREVER, even after the robot
+        # reconnects. Re-attach the LIVE bridge (cheap; the costly cuRobo build is untouched) so
+        # commission/execute work the moment the bridge comes up, without a forced rebuild.
+        if getattr(_MOTION_STACK, "bridge", None) is None:
+            _MOTION_STACK.bridge = get_bridge()
         return _MOTION_STACK
     from motion_engine import MotionStack  # sibling of this file in server/, like calib_engine
 
@@ -958,23 +976,31 @@ def sse_esdf_live(_q):
         yield {"done": True, "result": {"ok": False, "error": f"{type(e).__name__}: {e}"}}
         return
     b = get_bridge()
-    period = max(0.4, float((_q.get("period", ["1.2"])[0]) or 1.2))
-    max_iters = int((_q.get("max_iters", ["1200"])[0]) or 1200)
+    period = max(0.2, float((_q.get("period", ["0.3"])[0]) or 0.3))
+    max_iters = int((_q.get("max_iters", ["6000"])[0]) or 6000)
     for i in range(max_iters):
         rec: dict = {"frame": i}
         try:
-            with _bridge_lock:
-                frames, reasons = (_live_frames(st, b) if b is not None else ([], []))
-                if frames:
-                    wr = st.update_world_live(frames)
-                    for k in ("n_voxels", "n_live_voxels", "n_obstacle_voxels", "mask_fraction",
-                              "n_robot_pixels_masked"):
-                        rec[k] = wr.get(k)
-                rec["n_cams"] = sum(1 for r in (reasons or []) if r.get("ok"))
-                rec["cam_why"] = next((r.get("why") for r in (reasons or []) if not r.get("ok")), None)
-                v = _np.asarray(st.esdf_voxels(), dtype=float).reshape(-1, 3)
-                rec["voxels"] = v.tolist()
-                rec["voxel_size"] = float(st.esdf_voxel_size())
+            # LOCK ONLY FOR THE CAMERA GRAB — read the joints + depth under the bridge lock, then RELEASE
+            # and build the ESDF on the GPU off the lock, so the live mirror isn't starved for the whole
+            # build (the live-robot-freezes-during-live-world bug). The lock is held ~the grabs, not seconds.
+            frames, reasons, seed = [], [], None
+            if b is not None and _bridge_lock.acquire(blocking=True, timeout=2.0):
+                try:
+                    seed = st._seed_positions()                  # joints once, under the lock
+                    frames, reasons = _live_frames(st, b, seed=seed)
+                finally:
+                    _bridge_lock.release()
+            if frames:
+                wr = st.update_world_live(frames, seed=seed)        # GPU only — no bridge, off-lock
+                for k in ("n_voxels", "n_live_voxels", "n_obstacle_voxels", "mask_fraction",
+                          "n_robot_pixels_masked"):
+                    rec[k] = wr.get(k)
+            rec["n_cams"] = sum(1 for r in (reasons or []) if r.get("ok"))
+            rec["cam_why"] = next((r.get("why") for r in (reasons or []) if not r.get("ok")), None)
+            v = _np.asarray(st.esdf_voxels(), dtype=float).reshape(-1, 3)
+            rec["voxels"] = v.tolist()
+            rec["voxel_size"] = float(st.esdf_voxel_size())
         except Exception as e:  # noqa: BLE001 — never kill the stream on one bad cycle
             rec["error"] = f"{type(e).__name__}: {e}"
         yield rec
@@ -1125,7 +1151,7 @@ def _np_depth_stats(depth) -> dict:
             "depth_median_m": round(float(_np.median(v)), 3)}
 
 
-def _live_frames(st, b):
+def _live_frames(st, b, seed=None):
     """Build one `DepthFrame` per cell camera from the BRIDGE's per-camera observation (general — it
     relies only on the bridge contract the agent fulfils: depth + intrinsics per camera) and the
     camera's calibrated optical-frame pose via `stack.link_pose`. Camera/morphology-agnostic.
@@ -1168,7 +1194,7 @@ def _live_frames(st, b):
             # writer (`_ensure_complete_urdf`). REFUSE the bare body link: it carries no calibration and
             # mis-places the whole live cloud onto the robot. A missing optical frame means the URDF is
             # incomplete at commission — say so, loudly, with the fix.
-            pose = st.link_pose(f"{link}_optical_frame")
+            pose = st.link_pose(f"{link}_optical_frame", joints=seed)   # seed from the cache → no bridge call
             if pose is None:
                 reasons.append({"camera": name, "ok": False,
                                 "why": f"'{link}_optical_frame' is missing from robot.urdf — the URDF is INCOMPLETE "
