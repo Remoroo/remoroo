@@ -231,8 +231,12 @@ class CuroboMapper:
         intr = torch.as_tensor(np.asarray(intrinsics, dtype=np.float32), device=self._device).view(1, 3, 3)
         pos = torch.as_tensor(np.asarray(cam_pose_in_base[0], dtype=np.float32), device=self._device).view(1, 3)
         quat = torch.as_tensor(np.asarray(cam_pose_in_base[1], dtype=np.float32), device=self._device).view(1, 4)
+        # depth_to_meter=1.0: OUR depth is already in METRES. cuRobo's CameraObservation DEFAULTS to
+        # 0.001 (assumes millimetres) and multiplies the projection rays by it — which collapsed every
+        # point ~1000× onto the camera/wrist, so the whole scene read as robot (~99% masked) AND the
+        # mapper integrated it at the camera origin (0 voxels). This one field was the bug.
         return CameraObservation(depth_image=dimg, rgb_image=rgb, intrinsics=intr,
-                                 pose=Pose(position=pos, quaternion=quat))
+                                 pose=Pose(position=pos, quaternion=quat), depth_to_meter=1.0)
 
     def integrate(self, depth: np.ndarray, intrinsics: np.ndarray,
                   cam_pose_in_base: Tuple[Sequence[float], Sequence[float]],
