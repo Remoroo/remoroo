@@ -541,94 +541,7 @@ def _joint_value(val) -> float:
     return float(arr[0]) if arr.size else 0.0
 
 
-# ───────────────────────── the SINGLE robot-state owner ─────────────────────────
-# ONE background thread samples the joints and caches them; the Studio mirror, the planner seed, and
-# the live world all read this CACHE instead of each hitting the bridge (which serialises on the lock,
-# so concurrent readers stall — the "live robot freezes while the live world streams" bug). The cache
-# always holds the last pose, so a heavy op briefly holding the lock just delays the next sample.
-_STATE: dict = {"joints": {}, "t": 0.0, "err": None}
-_STATE_LOCK = threading.Lock()
-_poller_started = False
-
-
-def _read_joints_fast(b) -> dict:
-    """The robot's joints as {urdf_joint: value} via the LIGHTEST read the bridge offers — a state-only
-    `read_joint_positions()` (NO camera grab) before falling back to `get_observation().joint_positions`
-    (which may grab depth). {} on failure."""
-    for getter in ("read_joint_positions", "read_state", "joint_state"):
-        fn = getattr(b, getter, None)
-        if callable(fn):
-            try:
-                jp = fn()
-                if isinstance(jp, dict) and jp:
-                    return {str(n): _joint_value(v) for n, v in jp.items()}
-            except Exception:  # noqa: BLE001
-                pass
-    try:
-        obs = b.get_observation()
-        return {str(n): _joint_value(v) for n, v in (getattr(obs, "joint_positions", None) or {}).items()}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def _state_poller():
-    """Continuously sample the joints (~30 Hz) under the bridge lock and cache them — the one owner of
-    robot-state reads. Daemon; tolerates the bridge coming up later (G2) and any transient read error."""
-    while True:
-        b = get_bridge()
-        if b is not None and _bridge_lock.acquire(blocking=False):
-            try:
-                j = _read_joints_fast(b)
-                if j:
-                    with _STATE_LOCK:
-                        _STATE.update(joints=j, t=time.time(), err=None)
-            except Exception as e:  # noqa: BLE001
-                with _STATE_LOCK:
-                    _STATE["err"] = str(e)
-            finally:
-                _bridge_lock.release()
-        time.sleep(0.03)
-
-
-def _ensure_state_poller():
-    global _poller_started
-    with _STATE_LOCK:
-        if _poller_started:
-            return
-        _poller_started = True
-    threading.Thread(target=_state_poller, daemon=True, name="robot-state-poller").start()
-
-
-def latest_joints():
-    """(joints, t) from the cache — fresh, no bridge call. The planner seed + mirror read this."""
-    _ensure_state_poller()
-    with _STATE_LOCK:
-        return dict(_STATE.get("joints") or {}), float(_STATE.get("t") or 0.0)
-
-
 def sse_live_joints(_q):
-    """STREAM the cached joint state (the background poller owns the bridge reads) at ~30 Hz — no
-    bridge call here, so the mirror NEVER stalls behind a heavy op (commission / live-world / planner
-    build). Emits {t, joints} only when the pose CHANGED (the frontend holds the last pose otherwise)."""
-    _ensure_state_poller()
-    t0 = time.time()
-    last_t = -1.0
-    while True:
-        with _STATE_LOCK:
-            j = dict(_STATE.get("joints") or {})
-            tt = float(_STATE.get("t") or 0.0)
-            err = _STATE.get("err")
-        if tt != last_t and j:
-            last_t = tt
-            yield {"t": time.time() - t0, "joints": j}
-        elif not j and err:
-            yield {"t": time.time() - t0, "error": err}      # no joints yet → mirror holds last/ default
-        else:
-            yield {"t": time.time() - t0}                    # heartbeat (no change) → mirror holds pose
-        time.sleep(0.04)
-
-
-def _sse_live_joints_legacy(_q):
     """Poll the Bridge for joint state and emit {t, joints} frames (no 'done'). Robust to the
     0-d / 1-d / scalar joint-value shapes cells report; a single bad poll yields an {error}
     frame but the loop keeps streaming so the mirror recovers."""
@@ -1050,13 +963,13 @@ def sse_esdf_live(_q):
     for i in range(max_iters):
         rec: dict = {"frame": i}
         try:
-            # LOCK ONLY FOR THE CAMERA GRAB — read the depth under the bridge lock (the joints come from
-            # the cache, no bridge call), then RELEASE and build the ESDF on the GPU off the lock, so the
-            # state poller / live mirror aren't starved (the live-robot-freezes-during-live-world bug).
-            seed, _t0 = latest_joints()
-            frames, reasons = [], []
+            # LOCK ONLY FOR THE CAMERA GRAB — read the joints + depth under the bridge lock, then RELEASE
+            # and build the ESDF on the GPU off the lock, so the live mirror isn't starved for the whole
+            # build (the live-robot-freezes-during-live-world bug). The lock is held ~the grabs, not seconds.
+            frames, reasons, seed = [], [], None
             if b is not None and _bridge_lock.acquire(blocking=True, timeout=2.0):
                 try:
+                    seed = st._seed_positions()                  # joints once, under the lock
                     frames, reasons = _live_frames(st, b, seed=seed)
                 finally:
                     _bridge_lock.release()
@@ -2406,7 +2319,6 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     print(f"[remoroo-edge] REAL edge on http://127.0.0.1:{PORT}  cell={CELL_DIR}")
     print(f"[remoroo-edge] then: EDGE_URL=http://127.0.0.1:{PORT} npm run serve")
-    _ensure_state_poller()              # the single robot-state owner (joints cache for mirror + seed)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
