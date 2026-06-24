@@ -34,7 +34,7 @@ from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
 from .world import WorldInputs, load_world, mask_robot_points
-from .live_world import workspace_extent
+from .live_world import observed_extent, esdf_resolution
 
 # a pose: (position xyz [m], quaternion wxyz). Helpers below also accept a 7-list or a dict.
 Pose = Tuple[Sequence[float], Sequence[float]]
@@ -82,12 +82,14 @@ def _default_planner_factory(robot_cfg, world, *, limits, max_goalset):
     return CuroboV2Planner(robot_cfg, world, limits=limits, max_goalset=max_goalset)
 
 
-def _default_mapper_factory(extent_m, center, robot_cfg):
+def _default_mapper_factory(extent_m, center, robot_cfg, esdf_voxel_size=0.03, voxel_size=0.02):
     """The real mapper factory: build the GPU cuRobo perception subsystem (Mapper + RobotSegmenter +
-    FilterDepth) from the SAME robot cfg the planner uses. Lazy import keeps the stack off-GPU."""
+    FilterDepth) from the SAME robot cfg the planner uses, at the (data-derived) resolution. Lazy
+    import keeps the stack off-GPU."""
     from .curobo_v2 import make_mapper
 
-    return make_mapper(extent_m, center, robot_cfg=robot_cfg)
+    return make_mapper(extent_m, center, robot_cfg=robot_cfg,
+                       esdf_voxel_size=esdf_voxel_size, voxel_size=voxel_size)
 
 
 def _unit(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
@@ -201,25 +203,22 @@ class MotionStack:
         # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
         self._actuated = actuated_joints(urdf_path)
         self._cell_dir: Optional[str] = None          # set by from_cell → enables reload_world hot-swap
-        self._wall_bounds = True
 
     # --- construction -----------------------------------------------------
     @classmethod
-    def from_cell(cls, cell_dir: str, bridge=None, *, planner_factory: Optional[PlannerFactory] = None,
-                  wall_bounds: bool = True) -> "MotionStack":
+    def from_cell(cls, cell_dir: str, bridge=None, *, planner_factory: Optional[PlannerFactory] = None) -> "MotionStack":
         """Build from the on-disk cell: the AUTHORED config (cell.yaml groups) + collision_spheres.yml
         + world/ + safety."""
         config = load_robot_config(cell_dir)
         spheres, buffer = load_spheres(cell_dir)
         safety = load_safety(cell_dir)
-        world = load_world(cell_dir, safety=safety.world_kwargs(), wall_bounds=wall_bounds)
+        world = load_world(cell_dir)
         # ABSOLUTE path — cuRobo resolves a relative `urdf_path` against its OWN content/assets dir
         # (the "curobo/content/assets/robot.urdf is not a file" failure), never the cell.
         urdf_path = str((Path(cell_dir) / "robot_model" / "robot.urdf").resolve())
         st = cls(config=config, spheres=spheres, sphere_buffer=buffer, world=world,
                  safety=safety, bridge=bridge, urdf_path=urdf_path, planner_factory=planner_factory)
         st._cell_dir = str(cell_dir)
-        st._wall_bounds = bool(wall_bounds)
         return st
 
     # --- world hot-swap (obstacle edits: update_world, NOT rebuild/re-warm) -----------------
@@ -242,7 +241,7 @@ class MotionStack:
         swap overflows the cache (the caller then rebuilds)."""
         if not self._cell_dir:
             return {"ok": False, "message": "stack has no cell dir to reload from"}
-        world = load_world(self._cell_dir, safety=self.safety.world_kwargs(), wall_bounds=self._wall_bounds)
+        world = load_world(self._cell_dir)
         return self.set_world(world)
 
     # --- group/TCP resolution --------------------------------------------
@@ -322,10 +321,14 @@ class MotionStack:
         if not hasattr(planner, "update_voxel_world"):
             return {"ok": False, "message": "planner has no live/voxel world support"}
         if self._mapper is None:
-            bounds = getattr(self.safety, "bounds_m", None) or self.world.bounds_m
-            ext, ctr = workspace_extent(bounds)
             robot_cfg = self._robot_cfg_for([tcp])
-            self._mapper = (self._mapper_factory or _default_mapper_factory)(ext, ctr, robot_cfg)
+            # The mapped VOLUME = the depth ACTUALLY observed this build (data-derived), NOT a
+            # workspace box or robot reach; the ESDF resolution adapts so it's bounded at any scale.
+            oe = observed_extent(frames)
+            ext, ctr = oe if oe is not None else ((1.0, 1.0, 1.0), (0.0, 0.0, 0.0))
+            esdf_vs, voxel_sz = esdf_resolution(ext)
+            self._mapper = (self._mapper_factory or _default_mapper_factory)(
+                ext, ctr, robot_cfg, esdf_vs, voxel_sz)
         self._mapper.reset()
         q = self._seed_positions()                 # the live config the robot is masked at
         n_masked = 0
@@ -613,7 +616,7 @@ class MotionStack:
         try:
             from .curobo_v2 import CuroboV2Planner
             from .world import WorldInputs
-            p = CuroboV2Planner(robot_cfg, WorldInputs(points=np.zeros((0, 3)), scene={}),
+            p = CuroboV2Planner(robot_cfg, WorldInputs(scene={}),
                                 limits=self._limits, max_goalset=1, warmup=False, self_collision_check=False)
             return p.ik_check(tip, start)
         except Exception as e:  # noqa: BLE001
@@ -802,7 +805,7 @@ class MotionStack:
 
         from dataclasses import replace
         from .world import WorldInputs
-        rep["start_ok_no_world"], _ = check(WorldInputs(points=np.zeros((0, 3)), scene={}))
+        rep["start_ok_no_world"], _ = check(WorldInputs(scene={}))
         # ISOLATE cloud vs cuboids (collision is monotonic, so each ablation is decisive):
         rep["start_ok_no_cloud"], _ = check(replace(self.world, points=np.zeros((0, 3))))   # cuboids only
         rep["start_ok_no_cuboids"], _ = check(replace(self.world, scene={}))                 # cloud only
@@ -914,7 +917,7 @@ class MotionStack:
             from .curobo_v2 import CuroboV2Planner
             from .world import WorldInputs
             tip = self._tip(tcp)
-            empty = WorldInputs(points=np.zeros((0, 3)), scene={})
+            empty = WorldInputs(scene={})
             probe = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
                                     max_goalset=1, warmup=False, self_collision_check=False)
             res = probe.ik_check(tip, start)   # PURE IK — same path validate_config proved works

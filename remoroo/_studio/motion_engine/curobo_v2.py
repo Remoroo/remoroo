@@ -269,9 +269,10 @@ class CuroboMapper:
         return torch.as_tensor(np.asarray(vals, dtype=np.float32), device=self._device).view(1, -1)
 
     def fuse_static(self, scene) -> None:
-        """Stamp the modeled cuboids (table/wall/cage) into the SAME TSDF (cuRobo combines the static
-        channel with the live depth via min()), so the planner sees ONE canonical world. `scene` is a
-        public cuRobo Scene (SceneCfg); we tensorize it to SceneData for the mapper. No-op when empty."""
+        """Stamp the operator's MODELED static obstacles (table/wall the cameras can't see — input 2)
+        into the SAME TSDF (cuRobo combines the static channel with the live depth via min()), so the
+        planner sees ONE canonical world = live depth ⊕ modeled obstacles. `scene` is a public cuRobo
+        Scene (SceneCfg); we tensorize it to SceneData for the mapper. No-op when empty."""
         import torch
         from curobo.types import DeviceCfg
         from curobo.scene import SceneData
@@ -328,20 +329,22 @@ class CuroboV2Planner:
         limits = limits or {}
         self._vel_scale = float(np.clip(limits.get("velocity_scale", 1.0), 1e-3, 1.0))
 
-        # Size the collision cache per type: modeled keep-out/wall/obstacle cuboids + any modeled
-        # mesh obstacles + a VOXEL slot for the live ESDF (+ headroom so update_world never overflows).
-        # The scanned cloud is NOT loaded (see _full_scene) — the live ESDF is the real world.
+        # The collision world has exactly TWO inputs: (1) the live camera ESDF and (2) the operator's
+        # MODELED static obstacles. Cache slots: a cuboid/mesh slot for the modeled obstacles (input 2)
+        # + a VOXEL slot for the live ESDF (input 1). NO scanned cloud, NO workspace cage, NO keep-out.
         scene = world.scene or {}
         n_cuboid = len(scene.get("cuboid", {})) + 8
         n_mesh = len(scene.get("mesh", {})) + 4
         # The live-ESDF voxel slot MUST be a DICT {layers, dims, voxel_size}, NOT an int: cuRobo's
-        # SceneData.create_cache does `voxel_cache.get("layers", ...)`, so an int crashes planner build
-        # with "'int' object has no attribute 'get'". `layers: 1` is the real requirement — the live
-        # grid is referenced directly at update_world (create_from_voxel_grids, max_n==1), so these
-        # dims are a placeholder; we size them from the workspace (matching the mapper) for safety.
-        from .live_world import workspace_extent
-        _ext, _ = workspace_extent(getattr(world, "bounds_m", None))
-        voxel_cache = {"layers": 1, "dims": [float(e) for e in _ext], "voxel_size": 0.03}
+        # SceneData.create_cache does `voxel_cache.get("layers", …)`, so an int crashes planner build
+        # ("'int' object has no attribute 'get'"). `layers: 1` is the real requirement — the live grid
+        # is referenced into this buffer (create_from_voxel_grids, max_n==1), and the mapper adapts its
+        # esdf_voxel_size so the grid is ~ESDF_AXIS_VOXELS along its longest axis at ANY scene scale, so
+        # it always fits. cuRobo capacity = ∏ round(dims/voxel_size); here ≈ (ESDF_AXIS_VOXELS×1.4)³.
+        # dims/voxel_size only express the COUNT — absolute scale is irrelevant (the grid is referenced).
+        from .live_world import ESDF_AXIS_VOXELS
+        _cap_axis = int(ESDF_AXIS_VOXELS * 1.4)
+        voxel_cache = {"layers": 1, "dims": [_cap_axis * 0.05] * 3, "voxel_size": 0.05}
         cfg = MotionPlannerCfg.create(
             robot=robot_cfg,
             scene_model=scene or None,
@@ -353,10 +356,9 @@ class CuroboV2Planner:
         if warmup:
             self.planner.warmup(enable_graph=True, num_warmup_iterations=5)
 
-        # Fuse the scanned environment (keep-out/wall cuboids + the cloud-as-mesh) into the live
-        # world via update_world — symmetric with set_world/clear_world, which the motion diagnostic
-        # uses to A/B the SAME move with and without the world (isolating world-collision from
-        # self-collision/IK).
+        # Load input 2 (the modeled obstacles) as the planner's world at build. Once a live build runs,
+        # update_voxel_world REPLACES this with the ESDF (which already has the obstacles fused in), so
+        # the planner world is ALWAYS just the two inputs — modeled obstacles, or the live ESDF⊕them.
         self._world = world
         self._robot_cfg = robot_cfg            # kept so link_pose can FK any URDF link (camera frames)
         self._fk_cache: Dict[str, object] = {}  # per-link FK kinematics (None = link not in URDF)
@@ -412,14 +414,11 @@ class CuroboV2Planner:
 
     # --- world (live, toggleable for the diagnostic) ----------------------
     def _full_scene(self, world: WorldInputs):
-        """The modeled collision scene = the MODELED cuboids only (keep-out / wall / table / cage).
-
-        The stored scanned point CLOUD is deliberately NOT loaded into cuRobo: `Mesh.from_pointcloud`
-        builds a watertight occupancy mesh that ENCLOSES the robot base (mounted in the scan) → cuRobo
-        flags the base as born-in-collision even when it's clear. The real collision world at
-        commission/demo is the LIVE ESDF from the cameras (`update_voxel_world`), into which the
-        modeled cuboids are fused. The cloud survives only as a Studio visual reference, never as
-        geometry cuRobo plans against."""
+        """Input 2 ONLY: the operator's MODELED static obstacles (`world.scene` cuboids/meshes). No
+        scanned cloud, no workspace cage, no keep-out zones — `load_world` builds `world.scene` from
+        `cell.yaml: obstacles` and nothing else. (The stored cloud is never loaded into cuRobo: its
+        `Mesh.from_pointcloud` occupancy mesh ENCLOSED the robot base → spurious born-in-collision.)
+        The live ESDF (input 1) replaces this via `update_voxel_world` once cameras run."""
         from curobo.scene import Scene
 
         return Scene.create(world.scene) if world.scene else Scene()
@@ -435,17 +434,18 @@ class CuroboV2Planner:
         self.planner.update_world(self._full_scene(world or self._world))
 
     def update_voxel_world(self, voxelgrid) -> None:
-        """LIVE world: the planner's collision = the ESDF `voxelgrid`. This is the ONE canonical world
-        — the modeled cuboids (table/wall/cage) are already fused INTO the map (via the mapper's
-        `update_static_obstacles`, combined with live depth by min()), so the scene is just the voxel
-        grid (matching cuRobo's `Scene(voxel=[vg])` live pipeline). No cloud mesh."""
+        """LIVE world: the planner's collision = the ESDF `voxelgrid` — the ONE canonical world holding
+        BOTH inputs (input 1 = live depth, input 2 = the modeled obstacles fused in via the mapper's
+        `update_static_obstacles`, combined by min()). The scene is just the voxel grid (cuRobo's
+        `Scene(voxel=[vg])` live pipeline). Nothing else — no cloud mesh, no cage, no zones."""
         from curobo.scene import Scene
 
         self.planner.update_world(Scene(voxel=[voxelgrid]))
 
     @property
     def modeled_scene(self):
-        """The modeled cuboids (table/wall/cage) as a cuRobo Scene, for fusing into the live map."""
+        """Input 2 — the operator's MODELED static obstacles as a cuRobo Scene, for fusing into the
+        live map (so the ESDF holds both inputs). None when the cell has no modeled obstacles."""
         from curobo.scene import Scene
 
         return Scene.create(self._world.scene) if (self._world and self._world.scene) else None

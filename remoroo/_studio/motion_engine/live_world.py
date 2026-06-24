@@ -48,11 +48,78 @@ class DepthFrame:
     name: str = "cam"
 
 
-def workspace_extent(bounds_m: dict | None, *, default: float = 2.0,
+# The live ESDF's voxel budget along its LONGEST axis. A resolution/compute budget (like an image
+# resolution), NOT a spatial assumption: the extent comes from the data and the voxel SIZE adapts so
+# the grid is ~this many voxels at any scale (a 1 m desk or a 30 m hall → same voxel count, coarser
+# voxels for the hall). Keeps memory/compute bounded for ANY robot, fixed-base or mobile.
+ESDF_AXIS_VOXELS = 128
+
+
+def _quat_wxyz_to_R(q: Sequence[float]) -> np.ndarray:
+    """wxyz unit quaternion → 3×3 rotation matrix."""
+    w, x, y, z = [float(v) for v in q]
+    n = (w * w + x * x + y * y + z * z) ** 0.5 or 1.0
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ], dtype=float)
+
+
+def observed_extent(frames, *, margin: float = 0.3, stride: int = 12, lo_pct: float = 1.0,
+                    hi_pct: float = 99.0):
+    """(extent_xyz, center_xyz) covering the VALID depth ACTUALLY observed across all frames, in the
+    robot base frame — the real sensed scene, NOT a workspace box or robot reach. Back-projects a
+    subsample of each frame's valid depth pixels to base-frame points and takes their robust bbox
+    (percentile, to reject flyers) + `margin`. Scale/morphology-agnostic: a desk arm's workspace or a
+    mobile robot's LOCAL camera view (it re-centres as the robot moves — you only ever map what you
+    see, never the whole world). Returns None if there's no valid depth. Pure numpy → unit-tested."""
+    pts = []
+    for f in frames:
+        d = np.asarray(f.depth, dtype=np.float32)
+        if d.ndim != 2:
+            continue
+        H, W = d.shape
+        K = np.asarray(f.intrinsics, dtype=np.float64).reshape(3, 3)
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        vv, uu = np.mgrid[0:H:stride, 0:W:stride]
+        dd = d[vv, uu].astype(np.float64)
+        m = np.isfinite(dd) & (dd > 1e-3)
+        if not m.any():
+            continue
+        z = dd[m]
+        x = (uu[m] - cx) * z / fx
+        y = (vv[m] - cy) * z / fy
+        Xc = np.stack([x, y, z], axis=1)                      # camera frame
+        p, q = f.cam_pose_in_base
+        R = _quat_wxyz_to_R(q)
+        t = np.asarray(p, dtype=np.float64).reshape(-1)[:3]
+        pts.append(Xc @ R.T + t)                              # → base frame
+    if not pts:
+        return None
+    P = np.concatenate(pts, axis=0)
+    lo = np.percentile(P, lo_pct, axis=0)
+    hi = np.percentile(P, hi_pct, axis=0)
+    extent = tuple(float(max(0.3, (hi[i] - lo[i]) + 2 * margin)) for i in range(3))
+    center = tuple(float((hi[i] + lo[i]) / 2) for i in range(3))
+    return extent, center
+
+
+def esdf_resolution(extent: Sequence[float], *, axis_voxels: int = ESDF_AXIS_VOXELS,
+                    min_voxel: float = 0.01) -> Tuple[float, float]:
+    """(esdf_voxel_size, tsdf_voxel_size) for an observed `extent`: pick the ESDF voxel size so the
+    grid is ~`axis_voxels` along its longest axis (so the grid count is bounded at any scale), and a
+    finer TSDF (block-sparse → memory tracks surface area, not volume). NOT a spatial assumption."""
+    longest = max(float(e) for e in extent) if len(extent) else 1.0
+    esdf_vs = max(longest / float(axis_voxels), float(min_voxel))
+    return esdf_vs, max(esdf_vs / 2.0, 0.005)
+
+
+def workspace_extent(bounds_m: dict | None, *, default: float = 1.0,
                      pad: float = 0.3) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
-    """(extent_xyz, center_xyz) for the mapper's voxel volume, from the safety workspace bounds
-    (+pad). Falls back to a `default`-metre cube at the origin. Morphology-agnostic — this is the one
-    bit of OUR config (`safety.bounds_m`) that cuRobo's `MapperCfg` needs and can't infer."""
+    """LEGACY fallback only (used when there's no live depth at all). The live world's extent comes
+    from `observed_extent` — the actual sensed geometry — never from an arbitrary workspace box."""
     lo = (bounds_m or {}).get("min")
     hi = (bounds_m or {}).get("max")
     try:
