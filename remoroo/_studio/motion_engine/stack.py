@@ -200,6 +200,8 @@ class MotionStack:
         # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace; the
         # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
         self._actuated = actuated_joints(urdf_path)
+        self._cell_dir: Optional[str] = None          # set by from_cell → enables reload_world hot-swap
+        self._wall_bounds = True
 
     # --- construction -----------------------------------------------------
     @classmethod
@@ -214,8 +216,34 @@ class MotionStack:
         # ABSOLUTE path — cuRobo resolves a relative `urdf_path` against its OWN content/assets dir
         # (the "curobo/content/assets/robot.urdf is not a file" failure), never the cell.
         urdf_path = str((Path(cell_dir) / "robot_model" / "robot.urdf").resolve())
-        return cls(config=config, spheres=spheres, sphere_buffer=buffer, world=world,
-                   safety=safety, bridge=bridge, urdf_path=urdf_path, planner_factory=planner_factory)
+        st = cls(config=config, spheres=spheres, sphere_buffer=buffer, world=world,
+                 safety=safety, bridge=bridge, urdf_path=urdf_path, planner_factory=planner_factory)
+        st._cell_dir = str(cell_dir)
+        st._wall_bounds = bool(wall_bounds)
+        return st
+
+    # --- world hot-swap (obstacle edits: update_world, NOT rebuild/re-warm) -----------------
+    def set_world(self, world: WorldInputs) -> dict:
+        """HOT-SWAP the modeled collision world into EVERY warm (cached) planner via cuRobo's
+        `update_world` — no rebuild, no re-warmup (the costly part). The planners were built with cache
+        headroom; a change within it just reloads. The live ESDF path re-fuses these cuboids on its
+        next `update_world_live`. Returns {ok, n_planners}."""
+        self.world = world
+        n = 0
+        for p in self._planners.values():
+            if hasattr(p, "set_world"):
+                p.set_world(world)
+                n += 1
+        return {"ok": True, "n_planners": n}
+
+    def reload_world(self) -> dict:
+        """Re-read the collision world from the cell on disk and HOT-SWAP it into the warm planners
+        (cheap obstacle edits — no rebuild). Falls back to {ok:False} when there's no cell dir or the
+        swap overflows the cache (the caller then rebuilds)."""
+        if not self._cell_dir:
+            return {"ok": False, "message": "stack has no cell dir to reload from"}
+        world = load_world(self._cell_dir, safety=self.safety.world_kwargs(), wall_bounds=self._wall_bounds)
+        return self.set_world(world)
 
     # --- group/TCP resolution --------------------------------------------
     @property
@@ -271,48 +299,12 @@ class MotionStack:
             default_joint_position=self._seed_positions())
 
     def _self_mask_world(self, planner) -> bool:
-        """ONE-TIME: drop cloud points inside the robot's own collision spheres (at the current seed),
-        so the robot is born collision-free against the cloud. Updates `self.world` — the CANONICAL
-        world the planner AND the Studio clearance/`/edge/motion/world` share. Returns True if it
-        removed points (so the caller REBUILDS the planner from the masked world — we don't trust
-        update_world to replace the baked cloud mesh). The world we clear == the world cuRobo loads."""
-        if self._world_finalized:
-            return False
+        """DEAD by design: the scanned cloud is no longer loaded into cuRobo (see
+        `CuroboV2Planner._full_scene` — modeled cuboids only; the live ESDF is the real world), so
+        there is nothing to self-mask and no reason to rebuild the planner. The robot is masked from
+        the LIVE depth by cuRobo's `RobotSegmenter` instead (`update_world_live`). Kept as a no-op so
+        the `_planner_for` build path stays single-shot (never the old mask→rebuild double build)."""
         self._world_finalized = True
-        if self.world.n_points == 0 or not hasattr(planner, "robot_spheres"):
-            return False
-        try:
-            from dataclasses import replace
-            sph = planner.robot_spheres(self._seed_positions())
-            # Cover cuRobo's EFFECTIVE collision footprint so a point can't survive as a voxel that
-            # the robot penetrates: a point may sit at the far edge of its cell, so the occupancy
-            # mesh extends up to a FULL `voxel_size` toward the robot beyond the point — plus the
-            # sphere buffer + collision activation distance (~1cm). Mask radius+this, generously.
-            # A point can sit a FULL voxel from its cell edge AND the cell is a solid cube, so the
-            # occupancy mesh can reach ~2·voxel past the point; add the sphere buffer + activation.
-            # Floor at 4cm so a thin residual-robot shell (seen at ~2.5cm) is always cleared.
-            voxel = float(getattr(self.world, "voxel_size", 0.02))
-            margin = max(0.04, 2.0 * voxel + float(self.sphere_buffer) + 0.02)
-            masked, n = mask_robot_points(self.world.points, sph, margin=margin)
-            # The robot is MOUNTED in the scan: the occupancy mesh of the surface it's bolted to
-            # ENCLOSES the base (cuRobo reads the base as deep-inside, even with the near points
-            # masked). Drop the cloud BELOW the robot's lowest sphere — the mount/floor the robot
-            # can't move into (the cage floor + table cuboid already bound it). This OPENS the
-            # enclosure so the base reads as outside.
-            import numpy as _np
-            base_z = float((_np.asarray(sph, dtype=float)[:, 2] - _np.asarray(sph, dtype=float)[:, 3]).min())
-            before = len(masked)
-            masked = masked[masked[:, 2] > base_z - 0.005]
-            n_below = before - len(masked)
-            n_total = int(n) + int(n_below)
-            if n_total > 0:
-                self.world = replace(self.world, points=masked,
-                                     meta={**self.world.meta, "n_robot_masked": int(n),
-                                           "n_below_base_cropped": int(n_below),
-                                           "base_floor_z": round(base_z, 4)})
-                return True
-        except Exception as e:  # noqa: BLE001
-            self._world_warn = f"cloud self-mask failed: {type(e).__name__}: {e}"
         return False
 
     # --- LIVE volumetric world (cuRobo Mapper → ESDF) --------------------
@@ -351,6 +343,13 @@ class MotionStack:
         """The current live world's occupied voxel centres `[N, 3]` (x, y, z) in the base frame — the
         Studio renders these as the live collision world."""
         return self._live_voxels
+
+    def reset_cuda_graph(self) -> None:
+        """Reset every warm planner's CUDA graphs — hygiene before a repeatable run that reuses the
+        build (a stale graph can make a previously-plannable goal fail; cuRobo issue #503)."""
+        for p in self._planners.values():
+            if hasattr(p, "reset_cuda_graph"):
+                p.reset_cuda_graph()
 
     def link_pose(self, link: str, joints: Optional[Dict[str, float]] = None,
                   tcp: Optional[str] = None):
@@ -1045,6 +1044,30 @@ class MotionStack:
                 report["message"] = f"live world build failed: {e}"
                 return report
 
+        # BORN-IN-COLLISION pre-check (the canonical world cuRobo plans against): is the START config
+        # already clipping a STATIC obstacle (table/wall/cage/floor)? If so, EVERY plan fails "no
+        # collision-free trajectory" — a NAMED step here distinguishes "the world clips the robot at
+        # rest, fix the obstacle/safety placement" from "the target is unreachable". World-only verdict
+        # (n_penetrating from RobotCollisionChecker's per-sphere distance), so self-collision/bounds —
+        # a different fault — don't masquerade as a world problem.
+        try:
+            planner = self._planner_for([first])
+            if hasattr(planner, "world_sphere_collision"):
+                wc = planner.world_sphere_collision(self._seed_positions())
+                report["start_collision"] = wc
+                n_pen = int(wc.get("n_penetrating", 0))
+                msg = (None if n_pen == 0 else
+                       f"{n_pen} collision sphere(s) already penetrate the static world at the start — the "
+                       "robot is BORN in collision, so planning can't begin. Fix the obstacle / cage wall / "
+                       "safety-bounds (e.g. a floor at z=0) that clips it — not the target.")
+                if not step("start_collision", n_pen == 0, n_penetrating=n_pen,
+                            penetrating=wc.get("penetrating_spheres"), collision_free=wc.get("collision_free"),
+                            message=msg):
+                    report["message"] = msg
+                    return report
+        except Exception as e:  # noqa: BLE001 — never let the pre-check itself abort commission
+            step("start_collision", True, warn=f"start-collision check skipped: {type(e).__name__}: {e}")
+
         if target is not None:
             emit(step="plan_move", ok=True, note=f"planning to the chosen point {list(target)[:3]}")
             mv = self.plan_to_point(first, list(target)[:3], execute=execute)
@@ -1059,6 +1082,65 @@ class MotionStack:
         report["message"] = "commissioned — the motion stack is proven end-to-end" if mv.ok else mv.message
         report["move"] = mv.to_dict()
         return report
+
+    def demo_run(self, *, n_poses: int = 3, execute: bool = True,
+                 frames: Optional[Callable[[], Sequence]] = None, tcp: Optional[str] = None,
+                 progress: Optional[Callable[[dict], None]] = None) -> dict:
+        """The REPEATABLE autonomous-motion DEMO (gate 12) — distinct from commission (which proves
+        ONE move): REUSE the already-commissioned WARM stack (no rebuild/re-warm), and move through
+        several reachable, collision-free poses, REFRESHING the live ESDF before each leg so the robot
+        re-plans against the CURRENT scene (the reactive bar). Retracts home at the end. Streams each
+        leg; supervised (the executor polls the E-stop every waypoint). `frames` = the live-depth
+        provider (None / [] → plans against the modeled world, still a valid repeatable demo)."""
+        def emit(**kw):
+            if progress:
+                progress(kw)
+
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"ok": False, "legs": []}
+        if tcp is None:
+            rep["message"] = "no kinematic groups in the cell"
+            return rep
+        try:
+            self._planner_for([tcp])                 # REUSE the warm planner (built at commission)
+        except Exception as e:  # noqa: BLE001
+            rep["message"] = f"planner unavailable: {e}"
+            return rep
+        self.reset_cuda_graph()                      # clear stale graph state from commission (#503)
+
+        done = 0
+        for i in range(int(n_poses)):
+            # refresh the LIVE world so each leg plans against the current scene (move an obstacle →
+            # the robot re-plans). Hot-swap (update_world_live), never a rebuild.
+            if frames is not None:
+                fr = list(frames() or [])
+                if fr:
+                    wr = self.update_world_live(fr, tcp=tcp)
+                    emit(step="world", leg=i, ok=wr.get("ok", False), n_voxels=wr.get("n_voxels"))
+            targets = self.find_free_targets(tcp, n=1)        # a reachable, collision-free point
+            if not targets:
+                emit(step="leg", leg=i, ok=False, message="no reachable collision-free pose found "
+                     "from here — the arm may be boxed in by the live world")
+                continue
+            pt = targets[0]["point"]
+            mv = self.plan_to_point(tcp, pt, execute=execute)
+            done += 1 if mv.ok and not mv.aborted else 0
+            emit(step="leg", leg=i, ok=mv.ok, target=pt, executed=mv.executed,
+                 trajectory=(mv.trajectory.summary() if mv.trajectory else None), message=mv.message)
+            rep["legs"].append({"leg": i, "ok": mv.ok, "target": pt})
+            if mv.aborted:
+                rep["message"] = "aborted (E-stop)"
+                return rep
+
+        rt = self.retract(tcp, execute=execute)               # collision-free path home
+        emit(step="retract", ok=rt.ok, executed=rt.executed, message=rt.message)
+        rep["ok"] = done > 0 and rt.ok
+        rep["n_legs"] = done
+        rep["tcp"] = tcp
+        rep["message"] = (f"demo complete — {done} autonomous collision-free pose(s) + retract, "
+                          "re-planned against the live world" if rep["ok"]
+                          else "demo did not complete a full autonomous run")
+        return rep
 
     # --- plan → audit → execute → supervise ------------------------------
     def _finish(self, plan, execute: bool) -> MoveResult:

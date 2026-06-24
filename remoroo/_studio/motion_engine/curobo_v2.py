@@ -16,9 +16,10 @@ Written against the REAL in-repo V2 source (NOT guessed), verified in
 
 Multi-TCP is native: `GoalToolPose.position` is `[batch, horizon, num_links, num_goalset, 3]` with
 `num_links == len(tool_frames)`, so driving N end-effectors is N entries on the `num_links` axis —
-the SAME call for 1, 2, or a humanoid's many. The scanned cloud becomes a collision mesh via
-`Mesh.from_pointcloud` (voxelised-surface extraction; robust on sparse real scans, unlike marching
-cubes). Imports are LAZY (inside `__init__`/methods) so this module imports cleanly off-GPU.
+the SAME call for 1, 2, or a humanoid's many. The collision world is the modeled cuboids
+(`_full_scene`) + the LIVE ESDF from the cameras (`update_voxel_world`); the stored scanned point
+cloud is NOT loaded into cuRobo (its occupancy mesh enclosed the robot base). Imports are LAZY
+(inside `__init__`/methods) so this module imports cleanly off-GPU.
 """
 from __future__ import annotations
 
@@ -190,7 +191,11 @@ class CuroboMapper:
 
     def _observation(self, depth: np.ndarray, intrinsics: np.ndarray,
                      cam_pose_in_base: Tuple[Sequence[float], Sequence[float]]):
-        """Build a batched (1,H,W) cuRobo CameraObservation in the robot base frame."""
+        """Build a batched (1,H,W) cuRobo CameraObservation in the robot base frame. We map for
+        COLLISION (geometry only), so RGB carries no information — but cuRobo's camera-integration
+        kernel REQUIRES an `rgb_image` of shape (num_cameras,H,W,3) uint8 and validates it (it is not
+        None-guarded, unlike the dataclass field). So we pass a zeros RGB of the right shape; the
+        voxels are uncolored, which is irrelevant since we read only `.centers`."""
         import torch
         from curobo.types import CameraObservation, Pose
 
@@ -198,10 +203,12 @@ class CuroboMapper:
         h, w = d.shape
         dimg = torch.as_tensor(np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0),
                                device=self._device).view(1, h, w)
+        rgb = torch.zeros((1, h, w, 3), dtype=torch.uint8, device=self._device)   # kernel requires it
         intr = torch.as_tensor(np.asarray(intrinsics, dtype=np.float32), device=self._device).view(1, 3, 3)
         pos = torch.as_tensor(np.asarray(cam_pose_in_base[0], dtype=np.float32), device=self._device).view(1, 3)
         quat = torch.as_tensor(np.asarray(cam_pose_in_base[1], dtype=np.float32), device=self._device).view(1, 4)
-        return CameraObservation(depth_image=dimg, intrinsics=intr, pose=Pose(position=pos, quaternion=quat))
+        return CameraObservation(depth_image=dimg, rgb_image=rgb, intrinsics=intr,
+                                 pose=Pose(position=pos, quaternion=quat))
 
     def integrate(self, depth: np.ndarray, intrinsics: np.ndarray,
                   cam_pose_in_base: Tuple[Sequence[float], Sequence[float]],
@@ -292,8 +299,9 @@ class CuroboV2Planner:
         limits = limits or {}
         self._vel_scale = float(np.clip(limits.get("velocity_scale", 1.0), 1e-3, 1.0))
 
-        # Size the collision cache per type: keep-out/wall/obstacle cuboids, and mesh obstacles +
-        # the single scanned-cloud mesh (+ headroom so a later update_world never overflows).
+        # Size the collision cache per type: modeled keep-out/wall/obstacle cuboids + any modeled
+        # mesh obstacles + a VOXEL slot for the live ESDF (+ headroom so update_world never overflows).
+        # The scanned cloud is NOT loaded (see _full_scene) — the live ESDF is the real world.
         scene = world.scene or {}
         n_cuboid = len(scene.get("cuboid", {})) + 8
         n_mesh = len(scene.get("mesh", {})) + 4
@@ -348,17 +356,17 @@ class CuroboV2Planner:
 
     # --- world (live, toggleable for the diagnostic) ----------------------
     def _full_scene(self, world: WorldInputs):
-        """The complete collision scene: keep-out/wall/obstacle cuboids + the scanned cloud-as-mesh."""
-        from curobo.scene import Scene, Mesh
+        """The modeled collision scene = the MODELED cuboids only (keep-out / wall / table / cage).
 
-        scene = Scene.create(world.scene) if world.scene else Scene()
-        if world.n_points > 0:
-            scene.add_obstacle(Mesh.from_pointcloud(
-                np.asarray(world.points, dtype=np.float64),
-                pitch=float(world.voxel_size),
-                name="scanned_world",
-            ))
-        return scene
+        The stored scanned point CLOUD is deliberately NOT loaded into cuRobo: `Mesh.from_pointcloud`
+        builds a watertight occupancy mesh that ENCLOSES the robot base (mounted in the scan) → cuRobo
+        flags the base as born-in-collision even when it's clear. The real collision world at
+        commission/demo is the LIVE ESDF from the cameras (`update_voxel_world`), into which the
+        modeled cuboids are fused. The cloud survives only as a Studio visual reference, never as
+        geometry cuRobo plans against."""
+        from curobo.scene import Scene
+
+        return Scene.create(world.scene) if world.scene else Scene()
 
     def clear_world(self) -> None:
         """Drop ALL obstacles (empty world). Diagnostic only — restore with `set_world`."""
@@ -505,17 +513,38 @@ class CuroboV2Planner:
         return [float(v) for v in pos[:3]], [float(v) for v in quat[:4]]
 
     # --- planning ---------------------------------------------------------
+    def reset_cuda_graph(self) -> None:
+        """Reset the CUDA graphs of the IK / trajopt / graph solvers. A warm-reused planner (we build
+        ONCE and reuse across commission + every demo leg) can leave a STALE cuda graph where the same
+        goal that planned before now fails — resolved only by a reset (cuRobo issue #503). Cheap;
+        the next plan recompiles the graph."""
+        for sol in (getattr(self.planner, "ik_solver", None),
+                    getattr(self.planner, "trajopt_solver", None),
+                    getattr(self.planner, "graph_planner", None)):
+            if sol is not None and hasattr(sol, "reset_cuda_graph"):
+                try:
+                    sol.reset_cuda_graph()
+                except Exception:  # noqa: BLE001 — best-effort hygiene, never fatal
+                    pass
+
     def _start_js(self, start_positions: Optional[Dict[str, float]]):
-        """A JointState over the planner's active joints; missing joints take the robot default."""
+        """A JointState over the planner's active joints; missing joints take the robot default. The
+        start is CLAMPED to the joint limits: a marginally out-of-range seed (sensor noise, or the arm
+        resting exactly AT a limit) otherwise fails with INVALID_START_STATE_JOINT_LIMITS (issue #524);
+        clamping a hair inside lets planning proceed from the nearest valid config."""
         import torch
         from curobo.types import JointState
 
         names = self.planner.joint_names
         default = self.planner.default_joint_state.position.detach().cpu().numpy().reshape(-1)
         q = np.array(default[: len(names)], dtype=np.float32)
+        lims = self.joint_limits()
         for i, n in enumerate(names):
             if start_positions and n in start_positions:
                 q[i] = float(start_positions[n])
+            if n in lims:
+                lo, hi = lims[n]
+                q[i] = min(max(float(q[i]), lo + 1e-4), hi - 1e-4)
         t = torch.tensor(q, device=self._device, dtype=torch.float32).unsqueeze(0)
         return JointState.from_position(t, joint_names=list(names))
 

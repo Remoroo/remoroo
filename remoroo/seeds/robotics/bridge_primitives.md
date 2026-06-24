@@ -196,10 +196,11 @@ class Bridge:
 
     # ---- The motion stack (SHIPPED — you do NOT write cuRobo) -------------
     def motion(self):
-        """The unified autonomous-motion stack — `motion_engine.MotionStack`, built ONCE from
-        ALL the setup artifacts (calibrated URDF + collision spheres + scanned world + safety
-        envelope). It owns the cuRoboV2 planner; this Bridge only supplies state +
-        `execute_trajectory` (the per-arm executor). Built/verified at the COMMISSION gate; see
+        """The unified autonomous-motion stack — `motion_engine.MotionStack`, built ONCE (warm
+        cuRobo planner, once per bring-up) from the setup artifacts (calibrated URDF + collision
+        spheres + modeled obstacles + safety envelope). Its collision world at commission/demo is the
+        LIVE ESDF built from the cameras (robot masked); this Bridge supplies per-camera depth, state,
+        and `execute_trajectory` (the per-arm executor). Built/verified at COMMISSION; see
         commission.md."""
         if self._motion is None:
             from motion_engine import MotionStack

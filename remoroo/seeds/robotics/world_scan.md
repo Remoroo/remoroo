@@ -238,5 +238,8 @@ serialization detail lives in `ADC/remoroo_scene_representation_to_llm.md`):
       "plannable" verdict.
 
 This world is **versioned + editable** and will be rebuilt as the cell changes
-— do not treat it as frozen. It is the geometry the Phase-8 safe-motion demo
-plans against.
+— do not treat it as frozen. At commission/demo the collision world the planner
+plans against is the **LIVE ESDF built from the cameras** (cuRobo Mapper, robot
+masked out); this scan supplies the **modeled static obstacles** (table/wall/cage)
+that get fused into that live map. So keep the modeled cuboids accurate here, but
+the demo's real-time geometry comes from the live cameras, not this stored scan.

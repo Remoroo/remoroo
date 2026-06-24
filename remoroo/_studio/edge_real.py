@@ -626,7 +626,11 @@ def sse_commission(_q):
 
     try:
         _preload_warp()                 # MAIN THREAD — load warp.torch before the build worker
-        st = motion_stack(force=True)
+        # REUSE the warm planner (build + cuRobo warmup is the costly step, done ONCE per bring-up).
+        # Mutations that invalidate it already drop the cache (model/spheres → reset_motion_stack;
+        # obstacles → hot-swapped in place). Pass ?rebuild=1 to force a fresh build after an upstream
+        # artifact (safety/calib) was redone.
+        st = motion_stack(force=(_q.get("rebuild", ["0"])[0] == "1"))
     except Exception as e:  # noqa: BLE001
         yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
         return
@@ -644,18 +648,70 @@ def sse_commission(_q):
 
     b = get_bridge()
 
-    def frames():
-        """The LIVE volumetric world from THIS cell's cameras (general; [] → modeled cuboids only)."""
-        try:
-            return _live_frames(st, b) if b is not None else []
-        except Exception:  # noqa: BLE001 — never let a camera hiccup abort the commission
-            return []
+    def run():
+        with _bridge_lock:
+            try:
+                # Build the live frames ONCE up front + emit a per-camera verdict, so a 0-frame
+                # outcome is visible (which camera/layer was missing) — never a silent fallback.
+                live, reasons = ([], [])
+                if b is not None:
+                    try:
+                        live, reasons = _live_frames(st, b)
+                    except Exception as e:  # noqa: BLE001
+                        reasons = [{"camera": None, "ok": False, "why": f"{type(e).__name__}: {e}"}]
+                q.put({"step": "camera_inputs", "ok": bool(live), "n_frames": len(live), "cameras": reasons})
+                out["report"] = st.commission(execute=execute, target=target, tcp=tcp,
+                                               frames=lambda: live, progress=lambda s: q.put(s))
+            except Exception as e:  # noqa: BLE001
+                out["report"] = {"ok": False, "message": f"{type(e).__name__}: {e}"}
+            finally:
+                q.put(None)
+
+    _threading.Thread(target=run, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        yield item
+    yield {"done": True, "result": out.get("report", {"ok": False, "message": "no report"})}
+
+
+def sse_demo(_q):
+    """The repeatable autonomous-motion DEMO (gate 12) — distinct from commission (prove ONE move).
+    REUSES the already-commissioned WARM stack (no rebuild/re-warm), refreshes the LIVE ESDF before
+    each leg (the robot re-plans against the current scene), moves through several reachable poses,
+    then retracts. Streams `world`/`leg`/`retract` steps; ends {done, result}. Supervised in the
+    Studio (E-stop). GET params: tcp, n (poses, default 3), execute ('0'=plan-only)."""
+    import queue as _queue
+    import threading as _threading
+
+    try:
+        _preload_warp()
+        st = motion_stack()                          # REUSE the warm stack from commission
+    except Exception as e:  # noqa: BLE001
+        yield {"done": True, "result": {"ok": False, "message": f"{type(e).__name__}: {e}"}}
+        return
+
+    execute = (_q.get("execute", ["1"])[0] != "0")
+    tcp = (_q.get("tcp", [None])[0]) or None
+    try:
+        n_poses = max(1, min(8, int(_q.get("n", ["3"])[0])))
+    except (TypeError, ValueError):
+        n_poses = 3
+    b = get_bridge()
+    q: "_queue.Queue" = _queue.Queue()
+    out: dict = {}
 
     def run():
         with _bridge_lock:
             try:
-                out["report"] = st.commission(execute=execute, target=target, tcp=tcp,
-                                               frames=frames, progress=lambda s: q.put(s))
+                def frames():
+                    try:
+                        return _live_frames(st, b)[0] if b is not None else []
+                    except Exception:  # noqa: BLE001
+                        return []
+                out["report"] = st.demo_run(n_poses=n_poses, execute=execute, tcp=tcp,
+                                            frames=frames, progress=lambda s: q.put(s))
             except Exception as e:  # noqa: BLE001
                 out["report"] = {"ok": False, "message": f"{type(e).__name__}: {e}"}
             finally:
@@ -832,31 +888,48 @@ def _obs_depth(obs):
 def _live_frames(st, b):
     """Build one `DepthFrame` per cell camera from the BRIDGE's per-camera observation (general — it
     relies only on the bridge contract the agent fulfils: depth + intrinsics per camera) and the
-    camera's calibrated optical-frame pose via `stack.link_pose`. Camera/morphology-agnostic. Returns
-    [] when no camera exposes depth, so commission gracefully plans against the modeled cuboids."""
+    camera's calibrated optical-frame pose via `stack.link_pose`. Camera/morphology-agnostic.
+
+    Returns (frames, reasons): `reasons` carries a per-camera verdict so a 0-frame outcome is NEVER
+    silent — it says WHICH layer was missing (no depth on the obs / no intrinsics / FK link absent),
+    making it unambiguous whether the gap is the bridge (the agent's primitives.py — risk #1) or the
+    motion_engine↔cuRobo seam. When `frames` is empty, commission plans against the modeled cuboids."""
     from motion_engine import DepthFrame
-    frames = []
+    frames, reasons = [], []
     cams = load_cell_yaml().get("cameras") or []
+    if not cams:
+        reasons.append({"camera": None, "ok": False, "why": "no cameras in cell.yaml"})
     for cam in cams:
         name = cam.get("name") or cam.get("link") or ""
         link = cam.get("link") or name
         try:
-            obs = b.get_observation(camera=name)
-        except TypeError:
-            obs = b.get_observation()
-        except Exception:  # noqa: BLE001
-            continue
-        depth = _obs_depth(obs)
-        K, _wh = _intrinsics_from_bridge(b, name)
-        if depth is None or K is None:
-            continue
-        # the calibrated optical frame (calibration writes it as a child of the camera link); FK it
-        # at the LIVE joints (eye-in-hand) — fixed result for a static camera.
-        pose = st.link_pose(f"{link}_optical_frame") or st.link_pose(link)
-        if pose is None:
-            continue
-        frames.append(DepthFrame(depth=depth, intrinsics=K, cam_pose_in_base=pose, name=name))
-    return frames
+            try:
+                obs = b.get_observation(camera=name)
+            except TypeError:
+                obs = b.get_observation()
+            depth = _obs_depth(obs)
+            K, _wh = _intrinsics_from_bridge(b, name)
+            if depth is None:
+                reasons.append({"camera": name, "ok": False,
+                                "why": "bridge observation exposes no depth (depth_m/depth/depth_image) — the agent's "
+                                       "primitives.py must return per-camera metric depth for the live ESDF"})
+                continue
+            if K is None:
+                reasons.append({"camera": name, "ok": False, "why": "no intrinsics for this camera from the bridge"})
+                continue
+            # the calibrated optical frame (calibration writes it as a child of the camera link); FK
+            # it at the LIVE joints (eye-in-hand) — fixed result for a static camera.
+            pose = st.link_pose(f"{link}_optical_frame") or st.link_pose(link)
+            if pose is None:
+                reasons.append({"camera": name, "ok": False,
+                                "why": f"FK could not resolve '{link}_optical_frame'/'{link}' — check the camera link "
+                                       "exists in the URDF and calibration wrote the optical frame"})
+                continue
+            frames.append(DepthFrame(depth=depth, intrinsics=K, cam_pose_in_base=pose, name=name))
+            reasons.append({"camera": name, "ok": True, "depth_hw": list(depth.shape)})
+        except Exception as e:  # noqa: BLE001
+            reasons.append({"camera": name, "ok": False, "why": f"{type(e).__name__}: {e}"})
+    return frames, reasons
 
 
 def h_world_collision_at_seed(_q):
@@ -1771,9 +1844,22 @@ def h_set_obstacles(_q, body):
     cy = load_cell_yaml()
     cy["obstacles"] = list((body or {}).get("obstacles") or [])
     (CELL_DIR / "cell.yaml").write_text(yaml.safe_dump(cy, sort_keys=False), encoding="utf-8")
-    reset_curobo_cache()   # the obstacle world is baked into the planner + collision checker
-    reset_motion_stack()   # …and into the unified motion stack's scene
-    return {"ok": True, "obstacles": cy["obstacles"]}
+    reset_curobo_cache()   # the SEPARATE feasibility checker (_curobo_world) bakes obstacles in
+    # HOT-SWAP the warm motion planner's world (cuRobo update_world) instead of a rebuild+re-warm —
+    # an obstacle edit must NOT throw away the costly cuRobo warmup. Fall back to a rebuild only if the
+    # in-place swap fails (e.g. the obstacle count overflowed the planner's collision cache).
+    swap = {"hot_swapped": False}
+    if _MOTION_STACK is not None:
+        try:
+            with _bridge_lock:
+                r = _MOTION_STACK.reload_world()
+            swap = {"hot_swapped": bool(r.get("ok")), "n_planners": r.get("n_planners")}
+            if not r.get("ok"):
+                reset_motion_stack()
+        except Exception as e:  # noqa: BLE001
+            reset_motion_stack()
+            swap = {"hot_swapped": False, "error": f"{type(e).__name__}: {e}"}
+    return {"ok": True, "obstacles": cy["obstacles"], **swap}
 
 
 def _find_collision_spheres(obj) -> dict:
@@ -1850,6 +1936,7 @@ ROUTES = {
     "/edge/record": ("sse", sse_record),
     "/edge/plan": ("sse", sse_plan),
     "/edge/motion/commission": ("sse", sse_commission),
+    "/edge/motion/demo": ("sse", sse_demo),
     "/edge/motion/plan_move": ("sse", sse_plan_move),
     "/edge/motion/tcp_pose": ("json", h_tcp_pose),
     "/edge/motion/suggest_targets": ("json", h_suggest_targets),

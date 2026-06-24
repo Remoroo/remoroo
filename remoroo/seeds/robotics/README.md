@@ -77,8 +77,8 @@ for real at G4/G8.
 | 4 | World scan → TSDF/ESDF + collision world (**env only — exclude arms**) | A⚠O | **G4** world reliable for small autonomous moves; operator confirms coverage |
 | 6 | Data-capture validation | A | **G6** one sample episode valid (sync/schema/complete) |
 | 7 | Task & eval **spec** (the operator's intent) | **O** | **G7** `task_spec.md` operator-defined + approved |
-| 7.5·commission | **Wire + verify the motion stack** — fuse URDF+spheres+world+safety into `motion_engine`; ONE collision-free plan+execute | A⚠O | **Gc** stack builds; spheres healthy; one safe move against the SCANNED world; E-stop aborts it |
-| 8 | Autonomous safe-motion demo (**THE bar**) — exercise the commissioned stack | A⚠O | **G8** repeatable safe autonomous motion; interlocks verified; no task |
+| 7.5·commission | **Build + PROVE the motion stack (live demo)** — fuse URDF+spheres+safety into ONE warm cuRobo stack; build the LIVE ESDF from the cameras (robot masked, cuboids fused); born-collision check; ONE supervised move | A⚠O | **Gc** stack builds; spheres healthy; live ESDF builds (n_voxels>0); one safe move against the LIVE world; E-stop aborts it |
+| 8 | Autonomous safe-motion demo (**THE bar**) — REUSE the commissioned warm stack (`stack.demo_run`); refresh the live world each leg + re-plan; several poses + retract | A⚠O | **G8** repeatable safe autonomous motion against the live world; interlocks verified; no task |
 | 9 | Snapshot + readiness card + handoff | A→O | **G9** all green, committed, operator signs off |
 
 > Owner key: **A** = you (operator watches/approves) · **A→O** = you propose,
@@ -110,10 +110,12 @@ for real at G4/G8.
   **environment only** (ignore the arms — cuRobo handles the robot).
 - `task_spec_template.md` — Phase 7. The human-readable task + eval **spec**
   the operator approves (no code).
-- `commission.md` — Phase 7.5. WIRE the bridge to the shipped `motion_engine`
-  stack and VERIFY one collision-free plan+execute against the scanned world
-  (the high-level `move_to_pose`/`move_to_poses`/`retract` surface). You do NOT
-  write cuRobo — the planner is shipped; you supply `execute_trajectory` + state.
+- `commission.md` — Phase 7.5 **and** Phase 8. Build + PROVE the shipped
+  `motion_engine` stack: grab depth from the cameras → `stack.commission(frames=…)`
+  builds the LIVE ESDF (cuRobo Mapper, robot masked, cuboids fused) and verifies ONE
+  supervised move against it. Phase 8 REUSES the same warm stack via `stack.demo_run`
+  (refresh the live world each leg + re-plan, several poses). You do NOT write cuRobo,
+  masking, or mapping — you supply per-camera depth + `execute_trajectory` + state.
 
 ## What you author vs. what is shipped
 
@@ -129,9 +131,11 @@ for real at G4/G8.
   brain↔worker transport, the episode-writer base, the **calibration engine**
   (`calib_engine` — detection, observability pose-gen, the reprojection bundle,
   held-out/tip-landing metrics, curation, optical-frame write-back), and the
-  **motion engine** (`motion_engine` — the cuRoboV2 planner, the scanned-world
-  collision model, safety-as-planner-input, and the high-level `move_to_pose`/
-  `move_to_poses`/`move_through_poses`/`retract` surface). These ship in
+  **motion engine** (`motion_engine` — the cuRoboV2 planner, the LIVE ESDF collision
+  world built from the cameras (`update_world_live`, robot auto-masked + cuboids
+  fused, hot-swapped not rebuilt), safety-as-planner-input, `link_pose`, and the
+  high-level `commission`/`demo_run`/`move_to_pose`/`move_to_poses`/
+  `move_through_poses`/`retract` surface). These ship in
   the installed Remoroo package / the Studio edge. (Import them from the shipped
   runtime spine; see `bridge_primitives.md` for the import surface and a fallback
   shim if the spine isn't importable yet during R&D.)

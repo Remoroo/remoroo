@@ -118,5 +118,22 @@ per-error UI.
 - [ ] `commission_report.md`: the stack config, the live-world stats, the verify
       trajectory, pass/fail.
 
-The G8 demo then just exercises this stack (refresh the live world → `move_to_pose`
-/ `move_through_poses` / `retract`) — no re-derivation of a cuRobo integration.
+## Commission vs the G8 demo (don't conflate them)
+
+Commission **proves the stack ONCE** (build the warm stack → live ESDF → one
+supervised move). The G8 **demo** is the *repeatable bar* and **REUSES this same
+warm stack** — never rebuild or re-warm it (the cuRobo build is once per bring-up),
+never re-derive the integration. The agent drives the demo with the shipped method:
+
+```python
+# G8 demo — reuse the commissioned warm stack; refresh the live world BEFORE each leg
+# (the robot re-plans against the current scene), move through several reachable poses, retract.
+report = stack.demo_run(n_poses=3, frames=live_frames, progress=lambda s: print(s))
+assert report["ok"], report["message"]    # n_legs autonomous collision-free poses + retract
+```
+
+`demo_run` refreshes the ESDF each leg (move an obstacle → it routes around it),
+plans collision-free against the LIVE world, and replays each leg through the
+executor under the E-stop. Same `frames` provider as commission; same warm planner.
+If you edit a static obstacle between runs, the world **hot-swaps** (cuRobo
+`update_world`) — the warm planner is never thrown away.
