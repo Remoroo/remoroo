@@ -162,22 +162,20 @@ class CuroboMapper:
                  robot_cfg: Optional[dict] = None, voxel_size: float = 0.02,
                  esdf_voxel_size: float = 0.03, segment_distance: float = 0.05,
                  device: str = "cuda") -> None:
-        from curobo.perception import Mapper, MapperCfg, RobotSegmenter
+        from curobo.perception import RobotSegmenter
 
         self._device = device
         self._voxel_size = float(voxel_size)
-        self._mapper = Mapper(MapperCfg(
-            extent_meters_xyz=tuple(float(v) for v in extent_m),
-            grid_center=tuple(float(v) for v in center),
-            voxel_size=self._voxel_size,
-            esdf_voxel_size=float(esdf_voxel_size),
-            truncation_distance=self._voxel_size * 4.0,
-            enable_static=True,          # allocate the static channel so fuse_static (modeled cuboids) lands
-            device=device,
-        ))
+        self._esdf_voxel_size = float(esdf_voxel_size)
+        self._extent = tuple(float(v) for v in extent_m)
+        self._center = tuple(float(v) for v in center)
+        # The cuRobo Mapper is built LAZILY on the first frame: MapperCfg REQUIRES image_height/width
+        # (to pre-allocate the camera projective scratch buffer), which we only know once we see a
+        # depth frame. Assumes all cameras share a resolution (true for a matched rig, e.g. 2× ZED X).
+        self._mapper = None
         # The segmenter masks the robot from each depth frame at its live config — cuRobo's own,
         # CUDA-graphed, batched. Built from the SAME robot cfg the planner uses (the inner dict under
-        # "robot_cfg" carries the "kinematics" key RobotSegmenter expects).
+        # "robot_cfg" carries the "kinematics" key RobotSegmenter expects). No image size needed.
         self._segmenter = None
         if robot_cfg is not None:
             kin = robot_cfg.get("robot_cfg", robot_cfg)
@@ -185,8 +183,27 @@ class CuroboMapper:
         self._voxelgrid = None
         self._depth_filter = None        # built lazily per image shape
 
+    def _ensure_mapper(self, h: int, w: int):
+        """Build the cuRobo Mapper now that the image size is known (MapperCfg needs image_h/w)."""
+        if self._mapper is None:
+            from curobo.perception import Mapper, MapperCfg
+            self._mapper = Mapper(MapperCfg(
+                extent_meters_xyz=self._extent,
+                grid_center=self._center,
+                voxel_size=self._voxel_size,
+                esdf_voxel_size=self._esdf_voxel_size,
+                truncation_distance=self._voxel_size * 4.0,
+                enable_static=True,      # allocate the static channel so fuse_static (modeled cuboids) lands
+                num_cameras=1,           # we integrate one camera at a time (n_cameras must == this)
+                image_height=int(h),
+                image_width=int(w),
+                device=self._device,
+            ))
+        return self._mapper
+
     def reset(self) -> None:
-        self._mapper.reset()
+        if self._mapper is not None:
+            self._mapper.reset()
         self._voxelgrid = None
 
     def _observation(self, depth: np.ndarray, intrinsics: np.ndarray,
@@ -221,6 +238,7 @@ class CuroboMapper:
 
         obs = self._observation(depth, intrinsics, cam_pose_in_base)
         h, w = obs.depth_image.shape[-2], obs.depth_image.shape[-1]
+        self._ensure_mapper(h, w)        # build the Mapper now that we know the image size
         if self._depth_filter is None:
             self._depth_filter = FilterDepth(image_shape=(h, w))
         filtered, _ = self._depth_filter(obs.depth_image.unsqueeze(0))
@@ -249,7 +267,7 @@ class CuroboMapper:
         from curobo.types import DeviceCfg
         from curobo.scene import SceneData
 
-        if scene is None or not getattr(scene, "cuboid", None):
+        if self._mapper is None or scene is None or not getattr(scene, "cuboid", None):
             return
         device_cfg = DeviceCfg(device=torch.device(self._device), dtype=torch.float32)
         self._mapper.update_static_obstacles(SceneData.from_scene_cfg(scene, device_cfg))
@@ -262,6 +280,8 @@ class CuroboMapper:
     def occupied_voxels(self) -> np.ndarray:
         """Occupied voxel centres `[N, 3]` (x, y, z) in the base frame — for the Studio render. Uses
         cuRobo's tested `extract_occupied_voxels` (surface + inside), not a raw grid threshold."""
+        if self._mapper is None:
+            return np.zeros((0, 3), dtype=float)
         occ = self._mapper.extract_occupied_voxels(surface_only=False)
         if len(occ) == 0:
             return np.zeros((0, 3), dtype=float)
