@@ -29,7 +29,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .robot import actuated_joints, load_robot_config, load_spheres, neighbor_ignore, sphere_health
+from .robot import (actuated_joints, load_robot_config, load_spheres, mimic_coupled_ignore,
+                    neighbor_ignore, sphere_health)
 from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
@@ -267,7 +268,11 @@ class MotionStack:
         """The self-collision ignore matrix, generated ONCE via cuRobo's RobotBuilder (parent↔child
         PLUS link-pairs that overlap at the default config — the step the dict-loader path skips,
         without which by-design-touching links phantom-collide and nothing plans). Falls back to the
-        parent↔child adjacency if generation fails (e.g. off-GPU), recording why in `_ignore_warn`."""
+        parent↔child adjacency if generation fails (e.g. off-GPU), recording why in `_ignore_warn`.
+        ALWAYS unioned with the MIMIC-COUPLED mechanism pairs (a gripper's sibling knuckles/fingers):
+        cuRobo's default-config matrix misses them (siblings, clear at the open default but overlapping
+        at other gripper positions), so they phantom-collide. Deterministic + generic — in the
+        GENERATOR (not a one-off gate dump), so every build for every rig gets it."""
         if self._ignore_full is not None:
             return self._ignore_full
         ig = {k: list(v) for k, v in (self._self_ignore or {}).items()}
@@ -282,6 +287,8 @@ class MotionStack:
         except Exception as e:  # noqa: BLE001 — never block a build on generation; fall back loudly
             self._ignore_warn = (f"self-collision ignore generation failed ({type(e).__name__}: {e}); "
                                  "using parent↔child only — phantom self-collisions may block planning")
+        for link, coupled in mimic_coupled_ignore(self.urdf_path).items():
+            ig[link] = sorted(set(ig.get(link, [])) | set(coupled))
         self._ignore_full = ig
         return ig
 

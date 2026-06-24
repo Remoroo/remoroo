@@ -111,6 +111,56 @@ def neighbor_ignore(urdf_path: str) -> Dict[str, List[str]]:
     return ignore
 
 
+def mimic_coupled_ignore(urdf_path: str) -> Dict[str, List[str]]:
+    """Self-collision ignore pairs for MIMIC-COUPLED mechanisms (e.g. a parallel gripper). A `<mimic>`
+    joint is mechanically GEARED to a driving joint — it has no independent motion — so the links a
+    driver + all its mimics move form ONE rigid mechanism whose internal sphere overlaps are BY DESIGN,
+    at every config. Those links are SIBLINGS (a gripper's inner/outer knuckles share the gripper base,
+    they are NOT parent↔child), so adjacency + the default-config matrix miss them and they phantom-
+    collide. We ignore every pair WITHIN each mimic group. Deterministic — a pure URDF parse, no
+    sampling/threshold — and generic for ANY robot with a mimic linkage. Returns `{link: [coupled]}`."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except Exception:  # noqa: BLE001 — never block the build on a parse hiccup
+        return {}
+    child_of: Dict[str, str] = {}
+    mimic_target: Dict[str, str] = {}              # joint → the joint it is geared to
+    for j in root.findall("joint"):
+        name = j.get("name")
+        child = j.find("child")
+        if not name or child is None or not child.get("link"):
+            continue
+        child_of[name] = child.get("link")
+        m = j.find("mimic")
+        if m is not None and m.get("joint"):
+            mimic_target[name] = m.get("joint")
+
+    def driver(jn: str, seen=None) -> str:         # resolve a (possibly chained) mimic to its root driver
+        seen = seen or set()
+        if jn in mimic_target and jn not in seen:
+            seen.add(jn)
+            return driver(mimic_target[jn], seen)
+        return jn
+
+    # group every joint's child link by its ROOT driver; keep only groups a mimic actually couples.
+    groups: Dict[str, set] = {}
+    for jn, child in child_of.items():
+        groups.setdefault(driver(jn), set()).add(child)
+    driven = {driver(jn) for jn in mimic_target}   # drivers that genuinely have ≥1 mimic
+    out: Dict[str, set] = {}
+    for d, links in groups.items():
+        if d not in driven or len(links) < 2:
+            continue                               # not a coupled mechanism
+        ll = sorted(links)
+        for a in ll:
+            for b in ll:
+                if a != b:
+                    out.setdefault(a, set()).add(b)
+    return {k: sorted(v) for k, v in out.items()}
+
+
 def normalise_kinematics(kin: dict) -> dict:
     """Strip classic-only keys V2 rejects; return a shallow copy safe to merge into a V2 cfg."""
     return {k: v for k, v in dict(kin).items() if k not in _CLASSIC_ONLY_KEYS}
