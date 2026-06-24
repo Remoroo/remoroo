@@ -162,8 +162,6 @@ class CuroboMapper:
                  robot_cfg: Optional[dict] = None, voxel_size: float = 0.02,
                  esdf_voxel_size: float = 0.03, segment_distance: float = 0.05,
                  device: str = "cuda") -> None:
-        from curobo.perception import RobotSegmenter
-
         self._device = device
         self._voxel_size = float(voxel_size)
         self._esdf_voxel_size = float(esdf_voxel_size)
@@ -174,12 +172,21 @@ class CuroboMapper:
         # depth frame. Assumes all cameras share a resolution (true for a matched rig, e.g. 2× ZED X).
         self._mapper = None
         # The segmenter masks the robot from each depth frame at its live config — cuRobo's own,
-        # CUDA-graphed, batched. Built from the SAME robot cfg the planner uses (the inner dict under
-        # "robot_cfg" carries the "kinematics" key RobotSegmenter expects). No image size needed.
+        # CUDA-graphed. Force FLOAT32 ops: `from_robot_file` builds it with the default
+        # ops_dtype=bfloat16, but the mask op converts robot_spheres to ops_dtype then asserts float32
+        # (check_float32_tensors), so bfloat16 fails with "robot_spheres: expected float32, got
+        # bfloat16". Construct directly with ops_dtype=float32 (consistent with the float32 point cloud).
         self._segmenter = None
         if robot_cfg is not None:
+            import torch
+            from curobo.perception import RobotSegmenter
+            from curobo._src.types.robot import RobotCfg
+            from curobo._src.robot.kinematics.kinematics import Kinematics
+            from curobo.types import DeviceCfg
             kin = robot_cfg.get("robot_cfg", robot_cfg)
-            self._segmenter = RobotSegmenter.from_robot_file(kin, distance_threshold=float(segment_distance))
+            rc = RobotCfg.create(kin, device_cfg=DeviceCfg(device=torch.device(device), dtype=torch.float32))
+            self._segmenter = RobotSegmenter(Kinematics(rc.kinematics),
+                                             distance_threshold=float(segment_distance), ops_dtype=torch.float32)
         self._voxelgrid = None
         self._depth_filter = None        # built lazily per image shape
 
