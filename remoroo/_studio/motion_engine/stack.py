@@ -1189,6 +1189,56 @@ class MotionStack:
                             "(ignore matrix too sparse), joint-limits, or kinematics at the start — not the "
                             "ESDF. Cross-check validate_config / diagnose_motion.")}
 
+    def self_collision_pairs(self, tcp: Optional[str] = None, *, top: int = 40) -> dict:
+        """100% PROOF of WHICH link pairs self-collide at the seed — cuRobo's self-collision IS
+        sphere-pair distance over NON-ignored link pairs, so we replicate it transparently: FK each
+        link, place ITS collision spheres (radius + the same buffer cuRobo adds) in the base frame, and
+        report every NON-ignored pair whose spheres overlap, the penetration, and whether the links are
+        parent↔child ADJACENT (→ a by-design touch the ignore matrix should cover = PHANTOM) vs apart
+        (→ a REAL overlap, e.g. the two arms / a bad base-to-base). Pure FK + numpy → matches what
+        cuRobo flags, and names it. Also returns the involved spheres `[x,y,z,r]` for the Studio."""
+        from .live_world import _quat_wxyz_to_R
+        seed = self._seed_positions()
+        ignore = self._self_collision_ignore()
+        nb = self._self_ignore or {}                       # parent↔child adjacency
+        buf = float(self.sphere_buffer)
+        by_link: Dict[str, list] = {}
+        for link, sl in self.spheres.items():
+            pose = self.link_pose(link, seed, tcp=tcp)
+            if pose is None:
+                continue
+            R = _quat_wxyz_to_R(pose[1])
+            t = np.asarray(pose[0], dtype=float)
+            arr = []
+            for s in (sl or []):
+                r = float(s.get("radius", 0.0))
+                if r <= 0:
+                    continue
+                arr.append((R @ np.asarray(s["center"], dtype=float) + t, r + buf))
+            if arr:
+                by_link[link] = arr
+        links = list(by_link)
+        pairs = []
+        for i in range(len(links)):
+            for j in range(i + 1, len(links)):
+                la, lb = links[i], links[j]
+                if lb in (ignore.get(la) or []) or la in (ignore.get(lb) or []):
+                    continue                                # cuRobo ignores this pair
+                worst = 1e9
+                for ca, ra in by_link[la]:
+                    for cb, rb in by_link[lb]:
+                        worst = min(worst, float(np.linalg.norm(ca - cb)) - ra - rb)
+                if worst < 0:
+                    adjacent = (lb in (nb.get(la) or [])) or (la in (nb.get(lb) or []))
+                    pairs.append({"links": [la, lb], "penetration_mm": round(-worst * 1000, 1),
+                                  "adjacent": bool(adjacent)})
+        pairs.sort(key=lambda p: -p["penetration_mm"])
+        hot = {l for p in pairs for l in p["links"]}
+        spheres = [[round(float(c[0]), 4), round(float(c[1]), 4), round(float(c[2]), 4), round(float(r), 4)]
+                   for link in hot for (c, r) in by_link[link]]
+        return {"n_pairs": len(pairs), "pairs": pairs[:top], "spheres": spheres,
+                "all_adjacent": bool(pairs) and all(p["adjacent"] for p in pairs)}
+
     def diagnose_plan(self, tcp: Optional[str] = None, *, delta: float = 0.05,
                       test_plan_no_self: bool = True) -> dict:
         """DECISIVE ablation for 'no collision-free move' once the WORLD is ruled out — the exact tests
@@ -1228,6 +1278,12 @@ class MotionStack:
         ig = self._self_collision_ignore()
         rep["self_collision_ignore"] = {"n_links": len(ig), "n_pairs": sum(len(v) for v in ig.values()),
                                         "generated_by_curobo": self._ignore_warn is None, "warn": self._ignore_warn}
+        # If the start is self-colliding, NAME the exact link pairs (100% — replicates cuRobo's rule).
+        if rep.get("start_self_collision_free") is False:
+            try:
+                rep["self_collision_pairs"] = self.self_collision_pairs(tcp)
+            except Exception as e:  # noqa: BLE001
+                rep["self_collision_pairs_error"] = f"{type(e).__name__}: {e}"
         if test_plan_no_self:                                   # the confirmatory plan (needs warmup)
             try:
                 pn = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
@@ -1249,11 +1305,24 @@ class MotionStack:
             rep["verdict"] = (f"JOINT LIMITS: the seed is outside limits on {list(viol)} — no trajectory can be "
                               "valid. Fix the limits (URDF/safety) or the seed read.")
         elif ssf is False:
-            rep["verdict"] = ("SELF-COLLISION at the START config: with an EMPTY world the robot is still 'in "
-                              "collision', so its own spheres overlap at rest (or bounds). Likely the self-collision "
-                              "IGNORE matrix is too sparse for this (bimanual) robot — by-design-touching links "
-                              "phantom-collide — or two limbs genuinely overlap at the seed."
-                              + (" CONFIRMED: the nudge plans with self-collision OFF." if pns else ""))
+            scp = rep.get("self_collision_pairs") or {}
+            pairs = scp.get("pairs") or []
+            top = "; ".join(f"{p['links'][0]}↔{p['links'][1]} ({p['penetration_mm']}mm"
+                            f"{', adjacent' if p['adjacent'] else ''})" for p in pairs[:4])
+            if pairs and scp.get("all_adjacent"):
+                cause = (f"{scp.get('n_pairs')} pair(s), ALL parent↔child ADJACENT → PHANTOM self-collision: the "
+                         "self-collision IGNORE matrix is missing by-design-touching links. FIX the ignore-matrix "
+                         "generation (RobotBuilder default-config check) for these links — not the robot.")
+            elif pairs:
+                cause = (f"{scp.get('n_pairs')} pair(s); some are NON-adjacent → a REAL overlap (two limbs / a wrong "
+                         "base-to-base placement) AND/OR missing ignore pairs. Inspect the non-adjacent pairs.")
+            else:
+                cause = ("no overlapping NON-ignored sphere pair found by the analytic check, yet cuRobo's validate "
+                         "says self-collision — a sphere-buffer/activation mismatch or the ignore matrix cuRobo baked "
+                         "≠ ours. Inspect self_collision_ignore.")
+            rep["verdict"] = (f"100% SELF-COLLISION at the START (empty world; joints within limits): {cause}"
+                              + (f" Pairs: {top}." if top else "")
+                              + (" CONFIRMED — the nudge plans with self-collision OFF." if pns else ""))
         elif pns is True:
             rep["verdict"] = ("SELF-COLLISION on the PATH: the nudge plans with self-collision OFF (and the start "
                               "isn't world- or self-colliding) → a sphere/ignore-matrix is too aggressive along the "

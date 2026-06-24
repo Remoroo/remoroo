@@ -1003,6 +1003,12 @@ def h_diagnose_plan(_q):
     print(f"  start_self_collision_free={rep.get('start_self_collision_free')}  "
           f"ik_reach={rep.get('ik_reach')}  limit_violations={list(rep.get('joint_limit_violations') or {})}")
     print(f"  self_collision_ignore={rep.get('self_collision_ignore')}")
+    scp = rep.get("self_collision_pairs") or {}
+    if scp.get("pairs"):
+        print(f"  SELF-COLLIDING PAIRS ({scp.get('n_pairs')}, all_adjacent={scp.get('all_adjacent')}):")
+        for p in scp["pairs"][:20]:
+            print(f"    {p['links'][0]:>28s} ↔ {p['links'][1]:<28s}  {p['penetration_mm']:>6.1f} mm"
+                  f"  {'adjacent' if p['adjacent'] else 'NON-adjacent'}")
     print(f"  plan_no_self_no_world={rep.get('plan_no_self_no_world')}")
     print(f"  VERDICT: {rep.get('verdict')}\n==========================\n")
     return rep
