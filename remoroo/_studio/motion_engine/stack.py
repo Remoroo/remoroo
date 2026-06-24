@@ -1198,13 +1198,20 @@ class MotionStack:
         (→ a REAL overlap, e.g. the two arms / a bad base-to-base). Pure FK + numpy → matches what
         cuRobo flags, and names it. Also returns the involved spheres `[x,y,z,r]` for the Studio."""
         from .live_world import _quat_wxyz_to_R
+        tcp = tcp or next(iter(self._groups), None)
         seed = self._seed_positions()
         ignore = self._self_collision_ignore()
         nb = self._self_ignore or {}                       # parent↔child adjacency
-        buf = float(self.sphere_buffer)
+        # TRUE sphere radii (NO safety buffer): cuRobo's self-collision uses the un-inflated radii (we
+        # cancel the world `collision_sphere_buffer` for self via `self_collision_buffer`, see
+        # robotcfg.py), so the prober must match — else it reports buffer-induced phantoms the planner
+        # no longer sees.
+        # FK every sphere link in ONE build (not one-per-link) — the slow part otherwise.
+        planner = self._planner_for([tcp]) if tcp else None
+        poses = planner.link_poses(list(self.spheres.keys()), seed) if (planner and hasattr(planner, "link_poses")) else {}
         by_link: Dict[str, list] = {}
         for link, sl in self.spheres.items():
-            pose = self.link_pose(link, seed, tcp=tcp)
+            pose = poses.get(link) or self.link_pose(link, seed, tcp=tcp)   # batched, else per-link fallback
             if pose is None:
                 continue
             R = _quat_wxyz_to_R(pose[1])
@@ -1214,7 +1221,7 @@ class MotionStack:
                 r = float(s.get("radius", 0.0))
                 if r <= 0:
                     continue
-                arr.append((R @ np.asarray(s["center"], dtype=float) + t, r + buf))
+                arr.append((R @ np.asarray(s["center"], dtype=float) + t, r))
             if arr:
                 by_link[link] = arr
         links = list(by_link)

@@ -413,6 +413,60 @@ class CuroboV2Planner:
                 self._fk_cache[link] = None
         return self._fk_cache[link]
 
+    def _fk_for_many(self, links: Sequence[str]):
+        """ONE FK `Kinematics` tracking ALL `links` as tool_frames (cached) — so the self-collision
+        prober FKs N links with a SINGLE cfg build, not N builds (the build is the slow part; per-link
+        `_fk_for` was ~N×0.5–2 s on the Orin). Returns None if the cfg is rejected (caller falls back)."""
+        key = frozenset(links)
+        cache = getattr(self, "_fk_many_cache", None)
+        if cache is None:
+            cache = self._fk_many_cache = {}
+        if key not in cache:
+            cache[key] = None
+            try:
+                import copy
+                import torch
+                from curobo._src.types.robot import RobotCfg
+                from curobo._src.robot.kinematics.kinematics import Kinematics
+                from curobo.types import DeviceCfg
+
+                kin_dict = copy.deepcopy(self._robot_cfg.get("robot_cfg", self._robot_cfg))
+                kin = kin_dict.setdefault("kinematics", {})
+                tf = list(kin.get("tool_frames") or [])
+                for l in links:
+                    if l not in tf:
+                        tf.append(l)
+                kin["tool_frames"] = tf
+                rc = RobotCfg.create(kin_dict, device_cfg=DeviceCfg(device=torch.device(self._device),
+                                                                    dtype=torch.float32))
+                cache[key] = Kinematics(rc.kinematics)
+            except Exception:  # noqa: BLE001 — a link not in the URDF / cfg rejected → caller falls back
+                cache[key] = None
+        return cache[key]
+
+    def link_poses(self, links: Sequence[str], start_positions: Optional[Dict[str, float]] = None) -> dict:
+        """FK MANY links at once → `{link: (xyz, wxyz)}` in the base frame. One shared FK build + a
+        cheap FK per link (vs `link_pose`'s build-per-link). For the self-collision prober."""
+        import torch
+
+        links = list(dict.fromkeys(links))
+        fk = self._fk_for_many(links)
+        if fk is None:
+            return {}
+        names = list(fk.joint_names)
+        q = torch.as_tensor([float((start_positions or {}).get(n, 0.0)) for n in names],
+                            dtype=torch.float32, device=self._device).view(1, -1)
+        out: dict = {}
+        for l in links:
+            try:
+                pose = fk.get_link_poses(q, [l])
+                pos = pose.position.detach().cpu().numpy().reshape(-1)
+                quat = pose.quaternion.detach().cpu().numpy().reshape(-1)
+                out[l] = ([float(v) for v in pos[:3]], [float(v) for v in quat[:4]])
+            except Exception:  # noqa: BLE001 — skip a link FK can't resolve
+                pass
+        return out
+
     def link_pose(self, link: str, start_positions: Optional[Dict[str, float]] = None):
         """FK a URDF link → its pose `(xyz, wxyz)` in the base frame at the given (or zero) config.
         Resolves a camera's calibrated optical-frame pose for the live map (eye-in-hand: at the LIVE

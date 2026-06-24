@@ -100,12 +100,17 @@ def build_v2_robot_cfg(
                 "collision_link_names": list(spheres_by_link.keys()) or None,
                 "collision_spheres": spheres_by_link,
                 "collision_sphere_buffer": float(sphere_buffer),
-                # Both default to None in cuRobo's loader and are accessed UNCONDITIONALLY when
-                # building the collision model (`self_collision_buffer.copy()`,
-                # `self_collision_ignore.keys()`), so a missing field crashes planner build. Provide
-                # both explicitly: an empty per-link buffer, and the parent↔child ADJACENCY ignore
-                # (the loader path does NOT auto-generate it — without it every config self-collides).
-                "self_collision_buffer": {},
+                # DECOUPLE the safety buffer from SELF-collision. `collision_sphere_buffer` is a WORLD
+                # safety margin (keep the robot N mm off obstacles) but cuRobo inflates the spheres by
+                # it for SELF-collision too — which phantom-collides any by-design-close mechanism (a
+                # gripper's sibling knuckles read as colliding though they're cm apart). cuRobo MEANT to
+                # cancel this: kinematics_loader `_build_collision_model` computes
+                # `self_collision_buffer[j] -= collision_sphere_buffer` (lines ~881-884) — but then
+                # passes `self.self_collision_buffer` (the ORIGINAL), discarding the cancellation (a
+                # cuRobo bug, line ~911). So we supply the cancellation EXPLICITLY, per collision link:
+                # self-collision uses the TRUE sphere radii, the world keeps its margin. Generic — the
+                # safety margin is about the environment, never the robot's own geometry.
+                "self_collision_buffer": {link: -float(sphere_buffer) for link in spheres_by_link},
                 "self_collision_ignore": dict(self_collision_ignore or {}),
                 "lock_joints": None,   # see above — locking a sub-chain breaks V2 IK; drive all joints
                 "cspace": cspace,
