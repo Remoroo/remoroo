@@ -99,30 +99,34 @@ ignore_joints: []                         # any actuated joint deliberately NOT 
 
 Then `gate_checkpoint(gate=model)` with the authored groups for the operator to confirm.
 
-## Collision spheres → cuRobo YAML (YOURS — fast, NO Isaac Sim)
+## Collision spheres → cuRobo YAML (YOURS — quality over speed, NO Isaac Sim)
 
-cuRobo plans on a **sphere approximation** of the robot, not raw meshes. Fit spheres PER LINK with
-cuRobo's purpose-built `fit_spheres_to_mesh`. **Two hard-won rules (do NOT skip):**
+cuRobo plans on a **sphere approximation** of the robot, not raw meshes — the model is only as safe as
+this approximation. So generate it for QUALITY, then PROVE it with two checks before the gate. Fit
+spheres PER LINK with cuRobo's `fit_spheres_to_mesh`. **Hard-won rules:**
 
-1. **Use `fit_type=SphereFitType.VOXEL`, NOT the default `MORPHIT`.** MorphIt runs ~200 optimisation
-   iterations PER LINK — on a 30-link robot on a Jetson Orin that is **~80 minutes and often times
-   out**. VOXEL is a single Warp-SDF voxel-fill: deterministic, seconds per link. Also pass
-   `compute_metrics=False` (the metrics pass is expensive). **Do NOT use `RobotBuilder`** to generate
-   spheres — it additionally computes a self-collision matrix by sampling thousands of configs (very
-   slow on edge HW) AND it **ignores the per-mesh `<mesh scale>`** (see rule 2).
-2. **Apply the URDF `<mesh scale>` to each mesh BEFORE fitting** — load-bearing. Vendor meshes are
-   often in MILLIMETRES (`scale="0.001 0.001 0.001"`). `estimate_sphere_count` and the fit read the
-   mesh bbox in metres, so an un-scaled mm mesh comes out **1000× too big** (real symptom: a ZED
-   camera link fit to a **5.2 m** sphere). Mixed units bite per-link: xArm arm meshes were already in
-   metres (sane), the ZED/holder meshes were in mm (5 m spheres). Apply each mesh's own scale.
+1. **Use `fit_type=SphereFitType.MORPHIT` with `compute_metrics=True`.** MorphIt is a voxel-seeded Adam
+   optimisation of coverage/protrusion — strictly tighter than VOXEL (which is only MorphIt's *init*,
+   no optimisation). It is SLOW on a Jetson Orin (~200 iters × ~30 links ≈ tens of minutes) — that is
+   ACCEPTED: correctness beats speed for the collision model, and we make it OBSERVABLE by writing
+   per-link progress (below). `compute_metrics=True` returns the coverage numbers CHECK 1 gates on.
+2. **Apply the URDF `<mesh scale>` to each mesh BEFORE fitting** — load-bearing, and the historical bug.
+   Vendor meshes are often in MILLIMETRES (`scale="0.001 0.001 0.001"`); an un-scaled mm mesh fits to
+   METRE-wide spheres (a ZED link → 5.2 m), or doubled, microscopic ones. We apply scale explicitly in
+   trimesh (below) so it is under YOUR control — independent of any cuRobo mesh-loader behaviour — and
+   CHECK 1's `volume_ratio` catches it if it ever slips.
+3. **The self-collision ignore matrix is cuRobo's COMPLETE one**, not a cheap adjacency walk (below).
+
+### Fit each link (MorphIt + metrics + progress)
 
 ```python
-import os, trimesh, numpy as np, yaml
+import os, json, trimesh, numpy as np, yaml
 import xml.etree.ElementTree as ET
 from curobo.sphere_fit import fit_spheres_to_mesh, estimate_sphere_count, SphereFitType
 
 PKG_ROOT = "remoroo_cell"          # package://remoroo_cell/... → this dir
-CAP = 20                            # max spheres/link (planning speed); arms ~6-16, big base more
+OUT      = "remoroo_cell/robot_model"
+CAP      = 24                       # max spheres/link (planning speed); arms ~6-16, big base more
 
 def _origin_T(el):                 # <collision><origin xyz rpy> → 4x4 (link-local)
     rpy = [float(v) for v in ((el.get("rpy") if el is not None else None) or "0 0 0").split()]
@@ -136,81 +140,145 @@ def _resolve(filename):            # package://remoroo_cell/meshes/x.stl → rem
         filename = filename[len("package://"):].split("/", 1)[1]   # drop the "<pkg>/" prefix
     return os.path.join(PKG_ROOT, filename)
 
-def fit_link(link_el):
-    out = []
+def link_mesh(link_el):            # concat a link's collision meshes, mm→m scaled + origin'd, link frame
+    parts = []
     for col in link_el.findall("collision"):
         geo = col.find("geometry/mesh")
-        m = None
-        if geo is not None:
-            m = trimesh.load(_resolve(geo.get("filename")), force="mesh")
-            m.apply_scale([float(s) for s in (geo.get("scale") or "1 1 1").split()])   # RULE 2 — mm→m
-        # (primitives: box/cylinder/sphere → trimesh.creation.* ; fit them too)
-        if m is None or m.is_empty: continue
-        m.apply_transform(_origin_T(col.find("origin")))     # collision origin → link frame
-        n = max(3, min(CAP, estimate_sphere_count(m)))       # bigger link → more spheres, capped
-        r = fit_spheres_to_mesh(m, num_spheres=n, fit_type=SphereFitType.VOXEL, compute_metrics=False)  # RULE 1
-        out += [{"center": c.tolist(), "radius": float(rad)}
-                for c, rad in zip(r.centers.cpu().numpy(), r.radii.cpu().numpy()) if rad > 1e-3]
-    return out
+        if geo is None:
+            continue                                   # (primitives box/cyl/sphere → trimesh.creation.*)
+        m = trimesh.load(_resolve(geo.get("filename")), force="mesh")
+        m.apply_scale([float(s) for s in (geo.get("scale") or "1 1 1").split()])   # RULE 2 — mm→m
+        m.apply_transform(_origin_T(col.find("origin")))                            # collision origin
+        if not m.is_empty:
+            parts.append(m)
+    return trimesh.util.concatenate(parts) if parts else None
 
-root = ET.parse("remoroo_cell/robot_model/robot.urdf").getroot()
-spheres = {l.get("name"): fit_link(l) for l in root.findall("link")}
-spheres = {k: v for k, v in spheres.items() if v}            # drop links with no collision geom
+def fit_link(m, coverage_weight=1000.0):
+    n = max(3, min(CAP, estimate_sphere_count(m)))
+    r = fit_spheres_to_mesh(m, num_spheres=n, fit_type=SphereFitType.MORPHIT, compute_metrics=True,
+                            coverage_weight=coverage_weight, protrusion_weight=10.0)   # RULE 1
+    spheres = [{"center": c.tolist(), "radius": float(rad)}
+               for c, rad in zip(r.centers.cpu().numpy(), r.radii.cpu().numpy()) if rad > 1e-3]
+    mt = r.metrics
+    metrics = {"coverage": mt.coverage, "max_uncovered_gap": mt.max_uncovered_gap,
+               "surface_gap_p95": mt.surface_gap_p95, "protrusion": mt.protrusion,
+               "protrusion_dist_p95": mt.protrusion_dist_p95, "volume_ratio": mt.volume_ratio,
+               "num_spheres": mt.num_spheres}
+    return spheres, metrics
+
+root = ET.parse(f"{PKG_ROOT}/robot_model/robot.urdf").getroot()
+mesh_links = [l for l in root.findall("link") if link_mesh(l) is not None]
+spheres, metrics, n = {}, {}, len(mesh_links)
+for i, link_el in enumerate(mesh_links):
+    name = link_el.get("name")
+    json.dump({"link_i": i + 1, "n": n, "link": name},          # ← Studio reads /project/spheres/progress
+              open(f"{OUT}/spheres_progress.json", "w"))
+    spheres[name], metrics[name] = fit_link(link_mesh(link_el))
+spheres = {k: v for k, v in spheres.items() if v}               # drop links with no collision geom
 ```
 
-**Self-collision ignore — derive it cheaply from URDF adjacency, do NOT sample.** Ignore each
-parent↔child link pair (and pairs that are always touching). That's an XML walk, not a 10k-config
-sampling job:
+### CHECK 1 — coverage / scale (per link, geometry in isolation)
+
+`compute_metrics=True` already measured each link. The safety-critical metric is **`max_uncovered_gap`**
+(how much real robot surface sits OUTSIDE its spheres → cuRobo is blind to it there), and
+**`volume_ratio`** is the scale-bug detector. Gate on them; tighten a warn link by re-fitting with a
+higher coverage weight.
+
 ```python
-ignore = {}
-for j in root.findall("joint"):
-    p, c = j.find("parent").get("link"), j.find("child").get("link")
-    ignore.setdefault(p, []).append(c); ignore.setdefault(c, []).append(p)
+MAX_UNCOVERED_GAP_FAIL = 0.020      # m — >2cm of surface outside spheres = UNSAFE (robot invisible there)
+MAX_UNCOVERED_GAP_WARN = 0.005
+VOLUME_RATIO_LO, VOLUME_RATIO_HI = 0.3, 6.0   # sphere-vol/mesh-vol outside this ⇒ a scale/units bug
+COVERAGE_WARN, PROTRUSION_WARN = 0.90, 0.10
+
+def link_fails(mt):
+    return (mt["volume_ratio"] < VOLUME_RATIO_LO or mt["volume_ratio"] > VOLUME_RATIO_HI
+            or mt["max_uncovered_gap"] > MAX_UNCOVERED_GAP_FAIL)
+
+for name in list(spheres):          # tighten WARN links ONCE (push spheres to fill) before judging
+    mt = metrics[name]
+    warn = (mt["coverage"] < COVERAGE_WARN or mt["protrusion"] > PROTRUSION_WARN
+            or mt["max_uncovered_gap"] > MAX_UNCOVERED_GAP_WARN)
+    if warn and not link_fails(mt):
+        el = next(l for l in mesh_links if l.get("name") == name)
+        spheres[name], metrics[name] = fit_link(link_mesh(el), coverage_weight=3000.0)
+
+fails = [f"{name}: volume_ratio={metrics[name]['volume_ratio']:.2f}, "
+         f"max_uncovered_gap={metrics[name]['max_uncovered_gap'] * 1000:.0f}mm"
+         for name in spheres if link_fails(metrics[name])]
+if fails:
+    raise SystemExit("SPHERES CHECK 1 (coverage/scale) FAILED — fix, do NOT ship:\n  " + "\n  ".join(fails))
 ```
-Then assemble + write `robot_model/collision_spheres.yml` — **exactly this structure, with PLAIN
-python floats** (the Studio's collision view reads it from here):
+
+### Full self-collision ignore matrix (cuRobo's complete one)
+
+Derive the ignore matrix from cuRobo's `RobotBuilder` — neighbour pairs **plus** pairs that overlap at
+the default config (gripper fingers, dual-arm bases) **plus** sample-pruned never-collide pairs. This
+is the matrix the planner needs; the old cheap parent↔child walk left by-design touches reading as
+PERMANENT self-collisions, and nothing planned. Feed in the spheres you just fitted (no refit):
+
+```python
+from curobo._src.robot.builder.builder_robot import RobotBuilder
+
+cell = yaml.safe_load(open(f"{PKG_ROOT}/cell.yaml")) or {}
+tips = [t for g in (cell.get("groups") or []) for t in (g.get("tip_links") or [])]
+rb = RobotBuilder(f"{PKG_ROOT}/robot_model/robot.urdf", tool_frames=tips or None)
+rb._collision_spheres = {k: list(v) for k, v in spheres.items()}     # inject our spheres — no refit
+ignore = dict(rb.compute_collision_matrix(prune_collisions=True) or {})
+```
+
+### Write `collision_spheres.yml` (exact schema, PLAIN python floats)
+
 ```python
 robot_cfg = {"robot_cfg": {"kinematics": {
     "urdf_path": "robot.urdf",
     "collision_spheres": spheres,                  # {link: [{center:[x,y,z], radius:r}]}
     "collision_link_names": list(spheres.keys()),
-    "self_collision_ignore": ignore,
+    "self_collision_ignore": ignore,               # the COMPLETE matrix — the planner READS this
     "collision_sphere_buffer": 0.005,
 }}}
-import yaml
-yaml.safe_dump(robot_cfg, open("remoroo_cell/robot_model/collision_spheres.yml", "w"), sort_keys=False)
+yaml.safe_dump(robot_cfg, open(f"{OUT}/collision_spheres.yml", "w"), sort_keys=False)
 ```
-**Use `safe_dump`, and make every center/radius a PLAIN `float`/`list` (`.tolist()`, `float(r)`) —
-NOT numpy.** `safe_dump` REFUSES numpy types (so it's your guarantee the file is clean); a file dumped
-with `yaml.dump` of `np.float32` is full of `!!python/object` tags that the Studio (and other
-`safe_load` consumers) can't render — the spheres save to disk but show as nothing in the collision
-view. Load it back and run the G1 smoke plan to validate.
+**Use `safe_dump` with PLAIN `float`/`list` (`.tolist()`, `float(r)`) — NOT numpy.** `safe_dump`
+REFUSES numpy types; a `yaml.dump` of `np.float32` writes `!!python/object` tags the Studio can't
+render (spheres save to disk but show as nothing in the collision view).
 
-**SANITY-CHECK before you emit `collision_spheres.yml`** (this is where the failures show up): every
-link's sphere radii should be CENTIMETRES (a wrist ~1–5 cm), and the union should envelop the mesh. If
-any link's median radius is **> ~0.3 m** the scale is wrong (mm not converted) — fix it, don't ship.
-If a link's median is **< a few mm** the geometry is ~1000× too small. The Studio flags a degenerate
-set with a red "planning UNSAFE" banner, but the cuRobo model is broken until you regenerate it
-correctly. Tunables (R&D): `CAP`, `sphere_density`, ignore pairs — bigger/fewer is safer but more
-conservative; tune until the real-world smoke plan succeeds without phantom collisions.
+### CHECK 2 — self-collision across many joint states (the ASSEMBLED model)
 
-## Preview the spheres for the operator (lightweight)
-
-Pose the spheres on the operator's URDF meshes at a few joint configs and show
-them via `gate_checkpoint(gate=spheres)` with a `view_image` preview. Use a light
-viewer — trimesh scene, Open3D, or pyrender — **not** Isaac Sim. The operator
-confirms the spheres envelop the real geometry (gripper fingers covered, nothing
-clipping through links), or flags strays.
+Load the cell you just wrote and audit the FK-posed, multi-link model. This runs the SHIPPED
+`motion_engine` so the verdict == exactly what the planner will see (same `self_collision_buffer`
+cancellation, same ignore matrix you just wrote). A valid robot self-collides at plenty of real
+configs, so this NEVER fails on "collides somewhere" — it gates on `home_free` (the rest pose MUST be
+free), `free_fraction` (enough of the in-limit space is plannable), and named ADJACENT phantom pairs (a
+missing ignore = a defect to fix):
 
 ```python
-import trimesh
-scene = trimesh.Scene()
-scene.add_geometry(robot_mesh_at(config))              # FK-posed link meshes
-for s in spheres_at(config):
-    sph = trimesh.creation.icosphere(radius=s["radius"]).apply_translation(s["center"])
-    scene.add_geometry(sph)
-png = scene.save_image(resolution=(1280, 720))         # show the operator via view_image
+from motion_engine import MotionStack
+
+check2 = MotionStack.from_cell(PKG_ROOT).audit_self_collision(n=2000)
+if check2.get("verdict") == "fail":
+    raise SystemExit("SPHERES CHECK 2 (self-collision) FAILED:\n" + json.dumps(check2, indent=2))
 ```
+
+### Report + preview, then checkpoint
+
+Write the structured report the Studio renders (per-link coverage + the Check-2 verdict + phantom
+pairs), a desk preview (trimesh / Open3D / pyrender — **not** Isaac Sim), then hand off:
+
+```python
+report = {"n_links": len(spheres), "n_spheres": sum(len(v) for v in spheres.values()),
+          "metrics": metrics, "check2": check2}
+json.dump(report, open(f"{OUT}/spheres_report.json", "w"), indent=2)     # ← /project/spheres/report
+
+scene = trimesh.Scene()                                # FK-pose the spheres for a preview
+for name in spheres:
+    for s in spheres[name]:
+        scene.add_geometry(trimesh.creation.icosphere(radius=s["radius"]).apply_translation(s["center"]))
+scene.save_image(resolution=(1280, 720))               # → spheres_preview.png, shown via view_image
+```
+
+Then `gate_checkpoint(gate=spheres)` with the verdict + preview. The operator approves on the SURFACED
+evidence (per-link coverage, named phantom pairs) — not by eyeballing. **Tunables (R&D):** `CAP`,
+`coverage_weight`/`protrusion_weight`, the CHECK-1 thresholds, and `n` for the audit.
 
 ## The world ignores the arms
 
@@ -227,9 +295,10 @@ reuses these spheres to mask the arm out of each depth frame before fusion.
 cell.yaml                        # gains `groups:` — the AUTHORED kinematic config (source of truth) ← YOURS
 robot_model/
   robot.urdf                     # the OPERATOR's exported URDF (you read it; you do not author it)
-  collision_spheres.yml          # cuRobo robot config (spheres + limits + ignore pairs)  ← YOURS
-  spheres_preview.png            # desk visualization shown to the operator                ← YOURS
-  report.md                      # sphere counts, base_to_base used, FK check              ← YOURS
+  collision_spheres.yml          # cuRobo robot config (spheres + COMPLETE ignore matrix + buffer)  ← YOURS
+  spheres_report.json            # per-link coverage metrics + the CHECK-2 self-collision verdict ← YOURS
+  spheres_preview.png            # desk visualization shown to the operator                       ← YOURS
+  report.md                      # sphere counts, base_to_base used, FK check                     ← YOURS
 ```
 There is NO `arms.yaml` — the kinematic config is the authored `cell.yaml: groups`, computed by no
 one but you and confirmed by the operator, so it never drifts.
@@ -241,4 +310,8 @@ one but you and confirmed by the operator, so it never drifts.
 - `cell.yaml: groups` authored from the URDF and `urdf_io.validate_robot_config` returns NO errors
   (every joint placed, every name/tip real); operator confirmed the groups (+ physical labels).
 - cuRobo loads the robot YAML and the G1-style smoke plan still succeeds.
-- Spheres previewed and operator-confirmed to envelop the real geometry.
+- **CHECK 1 (coverage/scale) passes** — no link FAILs `volume_ratio`/`max_uncovered_gap`; warn links
+  re-fit. The spheres envelop the real geometry (the per-link metrics prove it, not just the eye).
+- **CHECK 2 (self-collision) verdict is not `fail`** — `home_free` true, healthy `free_fraction`, no
+  adjacent phantom pairs (`MotionStack.audit_self_collision`). The matrix written IS what the planner reads.
+- Spheres previewed and operator-confirmed on the surfaced report (coverage + named phantom pairs).

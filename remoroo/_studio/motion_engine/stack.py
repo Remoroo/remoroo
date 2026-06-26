@@ -29,8 +29,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .robot import (actuated_joints, load_robot_config, load_spheres, mimic_coupled_ignore,
-                    neighbor_ignore, sphere_health)
+from .robot import (actuated_joints, load_robot_config, load_self_collision_ignore, load_spheres,
+                    mimic_coupled_ignore, neighbor_ignore, sphere_health)
 from .robotcfg import build_v2_robot_cfg
 from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
@@ -176,7 +176,7 @@ class MotionStack:
     def __init__(self, *, config: dict, spheres: Dict[str, List[dict]], sphere_buffer: float,
                  world: WorldInputs, safety: Safety, bridge=None,
                  urdf_path: str = "robot.urdf", planner_factory: Optional[PlannerFactory] = None,
-                 mapper_factory=None) -> None:
+                 mapper_factory=None, self_collision_ignore: Optional[Dict[str, List[str]]] = None) -> None:
         self.config = config
         self.spheres = spheres
         self.sphere_buffer = sphere_buffer
@@ -192,8 +192,13 @@ class MotionStack:
         # This is the FALLBACK; `_self_collision_ignore()` upgrades it with cuRobo's default-config
         # generation (the link-pairs that overlap at rest — grippers, dual-arm bases) on first build.
         self._self_ignore = neighbor_ignore(urdf_path)
+        # The spheres gate's AUTHORED self-collision ignore matrix (cuRobo's complete
+        # compute_collision_matrix, written into collision_spheres.yml). When present it is the source
+        # of truth — the planner reads it instead of re-deriving (artifact == reality, Decision A).
+        self._authored_ignore = {k: list(v) for k, v in (self_collision_ignore or {}).items()}
         self._ignore_full: Optional[dict] = None      # cached generated matrix
         self._ignore_warn: Optional[str] = None       # why generation fell back, if it did
+        self._ignore_provenance: Optional[str] = None  # "authored" (from the YAML) | "regenerated"
         self._world_finalized = False                 # has the cloud been self-masked yet?
         self._world_warn: Optional[str] = None        # why the self-mask didn't run, if it didn't
         # LIVE volumetric world (cuRobo Mapper → ESDF). Injectable factory so the wiring tests off-GPU.
@@ -213,13 +218,15 @@ class MotionStack:
         + world/ + safety."""
         config = load_robot_config(cell_dir)
         spheres, buffer = load_spheres(cell_dir)
+        authored_ignore = load_self_collision_ignore(cell_dir)
         safety = load_safety(cell_dir)
         world = load_world(cell_dir)
         # ABSOLUTE path — cuRobo resolves a relative `urdf_path` against its OWN content/assets dir
         # (the "curobo/content/assets/robot.urdf is not a file" failure), never the cell.
         urdf_path = str((Path(cell_dir) / "robot_model" / "robot.urdf").resolve())
         st = cls(config=config, spheres=spheres, sphere_buffer=buffer, world=world,
-                 safety=safety, bridge=bridge, urdf_path=urdf_path, planner_factory=planner_factory)
+                 safety=safety, bridge=bridge, urdf_path=urdf_path, planner_factory=planner_factory,
+                 self_collision_ignore=authored_ignore)
         st._cell_dir = str(cell_dir)
         return st
 
@@ -277,17 +284,25 @@ class MotionStack:
         if self._ignore_full is not None:
             return self._ignore_full
         ig = {k: list(v) for k, v in (self._self_ignore or {}).items()}
-        try:
-            from .curobo_v2 import generate_self_collision_ignore
-            tips = [t for g in self._groups.values() for t in (g.get("tip_links") or [])]
-            full = generate_self_collision_ignore(self.urdf_path, self.spheres, tool_frames=tips or None)
-            if full:
-                ig = full
-            else:
-                self._ignore_warn = "cuRobo generated an empty ignore matrix; using parent↔child only"
-        except Exception as e:  # noqa: BLE001 — never block a build on generation; fall back loudly
-            self._ignore_warn = (f"self-collision ignore generation failed ({type(e).__name__}: {e}); "
-                                 "using parent↔child only — phantom self-collisions may block planning")
+        if self._authored_ignore:
+            # DECISION A: the spheres gate already computed cuRobo's COMPLETE matrix and wrote it to
+            # collision_spheres.yml. Trust it (artifact == reality) — no re-generation, no GPU at plan
+            # time. Still union the mechanism-coupled pairs as a belt-and-braces invariant.
+            ig = {k: list(v) for k, v in self._authored_ignore.items()}
+            self._ignore_provenance = "authored"
+        else:
+            self._ignore_provenance = "regenerated"
+            try:
+                from .curobo_v2 import generate_self_collision_ignore
+                tips = [t for g in self._groups.values() for t in (g.get("tip_links") or [])]
+                full = generate_self_collision_ignore(self.urdf_path, self.spheres, tool_frames=tips or None)
+                if full:
+                    ig = full
+                else:
+                    self._ignore_warn = "cuRobo generated an empty ignore matrix; using parent↔child only"
+            except Exception as e:  # noqa: BLE001 — never block a build on generation; fall back loudly
+                self._ignore_warn = (f"self-collision ignore generation failed ({type(e).__name__}: {e}); "
+                                     "using parent↔child only — phantom self-collisions may block planning")
         for link, coupled in mimic_coupled_ignore(self.urdf_path).items():
             ig[link] = sorted(set(ig.get(link, [])) | set(coupled))
         self._ignore_full = ig
@@ -1248,17 +1263,19 @@ class MotionStack:
                             "(ignore matrix too sparse), joint-limits, or kinematics at the start — not the "
                             "ESDF. Cross-check validate_config / diagnose_motion.")}
 
-    def self_collision_pairs(self, tcp: Optional[str] = None, *, top: int = 40) -> dict:
-        """100% PROOF of WHICH link pairs self-collide at the seed — cuRobo's self-collision IS
-        sphere-pair distance over NON-ignored link pairs, so we replicate it transparently: FK each
-        link, place ITS collision spheres (radius + the same buffer cuRobo adds) in the base frame, and
-        report every NON-ignored pair whose spheres overlap, the penetration, and whether the links are
-        parent↔child ADJACENT (→ a by-design touch the ignore matrix should cover = PHANTOM) vs apart
-        (→ a REAL overlap, e.g. the two arms / a bad base-to-base). Pure FK + numpy → matches what
-        cuRobo flags, and names it. Also returns the involved spheres `[x,y,z,r]` for the Studio."""
+    def self_collision_pairs(self, tcp: Optional[str] = None, *, top: int = 40,
+                             q: Optional[Dict[str, float]] = None) -> dict:
+        """100% PROOF of WHICH link pairs self-collide at a config (the seed by default, or the given
+        `q`) — cuRobo's self-collision IS sphere-pair distance over NON-ignored link pairs, so we
+        replicate it transparently: FK each link, place ITS collision spheres (radius + the same buffer
+        cuRobo adds) in the base frame, and report every NON-ignored pair whose spheres overlap, the
+        penetration, and whether the links are parent↔child ADJACENT (→ a by-design touch the ignore
+        matrix should cover = PHANTOM) vs apart (→ a REAL overlap, e.g. the two arms / a bad
+        base-to-base). Pure FK + numpy → matches what cuRobo flags, and names it. Also returns the
+        involved spheres `[x,y,z,r]` for the Studio."""
         from .live_world import _quat_wxyz_to_R
         tcp = tcp or next(iter(self._groups), None)
-        seed = self._seed_positions()
+        seed = dict(q) if q else self._seed_positions()
         ignore = self._self_collision_ignore()
         nb = self._self_ignore or {}                       # parent↔child adjacency
         # TRUE sphere radii (NO safety buffer): cuRobo's self-collision uses the un-inflated radii (we
@@ -1304,6 +1321,79 @@ class MotionStack:
                    for link in hot for (c, r) in by_link[link]]
         return {"n_pairs": len(pairs), "pairs": pairs[:top], "spheres": spheres,
                 "all_adjacent": bool(pairs) and all(p["adjacent"] for p in pairs)}
+
+    def audit_self_collision(self, tcp: Optional[str] = None, *, n: int = 2000,
+                             free_fraction_fail: float = 0.10,
+                             free_fraction_warn: float = 0.30) -> dict:
+        """CHECK 2 (spheres gate) — is the ASSEMBLED, FK-posed sphere model PLANNABLE and free of
+        PHANTOM self-collisions, sampled over many joint states? A valid robot self-collides at plenty
+        of real configs (folded elbow), so we never fail on "collides somewhere" — we test three things:
+
+          • home_free        the known-safe / current pose MUST be self-collision-free (empty world ⇒
+                             a non-free verdict is self/bounds). FALSE ⇒ a missing ignore pair, over-fat
+                             spheres (scale / buffer), or two chains modelled overlapping. HARD gate.
+          • free_fraction    fraction of N uniform in-limit configs that are collision-free+in-bounds.
+                             Near-zero ⇒ the model is over-constrained (phantom collisions everywhere)
+                             ⇒ planning will fail. HARD gate below `free_fraction_fail`.
+          • phantom_pairs    of the pairs that DO collide (at home + the worst sampled config), which are
+                             parent↔child ADJACENT (the ignore matrix should have covered them = a defect
+                             to fix) vs apart (a real, config-dependent collision = expected, leave it).
+
+        Runs against an EMPTY world (so the verdict is self+bounds only) using the SAME robot_cfg the
+        planner uses — including the `self_collision_buffer` cancellation and the AUTHORED ignore matrix
+        — so the audit verdict == what the planner actually sees. GPU; read-only (throwaway probe)."""
+        from .curobo_v2 import CuroboV2Planner
+        from .world import WorldInputs
+        tcp = tcp or next(iter(self._groups), None)
+        rep: dict = {"tcp": tcp, "n": int(n)}
+        if tcp is None:
+            rep["error"] = "no kinematic groups"
+            return rep
+        seed = self._seed_positions()
+        empty = WorldInputs(scene={})
+        try:
+            probe = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
+                                    max_goalset=1, warmup=False, self_collision_check=True)
+            sc = probe.world_sphere_collision(seed)            # empty world ⇒ collision_free = self+bounds
+            rep["home_free"] = bool(sc.get("collision_free"))
+            sweep = probe.validate_samples(int(n))             # GPU-batched ⇒ "many many" is cheap
+            rep["free_fraction"] = round(float(sweep.get("free_fraction", 0.0)), 4)
+            rep["self_collision_fraction"] = round(float(sweep.get("self_collision_fraction", 0.0)), 4)
+            worst_q = sweep.get("worst_colliding")             # one colliding sampled config (or None)
+        except Exception as e:  # noqa: BLE001 — surface the failure, never crash the gate
+            rep["probe_error"] = f"{type(e).__name__}: {e}"
+            return rep
+
+        # Name the offending pairs at the DECISIVE config (home) and at a sampled colliding config, so
+        # the operator sees WHICH links phantom-collide across the joint space, not just a number.
+        adjacent: Dict[Tuple[str, str], dict] = {}
+        apart: Dict[Tuple[str, str], dict] = {}
+        configs = [("home", seed)]
+        if worst_q:
+            configs.append(("sampled", dict(worst_q)))
+        for where, q in configs:
+            try:
+                for p in (self.self_collision_pairs(tcp, q=q).get("pairs") or []):
+                    key = tuple(sorted(p["links"]))
+                    bucket = adjacent if p.get("adjacent") else apart
+                    cur = bucket.get(key)
+                    if cur is None or p["penetration_mm"] > cur["penetration_mm"]:
+                        bucket[key] = {"links": list(key), "penetration_mm": p["penetration_mm"],
+                                       "adjacent": bool(p.get("adjacent")), "seen_at": where}
+            except Exception as e:  # noqa: BLE001
+                rep.setdefault("pair_warn", []).append(f"{where}: {type(e).__name__}: {e}")
+        rep["phantom_pairs"] = sorted(adjacent.values(), key=lambda d: -d["penetration_mm"])
+        rep["real_pairs"] = sorted(apart.values(), key=lambda d: -d["penetration_mm"])
+        rep["ignore_provenance"] = self._ignore_provenance
+
+        ff = rep.get("free_fraction", 0.0)
+        if rep.get("home_free") is False or ff < free_fraction_fail or rep["phantom_pairs"]:
+            rep["verdict"] = "fail"
+        elif ff < free_fraction_warn:
+            rep["verdict"] = "warn"
+        else:
+            rep["verdict"] = "pass"
+        return rep
 
     def diagnose_plan(self, tcp: Optional[str] = None, *, delta: float = 0.05,
                       test_plan_no_self: bool = True) -> dict:

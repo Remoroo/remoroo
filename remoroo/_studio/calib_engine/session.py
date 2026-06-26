@@ -23,6 +23,8 @@ from .metrics import (
     consensus_spread,
     fiducial_consistency_mm,
     held_out_reprojection,
+    heldout_interarm_agreement_mm,
+    interarm_agreement_mm,
     observability,
     reprojection_detail,
     stereo_consistency,
@@ -31,7 +33,12 @@ from .metrics import (
     well_observed,
 )
 from .posegen import suggest_next_pose
-from .solve import _estimate_target_pose, solve_eye_in_hand, solve_static_camera
+from .solve import (
+    _estimate_target_pose,
+    solve_base_to_base_bundle,
+    solve_eye_in_hand,
+    solve_static_camera,
+)
 from .types import BoardModel, CalibResult, CaptureSample, PlanItem
 
 
@@ -58,6 +65,23 @@ class BridgeProtocol(Protocol):
 
 def _T(x) -> list:
     return np.asarray(x, float).round(6).tolist()
+
+
+def _image_coverage(samples, wh, grid=(6, 4)) -> dict:
+    """Coarse grid of WHERE the board's detected corners landed in the image across all views —
+    the static-camera placement map (the interactive-calibration coverage idea). Empty cells are
+    regions the board never covered, so the operator knows to fill the frame corners + add tilt.
+    Returns {grid:[gx,gy], cells:[[...]], filled, total} for the Studio heatmap."""
+    W, H = (int(wh[0]) or 1, int(wh[1]) or 1)
+    gx, gy = grid
+    cells = np.zeros((gy, gx), int)
+    for s in samples:
+        for u, v in np.asarray(getattr(s, "corners", np.zeros((0, 2))), float):
+            cx = min(gx - 1, max(0, int(u / W * gx)))
+            cy = min(gy - 1, max(0, int(v / H * gy)))
+            cells[cy, cx] += 1
+    return {"grid": [gx, gy], "cells": cells.tolist(),
+            "filled": int((cells > 0).sum()), "total": int(gx * gy)}
 
 
 def build_plan(urdf_path: str) -> List[PlanItem]:
@@ -122,6 +146,7 @@ class CalibSession:
         accept_tip_mm: float = 3.0,
         accept_rot_sigma_deg: float = 0.5,
         accept_trans_sigma_mm: float = 2.0,
+        accept_static_depth_mm: float = 8.0,
     ):
         self.item = item
         self.board = board
@@ -141,6 +166,10 @@ class CalibSession:
         # cell.yaml by the service; defaults are sane for a wrist-cam eye-in-hand.
         self.accept_rot_sigma_deg = float(accept_rot_sigma_deg)
         self.accept_trans_sigma_mm = float(accept_trans_sigma_mm)
+        # A WORLD-FIXED camera has no hand-eye rotation coupling, so its weak DOF is the optical-axis
+        # (depth) translation — a near-frontal / single placement leaves it under-constrained. This is
+        # the hard depth-σ limit (mm) the static accept refuses past (unless the operator forces it).
+        self.accept_static_depth_mm = float(accept_static_depth_mm)
         # The supervised visual phase: seed (place + confirm the hand-eye seed) → collect
         # (look-at orbit) → verify (drift tracking) → done. Static cams skip seed (no chain).
         self.phase: str = "seed"
@@ -525,6 +554,21 @@ class CalibSession:
                 "worst_rot_sigma_deg": m.get("worst_rot_sigma_deg"),
                 "worst_trans_sigma_mm": m.get("worst_trans_sigma_mm")}
 
+    def _static_obs_json(self, result) -> dict:
+        """Static-camera feedback: the per-DOF camera-pose 1σ (same shape eye-in-hand emits, so the
+        Studio meter reads it unchanged), the DEPTH CAVEAT (the optical-axis translation σ dominates —
+        a near-frontal / single placement), and the image-coverage map (where to place the board next)."""
+        try:
+            o = observability(result)
+            obs = {k: round(float(v), 4) for k, v in o.items()}
+            tz = float(o["tz_mm"]); txy = max(float(o["tx_mm"]), float(o["ty_mm"]))
+            depth_caveat = bool(len(self.samples) < 2 or (tz > 2.0 and tz > 2.0 * max(txy, 1e-6)))
+            observable = bool(tz < self.accept_static_depth_mm and len(self.samples) >= 2)
+        except Exception:  # noqa: BLE001 — a near-degenerate covariance must not crash the solve
+            obs, depth_caveat, observable = None, True, False
+        return {"observability": obs, "depth_caveat": depth_caveat, "observable": observable,
+                "coverage": _image_coverage(self.samples, self.wh)}
+
     def _intrinsics_diag(self) -> dict:
         """Loud target/intrinsics diagnostics for the operator: the board-SCALE fit (far from 1.0
         ⇒ the printed marker size or the camera intrinsics are wrong), whether K was REFINED and by
@@ -550,7 +594,8 @@ class CalibSession:
             self.X_est = self.result.T_optical
             return {"type": "solve", "train_rms_px": round(self.result.residual_px, 3),
                     "scale": 1.0, "X": _T(self.result.T_optical), "board": _T(np.eye(4)),
-                    "samples": self.result.samples_used, "kind": "static", "t_lr_err_deg": None}
+                    "samples": self.result.samples_used, "kind": "static", "t_lr_err_deg": None,
+                    **self._static_obs_json(self.result)}
         # Over-parametrisation guard (10.7): the per-joint FK correction + board scale are only
         # identifiable with enough rotation-diverse poses. Fitting them on a thin set overfits
         # (absorbs noise into FK), so gate them on the sample count — a few poses solve X alone.
@@ -612,9 +657,13 @@ class CalibSession:
             sub = solve_static_camera(train, self.board.points, self.K) if len(train) >= 1 else self.result
             heldout_px = held_out_reprojection(sub, test, self.board.points, self.K, self.chain) if test else float("nan")
             passed = heldout_px == heldout_px and heldout_px < self.accept_heldout_px
-            return {"type": "validate", "heldout_px": round(float(heldout_px), 3), "tip_mm": None,
-                    "rot_worst_deg": 0.0, "observability": None, "t_lr_err_deg": None,
-                    "consensus_deg": 0.0, "n_heldout": len(test), "pass": bool(passed)}
+            out = {"type": "validate", "heldout_px": round(float(heldout_px), 3), "tip_mm": None,
+                   "rot_worst_deg": 0.0, "t_lr_err_deg": None,
+                   "consensus_deg": 0.0, "n_heldout": len(test), "pass": bool(passed)}
+            # Surface the per-DOF camera-pose σ (+ depth caveat + coverage) so the static flow has the
+            # SAME observability meter as eye-in-hand. Held-out px stays the accept gate.
+            out.update(self._static_obs_json(self.result))
+            return out
         if recollect or not self.heldout:
             self.heldout = []
             for _ in range(n_heldout):
@@ -667,6 +716,16 @@ class CalibSession:
         """Solve on the running set so the operator sees the per-DOF observability meter
         WHILE collecting (which axes are still weak → what motion to add). Cheap, no arm
         motion; needs a few poses to be meaningful."""
+        if self.static:
+            # World-fixed camera: a pooled PnP gives the per-DOF camera-pose σ + the coverage map
+            # live, so the operator sees the depth caveat clear as they add varied placements.
+            if len(self.samples) < 2:
+                return {"type": "observe", "ready": False, "collected": len(self.samples)}
+            r = solve_static_camera(self.samples, self.board.points, self.K)
+            self.result = r
+            self.X_est = r.T_optical
+            return {"type": "observe", "ready": True, "collected": len(self.samples),
+                    "train_rms_px": round(r.residual_px, 3), **self._static_obs_json(r)}
         if len(self.samples) < max(6, self.min_corners):
             return {"type": "observe", "ready": False, "collected": len(self.samples)}
         n = len(self.samples)
@@ -793,6 +852,19 @@ class CalibSession:
                                      "poses (translation under-constrained)", **self._obs_json(self.result)}
                 warning = ("saved while UNDER-OBSERVED — the translation is under-constrained; "
                            "collect more rotation-diverse poses before relying on it")
+        else:
+            # A world-fixed camera's weak DOF is DEPTH (the optical-axis translation): a near-frontal
+            # or single placement leaves it under-constrained. Refuse past the depth-σ limit (unless
+            # forced), the static analog of the rotation-diversity gate above.
+            sj = self._static_obs_json(self.result)
+            if not sj.get("observable"):
+                if not force:
+                    return {"type": "accept", "ok": False, "camera": self.item.camera_link,
+                            "error": "static camera pose is under-constrained along the optical axis "
+                                     "(depth) — capture the board at more varied DISTANCES and TILTS",
+                            "observability": sj.get("observability"), "depth_caveat": sj.get("depth_caveat")}
+                warning = ("saved while DEPTH-UNDER-CONSTRAINED — the camera's distance is uncertain; "
+                           "add board placements at more varied distances/tilts before relying on it")
         body_optical = inv_T(self.item.nominal_flange_body) @ self.result.T_optical
         dst = urdf_io.write_calibrated_optical(urdf_path, self.item.camera_link, body_optical,
                                                out_path=out_path, provenance=provenance)
@@ -890,15 +962,37 @@ def _write_hand_eye_summary(calib_dir: str, camera: str, flange: str, kind: str,
     (Path(calib_dir) / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def _b2b_obs_json(result: CalibResult) -> dict:
+    """The per-DOF 1σ of T_baseA_baseB (the SAME shape eye-in-hand emits, so the Studio's
+    ObservabilityMeter + mapObs read it unchanged) + which DOF is least observed."""
+    try:
+        o = observability(result)
+    except Exception:  # noqa: BLE001 — a near-degenerate covariance must not crash the solve
+        return {"observability": None, "weak_rot_axis": None, "worst_trans_axis": None}
+    trans = {"x": o["tx_mm"], "y": o["ty_mm"], "z": o["tz_mm"]}
+    worst_trans = max(trans, key=trans.get)
+    try:
+        weak = np.asarray(weak_rotation_axis(result), float).round(3).tolist()
+    except Exception:  # noqa: BLE001
+        weak = None
+    return {"observability": {k: round(float(v), 4) for k, v in o.items()},
+            "weak_rot_axis": weak, "worst_trans_axis": worst_trans}
+
+
 class BaseToBaseSession:
     """Dual-arm base-to-base (Pillar/variant 3). Both arms' wrist cams are already
     calibrated eye-in-hand (X_a, X_b); the operator places ONE board both cams can see, and
-    for each capture both arms view it. solve_base_to_base recovers T_baseA_baseB from the
-    shared sightings — matrix algebra, no nonlinear solve. Reuses the per-arm bridges."""
+    for each capture both arms view it. `solve_base_to_base_bundle` recovers T_baseA_baseB
+    AND its covariance from the shared sightings, so this flow has the SAME error feedback as
+    eye-in-hand: an inter-arm-agreement (mm) headline, a per-DOF observability meter, held-out
+    generalization, a fresh-placement verify, and an observability accept gate. Reuses the
+    per-arm bridges."""
 
     def __init__(self, item: PlanItem, board: BoardModel, K: np.ndarray,
                  chain_a: Chain, chain_b: Chain, bridge_a, bridge_b,
-                 X_a: np.ndarray, X_b: np.ndarray):
+                 X_a: np.ndarray, X_b: np.ndarray, *,
+                 accept_agreement_mm: float = 3.0,
+                 accept_rot_sigma_deg: float = 0.5, accept_trans_sigma_mm: float = 2.0):
         self.item = item
         self.board = board
         self.K = np.asarray(K, float)
@@ -906,49 +1000,147 @@ class BaseToBaseSession:
         self.bridge_a, self.bridge_b = bridge_a, bridge_b
         self.X_a, self.X_b = np.asarray(X_a, float), np.asarray(X_b, float)
         self.obs: List[dict] = []
-        self.result: Optional[np.ndarray] = None
+        self.result: Optional[CalibResult] = None
         self.min_corners = int(board.min_points)
+        self.accept_agreement_mm = float(accept_agreement_mm)
+        self.accept_rot_sigma_deg = float(accept_rot_sigma_deg)
+        self.accept_trans_sigma_mm = float(accept_trans_sigma_mm)
 
-    def capture(self) -> dict:
-        """Both arms view the shared board once; store (joints, camera->board) for each."""
+    def _capture_obs(self) -> Optional[dict]:
+        """Both arms view the shared board once → (joints, camera->marker) per arm, or None if
+        either camera misses it. Shared by capture / verify."""
         ida, uva = self.bridge_a.capture()
         idb, uvb = self.bridge_b.capture()
         if len(ida) < self.min_corners or len(idb) < self.min_corners:
-            return {"type": "b2b_capture", "accepted": False, "n_a": int(len(ida)), "n_b": int(len(idb)),
-                    "collected": len(self.obs)}
+            return None
         sa = CaptureSample(id=0, joints=self.bridge_a.read_joints(), fk_pose=self.bridge_a.read_pose(),
                            corner_ids=ida, corners=uva)
         sb = CaptureSample(id=0, joints=self.bridge_b.read_joints(), fk_pose=self.bridge_b.read_pose(),
                            corner_ids=idb, corners=uvb)
-        self.obs.append({
+        return {
             "joints_a": sa.joints, "T_ca_marker": _estimate_target_pose(sa, self.board.points, self.K),
             "joints_b": sb.joints, "T_cb_marker": _estimate_target_pose(sb, self.board.points, self.K),
-        })
-        return {"type": "b2b_capture", "accepted": True, "n_a": int(len(ida)), "n_b": int(len(idb)),
+            "_n_a": int(len(ida)), "_n_b": int(len(idb)),
+        }
+
+    def capture(self) -> dict:
+        o = self._capture_obs()
+        if o is None:
+            return {"type": "b2b_capture", "accepted": False, "n_a": 0, "n_b": 0,
+                    "collected": len(self.obs)}
+        n_a, n_b = o.pop("_n_a"), o.pop("_n_b")
+        self.obs.append(o)
+        return {"type": "b2b_capture", "accepted": True, "n_a": n_a, "n_b": n_b,
                 "collected": len(self.obs)}
+
+    def _bundle(self, obs: List[dict]) -> CalibResult:
+        return solve_base_to_base_bundle(obs, self.X_a, self.X_b, self.chain_a, self.chain_b,
+                                         self.board.points)
+
+    def observe(self) -> dict:
+        """Live feedback during collection (the b2b analog of CalibSession.observe): once ≥2
+        shared views exist, bundle-solve and report inter-arm agreement (mm) + the per-DOF
+        observability meter + the weakest DOF — so the operator watches the error shrink and
+        knows what placement to add. Cheap, no arm motion."""
+        if len(self.obs) < 2:
+            return {"type": "b2b_observe", "ready": False, "collected": len(self.obs)}
+        self.result = self._bundle(self.obs)
+        return {"type": "b2b_observe", "ready": True, "collected": len(self.obs),
+                "agreement_mm": round(float(self.result.metrics.get("agreement_mm", float("nan"))), 3),
+                **_b2b_obs_json(self.result)}
 
     def solve(self) -> dict:
         if len(self.obs) < 2:
             return {"type": "b2b_solve", "error": "need >=2 shared-board captures"}
-        from .solve import solve_base_to_base
-        self.result = solve_base_to_base(self.obs, self.X_a, self.X_b, self.chain_a, self.chain_b)
-        # spread of the per-obs transforms = a self-consistency quality (deg)
-        ts = [solve_base_to_base([o], self.X_a, self.X_b, self.chain_a, self.chain_b) for o in self.obs]
         from .geometry import transform_geodesic
-        spread = max((transform_geodesic(self.result, t)[0] for t in ts), default=0.0)
-        return {"type": "b2b_solve", "T_base_to_base": _T(self.result),
-                "captures": len(self.obs), "consensus_deg": round(float(spread), 3)}
+        from .solve import solve_base_to_base
+        self.result = self._bundle(self.obs)
+        T_AB = self.result.T_optical
+        agreement_mm = float(self.result.metrics.get("agreement_mm", float("nan")))
+        # Self-consistency: spread of the per-obs closed-form solves vs the bundle (rotation deg
+        # AND translation mm) — a free quality signal alongside the covariance.
+        ts = [solve_base_to_base([o], self.X_a, self.X_b, self.chain_a, self.chain_b) for o in self.obs]
+        spreads = [transform_geodesic(T_AB, t) for t in ts]
+        cons_deg = max((s[0] for s in spreads), default=0.0)
+        cons_trans_mm = max((s[1] for s in spreads), default=0.0) * 1000.0
+        obsj = _b2b_obs_json(self.result)
+        observable = bool(obsj.get("observability") and self._observable())
+        return {"type": "b2b_solve", "T_base_to_base": _T(T_AB), "captures": len(self.obs),
+                "agreement_mm": round(agreement_mm, 3), "consensus_deg": round(float(cons_deg), 3),
+                "consensus_trans_mm": round(float(cons_trans_mm), 3), "observable": observable,
+                **obsj}
+
+    def _observable(self) -> bool:
+        if self.result is None:
+            return False
+        try:
+            ok, _ = well_observed(self.result, rot_sigma_deg=self.accept_rot_sigma_deg,
+                                  trans_sigma_mm=self.accept_trans_sigma_mm)
+            return bool(ok)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def validate(self, n_heldout: int = 0) -> dict:
+        """Accept gate: inter-arm agreement on shared views HELD OUT of the fit (generalization,
+        not the training residual) + the observability gate. NaN held-out (too few views) falls
+        back to the training agreement so a small set still reports honestly."""
+        if len(self.obs) < 2:
+            return {"type": "b2b_validate", "error": "need >=2 shared-board captures"}
+        if self.result is None:
+            self.result = self._bundle(self.obs)
+        held = heldout_interarm_agreement_mm(self.obs, self.X_a, self.X_b, self.chain_a,
+                                             self.chain_b, self.board.points, n_test=n_heldout)
+        train_mm = float(self.result.metrics.get("agreement_mm", float("nan")))
+        score = held if held == held else train_mm   # NaN-safe: fall back to training agreement
+        observable = self._observable()
+        passed = bool(score == score and score < self.accept_agreement_mm and observable)
+        return {"type": "b2b_validate",
+                "heldout_agreement_mm": None if held != held else round(float(held), 3),
+                "agreement_mm": round(train_mm, 3), "observable": observable,
+                "n_heldout": (max(1, len(self.obs) // 3) if n_heldout <= 0 else n_heldout),
+                "pass": passed, **_b2b_obs_json(self.result)}
+
+    def verify(self) -> dict:
+        """The fresh-placement check (the b2b analog of the visual verify): the operator moves
+        the board to a NEW spot both cams see; we capture it WITHOUT adding it to the fit and
+        report the inter-arm agreement (mm) there. A correct T_AB agrees everywhere; an
+        under-observed one drifts at the unseen placement."""
+        if self.result is None:
+            return {"type": "b2b_verify", "ok": False, "reason": "solve first", "tracks": False}
+        o = self._capture_obs()
+        if o is None:
+            return {"type": "b2b_verify", "ok": False, "reason": "both cameras must see the board",
+                    "tracks": False}
+        o.pop("_n_a", None); o.pop("_n_b", None)
+        mm = interarm_agreement_mm(self.result.T_optical, [o], self.X_a, self.X_b,
+                                   self.chain_a, self.chain_b, self.board.points)
+        return {"type": "b2b_verify", "ok": True, "tracks": bool(mm < self.accept_agreement_mm),
+                "agreement_mm": round(float(mm), 3), "thresh_mm": self.accept_agreement_mm}
 
     def accept(self, calib_dir: str, urdf_path: Optional[str] = None,
-               out_path: Optional[str] = None) -> dict:
+               out_path: Optional[str] = None, force: bool = False) -> dict:
         import json
         assert self.result is not None
+        T_AB = self.result.T_optical
+        # OBSERVABILITY ACCEPT GATE: refuse an under-observed base-to-base (the dual-arm analog of
+        # the eye-in-hand 2x-translation guard) unless `force` (the operator SAVE override), which
+        # writes it with a warning instead.
+        warning = None
+        observable = self._observable()
+        if not observable:
+            if not force:
+                return {"type": "b2b_accept", "ok": False, "error": "base-to-base is not observable "
+                        "— place the shared marker at more varied positions/orientations in the "
+                        "overlap (the transform is under-constrained)", **_b2b_obs_json(self.result)}
+            warning = ("saved while UNDER-OBSERVED — the inter-arm transform is under-constrained; "
+                       "collect more varied shared placements before relying on it")
         Path(calib_dir).mkdir(parents=True, exist_ok=True)
         dst = str(Path(calib_dir) / "base_to_base.json")
         Path(dst).write_text(json.dumps({
-            "kind": "base_to_base", "T_base_to_base": _T(self.result),
+            "kind": "base_to_base", "T_base_to_base": _T(T_AB),
             "arm_a": self.item.partner_camera, "arm_b": self.item.secondary_camera,
             "captures": len(self.obs),
+            "agreement_mm": round(float(self.result.metrics.get("agreement_mm", float("nan"))), 4),
         }, indent=2), encoding="utf-8")
         # BAKE it into the URDF too: place arm B's base at its CALIBRATED pose relative to arm A, so the
         # motion planner's two arms are in their true relative pose (the JSON alone is consumed nowhere).
@@ -958,7 +1150,11 @@ class BaseToBaseSession:
             try:
                 from .bake import apply_base_to_base
                 baked = apply_base_to_base(urdf, self.item.partner_camera, self.item.secondary_camera,
-                                           self.result)
+                                           T_AB)
             except Exception as e:  # noqa: BLE001 — never block the save on the URDF write; report it
                 baked = {"error": f"{type(e).__name__}: {e}"}
-        return {"type": "b2b_accept", "path": dst, "T_base_to_base": _T(self.result), "urdf": baked}
+        out = {"type": "b2b_accept", "ok": True, "path": dst, "T_base_to_base": _T(T_AB),
+               "urdf": baked, **_b2b_obs_json(self.result)}
+        if warning:
+            out["warning"] = warning
+        return out

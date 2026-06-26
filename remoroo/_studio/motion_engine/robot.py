@@ -77,6 +77,29 @@ def load_spheres(cell_dir: str) -> Tuple[Dict[str, List[dict]], float]:
     return spheres, buffer
 
 
+def extract_self_collision_ignore(cfg: dict) -> Dict[str, List[str]]:
+    """The AUTHORED self-collision ignore matrix `{link: [links...]}`, wherever it lives in the file.
+    The spheres gate writes cuRobo's COMPLETE matrix (RobotBuilder.compute_collision_matrix —
+    neighbour + default-config + sample-pruned) here; the planner prefers it over re-generating."""
+    kin = _kinematics(cfg)
+    ig = kin.get("self_collision_ignore") or cfg.get("self_collision_ignore") or {}
+    if not isinstance(ig, dict):
+        return {}
+    return {str(k): [str(x) for x in (v or [])] for k, v in ig.items()}
+
+
+def load_self_collision_ignore(cell_dir: str) -> Dict[str, List[str]]:
+    """Read the gate-authored self-collision ignore matrix from `collision_spheres.yml` (empty if the
+    file predates the matrix-authoring gate — the stack then regenerates it via cuRobo)."""
+    p = Path(cell_dir) / "robot_model" / "collision_spheres.yml"
+    if not p.exists():
+        return {}
+    try:
+        return extract_self_collision_ignore(_load_yaml(p))
+    except Exception:  # noqa: BLE001 — a malformed matrix must never block the build; regenerate instead
+        return {}
+
+
 def actuated_joints(urdf_path: str) -> List[str]:
     """Every INDEPENDENT actuated joint in the URDF (non-fixed, non-mimic) — including ones not in
     any group (e.g. a gripper's `drive_joint`). cuRobo expects ALL of these in the robot cspace

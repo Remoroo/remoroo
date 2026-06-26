@@ -109,6 +109,40 @@ def fiducial_consistency_mm(
     return float(np.sqrt(np.mean(np.sum((P - P.mean(0)) ** 2, axis=1))) * 1000.0)
 
 
+def interarm_agreement_mm(
+    T_AB: np.ndarray, obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray,
+    chain_a: Chain, chain_b: Chain, board_points: np.ndarray,
+    *, fk_a=None, fk_b=None,
+) -> float:
+    """The base-to-base TASK-SPACE accuracy (the headline number): RMS Euclidean error (mm)
+    between the shared marker's corners as arm A sees them and where arm B's sighting predicts
+    them after T_baseA_baseB. This is exactly 'if arm A reaches the shared point, how far off
+    is arm B' — the dual-arm analog of tip-landing. Equals the bundle residual RMS."""
+    from .solve import _b2b_corner_pairs
+    PA, PB = _b2b_corner_pairs(obs, X_a, X_b, chain_a, chain_b, board_points, fk_a=fk_a, fk_b=fk_b)
+    if PA.shape[0] == 0:
+        return float("nan")
+    d = PA - transform_points(np.asarray(T_AB, float), PB)
+    return float(np.sqrt(np.mean(np.sum(d ** 2, axis=1))) * 1000.0)
+
+
+def heldout_interarm_agreement_mm(
+    obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
+    board_points: np.ndarray, *, n_test: int = 0,
+) -> float:
+    """Generalisation of the base-to-base solve: fit T_AB on a subset of the shared views and
+    score inter-arm agreement (mm) on the held-OUT ones — the b2b analog of held-out
+    reprojection. NaN when there aren't enough views to split."""
+    from .solve import solve_base_to_base_bundle
+    n = len(obs)
+    if n < 4:
+        return float("nan")
+    k = max(1, n // 3) if n_test <= 0 else int(n_test)
+    train, test = list(obs[: n - k]), list(obs[n - k:])
+    res = solve_base_to_base_bundle(train, X_a, X_b, chain_a, chain_b, board_points)
+    return interarm_agreement_mm(res.T_optical, test, X_a, X_b, chain_a, chain_b, board_points)
+
+
 def reprojection_detail(
     result: CalibResult,
     samples: Sequence[CaptureSample],

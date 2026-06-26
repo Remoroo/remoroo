@@ -364,6 +364,27 @@ def solve_eye_in_hand(
     return result
 
 
+class _StaticProblem:
+    """A world-fixed camera localized by pooled PnP: params are [rotvec(3), trans(3)] of the
+    board->camera pose, residual is the reprojection over ALL pooled corners (px). Stashed on
+    the result so `metrics.observability` gives the per-DOF camera-pose σ for free — the
+    optical-axis (depth) translation is the loud weak DOF when the board is near-frontal /
+    one placement. The [rotvec, trans] layout is the one the covariance metrics slice."""
+
+    def __init__(self, pts: np.ndarray, uv: np.ndarray, K: np.ndarray):
+        self.pts = np.asarray(pts, float)
+        self.uv = np.asarray(uv, float)
+        self.K = np.asarray(K, float)
+        self.nparams = 6
+
+    def residual(self, x: np.ndarray) -> np.ndarray:
+        T = make_T(rodrigues(x[:3]), x[3:])
+        return (project(self.K, transform_points(T, self.pts)) - self.uv).ravel()
+
+    def x0_from(self, T: np.ndarray) -> np.ndarray:
+        return np.concatenate([rotvec_from_R(T[:3, :3]), T[:3, 3]])
+
+
 def solve_static_camera(
     views: Sequence[CaptureSample],
     board_points: np.ndarray,
@@ -378,25 +399,27 @@ def solve_static_camera(
     that pools ALL views' corners (the board is one fixed placement, so every view shares the
     same board->camera). Result `T_optical` = board->camera = world->optical (board = world
     origin). If the operator moved the board between views, held-out reprojection blows up —
-    the honest signal to keep it fixed. No kinematics, no FK correction."""
+    the honest signal to keep it fixed. No kinematics, no FK correction. The bundle problem is
+    stashed on the result so the covariance/observability meter works (the depth caveat)."""
     pts = np.concatenate([np.asarray(board_points)[v.corner_ids] for v in views])
     uv = np.concatenate([np.asarray(v.corners, float) for v in views])
     T0 = _estimate_target_pose(views[0], board_points, K)     # PnP init from the first view
-
-    def resid(x):
-        T = make_T(rodrigues(x[:3]), x[3:])
-        return (project(K, transform_points(T, pts)) - uv).ravel()
-
-    x0 = np.concatenate([rotvec_from_R(T0[:3, :3]), T0[:3, 3]])
-    res = least_squares(resid, x0, loss="huber" if robust else "linear", f_scale=f_scale,
+    prob = _StaticProblem(pts, uv, K)
+    x0 = prob.x0_from(T0)
+    res = least_squares(prob.residual, x0, loss="huber" if robust else "linear", f_scale=f_scale,
                         method="trf", max_nfev=400)
     T = make_T(rodrigues(res.x[:3]), res.x[3:])
     rms = float(np.sqrt(np.mean(res.fun ** 2))) if res.fun.size else 0.0
-    return CalibResult(
+    result = CalibResult(
         T_optical=T, T_board=np.eye(4), fk_offsets=np.zeros(0), board_scale=1.0,
         residual_px=rms, samples_used=len(views), kind="static",
-        converged=bool(res.success), message=str(res.message), metrics={"train_rms_px": rms},
+        converged=bool(res.success), message=str(res.message),
+        K=np.asarray(K, float), metrics={"train_rms_px": rms},
     )
+    # Stash the problem + solution for the covariance metrics (per-DOF camera-pose σ).
+    result._problem = prob   # type: ignore[attr-defined]
+    result._x = res.x        # type: ignore[attr-defined]
+    return result
 
 
 def solve_base_to_base(
@@ -428,3 +451,84 @@ def solve_base_to_base(
         raise ValueError("base_to_base needs at least one shared-marker observation")
     from .geometry import average_transforms
     return average_transforms(Ts)
+
+
+# --------------------------------------------------------------------------- #
+# Base-to-base bundle (covariance-bearing) — the dual-arm analog of            #
+# solve_eye_in_hand: refine T_AB and carry the Fisher information for metrics. #
+# --------------------------------------------------------------------------- #
+def _b2b_corner_pairs(
+    obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
+    board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None, fk_b: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """The shared marker's board CORNERS reconstructed in BOTH arms' base frames. Returns
+    (PA, PB), each (N,3): PA[k] is corner k as arm A's wrist cam saw it mapped into baseA,
+    PB[k] the SAME physical corner as arm B's cam saw it mapped into baseB. A correct
+    T_baseA_baseB maps every PB onto its PA, so `PA - T_AB·PB` is the inter-arm disagreement
+    (the task-space metric AND the bundle residual). Using the marker's CORNERS (the full
+    pose, a spanning plane) — not just its origin — pins T_AB's rotation from one placement."""
+    fa = np.zeros(chain_a.n) if fk_a is None else np.asarray(fk_a, float)
+    fb = np.zeros(chain_b.n) if fk_b is None else np.asarray(fk_b, float)
+    P = np.asarray(board_points, float)
+    PA: List[np.ndarray] = []
+    PB: List[np.ndarray] = []
+    for o in obs:
+        TA = chain_a.fk(np.asarray(o["joints_a"], float) + fa) @ X_a @ np.asarray(o["T_ca_marker"], float)
+        TB = chain_b.fk(np.asarray(o["joints_b"], float) + fb) @ X_b @ np.asarray(o["T_cb_marker"], float)
+        PA.append(transform_points(TA, P))
+        PB.append(transform_points(TB, P))
+    if not PA:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    return np.concatenate(PA), np.concatenate(PB)
+
+
+class _B2BProblem:
+    """The base-to-base bundle: parameters are T_baseA_baseB as [rotvec(3), trans(3)] (the
+    layout `metrics.observability` slices into deg/mm), residual is the 3D disagreement
+    `PA - T_AB·PB` over every shared corner (metres). Stashed on the result so the covariance
+    metrics (observability / well_observed / weak_rotation_axis) read it with no changes."""
+
+    def __init__(self, PA: np.ndarray, PB: np.ndarray):
+        self.PA = np.asarray(PA, float)
+        self.PB = np.asarray(PB, float)
+        self.nparams = 6
+
+    def residual(self, x: np.ndarray) -> np.ndarray:
+        T = make_T(rodrigues(x[:3]), x[3:])
+        return (self.PA - transform_points(T, self.PB)).ravel()
+
+    def x0_from(self, T: np.ndarray) -> np.ndarray:
+        return np.concatenate([rotvec_from_R(T[:3, :3]), T[:3, 3]])
+
+
+def solve_base_to_base_bundle(
+    obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
+    board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None,
+    fk_b: Optional[np.ndarray] = None, robust: bool = True, f_scale: float = 0.005,
+) -> CalibResult:
+    """Refine T_baseA_baseB with a small bundle that minimises the shared marker's corner
+    disagreement across both arms (init from the closed-form average). Returns a CalibResult
+    (kind 'base_to_base', `T_optical` = T_AB) carrying the bundle problem for the covariance
+    metrics — the dual-arm analog of solve_eye_in_hand. `metrics['agreement_mm']` is the RMS
+    inter-arm point error (the headline task-space number)."""
+    T0 = solve_base_to_base(obs, X_a, X_b, chain_a, chain_b, fk_a=fk_a, fk_b=fk_b)
+    PA, PB = _b2b_corner_pairs(obs, X_a, X_b, chain_a, chain_b, board_points, fk_a=fk_a, fk_b=fk_b)
+    prob = _B2BProblem(PA, PB)
+    x0 = prob.x0_from(T0)
+    if PA.shape[0] >= 1:
+        res = least_squares(prob.residual, x0, loss="huber" if robust else "linear",
+                            f_scale=f_scale, method="trf", max_nfev=200)
+        x, r, success, msg = res.x, res.fun, bool(res.success), str(res.message)
+    else:
+        x, r, success, msg = x0, np.zeros(0), False, "no observations"
+    T_AB = make_T(rodrigues(x[:3]), x[3:])
+    d = PA - transform_points(T_AB, PB) if PA.shape[0] else np.zeros((0, 3))
+    agreement_mm = float(np.sqrt(np.mean(np.sum(d ** 2, axis=1))) * 1000.0) if d.shape[0] else float("nan")
+    result = CalibResult(
+        T_optical=T_AB, T_board=np.eye(4), fk_offsets=np.zeros(0), board_scale=1.0,
+        residual_px=0.0, samples_used=len(obs), kind="base_to_base",
+        converged=success, message=msg, metrics={"agreement_mm": agreement_mm},
+    )
+    result._problem = prob   # type: ignore[attr-defined]
+    result._x = x            # type: ignore[attr-defined]
+    return result

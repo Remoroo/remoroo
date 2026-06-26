@@ -23,4 +23,9 @@ def _build(item, ctx: StepContext) -> BaseToBaseSession:
         ctx.chain_provider(pa.flange_link), ctx.chain_provider(pb.flange_link),
         ctx.bridge_factory(pa), ctx.bridge_factory(pb),
         ra.T_optical, rb.T_optical,
+        # the task-space agreement gate reuses the tip-landing mm budget; the observability gate
+        # reuses the same per-DOF σ limits as the supervised cameras (operator-tuned in cell.yaml).
+        accept_agreement_mm=ctx.accept_tip_mm,
+        accept_rot_sigma_deg=ctx.accept_rot_sigma_deg,
+        accept_trans_sigma_mm=ctx.accept_trans_sigma_mm,
     )

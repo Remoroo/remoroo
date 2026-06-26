@@ -380,6 +380,29 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self._json({"spheres": [], "error": f"{type(e).__name__}: {e}"})
             return
+        # The spheres gate's CHECK report (per-link coverage metrics + the self-collision audit
+        # verdict + named phantom pairs) the agent writes alongside collision_spheres.yml. The Studio
+        # renders it so the operator approves on evidence, not by eyeballing.
+        if path == "/project/spheres/report" and self.command == "GET":
+            f = PROJECT / "remoroo_cell" / "robot_model" / "spheres_report.json"
+            if not f.exists():
+                self._json({}); return
+            try:
+                self._json(json.loads(f.read_text()))
+            except Exception as e:  # noqa: BLE001
+                self._json({"error": f"{type(e).__name__}: {e}"})
+            return
+        # Live progress of the (slow, on-edge) MorphIt fit — the agent writes {link_i, n, link} per
+        # link so the gate shows "fitting 12/30" instead of a hung window. Stale once the fit finishes.
+        if path == "/project/spheres/progress" and self.command == "GET":
+            f = PROJECT / "remoroo_cell" / "robot_model" / "spheres_progress.json"
+            if not f.exists():
+                self._json({}); return
+            try:
+                self._json(json.loads(f.read_text()))
+            except Exception as e:  # noqa: BLE001
+                self._json({"error": f"{type(e).__name__}: {e}"})
+            return
         # Serve the PERSISTED model (robot_model/robot.urdf) + its meshes so the
         # studio can AUTOLOAD the full geometry from the repo on reopen — instead
         # of losing the URDF/meshes (blobs are in-browser only).

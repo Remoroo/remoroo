@@ -637,6 +637,26 @@ class CuroboV2Planner:
         q = self._collision_checker().sample(int(n), mask_valid=True)
         return q.detach().cpu().numpy().reshape(-1, len(self.planner.joint_names))
 
+    def validate_samples(self, n: int) -> dict:
+        """Sweep `n` UNIFORM in-limit configs (cuRobo's bounded sampler) and `validate` each — the
+        'many many joint states' self-collision check. With this planner's EMPTY world the verdict is
+        self-collision + bounds only, so (bounded samples ⇒ bounds rarely fail) the invalid fraction is
+        effectively the self-collision rate. Returns the free fraction + ONE colliding config (joint
+        dict) so the caller can name the offending link pairs at a sampled state. GPU-batched ⇒ cheap."""
+        import torch
+        checker = self._collision_checker()
+        names = list(self.planner.joint_names)
+        q = checker.sampler.get_samples(int(n), bounded=True).view(int(n), len(names))  # [n, dof]
+        mask = checker.validate(q.unsqueeze(1)).view(-1)                                # [n] bool (valid)
+        free = float(mask.float().mean().item())
+        worst = None
+        invalid = (~mask).nonzero().view(-1)
+        if invalid.numel() > 0:
+            vals = q[int(invalid[0].item())].detach().cpu().numpy().reshape(-1)
+            worst = {nm: float(vals[i]) for i, nm in enumerate(names)}
+        return {"n": int(n), "free_fraction": free, "self_collision_fraction": 1.0 - free,
+                "joint_names": names, "worst_colliding": worst}
+
     def joint_limits(self) -> Dict[str, Tuple[float, float]]:
         """{joint: (min, max)} position limits over the planner's active joints — to catch a START
         config that's outside limits (a non-self-collision reason planning finds nothing)."""

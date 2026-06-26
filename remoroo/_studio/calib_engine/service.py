@@ -118,12 +118,16 @@ class CalibService:
                     "flange_link": item.flange_link, "id": item.id or item.camera_link}
 
         # base_to_base verbs run against the dedicated dual-arm session
-        if verb in ("b2b_capture", "b2b_solve", "b2b_accept"):
+        if verb in ("b2b_capture", "b2b_observe", "b2b_solve", "b2b_validate", "b2b_verify", "b2b_accept"):
             if self.b2b is None:
                 return {"error": "select the base_to_base item first"}
-            if verb == "b2b_capture":  return self.b2b.capture()
-            if verb == "b2b_solve":    return self.b2b.solve()
-            return self.b2b.accept(self.calib_dir or ".", urdf_path=self.urdf_path, out_path=self.out_urdf)
+            if verb == "b2b_capture":   return self.b2b.capture()
+            if verb == "b2b_observe":   return self.b2b.observe()
+            if verb == "b2b_solve":     return self.b2b.solve()
+            if verb == "b2b_validate":  return self.b2b.validate(n_heldout=int(body.get("n_heldout", 0)))
+            if verb == "b2b_verify":    return self.b2b.verify()
+            return self.b2b.accept(self.calib_dir or ".", urdf_path=self.urdf_path,
+                                   out_path=self.out_urdf, force=bool(body.get("force", False)))
 
         s = self.session
         if s is None:
