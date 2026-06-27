@@ -1322,77 +1322,55 @@ class MotionStack:
         return {"n_pairs": len(pairs), "pairs": pairs[:top], "spheres": spheres,
                 "all_adjacent": bool(pairs) and all(p["adjacent"] for p in pairs)}
 
-    def audit_self_collision(self, tcp: Optional[str] = None, *, n: int = 2000,
-                             free_fraction_fail: float = 0.10,
-                             free_fraction_warn: float = 0.30) -> dict:
-        """CHECK 2 (spheres gate) — is the ASSEMBLED, FK-posed sphere model PLANNABLE and free of
-        PHANTOM self-collisions, sampled over many joint states? A valid robot self-collides at plenty
-        of real configs (folded elbow), so we never fail on "collides somewhere" — we test three things:
-
-          • home_free        the known-safe / current pose MUST be self-collision-free (empty world ⇒
-                             a non-free verdict is self/bounds). FALSE ⇒ a missing ignore pair, over-fat
-                             spheres (scale / buffer), or two chains modelled overlapping. HARD gate.
-          • free_fraction    fraction of N uniform in-limit configs that are collision-free+in-bounds.
-                             Near-zero ⇒ the model is over-constrained (phantom collisions everywhere)
-                             ⇒ planning will fail. HARD gate below `free_fraction_fail`.
-          • phantom_pairs    of the pairs that DO collide (at home + the worst sampled config), which are
-                             parent↔child ADJACENT (the ignore matrix should have covered them = a defect
-                             to fix) vs apart (a real, config-dependent collision = expected, leave it).
-
-        Runs against an EMPTY world (so the verdict is self+bounds only) using the SAME robot_cfg the
-        planner uses — including the `self_collision_buffer` cancellation and the AUTHORED ignore matrix
-        — so the audit verdict == what the planner actually sees. GPU; read-only (throwaway probe)."""
-        from .curobo_v2 import CuroboV2Planner
-        from .world import WorldInputs
-        tcp = tcp or next(iter(self._groups), None)
-        rep: dict = {"tcp": tcp, "n": int(n)}
-        if tcp is None:
-            rep["error"] = "no kinematic groups"
-            return rep
-        seed = self._seed_positions()
-        empty = WorldInputs(scene={})
+    def _link_to_group(self) -> Dict[str, str]:
+        """`{link: group_name}` — which actuated GROUP moves each link (a joint's child link belongs to
+        the group that drives it; tips too). Lets the audit tell an INTER-arm overlap (links of two
+        different groups — expected, the planner never commands it) from an INTRA-arm one (same group →
+        a real per-arm collision / over-fat spheres). Static/base links stay unmapped."""
+        from calib_engine import urdf_io
         try:
-            probe = CuroboV2Planner(self._robot_cfg_for([tcp]), empty, limits=self._limits,
-                                    max_goalset=1, warmup=False, self_collision_check=True)
-            sc = probe.world_sphere_collision(seed)            # empty world ⇒ collision_free = self+bounds
-            rep["home_free"] = bool(sc.get("collision_free"))
-            sweep = probe.validate_samples(int(n))             # GPU-batched ⇒ "many many" is cheap
-            rep["free_fraction"] = round(float(sweep.get("free_fraction", 0.0)), 4)
-            rep["self_collision_fraction"] = round(float(sweep.get("self_collision_fraction", 0.0)), 4)
-            worst_q = sweep.get("worst_colliding")             # one colliding sampled config (or None)
-        except Exception as e:  # noqa: BLE001 — surface the failure, never crash the gate
-            rep["probe_error"] = f"{type(e).__name__}: {e}"
-            return rep
+            joints = urdf_io.urdf_facts(self.urdf_path).get("joints", [])
+        except Exception:  # noqa: BLE001 — a parse hiccup just means coarser (group-blind) classification
+            joints = []
+        child_of = {j.get("name"): j.get("child") for j in joints}
+        l2g: Dict[str, str] = {}
+        for gname, g in self._groups.items():
+            for jn in g.get("joint_names", []):
+                c = child_of.get(jn)
+                if c:
+                    l2g[c] = gname
+            for t in (g.get("tip_links") or []):
+                l2g[t] = gname
+        return l2g
 
-        # Name the offending pairs at the DECISIVE config (home) and at a sampled colliding config, so
-        # the operator sees WHICH links phantom-collide across the joint space, not just a number.
-        adjacent: Dict[Tuple[str, str], dict] = {}
-        apart: Dict[Tuple[str, str], dict] = {}
-        configs = [("home", seed)]
-        if worst_q:
-            configs.append(("sampled", dict(worst_q)))
-        for where, q in configs:
-            try:
-                for p in (self.self_collision_pairs(tcp, q=q).get("pairs") or []):
-                    key = tuple(sorted(p["links"]))
-                    bucket = adjacent if p.get("adjacent") else apart
-                    cur = bucket.get(key)
-                    if cur is None or p["penetration_mm"] > cur["penetration_mm"]:
-                        bucket[key] = {"links": list(key), "penetration_mm": p["penetration_mm"],
-                                       "adjacent": bool(p.get("adjacent")), "seen_at": where}
-            except Exception as e:  # noqa: BLE001
-                rep.setdefault("pair_warn", []).append(f"{where}: {type(e).__name__}: {e}")
-        rep["phantom_pairs"] = sorted(adjacent.values(), key=lambda d: -d["penetration_mm"])
-        rep["real_pairs"] = sorted(apart.values(), key=lambda d: -d["penetration_mm"])
+    def audit_self_collision(self, *, n: int = 400, phantom_warn: float = 0.02,
+                             phantom_fail: float = 0.10) -> dict:
+        """CHECK 2 (spheres gate) — does the SPHERE model AGREE with the MESH model? Instead of asking
+        the un-answerable "how often does it self-collide?" (a valid robot self-collides at plenty of
+        real configs, so there's no good baseline), we compare cuRobo's sphere self-collision verdict to
+        the EXACT mesh verdict at the same config (the `foam` sphere-approx methodology):
+
+          • PHANTOM  spheres collide, meshes DON'T → planner blocked for nothing (over-fat spheres /
+                     missing ignore pair / two chains too close). `phantom_rate` baseline is ~0.
+          • MISS     meshes collide, spheres DON'T → planner blind to a real collision (UNSAFE).
+
+        Delegates to the PURE, unit-tested `sphere_audit` (CPU; FCL ground truth, scipy hull fallback) —
+        no cuRobo, no GPU. Uses the SAME true radii + AUTHORED ignore matrix the planner uses, so the
+        verdict == planner reality. Adds a cross-arm tag to each phantom pair (different groups ⇒ the
+        arms are modelled too close / a bad base-to-base; same group ⇒ over-fat spheres)."""
+        from . import sphere_audit
+        if not self._cell_dir:
+            return {"verdict": "warn", "error": "no cell dir on this stack — CHECK 2 needs the link "
+                    "meshes to ground-truth the spheres (build via from_cell)"}
+        rep = sphere_audit.audit(self.urdf_path, self.spheres, self._self_collision_ignore(),
+                                 pkg_root=self._cell_dir, seed=self._seed_positions(),
+                                 n=int(n), phantom_warn=phantom_warn, phantom_fail=phantom_fail)
         rep["ignore_provenance"] = self._ignore_provenance
-
-        ff = rep.get("free_fraction", 0.0)
-        if rep.get("home_free") is False or ff < free_fraction_fail or rep["phantom_pairs"]:
-            rep["verdict"] = "fail"
-        elif ff < free_fraction_warn:
-            rep["verdict"] = "warn"
-        else:
-            rep["verdict"] = "pass"
+        l2g = self._link_to_group()
+        for p in rep.get("phantom_pairs", []):
+            la, lb = p.get("links", [None, None])[:2]
+            ga, gb = l2g.get(la), l2g.get(lb)
+            p["cross_arm"] = bool(ga and gb and ga != gb)
         return rep
 
     def diagnose_plan(self, tcp: Optional[str] = None, *, delta: float = 0.05,

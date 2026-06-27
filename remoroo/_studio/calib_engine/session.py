@@ -664,6 +664,25 @@ class CalibSession:
             # SAME observability meter as eye-in-hand. Held-out px stays the accept gate.
             out.update(self._static_obs_json(self.result))
             return out
+        if self.kind == "eye_to_hand":
+            # FIXED camera, board PRESENTED by the arm (operator hand-moves it). Like the static
+            # cam, we hold out a SPLIT of the collected views rather than driving the arm to new
+            # poses (the look-at orbit assumes a MOVING camera, which this isn't). The eye-to-hand
+            # bundle re-fits on the train split; held-out reprojection on the rest is the honest gate.
+            n = len(self.samples)
+            k = max(1, min(n_heldout, n // 3))
+            train, test = self.samples[: n - k], self.samples[n - k:]
+            sub = solve_eye_in_hand(train, self.board.points, self.K, self.chain, mode="eye_to_hand") \
+                if len(train) >= self.min_corners else self.result
+            heldout_px = held_out_reprojection(sub, test, self.board.points, self.K, self.chain) \
+                if test else float("nan")
+            obs = observability(self.result)
+            passed = heldout_px == heldout_px and heldout_px < self.accept_heldout_px
+            return {"type": "validate", "heldout_px": round(float(heldout_px), 3), "tip_mm": None,
+                    "rot_worst_deg": round(obs["rot_worst_deg"], 4),
+                    "observability": {kk: round(float(v), 4) for kk, v in obs.items()},
+                    "t_lr_err_deg": None, "consensus_deg": 0.0, "n_heldout": len(test),
+                    "pass": bool(passed), **self._obs_json(self.result)}
         if recollect or not self.heldout:
             self.heldout = []
             for _ in range(n_heldout):

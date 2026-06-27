@@ -1618,6 +1618,18 @@ def _camera_intrinsics(b, camera_id: str, cal: dict):
     return _intrinsics_from_bridge(b, camera_id)
 
 
+def _arm_flange_map(cy: dict, urdf_path: str) -> dict:
+    """Map each authored arm/group → its flange (tip) URDF link, so an eye-to-hand
+    `board_source="arm"` step resolves the PRESENTING arm's chain (not the fixed camera's,
+    which has no movable joint). Empty when there's no URDF / no groups."""
+    from calib_engine import urdf_io
+    if not os.path.exists(urdf_path):
+        return {}
+    groups = urdf_io.robot_config(cy, urdf_path).get("groups", [])
+    return {str(g.get("name")): str((g.get("tip_links") or [""])[0])
+            for g in groups if (g.get("tip_links") or [])}
+
+
 def _load_pipeline(cy: dict, cal: dict, urdf_path: str):
     """The AUTHORED pipeline (remoroo_cell/calibration/pipeline.yaml) → (plan_items, targets).
     If the agent hasn't authored one yet, fall back to a URDF-derived plan bound to the cell's
@@ -1633,7 +1645,7 @@ def _load_pipeline(cy: dict, cal: dict, urdf_path: str):
         arms = [str(a.get("name") or "") for a in (cy.get("arms") or [])]
         pipeline.validate(psteps, tspecs, kinds=steps.known_kinds(), family_of=steps.family_of,
                           cameras=list({*urdf_cams, *cell_cams}), arms=arms)
-        items = pipeline.resolve_items(psteps, urdf_path)
+        items = pipeline.resolve_items(psteps, urdf_path, arm_flanges=_arm_flange_map(cy, urdf_path))
         targets = pipeline.build_targets(tspecs, fiducials.build_target)
         return items, targets
     # Fallback: no authored pipeline yet → derive the plan from the URDF, bound to the cell's
@@ -1944,7 +1956,7 @@ def _pipeline_for_ui() -> dict:
         arms = [str(a.get("name") or "") for a in (cy.get("arms") or [])]
         pipeline.validate(psteps, tspecs, kinds=steps.known_kinds(), family_of=steps.family_of,
                           cameras=list({*urdf_cams, *cell_cams}), arms=arms)
-        items = pipeline.resolve_items(psteps, urdf_path)
+        items = pipeline.resolve_items(psteps, urdf_path, arm_flanges=_arm_flange_map(cy, urdf_path))
         target_specs = {tid: {"type": t.type, "params": t.params} for tid, t in tspecs.items()}
     else:
         from calib_engine.session import build_plan

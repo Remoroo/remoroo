@@ -31,10 +31,11 @@ harness with known ground truth:
   `checkerboard` (OpenCV-version-robust, no API guessing). The engine names no fiducial:
   it consumes a `Target` (named 3D points + a detector + `min_points`) built from your
   open `{type, params}` spec, or a custom detector you register.
-- **A step-executor registry** keyed by KIND (`eye_in_hand`, `eye_to_hand`, `static`,
-  `base_to_base`, …). The engine runs whatever steps your `pipeline.yaml` declares, in
-  dependency order — it does NOT derive the plan from URDF link-name strings. Each step
-  starts from the bound camera's **nominal** URDF transform and is *refined*, not guessed.
+- **A step-executor registry** keyed by KIND (`eye_in_hand` for a wrist camera,
+  `eye_to_hand` for a fixed/world camera, `base_to_base` to tie arm bases together). The engine runs
+  whatever steps your `pipeline.yaml` declares, in dependency order — it does NOT derive the
+  plan from URDF link-name strings. Each step starts from the bound camera's **nominal** URDF
+  transform and is *refined*, not guessed.
 - **Cartesian LOOK-AT pose generation** — the camera is ORBITED on a hemisphere over the
   marker, every pose LOOKING AT it (so the marker is in frame BY CONSTRUCTION), the desired
   camera pose converted to joints by the engine's damped-least-squares IK; ranked by
@@ -162,8 +163,34 @@ steps:                         # ordered; `depends_on` gates execution + the Stu
 ```
 
 `camera`/`cameras` are the **URDF camera-link names** (what the Bridge keys on and the
-engine walks the chain to). `arm`/`arms` are the cell.yaml arm names. `kind` is one of
-`eye_in_hand` | `eye_to_hand` | `static` | `base_to_base`.
+engine walks the chain to). `arm`/`arms` are the cell.yaml arm names. `kind`:
+
+- **`eye_in_hand`** — a camera on a **moving flange** (a wrist cam). The arm moves the camera
+  over a fixed board; the engine orbits the camera look-at and solves `camera→flange`.
+- **`eye_to_hand`** — a **FIXED / world camera** (overhead, on a post, a bench cam) calibrated
+  to the **robot base**. The camera can't move, so the **arm presents the board to it**: set
+  **`board_source: arm`** and bind the **presenting arm** (`arm:`); the operator mounts the board
+  on that arm's gripper and **hand-moves the arm** to show the board to the camera from many
+  angles & distances (no look-at orbit — the camera is fixed). Solves **`base→camera`**, the
+  transform every downstream consumer needs.
+- **`base_to_base`** — relates **two** arms' bases via a marker both their wrist cams see (gated
+  on those two `eye_in_hand` steps). A rig with **N** arms needs **N−1** of these to span every
+  base (2 arms → 1, 3 arms → 2, a humanoid's limbs → one per extra limb) — never assume two.
+
+> **A fixed/world camera ALWAYS uses `eye_to_hand` with `board_source: arm` + a presenting arm.**
+> Do **NOT** use `kind: static`, and do **NOT** author `eye_to_hand` without `board_source: arm`:
+> those only LOCALIZE the camera against a hand-placed board (camera↔board), they never relate it
+> to the robot base, and Remoroo has **no use** for that. If a fixed camera has no arm that can
+> present a board into its view, raise it as a `gate_checkpoint` PROBLEM — don't fall back to
+> board-localization.
+
+```yaml
+# a single arm + a FIXED overhead camera: arm_1 presents the board to cam_oh → base→camera
+steps:
+  - { id: a1c1, kind: eye_in_hand, arm: arm_1, camera: cam_1,  target: big_tag }
+  - { id: oh,   kind: eye_to_hand, arm: arm_1, camera: cam_oh, target: big_tag,
+      board_source: arm }
+```
 
 **Targets — shipped library, no fiducial named in your code.** Most rigs need nothing more
 than the `{type, params}` spec above (`single_aruco`, `charuco`, `apriltag`, `aruco_grid`,
@@ -218,12 +245,12 @@ overlay shows the board not-seen before any motion), not silently.
    intrinsics → camera not reporting `obs.intrinsics`; target not seen → wrong
    `calibration.target` or pipeline binding), **fix the Bridge / pipeline / target
    yourself** and **re-issue the same checkpoint**. Never tell the operator to edit code.
-5. For **dual-arm**, the pipeline's two eye-in-hand steps run first, then the
-   **base-to-base** step (gated on both being accepted): place ONE target both cams see
-   and capture a few shared
-   views — the engine recovers the transform between the arms' bases (matrix algebra,
-   no extra solve) and writes `calibration/base_to_base.json`, which cuRobo uses
-   alongside the operator's URDF layout (see `robot_model.md`).
+5. For **multiple arms**, the eye-in-hand steps run first, then **each** `base_to_base`
+   step (each gated on its two eye-in-hand steps — a rig with N arms has N−1 of them): place
+   ONE target both of that step's cams see and capture a few shared views — the engine recovers
+   the transform between those two bases (matrix algebra, no extra solve) and accumulates them in
+   `calibration/base_to_base.json`, which cuRobo uses alongside the operator's URDF layout
+   (see `robot_model.md`).
 6. **Time-sync / payload sysid** (camera↔arm latency, tool mass/COM) are recorded
    for the recorder + controller where the cell needs them — small, separate from
    the hand-eye solve.
@@ -235,7 +262,7 @@ remoroo_cell/
   calibration/<camera>.json        # the CalibResult per camera (X, fk_offsets, board
                                    #   scale, metrics: held-out px, tip mm, observability,
                                    #   consensus, T_L_R; samples used)
-  calibration/base_to_base.json    # dual-arm only: transform between the two arm bases
+  calibration/base_to_base.json    # multi-arm: transform(s) between arm bases (N arms → N−1)
   robot_model/robot.urdf           # updated: calibrated *_optical_frame per camera,
                                    #   with provenance (sdk | measured | assumed)
 ```

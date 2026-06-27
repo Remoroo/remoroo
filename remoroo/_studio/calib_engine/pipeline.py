@@ -184,11 +184,19 @@ def resolve(
     return resolve_items(steps, urdf_path), build_targets(target_specs, build_target)
 
 
-def resolve_items(steps: Sequence[PipelineStep], urdf_path: str) -> List[PlanItem]:
+def resolve_items(steps: Sequence[PipelineStep], urdf_path: str,
+                  arm_flanges: Dict[str, str] | None = None) -> List[PlanItem]:
     """Fill each step's URDF kinematics (flange + nominal transforms, derived per bound
     camera link) → engine `PlanItem`s in dependency order. cv2-free (no detector building).
     The KIND is the agent's (authored), never re-guessed; the URDF supplies only the geometry
-    for the camera the step bound."""
+    for the camera the step bound.
+
+    `arm_flanges` maps a bound arm name → its flange/tip URDF link. It is REQUIRED for the
+    eye-to-hand `board_source="arm"` case (a FIXED camera an arm presents a board to): there the
+    thing that moves is the ARM, so the kinematic chain must be the presenting arm's — NOT the
+    camera's, which traces to the world root and has no movable joint. The camera still supplies
+    the X = base->camera seed and the optical-frame write-back; only the CHAIN comes from the arm."""
+    arm_flanges = dict(arm_flanges or {})
     items: List[PlanItem] = []
     for s in ordered(steps):
         if family_is_b2b(s):
@@ -202,13 +210,19 @@ def resolve_items(steps: Sequence[PipelineStep], urdf_path: str) -> List[PlanIte
             ))
             continue
         cam = s.all_cameras()[0]
-        flange = urdf_io.find_flange_link(urdf_path, cam)
-        flange_body = urdf_io.link_chain_transform(urdf_path, flange, cam)
+        cam_flange = urdf_io.find_flange_link(urdf_path, cam)              # the CAMERA's mount link
+        flange_body = urdf_io.link_chain_transform(urdf_path, cam_flange, cam)
         body_optical = urdf_io.read_nominal_optical(urdf_path, cam)
+        # The CHAIN link positions whatever the calibration tracks. A moving camera tracks itself
+        # (its own flange). An arm-PRESENTED board (eye-to-hand) rides the arm, so the chain is the
+        # presenting arm's flange; the camera nominals above stay camera-based (X seed + write-back).
+        chain_flange = cam_flange
+        if s.board_source == "arm" and s.arm:
+            chain_flange = arm_flanges.get(s.arm, s.arm)
         items.append(PlanItem(
             camera_link=cam, optical_frame=f"{cam}_optical_frame", kind=s.kind,
-            flange_link=flange, nominal_flange_body=flange_body,
-            nominal_T=flange_body @ body_optical, arm=(s.arm or flange),
+            flange_link=chain_flange, nominal_flange_body=flange_body,
+            nominal_T=flange_body @ body_optical, arm=(s.arm or cam_flange),
             board_source=s.board_source,
             id=s.id, target_id=s.target, depends_on=list(s.depends_on),
         ))

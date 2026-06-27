@@ -64,6 +64,29 @@ class LocalWorkerContext:
     in_place: bool
     verbose: bool
 
+    def abort_remote_run(self, reason: str = "studio_stopped") -> None:
+        """Tell the control plane to terminate this run (best-effort).
+
+        Closing Studio / Ctrl-C must actually end the run: this sets the abort
+        flag the brain polls (ask_human / gate_checkpoint / agent_loop), stops
+        token burn, and finalizes billing for the runtime actually consumed.
+        Without it the run lingers RUNNING until zombie recovery releases it for
+        $0 — real LLM cost, no charge. The server no-ops if the run already
+        reached a terminal state, so this is safe to call after a clean finish.
+        """
+        import requests
+
+        try:
+            requests.post(
+                f"{self.api_url}/runs/{self.remote_run_id}/abort",
+                headers={"Authorization": f"Bearer {self.session_key}"},
+                timeout=10.0,
+            )
+        except Exception:
+            # Never let a teardown abort failure mask the user's stop intent;
+            # the stale-reservation reconciler is the backstop.
+            pass
+
 
 def _budget_tui_from_run_json(requested_max_wall_time_s: int, run_data: dict):
     """Build TUI budget strip state from POST /runs JSON."""
@@ -531,6 +554,10 @@ def finalize_local_worker_session(ctx: LocalWorkerContext, rb: dict) -> LocalRun
     try:
         stop_heartbeat.set()
         if outcome == "INTERRUPTED":
+            # User interrupted (Ctrl-C / closed the session). Terminate the run
+            # on the CP so it bills the runtime consumed instead of lingering
+            # RUNNING until zombie recovery releases it for $0.
+            ctx.abort_remote_run(reason="interrupted")
             _teardown_local_worker_processes(rb.get("_cleanup_worker"))
             _teardown_local_worker_processes(current_local_worker())
 

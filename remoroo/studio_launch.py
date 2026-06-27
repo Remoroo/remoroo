@@ -375,4 +375,13 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
     worker_thread = threading.Thread(target=_worker_loop, daemon=True)
     worker_thread.start()
 
-    return _serve_loop(studio_proc, [edge_proc], on_stop=lambda: ctx.stop_heartbeat.set(), echo=echo)
+    def _on_stop() -> None:
+        # Closing Studio must terminate the run on the CP, not just stop the
+        # local heartbeat. Otherwise the run lingers RUNNING until zombie
+        # recovery releases it for $0 despite the LLM cost already incurred.
+        # No-op server-side once the run reached a terminal state, so this is
+        # safe even after the "still serving for review" phase.
+        ctx.abort_remote_run(reason="studio_stopped")
+        ctx.stop_heartbeat.set()
+
+    return _serve_loop(studio_proc, [edge_proc], on_stop=_on_stop, echo=echo)

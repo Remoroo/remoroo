@@ -242,21 +242,29 @@ yaml.safe_dump(robot_cfg, open(f"{OUT}/collision_spheres.yml", "w"), sort_keys=F
 REFUSES numpy types; a `yaml.dump` of `np.float32` writes `!!python/object` tags the Studio can't
 render (spheres save to disk but show as nothing in the collision view).
 
-### CHECK 2 — self-collision across many joint states (the ASSEMBLED model)
+### CHECK 2 — self-collision: does the SPHERE model agree with the MESH model?
 
-Load the cell you just wrote and audit the FK-posed, multi-link model. This runs the SHIPPED
-`motion_engine` so the verdict == exactly what the planner will see (same `self_collision_buffer`
-cancellation, same ignore matrix you just wrote). A valid robot self-collides at plenty of real
-configs, so this NEVER fails on "collides somewhere" — it gates on `home_free` (the rest pose MUST be
-free), `free_fraction` (enough of the in-limit space is plannable), and named ADJACENT phantom pairs (a
-missing ignore = a defect to fix):
+"How often does the robot self-collide?" has no good answer — a valid arm self-collides at plenty of
+real configs, so a raw collision frequency has no baseline to gate on. The answerable question is
+whether the SPHERES agree with the real GEOMETRY. Load the cell you just wrote and run the SHIPPED
+`motion_engine` audit (`sphere_audit`): over many configs sampled within the URDF joint limits, it
+compares cuRobo's sphere self-collision verdict (same true radii + the ignore matrix you just wrote) to
+the EXACT mesh verdict (FCL, scipy hull fallback) — the `foam` sphere-approximation methodology:
+
+  • **PHANTOM** — spheres collide, meshes DON'T → the planner is blocked for nothing (over-fat spheres /
+    a missing ignore pair / two chains too close). `phantom_rate` baseline is ~0, so nonzero is a signal.
+  • **MISS** — meshes collide, spheres DON'T → the planner is blind to a real collision (UNSAFE).
+
+It gates on `home_free` + `phantom_rate` (warn >2%, fail >10%) + `miss_rate` (any miss ⇒ fail). Each
+phantom pair is named (with a `cross_arm` tag: different groups ⇒ arms modelled too close / bad
+base-to-base; same group ⇒ over-fat spheres) so you know what to fix:
 
 ```python
 from motion_engine import MotionStack
 
-check2 = MotionStack.from_cell(PKG_ROOT).audit_self_collision(n=2000)
+check2 = MotionStack.from_cell(PKG_ROOT).audit_self_collision(n=400)
 if check2.get("verdict") == "fail":
-    raise SystemExit("SPHERES CHECK 2 (self-collision) FAILED:\n" + json.dumps(check2, indent=2))
+    raise SystemExit("SPHERES CHECK 2 (mesh-vs-sphere) FAILED:\n" + json.dumps(check2, indent=2))
 ```
 
 ### Report + preview, then checkpoint
@@ -312,6 +320,7 @@ one but you and confirmed by the operator, so it never drifts.
 - cuRobo loads the robot YAML and the G1-style smoke plan still succeeds.
 - **CHECK 1 (coverage/scale) passes** — no link FAILs `volume_ratio`/`max_uncovered_gap`; warn links
   re-fit. The spheres envelop the real geometry (the per-link metrics prove it, not just the eye).
-- **CHECK 2 (self-collision) verdict is not `fail`** — `home_free` true, healthy `free_fraction`, no
-  adjacent phantom pairs (`MotionStack.audit_self_collision`). The matrix written IS what the planner reads.
+- **CHECK 2 (mesh-vs-sphere) verdict is not `fail`** — `home_free` true, `miss_rate` 0 (no unsafe
+  blind spots), `phantom_rate` below threshold (`MotionStack.audit_self_collision`). The matrix written
+  IS what the planner reads.
 - Spheres previewed and operator-confirmed on the surfaced report (coverage + named phantom pairs).
