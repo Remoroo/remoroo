@@ -170,7 +170,8 @@ engine walks the chain to). `arm`/`arms` are the cell.yaml arm names. `kind`:
 - **`eye_to_hand`** — a **FIXED / world camera** (overhead, on a post, a bench cam) calibrated
   to the **robot base**. The camera can't move, so the **arm presents the board to it**: set
   **`board_source: arm`** and bind the **presenting arm** (`arm:`); the operator mounts the board
-  on that arm's gripper and **hand-moves the arm** to show the board to the camera from many
+  on that arm's **end-effector** (gripper / hand / tool mount) and **hand-moves the arm** to show
+  the board to the camera from many
   angles & distances (no look-at orbit — the camera is fixed). Solves **`base→camera`**, the
   transform every downstream consumer needs.
 - **`base_to_base`** — relates **two** arms' bases via a marker both their wrist cams see (gated
