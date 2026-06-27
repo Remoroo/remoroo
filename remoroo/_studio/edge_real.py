@@ -545,11 +545,20 @@ def sse_live_joints(_q):
     """Poll the Bridge for joint state and emit {t, joints} frames (no 'done'). Robust to the
     0-d / 1-d / scalar joint-value shapes cells report; a single bad poll yields an {error}
     frame but the loop keeps streaming so the mirror recovers."""
-    b = get_bridge()
-    if b is None:
-        yield {"t": 0.0, "joints": {}, "error": _bridge_err or "no bridge"}
-        return
     t0 = time.time()
+    b = get_bridge()
+    # The robot Bridge isn't ready until primitives.py is authored (G2) and the arm is reachable,
+    # so EARLY in setup get_bridge() returns None. DON'T end the stream here: a closed SSE makes the
+    # browser EventSource reconnect-loop (onerror), so the live dot shows a SILENT orange
+    # "disconnected" with no reason — the exact failure operators hit at the calibrate gate. Instead
+    # keep the stream OPEN, retry get_bridge() (it backs off internally), and HEARTBEAT the current
+    # bridge error so the Studio can say "edge up · robot bridge not ready: <reason>" instead of a
+    # blank orange dot. Once the bridge connects we fall through to the joint-streaming loop.
+    while b is None:
+        yield {"t": time.time() - t0, "joints": {}, "waiting": True,
+               "error": _bridge_err or "robot bridge not connected yet"}
+        time.sleep(1.0)
+        b = get_bridge()
     while True:
         # NON-BLOCKING: a heavy motion op (commission / diagnose / planner build + self-collision
         # generation) holds _bridge_lock for tens of seconds. Blocking here would freeze the mirror;

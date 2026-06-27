@@ -193,6 +193,34 @@ def _edge_python(echo: Echo) -> tuple[str, bool]:
     return (sys.executable or "python3"), False
 
 
+def _tail(path: Optional[Path], n: int) -> list[str]:
+    try:
+        if not path:
+            return []
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return [ln for ln in lines if ln.strip()][-n:]
+    except Exception:
+        return []
+
+
+def _report_edge_death(proc: subprocess.Popen, log_path: Optional[Path], eport: str, echo: Echo) -> None:
+    """The edge exited before it ever answered /health. It is spawned fire-and-forget, so without
+    this the only symptom is a SILENT orange 'disconnected' dot in the Studio. Print the exit code,
+    the tail of its log, and the most common fix (the edge python lacking numpy/cuRobo)."""
+    code = proc.poll()
+    echo("")
+    echo(f"  ❌ The real edge (edge_real.py) EXITED immediately (code {code}). The Studio's live")
+    echo("     robot mirror + the calibration/world/cuRobo gates will show 'disconnected' (orange).")
+    tail = _tail(log_path, 25)
+    if tail:
+        echo(f"     ── last lines of {log_path} ──")
+        for ln in tail:
+            echo(f"     │ {ln}")
+        echo("     ──────────────────────────────────────────────")
+    echo("     Most common cause: the edge python can't `import numpy`/`curobo` or a robot SDK.")
+    echo("     Fix: REMOROO_EDGE_PYTHON=/path/to/your/robotics/python remoroo setup …")
+
+
 def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional[subprocess.Popen], str]:
     py, numpy_ok = _edge_python(echo)
     if not py:
@@ -205,11 +233,54 @@ def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional
     # cell.yaml / pipeline.yaml / the agent's code (e.g. a "—" in a comment → 0xe2).
     env.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell"),
                 "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
-    proc = subprocess.Popen([py, str(studio.edge_py)], env=env)
+    # CAPTURE the edge's stdout+stderr to a logfile. It's a fire-and-forget subprocess, so a crash
+    # on startup — missing numpy/cuRobo, the EDGE_PORT already in use, a cell primitives.py import
+    # error — otherwise vanishes and the Studio just shows a silent orange 'disconnected'. With a
+    # logfile + the readiness probe below, a dead edge becomes LOUD and diagnosable.
+    log_path: Optional[Path] = None
+    log_fh = None
+    try:
+        (project_dir / ".remoroo").mkdir(parents=True, exist_ok=True)
+        log_path = project_dir / ".remoroo" / "edge.log"
+        log_fh = open(log_path, "w", encoding="utf-8")
+    except Exception:
+        log_path, log_fh = None, None
+    if log_fh is not None:
+        proc = subprocess.Popen([py, str(studio.edge_py)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
+    else:
+        proc = subprocess.Popen([py, str(studio.edge_py)], env=env)
     echo(f"Started the real edge (edge_real.py) on :{eport} using {py}")
+    if log_path:
+        echo(f"  edge log → {log_path}")
     if not numpy_ok:
         echo("  ⚠ that python has NO numpy — calibration/world/cuRobo will fail with import errors.")
         echo("    Set REMOROO_EDGE_PYTHON=/path/to/your/robotics/python (the env with numpy + cuRobo + the robot SDKs) and re-run.")
+
+    # READINESS PROBE (daemon): poll /health and announce success, or LOUDLY report a dead edge.
+    def _watch() -> None:
+        import time as _t
+        from urllib.request import urlopen as _urlopen
+
+        url = f"http://127.0.0.1:{eport}/health"
+        deadline = _t.time() + 12.0
+        while _t.time() < deadline:
+            if proc.poll() is not None:
+                _report_edge_death(proc, log_path, eport, echo)
+                return
+            try:
+                with _urlopen(url, timeout=1.0) as r:
+                    if getattr(r, "status", 200) == 200:
+                        echo(f"  ✅ edge is up on :{eport} (live robot mirror + cuRobo gates enabled)")
+                        return
+            except Exception:
+                _t.sleep(0.5)
+        if proc.poll() is None:
+            echo(f"  ⚠ edge on :{eport} hasn't answered /health yet — if the live dot stays orange, "
+                 f"check {log_path or 'the edge output'}.")
+        else:
+            _report_edge_death(proc, log_path, eport, echo)
+
+    threading.Thread(target=_watch, daemon=True).start()
     return proc, f"http://127.0.0.1:{eport}"
 
 
