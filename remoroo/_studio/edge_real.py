@@ -136,6 +136,7 @@ _ensure_safety_shim_resolves()
 # --------------------------------------------------------------------------- #
 _bridge = None
 _bridge_err: str | None = None
+_bridge_err_logged: str | None = None  # last bridge error PRINTED (dedup the 3s-retry spam)
 _bridge_last_try: float = 0.0
 # Serialises every touch of the shared cell Bridge. The live-joints SSE polls
 # get_observation() ~20 Hz WHILE the calibration verbs move/capture on the SAME bridge — on a
@@ -150,7 +151,7 @@ def get_bridge():
     live robot never connects this session. On failure we retry (with a short
     backoff) so the bridge comes up the moment primitives.py exists / the robot is
     reachable."""
-    global _bridge, _bridge_err, _bridge_last_try
+    global _bridge, _bridge_err, _bridge_err_logged, _bridge_last_try
     if _bridge is not None:
         return _bridge
     now = time.time()
@@ -164,12 +165,24 @@ def get_bridge():
         b.connect()
         _bridge = b
         _bridge_err = None
+        if _bridge_err_logged is not None:           # recovered after a prior failure → say so
+            print("[remoroo-edge] ✅ robot bridge connected.", file=sys.stderr, flush=True)
+            _bridge_err_logged = None
     except Exception as e:  # noqa: BLE001
         # Capture WHERE it failed (file:line) — a bare "TypeError: float()..." off a customer
         # machine is undiagnosable; the deepest frame tells us which line in which module.
         tb = traceback.extract_tb(e.__traceback__)
         where = f" (at {os.path.basename(tb[-1].filename)}:{tb[-1].lineno})" if tb else ""
         _bridge_err = f"{type(e).__name__}: {e}{where}"
+        # SURFACE the FULL error to the console/log (deduped across the 3s retries). It used to live
+        # ONLY in the live-mirror SSE frames → the truncated Studio header, never the terminal. Now
+        # the complete reason + traceback land in the edge output (teed to the shell + .remoroo/edge.log).
+        if _bridge_err != _bridge_err_logged:
+            _bridge_err_logged = _bridge_err
+            print(f"\n[remoroo-edge] ROBOT BRIDGE NOT CONNECTED: {_bridge_err}", file=sys.stderr)
+            print("".join(traceback.format_exception(type(e), e, e.__traceback__)).rstrip(), file=sys.stderr)
+            print("[remoroo-edge] (retrying every 3s; the live robot mirror stays home until this clears)\n",
+                  file=sys.stderr, flush=True)
     return _bridge
 
 

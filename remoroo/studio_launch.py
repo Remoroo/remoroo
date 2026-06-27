@@ -233,25 +233,48 @@ def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional
     # cell.yaml / pipeline.yaml / the agent's code (e.g. a "—" in a comment → 0xe2).
     env.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell"),
                 "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
-    # CAPTURE the edge's stdout+stderr to a logfile. It's a fire-and-forget subprocess, so a crash
-    # on startup — missing numpy/cuRobo, the EDGE_PORT already in use, a cell primitives.py import
-    # error — otherwise vanishes and the Studio just shows a silent orange 'disconnected'. With a
-    # logfile + the readiness probe below, a dead edge becomes LOUD and diagnosable.
+    # TEE the edge's stdout+stderr to BOTH the shell (so you SEE crashes + the FULL robot-bridge
+    # error live — not a truncated snippet in the browser header) AND a logfile (full record + the
+    # death-report tail below). A logfile-only redirect hid the output from the terminal; inheriting
+    # the terminal lost it to scrollback and kept no file. Tee gives both. The edge is otherwise a
+    # fire-and-forget subprocess whose failures (missing numpy/cuRobo, EDGE_PORT in use, a cell
+    # primitives.py import error) would just show as a silent orange 'disconnected'.
     log_path: Optional[Path] = None
-    log_fh = None
     try:
         (project_dir / ".remoroo").mkdir(parents=True, exist_ok=True)
         log_path = project_dir / ".remoroo" / "edge.log"
-        log_fh = open(log_path, "w", encoding="utf-8")
     except Exception:
-        log_path, log_fh = None, None
-    if log_fh is not None:
-        proc = subprocess.Popen([py, str(studio.edge_py)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
-    else:
-        proc = subprocess.Popen([py, str(studio.edge_py)], env=env)
+        log_path = None
+    proc = subprocess.Popen([py, str(studio.edge_py)], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, bufsize=1, text=True,
+                            encoding="utf-8", errors="replace")
+
+    def _tee() -> None:
+        fh = None
+        try:
+            fh = open(log_path, "w", encoding="utf-8") if log_path else None
+        except Exception:
+            fh = None
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:  # blocks per-line until the edge exits (pipe EOF)
+                echo(f"[edge] {line.rstrip()}")
+                if fh:
+                    fh.write(line)
+                    fh.flush()
+        except Exception:
+            pass
+        finally:
+            if fh:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_tee, daemon=True).start()
     echo(f"Started the real edge (edge_real.py) on :{eport} using {py}")
     if log_path:
-        echo(f"  edge log → {log_path}")
+        echo(f"  edge output is shown below as [edge] … and saved to {log_path}")
     if not numpy_ok:
         echo("  ⚠ that python has NO numpy — calibration/world/cuRobo will fail with import errors.")
         echo("    Set REMOROO_EDGE_PYTHON=/path/to/your/robotics/python (the env with numpy + cuRobo + the robot SDKs) and re-run.")
@@ -265,6 +288,7 @@ def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional
         deadline = _t.time() + 12.0
         while _t.time() < deadline:
             if proc.poll() is not None:
+                _t.sleep(0.4)  # let the tee thread flush the final lines into the logfile
                 _report_edge_death(proc, log_path, eport, echo)
                 return
             try:
