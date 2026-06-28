@@ -2208,6 +2208,20 @@ def h_spheres(_q):
 
 
 # route table: path -> (kind, handler). kind in {"json","json_body","sse"}
+def sse_realtime(_q):
+    """The REALTIME gate — run the cell's agent-authored `realtime.py` (synchronized perception +
+    planning: the world stays valid while the arm MOVES) and stream its output. The loop exposes
+    `run(bridge, cell, on_event=...)` and emits `{voxels:[[x,y,z],...], voxel_size, ...}` events that
+    the Studio renders live in the existing 3D view. Until the agent authors `realtime.py` this returns
+    an honest 'not authored yet' — the plumbing is shipped; the loop is the agent's (guided by the
+    brain-only realtime seed), composing the shipped primitives (sync/Mapper/fk/plan_pose)."""
+    yield from _run_streaming_script(
+        "realtime.py",
+        "run(bridge, cell, on_event) → stream {voxels, voxel_size} for the live 3D view",
+        _q,
+    )
+
+
 ROUTES = {
     "/health": ("json", lambda q: {"ok": True, "edge": "real", "cell": str(CELL_DIR)}),
     "/edge/probe": ("json", h_probe),
@@ -2226,7 +2240,7 @@ ROUTES = {
     "/edge/record": ("sse", sse_record),
     "/edge/plan": ("sse", sse_plan),
     "/edge/motion/commission": ("sse", sse_commission),
-    "/edge/motion/demo": ("sse", sse_demo),
+    "/edge/realtime/run": ("sse", sse_realtime),   # the realtime gate (replaces the deleted demo gate)
     "/edge/motion/plan_move": ("sse", sse_plan_move),
     "/edge/motion/tcp_pose": ("json", h_tcp_pose),
     "/edge/motion/suggest_targets": ("json", h_suggest_targets),

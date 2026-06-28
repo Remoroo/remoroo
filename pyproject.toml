@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remoroo"
-version = "0.13.35"
+version = "0.14.0"
 description = "Remoroo Offline Engine CLI"
 requires-python = ">=3.10"
 dependencies = [
@@ -34,7 +34,9 @@ include = ["remoroo*", "remoroo_offline*"]
 [tool.setuptools.package-data]
 remoroo = [
     "engine/Dockerfile",
-    "seeds/**/*.md",
+    # Seeds are NOT packaged — they are Remoroo methodology (IP), served from the
+    # brain at runtime via the read_seed tool (see remoroo_brain/seeds/). The CLI
+    # ships zero seeds; the boundary test enforces this.
     # Prebuilt Remoroo Studio (minified dist + Python servers) — populated by
     # remoroo_studio/scripts/bundle_studio.py in CI before the wheel is built.
     "_studio/*.py",

@@ -370,31 +370,9 @@ def setup(
                 fg=typer.colors.YELLOW,
             )
 
-    # Stage the bundled robotics seed catalog INTO THE OPERATOR'S REPO before
-    # the run is submitted. The CLI is the side with filesystem access; the
-    # brain is never asked to write files in the operator's workspace. Aligns
-    # with what ``@robot_setup`` declares as
-    # ``cli_seed_categories=("robotics",)``.
-    from .seed_staging import stage_seed_categories, SEED_STAGING_ROOT
-
-    stage_result = stage_seed_categories(repo_path, ("robotics",))
-    typer.secho(
-        f"📚 Staged {len(stage_result.staged)} robotics seeds into "
-        f"{SEED_STAGING_ROOT}/robotics/  "
-        f"(skipped {len(stage_result.skipped)}, "
-        f"failed {len(stage_result.failed)})",
-        fg=typer.colors.GREEN if not stage_result.failed else typer.colors.YELLOW,
-    )
-    if stage_result.failed:
-        for f in stage_result.failed:
-            typer.secho(f"   ⚠ {f}", fg=typer.colors.YELLOW)
-    if stage_result.requested == 0:
-        typer.secho(
-            "❌ No robotics seeds were bundled with this CLI build. Reinstall "
-            "remoroo or contact support.",
-            fg=typer.colors.RED,
-        )
-        raise typer.Exit(code=1)
+    # Seeds are NO LONGER staged to the operator's repo or shipped in the CLI.
+    # The robotics methodology (IP) lives in the brain; the agent reads it at
+    # runtime via the brain-served `read_seed` tool. Nothing to stage.
 
     # Robot-cell setup is heavyweight, supervised reasoning work — it wants the
     # FLAGSHIP model. The Studio path (the default) does not run the model picker,

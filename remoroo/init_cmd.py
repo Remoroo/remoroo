@@ -157,31 +157,9 @@ def init(
                 fg=typer.colors.YELLOW,
             )
 
-    # Stage the bundled seed catalog INTO THE OPERATOR'S REPO before the
-    # run is submitted. The CLI is the side with filesystem access; the
-    # brain is never asked to write files in the operator's workspace.
-    # Aligns with what `@bootstrap_program_md` declares as
-    # ``cli_seed_categories=("program_md",)``.
-    from .seed_staging import stage_seed_categories, SEED_STAGING_ROOT
-
-    stage_result = stage_seed_categories(repo_path, ("program_md",))
-    typer.secho(
-        f"📚 Staged {len(stage_result.staged)} seeds into "
-        f"{SEED_STAGING_ROOT}/program_md/  "
-        f"(skipped {len(stage_result.skipped)}, "
-        f"failed {len(stage_result.failed)})",
-        fg=typer.colors.GREEN if not stage_result.failed else typer.colors.YELLOW,
-    )
-    if stage_result.failed:
-        for f in stage_result.failed:
-            typer.secho(f"   ⚠ {f}", fg=typer.colors.YELLOW)
-    if stage_result.requested == 0:
-        typer.secho(
-            "❌ No seeds were bundled with this CLI build. Reinstall "
-            "remoroo or contact support.",
-            fg=typer.colors.RED,
-        )
-        raise typer.Exit(code=1)
+    # Seeds are NO LONGER staged to the operator's repo or shipped in the CLI.
+    # They are Remoroo methodology (IP) and live in the brain; the agent reads
+    # them at runtime via the brain-served `read_seed` tool. Nothing to stage.
 
     cfg = LaunchConfig(
         mode="new",
