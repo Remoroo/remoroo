@@ -144,6 +144,12 @@ _bridge_last_try: float = 0.0
 # live mirror and the supervised flow take turns on the one physical device (G14).
 _bridge_lock = threading.RLock()
 
+# While a STANDALONE realtime.py subprocess is running, IT owns the devices (the ZED is single-open) and
+# its own CUDA context. The edge yields: get_bridge() returns None so nothing here opens the camera/robot
+# behind the child's back. `_realtime_proc` lets the E-stop terminate the child.
+_realtime_active = False
+_realtime_proc = None
+
 
 def get_bridge():
     """Construct + connect the cell Bridge. primitives.py is authored at G2 — i.e.
@@ -152,6 +158,8 @@ def get_bridge():
     backoff) so the bridge comes up the moment primitives.py exists / the robot is
     reachable."""
     global _bridge, _bridge_err, _bridge_err_logged, _bridge_last_try
+    if _realtime_active:
+        return None              # the standalone realtime.py child owns the devices — don't touch them
     if _bridge is not None:
         return _bridge
     now = time.time()
@@ -512,6 +520,14 @@ def h_applyfix(_q):
 
 
 def h_estop(_q):
+    # If a STANDALONE realtime.py child is running, it owns the devices in its own process — terminate it
+    # (its SIGTERM handler estops the robot; it also polls the physical E-stop). Then estop via our own
+    # bridge if we hold it (we don't during realtime — get_bridge() returns None then).
+    if _realtime_proc is not None and _realtime_proc.poll() is None:
+        try:
+            _realtime_proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
     b = get_bridge()
     try:
         if b is not None and hasattr(b, "estop"):
@@ -2204,17 +2220,60 @@ def h_spheres(_q):
 
 # route table: path -> (kind, handler). kind in {"json","json_body","sse"}
 def sse_realtime(_q):
-    """The REALTIME gate — run the cell's agent-authored `realtime.py` (synchronized perception +
-    planning: the world stays valid while the arm MOVES) and stream its output. The loop exposes
-    `run(bridge, cell, on_event=...)` and emits `{voxels:[[x,y,z],...], voxel_size, ...}` events that
-    the Studio renders live in the existing 3D view. Until the agent authors `realtime.py` this returns
-    an honest 'not authored yet' — the plumbing is shipped; the loop is the agent's (guided by the
-    brain-only realtime seed), composing the shipped primitives (sync/Mapper/fk/plan_pose)."""
-    yield from _run_streaming_script(
-        "realtime.py",
-        "run(bridge, cell, on_event) → stream {voxels, voxel_size} for the live 3D view",
-        _q,
-    )
+    """The REALTIME gate — LAUNCH the cell's STANDALONE `realtime.py` as its OWN PROCESS
+    (`python3 -u realtime.py --emit-json`) and stream the JSON events it prints to stdout. We do NOT
+    import it into the edge: process isolation is LOAD-BEARING. realtime.py grabs a CUDA-native camera
+    (ZED) AND runs cuRobo — in a SEPARATE process it gets its OWN clean CUDA context, so the camera and
+    cuRobo can't corrupt each other's CUDA-graph state (the cudaErrorStreamCaptureUnsupported /
+    illegal-address cascade you get running it inside the busy edge process). This is ALSO exactly how the
+    customer runs it: `python3 remoroo_cell/realtime.py`. The ZED is single-open, so we RELEASE the edge's
+    bridge first (the child owns the devices) and reconnect lazily after; the child polls the physical
+    E-stop, and the Studio E-stop (/edge/estop) also terminates the child."""
+    global _bridge, _realtime_active, _realtime_proc
+    import subprocess
+    import sys as _sys
+    import json as _json
+    script = CELL_DIR / "realtime.py"
+    if not script.exists():
+        yield {"done": True, "result": {"error": "realtime.py not authored yet — the agent writes it; "
+                                                  "run it standalone with `python3 remoroo_cell/realtime.py`"}}
+        return
+    # Yield the devices to the child: stop touching the bridge, then close it so the child can open the ZED.
+    _realtime_active = True
+    with _bridge_lock:
+        if _bridge is not None:
+            try:
+                _bridge.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _bridge = None
+    yield {"type": "status", "message": "launching `python3 realtime.py` (isolated process)…"}
+    proc = subprocess.Popen([_sys.executable, "-u", str(script), "--emit-json"],
+                            cwd=str(CELL_DIR.parent), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    _realtime_proc = proc
+    try:
+        for line in proc.stdout:                       # stream the child's stdout as it prints
+            line = line.rstrip()
+            if not line:
+                continue
+            try:
+                yield _json.loads(line)                # a JSON event → forwarded (voxels render in the 3D view)
+            except Exception:  # noqa: BLE001
+                yield {"type": "status", "message": line[:400]}   # a human print / a traceback line
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                proc.kill()
+        _realtime_proc = None
+        _realtime_active = False                       # the edge may reconnect its own bridge again
+    code = proc.returncode or 0
+    yield {"done": True, "result": {"ok": code == 0,
+           "message": "realtime.py finished" if code == 0 else f"realtime.py exited with code {code}"}}
 
 
 ROUTES = {
