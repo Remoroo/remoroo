@@ -343,6 +343,7 @@ class CuroboV2Planner:
         device: str = "cuda",
         warmup: bool = True,
         self_collision_check: bool = True,
+        enable_graph: bool = True,
     ) -> None:
         import torch  # noqa: F401  (lazy GPU import; presence validated by the toolchain gate)
         _ensure_warp_torch()                       # force-load Warp's torch interop or fail CLEARLY
@@ -376,8 +377,12 @@ class CuroboV2Planner:
             self_collision_check=bool(self_collision_check),   # False = diagnostic probe (isolate self-collision)
         )
         self.planner = MotionPlanner(cfg)
+        # enable_graph builds cuRobo's CUDA-graph capture (faster plans). Turn it OFF for the realtime
+        # gate: a graph capture puts a CUDA stream in capture mode, and a CUDA-native camera (e.g. the
+        # ZED) cannot do GPU work (cudaCreateTextureObject) while a stream is capturing
+        # (cudaErrorStreamCaptureUnsupported 900). Graph-free = no capture = the camera and cuRobo coexist.
         if warmup:
-            self.planner.warmup(enable_graph=True, num_warmup_iterations=5)
+            self.planner.warmup(enable_graph=bool(enable_graph), num_warmup_iterations=5)
 
         # Load input 2 (the modeled obstacles) as the planner's world at build. Once a live build runs,
         # update_voxel_world REPLACES this with the ESDF (which already has the obstacles fused in), so

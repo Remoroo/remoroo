@@ -76,11 +76,12 @@ class MoveResult:
         }
 
 
-def _default_planner_factory(robot_cfg, world, *, limits, max_goalset):
+def _default_planner_factory(robot_cfg, world, *, limits, max_goalset, enable_graph=True):
     """The real factory: build a GPU CuroboV2Planner. Imported lazily so the stack stays off-GPU."""
     from .curobo_v2 import CuroboV2Planner
 
-    return CuroboV2Planner(robot_cfg, world, limits=limits, max_goalset=max_goalset)
+    return CuroboV2Planner(robot_cfg, world, limits=limits, max_goalset=max_goalset,
+                           enable_graph=enable_graph)
 
 
 def _default_mapper_factory(extent_m, center, robot_cfg, esdf_voxel_size=0.03, voxel_size=0.02):
@@ -185,6 +186,7 @@ class MotionStack:
         self.bridge = bridge
         self.urdf_path = urdf_path
         self._factory = planner_factory or _default_planner_factory
+        self._enable_graph = True              # cuRobo CUDA-graph capture; OFF for realtime (see set_graph_capture)
         self._planners: Dict[frozenset, object] = {}
         self._groups = {g["name"]: g for g in config.get("groups", [])}
         self._limits = safety.planner_limits()
@@ -593,6 +595,17 @@ class MotionStack:
             if hasattr(p, "reset_cuda_graph"):
                 p.reset_cuda_graph()
 
+    def set_graph_capture(self, enable: bool) -> None:
+        """Enable/disable cuRobo CUDA-graph capture for this stack. **Turn it OFF for the realtime gate.**
+        A graph capture holds a CUDA stream in capture mode, and a CUDA-native camera (e.g. the ZED) then
+        cannot do GPU work — `cudaCreateTextureObject` fails with `cudaErrorStreamCaptureUnsupported`
+        (900) inside `grab()`, corrupting the context. Graph-free = no capture = the camera and cuRobo
+        coexist (the cost is a little plan-launch overhead, irrelevant to a perception loop). Clears the
+        planner cache so the next `_planner_for` builds graph-free; call BEFORE the first world build."""
+        if bool(enable) != self._enable_graph:
+            self._enable_graph = bool(enable)
+            self._planners.clear()                 # rebuild graph-free on next use
+
     def link_pose(self, link: str, joints: Optional[Dict[str, float]] = None,
                   tcp: Optional[str] = None):
         """FK ANY URDF link → `(xyz, wxyz)` in the base frame at the given (or live) config. The
@@ -614,10 +627,10 @@ class MotionStack:
         key = frozenset(active_groups)
         if key not in self._planners:
             planner = self._factory(self._robot_cfg_for(active_groups), self.world,
-                                    limits=self._limits, max_goalset=1)
+                                    limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
             if self._self_mask_world(planner):     # masked the cloud → rebuild from the masked world
                 planner = self._factory(self._robot_cfg_for(active_groups), self.world,
-                                        limits=self._limits, max_goalset=1)
+                                        limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
             self._planners[key] = planner
         return self._planners[key]
 
