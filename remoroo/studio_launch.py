@@ -193,119 +193,30 @@ def _edge_python(echo: Echo) -> tuple[str, bool]:
     return (sys.executable or "python3"), False
 
 
-def _tail(path: Optional[Path], n: int) -> list[str]:
+def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> str:
+    """Start the edge via the managed lifecycle (`edge_service`) and follow its log to the shell
+    as `[edge] …`. The edge is now a detached, pidfile-managed daemon the AGENT (and operator) can
+    `remoroo edge restart` after fixing the cell's authored code — NOT a fire-and-forget child of
+    this launcher. Returns the edge URL ("" on failure). Teardown calls edge_service.stop()."""
+    from . import edge_service
+
+    res = edge_service.start(project_dir, echo=echo)
+    if not res.get("ok"):
+        echo("  the gates that need the edge (live mirror, calibration, world, cuRobo) will show 'disconnected'.")
+        echo("  fix the cause above, then `remoroo edge restart` — no need to restart `remoroo setup`.")
+    # Follow the (detached) edge's log to THIS terminal so the operator still sees [edge] lines
+    # live, decoupled from the process so it survives `remoroo edge restart`.
+    edge_service.follow_log_to_shell(project_dir, echo)
+    return res.get("url", "") if res.get("url") else f"http://127.0.0.1:{edge_service.EDGE_PORT_DEFAULT}"
+
+
+def _stop_edge_quietly(project_dir: Path, echo: Echo) -> None:
+    """Stop the managed edge on Studio teardown (best-effort)."""
     try:
-        if not path:
-            return []
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return [ln for ln in lines if ln.strip()][-n:]
+        from . import edge_service
+        edge_service.stop(project_dir, echo=echo)
     except Exception:
-        return []
-
-
-def _report_edge_death(proc: subprocess.Popen, log_path: Optional[Path], eport: str, echo: Echo) -> None:
-    """The edge exited before it ever answered /health. It is spawned fire-and-forget, so without
-    this the only symptom is a SILENT orange 'disconnected' dot in the Studio. Print the exit code,
-    the tail of its log, and the most common fix (the edge python lacking numpy/cuRobo)."""
-    code = proc.poll()
-    echo("")
-    echo(f"  ❌ The real edge (edge_real.py) EXITED immediately (code {code}). The Studio's live")
-    echo("     robot mirror + the calibration/world/cuRobo gates will show 'disconnected' (orange).")
-    tail = _tail(log_path, 25)
-    if tail:
-        echo(f"     ── last lines of {log_path} ──")
-        for ln in tail:
-            echo(f"     │ {ln}")
-        echo("     ──────────────────────────────────────────────")
-    echo("     Most common cause: the edge python can't `import numpy`/`curobo` or a robot SDK.")
-    echo("     Fix: REMOROO_EDGE_PYTHON=/path/to/your/robotics/python remoroo setup …")
-
-
-def _start_edge(studio: Studio, project_dir: Path, echo: Echo) -> tuple[Optional[subprocess.Popen], str]:
-    py, numpy_ok = _edge_python(echo)
-    if not py:
-        echo("python not found — can't launch the real edge; the gates needing it will show 'edge not connected'.")
-        return None, ""
-    eport = os.environ.get("EDGE_PORT", "7779")
-    env = dict(os.environ)
-    # Force UTF-8 for the edge subprocess: a robot with an ascii/C locale otherwise makes
-    # Path.read_text()/open() default to ascii, which crashes on any non-ascii byte in
-    # cell.yaml / pipeline.yaml / the agent's code (e.g. a "—" in a comment → 0xe2).
-    env.update({"EDGE_PORT": eport, "REMOROO_CELL": str(project_dir / "remoroo_cell"),
-                "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
-    # TEE the edge's stdout+stderr to BOTH the shell (so you SEE crashes + the FULL robot-bridge
-    # error live — not a truncated snippet in the browser header) AND a logfile (full record + the
-    # death-report tail below). A logfile-only redirect hid the output from the terminal; inheriting
-    # the terminal lost it to scrollback and kept no file. Tee gives both. The edge is otherwise a
-    # fire-and-forget subprocess whose failures (missing numpy/cuRobo, EDGE_PORT in use, a cell
-    # primitives.py import error) would just show as a silent orange 'disconnected'.
-    log_path: Optional[Path] = None
-    try:
-        (project_dir / ".remoroo").mkdir(parents=True, exist_ok=True)
-        log_path = project_dir / ".remoroo" / "edge.log"
-    except Exception:
-        log_path = None
-    proc = subprocess.Popen([py, str(studio.edge_py)], env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, bufsize=1, text=True,
-                            encoding="utf-8", errors="replace")
-
-    def _tee() -> None:
-        fh = None
-        try:
-            fh = open(log_path, "w", encoding="utf-8") if log_path else None
-        except Exception:
-            fh = None
-        try:
-            assert proc.stdout is not None
-            for line in proc.stdout:  # blocks per-line until the edge exits (pipe EOF)
-                echo(f"[edge] {line.rstrip()}")
-                if fh:
-                    fh.write(line)
-                    fh.flush()
-        except Exception:
-            pass
-        finally:
-            if fh:
-                try:
-                    fh.close()
-                except Exception:
-                    pass
-
-    threading.Thread(target=_tee, daemon=True).start()
-    echo(f"Started the real edge (edge_real.py) on :{eport} using {py}")
-    if log_path:
-        echo(f"  edge output is shown below as [edge] … and saved to {log_path}")
-    if not numpy_ok:
-        echo("  ⚠ that python has NO numpy — calibration/world/cuRobo will fail with import errors.")
-        echo("    Set REMOROO_EDGE_PYTHON=/path/to/your/robotics/python (the env with numpy + cuRobo + the robot SDKs) and re-run.")
-
-    # READINESS PROBE (daemon): poll /health and announce success, or LOUDLY report a dead edge.
-    def _watch() -> None:
-        import time as _t
-        from urllib.request import urlopen as _urlopen
-
-        url = f"http://127.0.0.1:{eport}/health"
-        deadline = _t.time() + 12.0
-        while _t.time() < deadline:
-            if proc.poll() is not None:
-                _t.sleep(0.4)  # let the tee thread flush the final lines into the logfile
-                _report_edge_death(proc, log_path, eport, echo)
-                return
-            try:
-                with _urlopen(url, timeout=1.0) as r:
-                    if getattr(r, "status", 200) == 200:
-                        echo(f"  ✅ edge is up on :{eport} (live robot mirror + cuRobo gates enabled)")
-                        return
-            except Exception:
-                _t.sleep(0.5)
-        if proc.poll() is None:
-            echo(f"  ⚠ edge on :{eport} hasn't answered /health yet — if the live dot stays orange, "
-                 f"check {log_path or 'the edge output'}.")
-        else:
-            _report_edge_death(proc, log_path, eport, echo)
-
-    threading.Thread(target=_watch, daemon=True).start()
-    return proc, f"http://127.0.0.1:{eport}"
+        pass
 
 
 def _spawn_studio(studio: Studio, env: dict, echo: Echo) -> Optional[subprocess.Popen]:
@@ -361,9 +272,8 @@ def serve_studio(project_dir: Path, port: int = 7777, token: Optional[str] = Non
     project_dir = Path(project_dir).resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
     token = token or _stable_token(project_dir)
-    edge_proc = None
     if spawn_edge and not edge_url:
-        edge_proc, edge_url = _start_edge(studio, project_dir, echo)
+        edge_url = _start_edge(studio, project_dir, echo)
     env = dict(os.environ)
     env.update({"PORT": str(port), "TOKEN": token, "PROJECT": str(project_dir), "DIST": str(studio.dist),
                 "STUDIO_VERSION": _pkg_version(), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
@@ -376,7 +286,9 @@ def serve_studio(project_dir: Path, port: int = 7777, token: Optional[str] = Non
         return False
     url = f"http://{lan_ip()}:{port}/?token={token}"
     _banner(echo, url, port, token, project_dir, edge_url, brain_url, "")
-    return _serve_loop(proc, [edge_proc], None, echo)
+    # Stop the managed edge on teardown (it's a detached daemon now, not a child proc).
+    _on_stop = (lambda: _stop_edge_quietly(project_dir, echo)) if spawn_edge else None
+    return _serve_loop(proc, [], _on_stop, echo)
 
 
 def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, edge_url: str = "",
@@ -417,9 +329,8 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
         return False
 
     token = _stable_token(project_dir)
-    edge_proc = None
     if spawn_edge and not edge_url:
-        edge_proc, edge_url = _start_edge(studio, project_dir, echo)
+        edge_url = _start_edge(studio, project_dir, echo)
 
     # 2. serve the studio, proxying the run API to the CP (api_url) with the session key
     env = dict(os.environ)
@@ -478,5 +389,7 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
         # safe even after the "still serving for review" phase.
         ctx.abort_remote_run(reason="studio_stopped")
         ctx.stop_heartbeat.set()
+        if spawn_edge:
+            _stop_edge_quietly(project_dir, echo)  # stop the managed edge daemon too
 
-    return _serve_loop(studio_proc, [edge_proc], on_stop=_on_stop, echo=echo)
+    return _serve_loop(studio_proc, [], on_stop=_on_stop, echo=echo)

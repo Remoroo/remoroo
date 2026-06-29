@@ -21,7 +21,7 @@ import socket
 import subprocess
 import tempfile
 import zipfile
-from http.client import HTTPConnection, HTTPSConnection
+from http.client import HTTPConnection, HTTPSConnection, IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, urlparse, parse_qs
@@ -208,6 +208,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
+            pass  # the BROWSER hung up — normal SSE teardown
+        except (IncompleteRead, ValueError, OSError):
+            # The UPSTREAM (control plane) ended the chunked SSE without a clean
+            # terminating chunk — run finished, LB/idle timeout, or CP reconnect.
+            # For a long-lived stream that's a normal end-of-stream, not an error;
+            # the browser's EventSource just reconnects. Don't let it escape do_GET
+            # and spam ThreadingHTTPServer with an IncompleteRead traceback.
             pass
         finally:
             conn.close()
@@ -532,12 +539,39 @@ class Handler(BaseHTTPRequestHandler):
             if self._stale_run(p):
                 return
             self._proxy(BRAIN_URL, SESSION_KEY) if BRAIN_URL else self._json({"error": "no control plane"}, 501)
+        elif p.startswith("/control/edge"):
+            self._control_edge(p, q)
         elif p.startswith("/edge/"):
             self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "edge not connected"}, 501)
         elif p.startswith("/project/"):
             self._project(p, q)
         else:
             self._json({"error": "not found"}, 404)
+
+    def _control_edge(self, path: str, query: dict):
+        """Operator edge lifecycle from the Studio: POST /control/edge/{restart|stop|start}. Drives
+        the SAME pidfile-managed `remoroo edge` lifecycle the agent uses (so the running edge picks
+        up an authored-code fix). Token-gated; runs on the robot where the edge lives."""
+        if not token_ok(query, self.headers):
+            self._json({"error": "token required"}, 401)
+            return
+        action = path.rstrip("/").rsplit("/", 1)[-1]
+        if action not in ("restart", "stop", "start", "status"):
+            action = "restart"
+        try:
+            from remoroo import edge_service  # studio_server runs under the CLI python → importable
+        except Exception as e:  # noqa: BLE001
+            self._json({"error": f"edge control unavailable: {e}"}, 501)
+            return
+        try:
+            fn = {"restart": edge_service.restart, "stop": edge_service.stop, "start": edge_service.start}.get(action)
+            if fn is not None:
+                res = fn(PROJECT, echo=lambda s: print(f"[control] {s}", flush=True))
+            else:
+                res = edge_service.status(PROJECT)
+            self._json({"ok": True, "action": action, "result": res})
+        except Exception as e:  # noqa: BLE001
+            self._json({"ok": False, "action": action, "error": f"{type(e).__name__}: {e}"}, 500)
 
     def do_PUT(self):
         p, q = self._route()

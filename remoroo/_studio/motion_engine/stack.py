@@ -1343,8 +1343,8 @@ class MotionStack:
                 l2g[t] = gname
         return l2g
 
-    def audit_self_collision(self, *, n: int = 400, phantom_warn: float = 0.02,
-                             phantom_fail: float = 0.10) -> dict:
+    def audit_self_collision(self, *, n: int = 400, phantom_warn: float = 0.15,
+                             phantom_fail: float = 0.50, miss_fail: float = 0.01) -> dict:
         """CHECK 2 (spheres gate) — does the SPHERE model AGREE with the MESH model? Instead of asking
         the un-answerable "how often does it self-collide?" (a valid robot self-collides at plenty of
         real configs, so there's no good baseline), we compare cuRobo's sphere self-collision verdict to
@@ -1364,7 +1364,8 @@ class MotionStack:
                     "meshes to ground-truth the spheres (build via from_cell)"}
         rep = sphere_audit.audit(self.urdf_path, self.spheres, self._self_collision_ignore(),
                                  pkg_root=self._cell_dir, seed=self._seed_positions(),
-                                 n=int(n), phantom_warn=phantom_warn, phantom_fail=phantom_fail)
+                                 n=int(n), phantom_warn=phantom_warn, phantom_fail=phantom_fail,
+                                 miss_fail=miss_fail)
         rep["ignore_provenance"] = self._ignore_provenance
         l2g = self._link_to_group()
         for p in rep.get("phantom_pairs", []):

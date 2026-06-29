@@ -15,6 +15,7 @@ from .aliases_cmd import aliases
 from .init_cmd import init
 from .setup_cmd import setup
 from .studio_cmd import studio
+from .edge_cmd import edge_app
 app = typer.Typer(no_args_is_help=True)
 app.command(name="worker")(worker)
 app.command(name="block")(block)
@@ -25,6 +26,7 @@ app.command(name="aliases")(aliases)
 app.command(name="init")(init)
 app.command(name="setup")(setup)
 app.command(name="studio")(studio)
+app.add_typer(edge_app, name="edge")
 
 @app.command()
 def login():
