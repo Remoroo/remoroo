@@ -137,6 +137,86 @@ def test_write_file_unblocked(worker: LocalWorker, repo: Path) -> None:
     assert (repo / "notes.md").read_text() == "hi\n"
 
 
+def test_write_run_artifact_does_not_nest_remoroo(tmp_path: Path) -> None:
+    """Regression: run-scoped artifacts (checkpoint.json etc.) must not be
+    mirrored into a nested ``.remoroo/runs/<id>/.remoroo/runs/<id>/`` folder.
+
+    In ``remoroo setup``/``run`` the worker is created with
+    ``artifact_dir == persistence_dir == <repo>/.remoroo/runs/<run_id>`` and the
+    brain persists the checkpoint via ``write_file`` with a run-scoped
+    ``path=".remoroo/runs/<run_id>/checkpoint.json"`` and ``target_scope="original"``.
+    The primary write already lands in the run dir, so the artifact/persistence
+    mirror must be skipped instead of re-joining the run-scoped prefix.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "main.py").write_text("x = 1\n")
+
+    run_id = "bbd9fb79"
+    run_dir = repo / ".remoroo" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+
+    w = LocalWorker(
+        repo_root=str(repo),
+        artifact_dir=str(run_dir),
+        original_repo_root=str(repo),
+        run_id=run_id,
+        engine="venv",
+        persistence_dir=str(run_dir),
+        in_place=True,
+    )
+
+    res = _send(
+        w,
+        "write_file",
+        path=f".remoroo/runs/{run_id}/checkpoint.json",
+        content='{"ok": true}',
+        target_scope="original",
+    )
+    assert res.success is True
+
+    # The one true checkpoint lives directly under the run dir …
+    assert (run_dir / "checkpoint.json").read_text() == '{"ok": true}'
+    # … and there is NO nested ``.remoroo`` duplicate inside the run dir.
+    assert not (run_dir / ".remoroo").exists()
+
+
+def test_write_repo_file_still_mirrors_into_run_dir(tmp_path: Path) -> None:
+    """Non-``.remoroo`` files are still mirrored into the run dir (CLI snapshot)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "main.py").write_text("x = 1\n")
+
+    run_id = "628bac05"
+    run_dir = repo / ".remoroo" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+
+    w = LocalWorker(
+        repo_root=str(repo),
+        artifact_dir=str(run_dir),
+        original_repo_root=str(repo),
+        run_id=run_id,
+        engine="venv",
+        persistence_dir=str(run_dir),
+        in_place=True,
+    )
+
+    res = _send(
+        w,
+        "write_file",
+        path="remoroo_cell/cell.yaml",
+        content="groups: []\n",
+        target_scope="original",
+    )
+    assert res.success is True
+    assert (repo / "remoroo_cell" / "cell.yaml").read_text() == "groups: []\n"
+    # Mirrored snapshot copy lives in the run dir, exactly one level deep.
+    assert (run_dir / "remoroo_cell" / "cell.yaml").read_text() == "groups: []\n"
+    assert not (run_dir / ".remoroo").exists()
+
+
 def test_apply_patch_refuses_blocked_target(worker: LocalWorker) -> None:
     patch_proposal: Dict[str, Any] = {
         "patch_id": "x",

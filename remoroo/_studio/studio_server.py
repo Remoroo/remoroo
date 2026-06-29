@@ -313,9 +313,7 @@ class Handler(BaseHTTPRequestHandler):
                 "calibrate": has("calibration/report.md", "calibration/hand_eye.yaml"),
                 "spheres": has("robot_model/collision_spheres.yml"),
                 "model": has("robot_model/robot.urdf"),
-                "world": has("world/scene.json", "world/collision.obj", "world/collision.ply"),
                 "capture": has("capture/schema.json", "capture/sample_episode"),
-                "taskspec": has("task_spec.md"),
                 "signoff": has("setup_report.md"),
             })
             return
@@ -356,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "path": str(state_path)})
             return
         # Read REAL artifacts back so a resume/refresh shows actual progress, not an
-        # empty stage: the cuRobo collision spheres + the scanned world cloud.
+        # empty stage: the cuRobo collision spheres.
         if path == "/project/spheres" and self.command == "GET":
             f = PROJECT / "remoroo_cell" / "robot_model" / "collision_spheres.yml"
             if not f.exists():
@@ -438,17 +436,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers(); self.wfile.write(data); return
-        if path == "/project/world" and self.command == "GET":
-            # The agent's world/scan.py writes a simple world/cloud.json
-            # ({"points":[[x,y,z],...], "coverage":0.x}) for the Studio to render.
-            f = PROJECT / "remoroo_cell" / "world" / "cloud.json"
-            if not f.exists():
-                self._json({"points": [], "coverage": 0}); return
-            try:
-                self._json(json.loads(f.read_text()))
-            except Exception as e:  # noqa: BLE001
-                self._json({"points": [], "coverage": 0, "error": str(e)})
-            return
         # The operator's MODEL, persisted at the model gate: overlay robot_model/
         # robot.urdf + meshes/ into remoroo_cell/ so the agent + cuRobo consume the
         # complete URDF immediately. Overlay (extractall) — does NOT wipe other

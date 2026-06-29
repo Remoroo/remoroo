@@ -2062,15 +2062,32 @@ class LocalWorker:
                      
                      # Normalize path so os.path.join doesn't ignore the base dir if path is absolute
                      rel_path = path[5:] if path.startswith("/app/") else (path[1:] if path.startswith("/") else path)
-                     
-                     if self.artifact_dir and (target_scope == "original" or not self.is_ephemeral):
+
+                     def _already_inside(dest: str) -> bool:
+                         # The primary write above may already land inside the mirror
+                         # destination. This happens for run-scoped artifacts whose
+                         # rel_path is ".remoroo/runs/<run_id>/checkpoint.json" while
+                         # artifact_dir/persistence_dir IS "<repo>/.remoroo/runs/<run_id>"
+                         # (see run_local.py). Re-joining the run-scoped prefix onto the
+                         # run dir would create a nested
+                         # ".remoroo/runs/<run_id>/.remoroo/runs/<run_id>/..." duplicate.
+                         # Skip the mirror in that case — the file is already there.
+                         try:
+                             dest_abs = os.path.abspath(dest)
+                             return os.path.commonpath([os.path.abspath(target_path), dest_abs]) == dest_abs
+                         except ValueError:
+                             return False
+
+                     if (self.artifact_dir and (target_scope == "original" or not self.is_ephemeral)
+                             and not _already_inside(self.artifact_dir)):
                          cache_path = os.path.join(self.artifact_dir, rel_path)
                          os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                          with open(cache_path, 'w', encoding='utf-8') as f:
                              f.write(content)
 
                      # v16: ALSO save to persistence_dir (for CLI transparency in summary/prompt)
-                     if self.persistence_dir and (target_scope == "original" or not self.is_ephemeral):
+                     if (self.persistence_dir and (target_scope == "original" or not self.is_ephemeral)
+                             and not _already_inside(self.persistence_dir)):
                          persist_path = os.path.join(self.persistence_dir, rel_path)
                          os.makedirs(os.path.dirname(persist_path), exist_ok=True)
                          with open(persist_path, 'w', encoding='utf-8') as f:

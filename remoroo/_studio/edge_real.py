@@ -651,8 +651,9 @@ def reset_motion_stack():
 
 def motion_stack(force: bool = False):
     """The shipped `motion_engine.MotionStack`, built from ALL the cell artifacts (calibrated
-    URDF + collision spheres + scanned world + safety) and wired to the live bridge. This is the
-    ONE unified autonomous-motion surface; the bridge supplies state + execute_trajectory."""
+    URDF + collision spheres + modeled obstacles + safety) and wired to the live bridge. This is the
+    ONE unified autonomous-motion surface; the bridge supplies state + execute_trajectory. The
+    collision world is the LIVE camera ESDF built at commission, not a stored scan."""
     global _MOTION_STACK
     if _MOTION_STACK is not None and not force:
         return _MOTION_STACK
@@ -687,7 +688,8 @@ def _preload_warp() -> None:
 
 def sse_commission(_q):
     """Build the unified motion stack from every prior gate's output and VERIFY one collision-free
-    plan+execute against the SCANNED world. Streams each commission step (sphere health → planner
+    plan+execute against the LIVE world (the cuRoboV2 ESDF built from the cameras + modeled
+    obstacles). Streams each commission step (sphere health → planner
     build → plan → audit → executor replay); ends {done, result:<report>}. The motion is
     operator-gated in the Studio (default_proceed=false).
 
@@ -1361,13 +1363,6 @@ def _run_streaming_script(rel: str, entry_desc: str, _q):
             yield {"done": True, "result": item.get("result", {})}
         else:
             yield item  # pose / status events stream straight through
-
-
-def sse_scan(_q):
-    """Run the agent's world scan live and stream coverage/points events.
-    Events: {type:'points', xyz:[[x,y,z],...]} {type:'status', coverage, message}
-            final {done, result:{coverage, points, scene}}."""
-    yield from _run_streaming_script("world/scan.py", "run(bridge, cell, on_event=...)", _q)
 
 
 def sse_record(q):
@@ -2236,7 +2231,6 @@ ROUTES = {
     "/edge/obstacles/set": ("json_body", h_set_obstacles),
     "/edge/spheres": ("json", h_spheres),
     "/live/joints": ("sse", sse_live_joints),
-    "/edge/scanWorld": ("sse", sse_scan),
     "/edge/record": ("sse", sse_record),
     "/edge/plan": ("sse", sse_plan),
     "/edge/motion/commission": ("sse", sse_commission),
