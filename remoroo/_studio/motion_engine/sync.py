@@ -55,6 +55,22 @@ def host_capture_time(host_now: float, device_now: float, device_capture: float)
     return float(host_now) - (float(device_now) - float(device_capture))
 
 
+def flush_gpu() -> None:
+    """Generic GPU boundary for the realtime loop — block until all pending CUDA work completes so the
+    camera SDK and cuRobo never have OVERLAPPING in-flight kernels. cuRobo runs on CUDA graphs; a
+    GPU-using camera (e.g. the ZED) runs its depth kernels async — an overlap corrupts the CUDA context
+    ("operation failed due to a previous error during capture" / illegal address). This is NOT
+    camera-specific: it bites any GPU-using camera (a CPU camera like RealSense simply never overlaps).
+    Call it at the camera↔cuRobo boundary (the realtime loop's top, before grabbing). No-op when
+    torch/CUDA isn't present, so it's safe everywhere and in the off-robot tests."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @dataclass
 class SyncResult:
     """The answer to "joints at time t". `ok=False` means SKIP this frame (do not integrate)."""

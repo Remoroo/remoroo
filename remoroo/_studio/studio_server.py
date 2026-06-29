@@ -163,6 +163,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def handle_one_request(self):
+        # A browser/tab that disconnects mid-response (closed tab, cancelled fetch, navigated
+        # away) makes a handler write raise BrokenPipeError/ConnectionReset — a normal disconnect,
+        # not a server error. Swallow it so ThreadingHTTPServer doesn't dump a traceback.
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+
     # ---- helpers ----
     def _json(self, obj, code=200):
         data = json.dumps(obj).encode("utf-8")
@@ -509,6 +518,8 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/studio/session":
             self._json({"run_id": RUN_ID, "edge": "real" if EDGE_URL else "none", "brain": bool(BRAIN_URL),
                         "version": os.environ.get("STUDIO_VERSION", "")})
+        elif p == "/control/edge/log":
+            self._edge_log(q)
         elif p == "/live/joints" or p.startswith("/edge/"):
             self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "edge not connected"}, 501)
         elif p.startswith("/runs/") or p.startswith("/agent/"):
@@ -519,6 +530,24 @@ class Handler(BaseHTTPRequestHandler):
             self._project(p, q)
         else:
             self._static(p, q)
+
+    def _edge_log(self, query: dict):
+        """Serve the FULL edge log (the operator's 'send problem to agent' attaches this so the agent
+        gets the COMPLETE error — a tail would miss a crash-at-import traceback at the top). Token-gated."""
+        if not token_ok(query, self.headers):
+            self._json({"error": "token required"}, 401)
+            return
+        edge_log = PROJECT / ".remoroo" / "edge.log"
+        txt = ""
+        try:
+            from remoroo import edge_service  # studio_server runs under the CLI python
+            txt = edge_service.read_log(PROJECT)
+        except Exception:
+            try:
+                txt = edge_log.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                txt = ""
+        self._json({"log": txt, "path": str(edge_log)})
 
     def do_POST(self):
         p, q = self._route()

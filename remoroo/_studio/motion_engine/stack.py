@@ -364,6 +364,12 @@ class MotionStack:
         tcp = tcp or next(iter(self._groups), None)
         if tcp is None:
             return {"ok": False, "message": "no kinematic groups"}
+        # GPU hygiene (generic, camera-agnostic): flush any in-flight GPU work before cuRobo touches the
+        # device, so a pending camera kernel can't corrupt cuRobo's CUDA-graph capture ("operation failed
+        # due to a previous error during capture"). The realtime loop interleaves grab→integrate tightly
+        # — this is the cuRobo-side boundary; the loop flushes the camera side before grabbing.
+        from .sync import flush_gpu
+        flush_gpu()
         planner = self._planner_for([tcp])
         if not hasattr(planner, "update_voxel_world"):
             return {"ok": False, "message": "planner has no live/voxel world support"}

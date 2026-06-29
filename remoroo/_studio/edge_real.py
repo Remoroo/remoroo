@@ -2272,6 +2272,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quieter
         pass
 
+    def handle_one_request(self):
+        # A client (the studio proxy / browser) that disconnects mid-response makes the
+        # handler's wfile.write raise BrokenPipeError/ConnectionReset — a NORMAL disconnect
+        # (a cancelled poll, a closed tab, the proxy timing out), not an edge error. Swallow it
+        # so ThreadingHTTPServer doesn't dump a traceback (now teed to the operator's shell as
+        # [edge] noise) and, worse, bury a REAL authored-code traceback the agent needs to see.
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
 

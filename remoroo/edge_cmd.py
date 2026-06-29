@@ -62,13 +62,17 @@ def status(project: Optional[str] = typer.Option(None, "--project", "-p", help="
 @edge_app.command("logs")
 def logs(
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Project dir (defaults to cwd)."),
-    tail: int = typer.Option(80, "--tail", "-n", help="Number of trailing lines to show."),
+    tail: int = typer.Option(0, "--tail", "-n", help="Show only the last N lines (0 = the FULL log — the default)."),
 ):
-    """Print the tail of the edge log (the full stdout+stderr of the edge — where authored-code
-    tracebacks land)."""
-    lines = edge_service.tail(_project(project), n=tail)
-    if not lines:
-        typer.echo("(edge log is empty or not present yet)")
+    """Print the FULL edge log (all stdout+stderr — where authored-code tracebacks land, including
+    crash-at-import errors at the TOP). Pass --tail N for only the last N lines."""
+    if tail > 0:
+        lines = edge_service.tail(_project(project), n=tail)
+        if not lines:
+            typer.echo("(edge log is empty or not present yet)")
+            return
+        for ln in lines:
+            typer.echo(ln)
         return
-    for ln in lines:
-        typer.echo(ln)
+    txt = edge_service.read_log(_project(project))
+    typer.echo(txt if txt else "(edge log is empty or not present yet)")

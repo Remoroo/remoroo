@@ -78,10 +78,28 @@ def _write_json(p: Path, data: dict) -> None:
         pass
 
 
-def tail(project_dir: Path, n: int = 40) -> list[str]:
+def read_log(project_dir: Path, max_bytes: int = 400_000) -> str:
+    """The FULL edge log (every line — imports, tracebacks in the agent's authored code, prints).
+    This is what gets sent to the agent / shown to debug: a TAIL is wrong because a crash-at-import
+    traceback lives at the TOP. If the log is enormous we keep the HEAD (startup errors) and mark the
+    truncation — never silently drop the beginning."""
     try:
-        lines = log_path(project_dir).read_text(encoding="utf-8", errors="replace").splitlines()
-        return [ln for ln in lines if ln.strip()][-n:]
+        data = log_path(project_dir).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    if len(data) <= max_bytes:
+        return data
+    return data[:max_bytes] + (
+        f"\n\n[… {len(data) - max_bytes} more chars truncated — the full log is on the robot at "
+        ".remoroo/edge.log; read_file it for the rest …]"
+    )
+
+
+def tail(project_dir: Path, n: int = 40) -> list[str]:
+    """Last n non-blank lines (n<=0 → ALL). For a human glance; the agent uses the FULL log."""
+    try:
+        lines = [ln for ln in log_path(project_dir).read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+        return lines if n <= 0 else lines[-n:]
     except Exception:
         return []
 
