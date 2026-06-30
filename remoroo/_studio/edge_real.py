@@ -2252,14 +2252,20 @@ def sse_realtime(_q):
                             cwd=str(CELL_DIR.parent), stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
     _realtime_proc = proc
+    _last_text = ""        # last human/stderr line — the ACTUAL error if the child dies (argparse usage, traceback)
+    _saw_voxels = False    # did any event actually carry the world? (chips-but-no-3D is a real failure mode)
     try:
         for line in proc.stdout:                       # stream the child's stdout as it prints
             line = line.rstrip()
             if not line:
                 continue
             try:
-                yield _json.loads(line)                # a JSON event → forwarded (voxels render in the 3D view)
+                ev = _json.loads(line)                 # a JSON event → forwarded (voxels render in the 3D view)
+                if isinstance(ev, dict) and ev.get("voxels"):
+                    _saw_voxels = True
+                yield ev
             except Exception:  # noqa: BLE001
+                _last_text = line[:400]
                 yield {"type": "status", "message": line[:400]}   # a human print / a traceback line
         proc.wait(timeout=10)
     finally:
@@ -2272,8 +2278,18 @@ def sse_realtime(_q):
         _realtime_proc = None
         _realtime_active = False                       # the edge may reconnect its own bridge again
     code = proc.returncode or 0
-    yield {"done": True, "result": {"ok": code == 0,
-           "message": "realtime.py finished" if code == 0 else f"realtime.py exited with code {code}"}}
+    if code == 0 and _saw_voxels:
+        msg = "realtime.py finished"
+    elif code == 0:
+        msg = "realtime.py exited 0 but NEVER streamed any `voxels` — the 3D world stayed blank (the loop " \
+              "isn't emitting the world, or no frame synced). Check the event `voxels`/`mask` fields."
+    else:
+        msg = f"realtime.py exited with code {code}"
+        if _last_text:
+            msg += f" — {_last_text}"
+        if code == 2:                                  # argparse sys.exit(2): the CLI was rejected, not the perception
+            msg += " · code 2 = bad command line (argparse): realtime.py's main() must accept `--emit-json` exactly"
+    yield {"done": True, "result": {"ok": code == 0 and _saw_voxels, "message": msg}}
 
 
 ROUTES = {

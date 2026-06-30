@@ -18,7 +18,7 @@ ORCHESTRATION ONLY: it does not import cuRobo (the planner is injected / lazily 
 executor → defensive supervision — is unit-tested off-GPU against a fake driver.
 
 The executor is NOT here. cuRobo PLANS; the cell's `bridge.execute_trajectory(traj, should_abort=…)`
-REPLAYS the path on the arm's SDK (every SDK differs — see `seeds/robotics/arm_adapters.md`). The
+REPLAYS the path on the controller's SDK (every SDK differs — see `seeds/robotics/robot_adapters.md`). The
 stack hands over the whole `Trajectory` and a `should_abort` poll; it never sends a single endpoint.
 """
 from __future__ import annotations
@@ -390,10 +390,17 @@ class MotionStack:
             self._grid_meta = {"extent": [round(v, 3) for v in ext], "center": [round(v, 3) for v in ctr],
                                "esdf_voxel_size": round(float(esdf_vs), 4), "from_scene": scene is not None}
         self._mapper.reset()
-        q = self._seed_positions()                 # the live config the robot is masked at
+        q = self._seed_positions()                 # FALLBACK mask config (live "now") — used only for a
+                                                   # frame that carries no capture-time config (commission).
         total_px, n_masked = 0, 0
         for f in frames:
-            n_masked += int(self._mapper.integrate(f.depth, f.intrinsics, f.cam_pose_in_base, q) or 0)
+            # Mask THIS frame at the joints it was CAPTURED at (f.q), NOT "now". The depth + cam_pose are
+            # placed at the capture instant, so a MOVING arm is masked correctly only if the mask uses the
+            # SAME capture-time config; using "now" leaves the arm (moved since capture) unmasked and it
+            # fuses into the world — the "world goes wrong the moment the arm moves" bug. `q` (now) is the
+            # right fallback only when the arm is still (commission).
+            qf = getattr(f, "q", None) or q
+            n_masked += int(self._mapper.integrate(f.depth, f.intrinsics, f.cam_pose_in_base, qf) or 0)
             total_px += int(np.asarray(f.depth).size)
         if hasattr(self._mapper, "fuse_static"):   # one canonical world: live depth + modeled cuboids
             self._mapper.fuse_static(getattr(planner, "modeled_scene", None))

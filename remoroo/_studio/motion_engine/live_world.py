@@ -26,7 +26,7 @@ config, so it is never in its own collision world (the bug the stored-cloud path
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -40,12 +40,21 @@ class DepthFrame:
     cam_pose_in_base: (position[3] xyz, quaternion[4] wxyz) — the camera pose in the robot base frame
                       (the calibration result). For eye-in-hand this is `fk(joints) @ X`.
     name:             a label (e.g. the camera link) — advisory.
+    q:                the joint config (combined-URDF name→radians) the robot was at WHEN THIS FRAME
+                      WAS CAPTURED — the config the robot MASK uses for THIS frame. CRITICAL while the
+                      arm moves: the depth + `cam_pose_in_base` are placed at the capture instant, so the
+                      mask MUST use the SAME capture-time joints; otherwise the robot (moved since) is
+                      masked in the WRONG place and its own body fuses into the world. None → fall back
+                      to the live `get_observation()` config — correct ONLY when the arm is still
+                      (commission's one-shot build); for the realtime loop ALWAYS set it (= the synced
+                      capture-time config you also FK'd for `cam_pose_in_base`).
     """
 
     depth: np.ndarray
     intrinsics: np.ndarray
     cam_pose_in_base: Tuple[Sequence[float], Sequence[float]]
     name: str = "cam"
+    q: Optional[Dict[str, float]] = None
 
 
 # The live ESDF's voxel budget along its LONGEST axis. A resolution/compute budget (like an image
