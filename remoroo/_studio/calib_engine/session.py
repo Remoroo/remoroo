@@ -87,6 +87,21 @@ def _image_coverage(samples, wh, grid=(6, 4)) -> dict:
             "filled": int((cells > 0).sum()), "total": int(gx * gy)}
 
 
+def _chain_columns(routine, chain_names: Sequence[str], n_chain: int):
+    """Which columns of a (possibly WHOLE-BODY) routine belong to this step's chain. By NAME
+    when both sides carry names; [] when the routine is already chain-shaped (legacy/off-robot,
+    width == chain DOF); None when the chain can't be found in the routine (rig changed)."""
+    rn = [str(n) for n in (routine.joint_names or [])]
+    cn = [str(n) for n in (chain_names or [])]
+    if rn and cn and set(cn) <= set(rn):
+        cols = [rn.index(n) for n in cn]
+        return [] if cols == list(range(len(rn))) else cols
+    W = np.asarray(routine.waypoints, float)
+    if W.ndim == 2 and W.shape[1] == n_chain:
+        return []                                   # already chain-shaped
+    return None
+
+
 def build_plan(urdf_path: str) -> List[PlanItem]:
     """Derive the calibration plan from the rig (Pillar B): one item per detected camera.
     A camera on a moving flange -> eye_in_hand; one anchored to the world -> eye_to_hand.
@@ -209,8 +224,10 @@ class CalibSession:
         # while the operator collects, so the whole calibration can later be REPLAYED (direct
         # hops along the human-traversed path — never a planner). The edge feeds tick(); off-robot
         # tests call it directly. Armed at confirm_seed (eye-in-hand) / detect (eye-to-hand).
-        self.recorder: Optional[RoutineRecorder] = None if self.static else \
-            RoutineRecorder(getattr(bridge, "joint_names", None))
+        # NAME-LESS on purpose: the joint stream ADOPTS the whole body's joint names on its
+        # first full sample (a commissioned rig is ONE body — record all so replay/goto can
+        # restore all). Off-robot (no stream) the vector path records the chain, as before.
+        self.recorder: Optional[RoutineRecorder] = None if self.static else RoutineRecorder()
         self._replay: Optional[ReplayCursor] = None
         # Engine-COMMANDED motion happens with the bridge lock held for the whole move, so the
         # edge's poll ticker is blind during it. The bridge reports each commanded waypoint via
@@ -218,10 +235,13 @@ class CalibSession:
         # safe passage instead of a blind jump the replay guard would refuse.
         if self.recorder is not None:
             rec = self.recorder
+            chain_names = list(getattr(bridge, "joint_names", []) or [])
             try:
                 # commanded=True: an engine-commanded hop is a straight joint move by
-                # construction, so the recorder may densify it at any excursion.
-                bridge.on_move = lambda q: rec.tick(q, commanded=True)   # type: ignore[attr-defined]
+                # construction, so the recorder may densify it at any excursion. The hop is
+                # CHAIN-scoped; the recorder merges it BY NAME into the whole-body state (a
+                # commissioned rig is one body — record all so replay can restore all).
+                bridge.on_move = lambda q: rec.tick_named(chain_names, q, commanded=True)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001 — a hook-less bridge just relies on the stream
                 pass
 
@@ -549,7 +569,8 @@ class CalibSession:
         if accepted:
             bucket.append(s)
             if self.recorder is not None:      # tie this capture to the recorded trajectory
-                self.recorder.mark_capture(joints)
+                self.recorder.tick_named(list(getattr(self.bridge, "joint_names", []) or []),
+                                         joints, mark=True)
             # F9: also grab the RIGHT stereo lens (same instant) for the left/right self-check.
             if not held_out and self._capture_right is not None:
                 try:
@@ -918,9 +939,12 @@ class CalibSession:
                "joint_names": list(r.joint_names) or list(getattr(self.bridge, "joint_names", []) or []),
                "arm": r.arm or self.item.arm}
         try:
-            d = np.abs(np.asarray(self.bridge.read_joints(), float).reshape(-1) - W[0])
-            out["deltas_rad"] = d.round(4).tolist()
-            out["at_start"] = bool(d.max() <= HOP_TOL_RAD)
+            chain = _chain_columns(r, getattr(self.bridge, "joint_names", []) or [], self.chain.n)
+            if chain is not None:
+                w0 = W[0][chain] if len(chain) else W[0]
+                d = np.abs(np.asarray(self.bridge.read_joints(), float).reshape(-1) - w0)
+                out["deltas_rad"] = d.round(4).tolist()
+                out["at_start"] = bool(d.max() <= HOP_TOL_RAD)
         except Exception:  # noqa: BLE001 — proximity is advisory here; replay_start re-gates it
             pass
         return out
@@ -944,6 +968,18 @@ class CalibSession:
         # rigs sample joints far below the arm's rate when the stream is degraded), THEN apply
         # the guards. Only an excursion beyond the safe-interpolation bound is refused.
         r = Routine.load(p).densified()
+        cols = _chain_columns(r, getattr(self.bridge, "joint_names", []) or [], self.chain.n)
+        if cols is None:
+            return {"type": "replay_start", "ok": False,
+                    "error": "routine joints don't cover this step's chain — the rig changed; re-record"}
+        if len(cols):
+            # whole-body recording → the tape drives THIS chain's columns; the rest of the body
+            # was restored to its recorded start by drive-to-start (a commissioned rig is one body)
+            r = Routine(step_id=r.step_id, camera=r.camera, arm=r.arm,
+                        joint_names=[r.joint_names[i] for i in cols],
+                        waypoints=np.asarray(r.waypoints, float)[:, cols], dt=r.dt,
+                        capture_marks=list(r.capture_marks), target=r.target,
+                        created_at=r.created_at, schema=r.schema)
         err = r.validate_against(getattr(self.bridge, "joint_names", []) or [], self.chain.n)
         if err:
             return {"type": "replay_start", "ok": False, "error": err}

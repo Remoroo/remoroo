@@ -137,28 +137,6 @@ class Routine:
         return None
 
 
-def resolve_group(groups: Sequence[dict], joint_names: Sequence[str]):
-    """Which authored kinematic group (cell.yaml: groups) does a routine's JOINT SET belong to?
-    DATA OVER LABELS — the routine's recorded joint names are ground truth; the `arm` field is a
-    UI hint only. Morphology-agnostic by construction: works for one arm, N arms, a humanoid
-    limb, a gantry — any chain the agent declared as a group. Rules: the group must COVER the
-    routine's joints (⊇); with several covering groups (e.g. whole_body ⊃ left_arm) the
-    SMALLEST (most specific) wins; an exact tie or no cover is a LOUD refusal, never a guess.
-    Returns (group_name, None) or (None, error)."""
-    want = {str(n) for n in joint_names}
-    if not want:
-        return None, "routine carries no joint names — re-record it (older recording?)"
-    covering = [g for g in groups if want <= {str(j) for j in (g.get("joint_names") or [])}]
-    if not covering:
-        return None, (f"no authored group covers the routine's joints {sorted(want)} — "
-                      "fix cell.yaml groups or re-record the routine")
-    covering.sort(key=lambda g: len(g.get("joint_names") or []))
-    if len(covering) > 1 and len(covering[0].get("joint_names") or []) == len(covering[1].get("joint_names") or []):
-        return None, (f"ambiguous: groups {covering[0].get('name')!r} and {covering[1].get('name')!r} "
-                      "both cover the routine's joints equally — fix cell.yaml groups")
-    return str(covering[0].get("name")), None
-
-
 class RoutineRecorder:
     """Passively accumulates dense joint waypoints while ARMED. The edge feeds `tick()` at
     ~10 Hz from its poll loop; off-robot tests call it directly. `mark_capture()` force-appends
@@ -201,6 +179,60 @@ class RoutineRecorder:
         self._w.append(q)
         self._dt.append(dt)
         self._t_last = t
+
+    def tick_map(self, m: Dict[str, float], t: Optional[float] = None, *,
+                 commanded: bool = False) -> bool:
+        """Feed a NAMED joint sample covering the WHOLE BODY (the joint stream's map). On the
+        first full sample the recorder ADOPTS its names (sorted, stable) — a commissioned rig
+        is ONE body: we record all so replay can restore all. Later samples are reindexed by
+        name (a missing name holds its last value)."""
+        if not self.armed:
+            return False
+        with self._mu:
+            if not self.joint_names:
+                self.joint_names = sorted(str(k) for k in m.keys())
+                if self._w and len(self._w[-1]) != len(self.joint_names):
+                    # a few pre-adoption vector waypoints (chain-width hooks fired before the
+                    # stream's first full sample) — drop them; the body-wide tape starts here
+                    self._w, self._dt, self.capture_marks, self._t_last = [], [], [], None
+            if self._w is not None and len(self._w):
+                last = self._w[-1]
+                q = np.array([float(m.get(n, last[i])) for i, n in enumerate(self.joint_names)])
+            else:
+                if any(n not in m for n in self.joint_names):
+                    return False                    # first sample must cover the adopted names
+                q = np.array([float(m[n]) for n in self.joint_names])
+            if self._w and np.max(np.abs(q - self._w[-1])) < self.dedup_rad:
+                return False
+            self._append(q, time.time() if t is None else float(t), commanded=commanded)
+        return True
+
+    def tick_named(self, names: Sequence[str], joints, t: Optional[float] = None, *,
+                   commanded: bool = False, mark: bool = False) -> bool:
+        """Feed a PARTIAL sample (e.g. the step chain's commanded waypoint) by NAME — merged
+        into the last known whole-body state. Falls back to the plain vector path when the
+        recorder has no names to merge by (off-robot / name-less bridges). `mark=True` also
+        marks a capture at the appended waypoint."""
+        if not self.armed:
+            return False
+        names = [str(n) for n in (names or [])]
+        if self.joint_names and names and set(names) <= set(self.joint_names) and self._w:
+            m = dict(zip(self.joint_names, (float(v) for v in self._w[-1])))
+            m.update({n: float(v) for n, v in zip(names, np.asarray(joints, float).reshape(-1))})
+            with self._mu:
+                q = np.array([m[n] for n in self.joint_names])
+                if mark:
+                    self._append(q, time.time() if t is None else float(t), commanded=commanded)
+                    self.capture_marks.append(len(self._w) - 1)
+                    return True
+                if np.max(np.abs(q - self._w[-1])) < self.dedup_rad:
+                    return False
+                self._append(q, time.time() if t is None else float(t), commanded=commanded)
+            return True
+        if mark:
+            self.mark_capture(joints, t)
+            return True
+        return self.tick(joints, t, commanded=commanded)
 
     def tick(self, joints, t: Optional[float] = None, *, commanded: bool = False) -> bool:
         """Record the live joints (when armed). Dedups a resting arm. `commanded=True` marks a

@@ -1725,17 +1725,15 @@ _JSTREAM = None
 def _feed_calib_recorder(t: float, joints: dict) -> None:
     """The routine recorder rides the INDEPENDENT joint stream: whatever the stream sees, an
     armed recorder gets — recording is telemetry, never hostage to the calibration pipeline.
-    Maps the stream's {name: value} onto the recorder's joint order (any DOF, any morphology)."""
+    The WHOLE map is recorded (every actuated joint, any morphology): a modeled + commissioned
+    rig is ONE body — record all, so drive-to-start can restore all and the replayed chain's
+    corridor is valid (the other limbs are where they were when it was traversed)."""
     sess = getattr(_CALIB, "session", None) if _CALIB is not None else None
     rec = getattr(sess, "recorder", None) if sess is not None else None
     if rec is None or not rec.armed:
         return
-    names = rec.joint_names or list(getattr(sess.bridge, "joint_names", []) or [])
-    if not names:
-        return
     try:
-        if all(n in joints for n in names):
-            rec.tick([joints[n] for n in names], t=t)
+        rec.tick_map(joints, t=t)
     except Exception:  # noqa: BLE001 — a bad sample skips a waypoint, never kills telemetry
         pass
 
@@ -1804,9 +1802,11 @@ def h_motion_warmup(_q):
     def _build():
         try:
             with _bridge_lock:
-                motion_stack()
+                st = motion_stack()
+                warm = st.prewarm()                       # the WHOLE-BODY planner, built up front
             _MOTION_WARM.update(state="off", error=None)   # alive is derived from the stack itself
-            print("[edge] motion stack alive (operator warmup)")
+            print(f"[edge] motion stack alive (operator warmup) · whole-body planner built in "
+                  f"{warm.get('seconds')}s for groups {warm.get('groups')}")
         except Exception as e:  # noqa: BLE001
             _MOTION_WARM.update(state="error", error=f"{type(e).__name__}: {e}")
             print(f"[edge] motion stack warmup FAILED: {type(e).__name__}: {e}")
@@ -1826,8 +1826,7 @@ def _replay_goto_start() -> dict:
     stack's groups. The tape replay itself stays planner-free (move_direct) after this."""
     import json as _json
     import numpy as _np
-    from calib_engine.routine import HOP_TOL_RAD, resolve_group
-    from calib_engine import urdf_io
+    from calib_engine.routine import HOP_TOL_RAD
 
     svc = _calib_service()
     s = svc.session
@@ -1851,22 +1850,28 @@ def _replay_goto_start() -> dict:
     if sp.get("at_start"):
         return {"ok": True, "message": "already at the start pose", "at_start": True,
                 "deltas_rad": sp.get("deltas_rad")}
-    urdf = str(CELL_DIR / "robot_model" / "robot.urdf")
-    groups = urdf_io.robot_config(load_cell_yaml(), urdf).get("groups", [])
-    gname, gerr = resolve_group(groups, sp.get("joint_names") or [])
-    if gerr:
-        return {"ok": False, "error": gerr}
-    try:
-        stack_groups = set(_MOTION_STACK.group_names)
-    except Exception:  # noqa: BLE001
-        stack_groups = set()
-    if gname not in stack_groups:
-        return {"ok": False, "error": f"group {gname!r} is not in the motion stack "
-                f"({sorted(stack_groups)}) — rebuild the stack (header ⚡)"}
-    goal = {n: float(v) for n, v in zip(sp["joint_names"], sp["joints"])}
+    jnames = sp.get("joint_names") or []
+    if not jnames:
+        return {"ok": False, "error": "routine carries no joint names (older recording) — "
+                "re-record this calibration once; new recordings capture the whole body"}
+    # WHOLE-BODY goal: every recorded joint goes to its recorded start. A commissioned rig is
+    # ONE body — no group resolution, no held-at-seed limbs; the routine says where EVERYTHING
+    # belongs, and the foreign-motion guard refuses any plan that moves an un-goaled joint.
+    goal = {n: float(v) for n, v in zip(jnames, sp["joints"])}
     with _bridge_lock:
-        res = _MOTION_STACK.goto_joints(gname, goal, execute=True)
-    out = {"ok": bool(res.ok), "message": res.message, "group": gname}
+        res = _MOTION_STACK.goto_joints(goal, execute=True)
+    out = {"ok": bool(res.ok), "message": res.message}
+    try:
+        traj = getattr(res, "trajectory", None)
+        if traj is not None:
+            import numpy as _np2
+            pos = _np2.asarray(traj.positions, float)
+            span = _np2.max(_np2.abs(pos - pos[0]), axis=0)
+            movers = {n: round(float(v), 3) for n, v in zip(traj.joint_names, span) if v > 0.02}
+            out["moved_joints"] = movers
+            print(f"[edge] drive-to-start planned motion: {movers}")
+    except Exception:  # noqa: BLE001 — diagnostics only
+        pass
     try:
         d = _np.abs(_np.asarray(s.bridge.read_joints(), float).reshape(-1)
                     - _np.asarray(sp["joints"], float))

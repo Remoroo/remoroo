@@ -133,6 +133,20 @@ def _sphere_box_overlaps(spheres, scene: dict) -> dict:
     return out
 
 
+def _foreign_motion(traj, goal_names, tol_rad: float = 0.03) -> dict:
+    """Joints the trajectory MOVES (max |q - q0| > tol) that the goal never named — the
+    wrong-arm guard. Empty dict = safe. `tol_rad` absorbs planner smoothing wiggle only."""
+    pos = np.asarray(traj.positions, float)
+    out = {}
+    for i, n in enumerate(traj.joint_names):
+        if n in goal_names:
+            continue
+        excursion = float(np.max(np.abs(pos[:, i] - pos[0, i]))) if pos.ndim == 2 and pos.shape[0] else 0.0
+        if excursion > tol_rad:
+            out[str(n)] = round(excursion, 4)
+    return out
+
+
 def _quat_mul(a: Sequence[float], b: Sequence[float]) -> List[float]:
     """Hamilton product of two wxyz quaternions."""
     aw, ax, ay, az = a
@@ -701,24 +715,44 @@ class MotionStack:
         res = planner.plan_pose(goals, self._seed_positions(), max_attempts=max_attempts)
         return self._finish(res, execute)
 
-    def goto_joints(self, group: str, goal: Dict[str, float], *, execute: bool = True,
-                    max_attempts: int = 5) -> MoveResult:
-        """Plan ONE group to a JOINT-SPACE goal ({joint_name: rad}) and (default) execute it —
-        collision-free via the group's planner (`plan_joints` → V2 plan_cspace, the same call
-        retract rides) through the SAME defensive-audit + executor tail as every commissioned
-        move. No TCP is involved — a joint goal has none. Group joints NOT named in `goal`
-        HOLD their current position; every OTHER group's joints are locked by the per-group
-        robot cfg. Morphology-agnostic: `group` is any authored cell.yaml group (an arm, a
-        humanoid limb, a gantry axis…)."""
+    def goto_joints(self, goal: Dict[str, float], *, groups: Optional[Sequence[str]] = None,
+                    execute: bool = True, max_attempts: int = 5) -> MoveResult:
+        """Plan the ROBOT to a JOINT-SPACE goal ({joint_name: rad}) and (default) execute it —
+        collision-free (`plan_joints` → V2 plan_cspace, the same call retract rides) through
+        the SAME defensive-audit + executor tail as every commissioned move. No TCP — a joint
+        goal has none. WHOLE-BODY by default: a modeled + commissioned rig is ONE body (the V2
+        cfg drives all joints; lock_joints breaks V2 IK), so `groups` defaults to ALL groups
+        and the goal should name every joint you know (a routine's recorded start names them
+        all). Joints NOT named HOLD their current position — and the FOREIGN-MOTION GUARD
+        refuses any plan that moves an un-goaled joint beyond a hair (the wrong-arm guard:
+        an incomplete seed must surface as a refusal, never as a limb flying to a default)."""
         if not goal:
             return MoveResult(False, "no goal joints given")
-        planner = self._planner_for([group])
-        names = set(self._group(group)["joint_names"])
-        unknown = [n for n in goal if n not in names]
+        active = list(groups) if groups else list(self._groups.keys())
+        planner = self._planner_for(active)
+        known = {n for g in active for n in self._group(g)["joint_names"]}
+        unknown = [n for n in goal if n not in known]
         if unknown:
-            return MoveResult(False, f"goal names joints outside group {group!r}: {unknown}")
+            return MoveResult(False, f"goal names joints outside groups {active}: {unknown}")
         res = planner.plan_joints(dict(goal), self._seed_positions(), max_attempts=max_attempts)
+        if getattr(res, "success", False) and getattr(res, "trajectory", None) is not None:
+            moved = _foreign_motion(res.trajectory, set(goal))
+            if moved:
+                return MoveResult(False,
+                                  "REFUSED: the plan moves joints the goal never named — "
+                                  f"{moved} (an incomplete seed / stale observation; nothing was executed)",
+                                  trajectory=res.trajectory)
         return self._finish(res, execute)
+
+    def prewarm(self, *, groups: Optional[Sequence[str]] = None) -> dict:
+        """Build (and cache) the WHOLE-BODY planner up front — planner build + cuRobo warmup
+        is tens of seconds-to-minutes, and paying it lazily on the first goto (inside the
+        bridge lock) froze the Studio for minutes. Called by the header ⚡ warmup."""
+        import time as _time
+        t0 = _time.time()
+        active = list(groups) if groups else list(self._groups.keys())
+        self._planner_for(active)
+        return {"groups": active, "seconds": round(_time.time() - t0, 1)}
 
     def move_through_poses(self, tcp: str, poses: Sequence[object], *, execute: bool = True,
                            max_attempts: int = 3) -> MoveResult:
