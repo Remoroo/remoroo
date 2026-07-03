@@ -571,42 +571,34 @@ def _joint_value(val) -> float:
 
 
 def sse_live_joints(_q):
-    """Poll the Bridge for joint state and emit {t, joints} frames (no 'done'). Robust to the
-    0-d / 1-d / scalar joint-value shapes cells report; a single bad poll yields an {error}
-    frame but the loop keeps streaming so the mirror recovers."""
+    """The live mirror is a CONSUMER of the independent joint stream (one producer, many
+    consumers — the mirror no longer polls the Bridge itself, so it neither competes with the
+    calibration pipeline for the bridge lock nor pays for camera-bundled reads). Emits
+    {t, joints} frames (no 'done'); frames without `joints` make the frontend hold the last
+    real pose (a transient hiccup must not snap the mirror to the default)."""
     t0 = time.time()
-    b = get_bridge()
     # The robot Bridge isn't ready until primitives.py is authored (G2) and the arm is reachable,
     # so EARLY in setup get_bridge() returns None. DON'T end the stream here: a closed SSE makes the
     # browser EventSource reconnect-loop (onerror), so the live dot shows a SILENT orange
     # "disconnected" with no reason — the exact failure operators hit at the calibrate gate. Instead
-    # keep the stream OPEN, retry get_bridge() (it backs off internally), and HEARTBEAT the current
-    # bridge error so the Studio can say "edge up · robot bridge not ready: <reason>" instead of a
-    # blank orange dot. Once the bridge connects we fall through to the joint-streaming loop.
-    while b is None:
+    # keep the stream OPEN, retry (get_bridge backs off internally), and HEARTBEAT the current
+    # bridge error so the Studio can say "edge up · robot bridge not ready: <reason>".
+    js = _joint_stream()
+    while js is None:
         yield {"t": time.time() - t0, "joints": {}, "waiting": True,
                "error": _bridge_err or "robot bridge not connected yet"}
         time.sleep(1.0)
-        b = get_bridge()
+        js = _joint_stream()
     while True:
-        # NON-BLOCKING: a heavy motion op (commission / diagnose / planner build + self-collision
-        # generation) holds _bridge_lock for tens of seconds. Blocking here would freeze the mirror;
-        # instead we skip the poll and keep the last pose (the frontend only updates on frames that
-        # CARRY `joints`). Likewise on a read error we OMIT `joints` so the mirror holds the last
-        # real pose instead of snapping to the default (a transient xArm hiccup must not reset it).
-        if not _bridge_lock.acquire(blocking=False):
-            time.sleep(0.1)
-            continue
-        try:
-            obs = b.get_observation()
-            joints = {name: _joint_value(val) for name, val in (obs.joint_positions or {}).items()}
-            frame = {"t": time.time() - t0, "joints": joints}
-        except Exception as e:  # noqa: BLE001
-            frame = {"t": time.time() - t0, "error": str(e)}      # no `joints` → mirror keeps last pose
-        finally:
-            _bridge_lock.release()
+        evt = js.latest
+        if evt is None:
+            frame = {"t": time.time() - t0}
+            if js.error:
+                frame["error"] = js.error          # no `joints` → mirror keeps last pose
+        else:
+            frame = {"t": time.time() - t0, "joints": evt[1]}
         yield frame
-        time.sleep(0.05)  # ~20 Hz
+        time.sleep(0.05)  # ~20 Hz consumer; the producer sets the actual sample rate
 
 
 def sse_plan(_q):
@@ -1717,36 +1709,51 @@ def _load_pipeline(cy: dict, cal: dict, urdf_path: str):
 _CALIB = None
 
 
-_routine_ticker_started = False
+_JSTREAM = None
 
 
-def _start_routine_ticker() -> None:
-    """The routine RECORDER's feed: a daemon that polls the selected session's bridge joints
-    (~10 Hz while the recorder is armed) so the dense trajectory is logged no matter how the
-    arm is moved (hand-guided, jogged, or engine-driven). Same _bridge_lock non-blocking
-    discipline as the live-joints SSE — on contention it skips a tick, never blocks motion."""
-    global _routine_ticker_started
-    if _routine_ticker_started:
+def _feed_calib_recorder(t: float, joints: dict) -> None:
+    """The routine recorder rides the INDEPENDENT joint stream: whatever the stream sees, an
+    armed recorder gets — recording is telemetry, never hostage to the calibration pipeline.
+    Maps the stream's {name: value} onto the recorder's joint order (any DOF, any morphology)."""
+    sess = getattr(_CALIB, "session", None) if _CALIB is not None else None
+    rec = getattr(sess, "recorder", None) if sess is not None else None
+    if rec is None or not rec.armed:
         return
-    _routine_ticker_started = True
+    names = rec.joint_names or list(getattr(sess.bridge, "joint_names", []) or [])
+    if not names:
+        return
+    try:
+        if all(n in joints for n in names):
+            rec.tick([joints[n] for n in names], t=t)
+    except Exception:  # noqa: BLE001 — a bad sample skips a waypoint, never kills telemetry
+        pass
 
-    def _loop():
-        while True:
-            sess = getattr(_CALIB, "session", None) if _CALIB is not None else None
-            rec = getattr(sess, "recorder", None) if sess is not None else None
-            if rec is None or not rec.armed:
-                time.sleep(0.5)
-                continue
-            if _bridge_lock.acquire(blocking=False):
-                try:
-                    rec.tick(sess.bridge.read_joints())
-                except Exception:  # noqa: BLE001 — a bad poll skips a waypoint, never kills the feed
-                    pass
-                finally:
-                    _bridge_lock.release()
-            time.sleep(0.1)
 
-    threading.Thread(target=_loop, daemon=True, name="calib-routine-ticker").start()
+def _joint_stream():
+    """Build (once) the single-producer joint-state stream for the connected cell Bridge.
+    PUSH mode: the Bridge's `stream_joints(on_sample, should_stop)` — the CONTRACT
+    (bridge_primitives.md): the cell subscribes to each controller's NATIVE report stream, so
+    the rate is the SDK's own (an xArm pushes at 250 Hz). DEGRADED fallback for pre-contract
+    cells: poll `get_observation()` under the bridge lock non-blocking at a few Hz (still ONE
+    centralized poller instead of N competing ones)."""
+    global _JSTREAM
+    if _JSTREAM is not None:
+        return _JSTREAM
+    b = get_bridge()
+    if b is None:
+        return None
+    from joint_stream import DEGRADED_HZ, JointStream
+    if callable(getattr(b, "stream_joints", None)):
+        js = JointStream(subscribe=b.stream_joints, name="joint-stream-push")
+    else:
+        def read():
+            obs = b.get_observation()
+            return {name: _joint_value(val) for name, val in (obs.joint_positions or {}).items()}
+        js = JointStream(read, hz=DEGRADED_HZ, lock=_bridge_lock, name="joint-stream-degraded")
+    js.subscribe(_feed_calib_recorder)
+    _JSTREAM = js.start()
+    return _JSTREAM
 
 
 def _calib_service():
@@ -1821,7 +1828,7 @@ def _calib_service():
                           accept_rot_sigma_deg=acc_rot, accept_trans_sigma_mm=acc_tr,
                           plan_items=items, targets=targets,
                           intrinsics={c: kv for c, kv in intrinsics.items() if kv[0] is not None})
-    _start_routine_ticker()   # feeds the routine recorder while a session is armed
+    _joint_stream()   # the independent joint stream feeds the routine recorder (+ the mirror)
     return _CALIB
 
 

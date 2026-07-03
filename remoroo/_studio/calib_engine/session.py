@@ -217,9 +217,12 @@ class CalibSession:
         # this hook — the commanded path IS the traversed path, so the routine records the full
         # safe passage instead of a blind jump the replay guard would refuse.
         if self.recorder is not None:
+            rec = self.recorder
             try:
-                bridge.on_move = self.recorder.tick     # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001 — a hook-less bridge just relies on the ticker
+                # commanded=True: an engine-commanded hop is a straight joint move by
+                # construction, so the recorder may densify it at any excursion.
+                bridge.on_move = lambda q: rec.tick(q, commanded=True)   # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 — a hook-less bridge just relies on the stream
                 pass
 
     # ── C.0 pre-flight motion check (gates everything) ──────────────────────
@@ -914,7 +917,10 @@ class CalibSession:
         p = self._routine_path(calib_dir)
         if not Path(p).exists():
             return {"type": "replay_start", "ok": False, "error": "no recorded routine for this step"}
-        r = Routine.load(p)
+        # HEAL on load: bridge bounded-excursion recording gaps by joint interpolation (real
+        # rigs sample joints far below the arm's rate when the stream is degraded), THEN apply
+        # the guards. Only an excursion beyond the safe-interpolation bound is refused.
+        r = Routine.load(p).densified()
         err = r.validate_against(getattr(self.bridge, "joint_names", []) or [], self.chain.n)
         if err:
             return {"type": "replay_start", "ok": False, "error": err}

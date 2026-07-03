@@ -23,15 +23,18 @@ SCHEMA = 1
 # Consecutive waypoints closer than this (any joint, rad) are deduped — an arm at rest must
 # not spam waypoints. ~0.5 deg.
 DEDUP_RAD = 0.008
-# A hop between consecutive RECORDED waypoints larger than this (any joint, rad) means the
-# file is corrupt / recorded across a teleport — refuse to replay it. Also the default
-# start-proximity tolerance: the arm must already be near the routine's first waypoint.
+# The per-hop REPLAY limit (any joint, rad): replay drives direct hops, so each must be tiny.
+# Recordings are densified to half this; a post-densify violation means the file is corrupt.
+# Also the default start-proximity tolerance (the arm must be near the first waypoint).
 HOP_TOL_RAD = 0.15
-# Ticks closer together than this are DENSIFIED by joint-space interpolation when the hop is
-# large (a fast hand-move / a skipped poll): the arm physically traversed that span within the
-# gap, so interpolation reconstructs the real path. A LONGER gap could hide an arbitrary
-# excursion — those stay raw, and the replay hop-guard refuses them.
-MAX_INTERP_GAP_S = 0.5
+# The DENSIFY limit: a recording gap whose joint excursion is at most this (any joint, rad) is
+# bridged by joint-space interpolation — REGARDLESS of how long the gap took. On a real rig
+# joint reads arrive ~1 Hz at best (get_observation grabs a camera frame under the bridge
+# lock; capture/solve verbs hold it for many seconds), so time-based gating starves and normal
+# hand-move speeds record 0.3–0.8 rad "jumps". What makes interpolation safe is not the gap's
+# DURATION but its EXCURSION: within this bound a straight joint path stays in the neighborhood
+# the operator was supervising. Beyond it the arm may have detoured arbitrarily → refuse.
+MAX_INTERP_HOP_RAD = 0.8
 
 
 @dataclass
@@ -73,6 +76,39 @@ class Routine:
             schema=int(d.get("schema", 0)),
         )
 
+    def densified(self) -> "Routine":
+        """HEAL a sparse recording: bridge every bounded-excursion hop (≤ MAX_INTERP_HOP_RAD)
+        with joint-space interpolation so all hops are replayable (≤ HOP_TOL_RAD/2), remapping
+        the capture marks. Applied at replay-load so routines recorded at a slow effective tick
+        rate (a real rig reads joints ~1 Hz) replay without re-recording. Excursions beyond the
+        bound are kept raw — validate_against refuses them (the arm may have detoured)."""
+        W = np.asarray(self.waypoints, float)
+        if W.ndim != 2 or W.shape[0] < 2:
+            return self
+        new_w: List[np.ndarray] = [W[0]]
+        new_dt: List[float] = [float(self.dt[0]) if len(self.dt) else 0.0]
+        idx_map = {0: 0}
+        for i in range(1, W.shape[0]):
+            q, prev = W[i], new_w[-1]
+            dt = float(self.dt[i]) if i < len(self.dt) else 0.0
+            hop = float(np.max(np.abs(q - prev)))
+            if HOP_TOL_RAD / 2.0 < hop <= MAX_INTERP_HOP_RAD:
+                n = int(np.ceil(hop / (HOP_TOL_RAD / 2.0)))
+                for k in range(1, n):
+                    new_w.append(prev + (q - prev) * (k / n))
+                    new_dt.append(dt / n)
+                dt = dt / n
+            new_w.append(q)
+            new_dt.append(dt)
+            idx_map[i] = len(new_w) - 1
+        return Routine(
+            step_id=self.step_id, camera=self.camera, arm=self.arm,
+            joint_names=list(self.joint_names), waypoints=np.asarray(new_w, float),
+            dt=np.asarray(new_dt, float),
+            capture_marks=[idx_map[int(m)] for m in self.capture_marks if int(m) in idx_map],
+            target=dict(self.target), created_at=self.created_at, schema=self.schema,
+        )
+
     def validate_against(self, joint_names: Sequence[str], n_joints: int,
                          *, hop_tol: float = HOP_TOL_RAD) -> Optional[str]:
         """The refuse-to-replay guards. Returns an error string, or None when safe to replay.
@@ -95,8 +131,9 @@ class Routine:
                     f"({self.joint_names} vs {list(joint_names)}) — re-record it")
         hop = np.abs(np.diff(W, axis=0)).max() if W.shape[0] > 1 else 0.0
         if hop > hop_tol:
-            return (f"routine contains a {hop:.3f} rad jump between consecutive waypoints "
-                    f"(limit {hop_tol}) — file is corrupt or recording skipped; re-record it")
+            return (f"routine contains a {hop:.3f} rad jump the recording cannot account for "
+                    f"(beyond the {MAX_INTERP_HOP_RAD} rad safe-interpolation bound) — the arm "
+                    "may have detoured during a recording gap; re-record this calibration")
         return None
 
 
@@ -122,34 +159,38 @@ class RoutineRecorder:
     def n_waypoints(self) -> int:
         return len(self._w)
 
-    def _append(self, q: np.ndarray, t: float) -> None:
+    def _append(self, q: np.ndarray, t: float, *, commanded: bool = False) -> None:
         dt = 0.0 if self._t_last is None else max(0.0, t - self._t_last)
-        # Densify a large hop recorded across a SHORT gap: split it into sub-HOP_TOL_RAD/2
-        # interpolated waypoints so the routine stays replayable in tiny direct hops. dt==0
-        # (back-to-back reads on a coarse clock) is a short gap by definition.
-        if self._w and 0.0 <= dt < MAX_INTERP_GAP_S:
+        # Densify a hop into sub-HOP_TOL_RAD/2 interpolated waypoints so the routine stays
+        # replayable in tiny direct hops. A SAMPLED hop (a blind recording gap) is densified
+        # only within MAX_INTERP_HOP_RAD — beyond it the arm may have detoured, so it stays
+        # raw and the replay guard refuses. A COMMANDED hop is straight in joint space BY
+        # CONSTRUCTION (the SDK executes a direct move linearly), so it densifies at any size.
+        if self._w:
             prev = self._w[-1]
             hop = float(np.max(np.abs(q - prev)))
-            n = int(np.ceil(hop / (HOP_TOL_RAD / 2.0)))
-            for k in range(1, n):
-                self._w.append(prev + (q - prev) * (k / n))
-                self._dt.append(dt / n)
-            if n > 1:
-                dt = dt / n
+            if commanded or hop <= MAX_INTERP_HOP_RAD:
+                n = int(np.ceil(hop / (HOP_TOL_RAD / 2.0)))
+                for k in range(1, n):
+                    self._w.append(prev + (q - prev) * (k / n))
+                    self._dt.append(dt / n)
+                if n > 1:
+                    dt = dt / n
         self._w.append(q)
         self._dt.append(dt)
         self._t_last = t
 
-    def tick(self, joints, t: Optional[float] = None) -> bool:
-        """Record the live joints (when armed). Dedups a resting arm. Returns whether a
-        waypoint was appended."""
+    def tick(self, joints, t: Optional[float] = None, *, commanded: bool = False) -> bool:
+        """Record the live joints (when armed). Dedups a resting arm. `commanded=True` marks a
+        waypoint the engine COMMANDED (the bridge's on_move hook) — a straight joint move by
+        construction, safe to densify at any excursion. Returns whether a waypoint was appended."""
         if not self.armed:
             return False
         q = np.asarray(joints, float).reshape(-1)
         with self._mu:
             if self._w and np.max(np.abs(q - self._w[-1])) < self.dedup_rad:
                 return False
-            self._append(q, time.time() if t is None else float(t))
+            self._append(q, time.time() if t is None else float(t), commanded=commanded)
         return True
 
     def mark_capture(self, joints, t: Optional[float] = None) -> None:
