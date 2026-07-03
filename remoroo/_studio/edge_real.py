@@ -1517,6 +1517,12 @@ class RealBridge:
     def estop_ok(self):
         return True
 
+    def move_direct(self, joints):
+        """A DIRECT joint move that NEVER touches the planner — routine REPLAY re-follows the
+        recorded, human-traversed path in dense tiny hops, so planning (cuRobo) is neither
+        needed nor wanted (the world model isn't validated at calibration time)."""
+        self._direct_move([float(x) for x in joints])
+
     def _detect(self, img):
         import numpy as np
         # The AUTHORED target owns detection — the edge never names a fiducial type. A single
@@ -1698,6 +1704,38 @@ def _load_pipeline(cy: dict, cal: dict, urdf_path: str):
 _CALIB = None
 
 
+_routine_ticker_started = False
+
+
+def _start_routine_ticker() -> None:
+    """The routine RECORDER's feed: a daemon that polls the selected session's bridge joints
+    (~10 Hz while the recorder is armed) so the dense trajectory is logged no matter how the
+    arm is moved (hand-guided, jogged, or engine-driven). Same _bridge_lock non-blocking
+    discipline as the live-joints SSE — on contention it skips a tick, never blocks motion."""
+    global _routine_ticker_started
+    if _routine_ticker_started:
+        return
+    _routine_ticker_started = True
+
+    def _loop():
+        while True:
+            sess = getattr(_CALIB, "session", None) if _CALIB is not None else None
+            rec = getattr(sess, "recorder", None) if sess is not None else None
+            if rec is None or not rec.armed:
+                time.sleep(0.5)
+                continue
+            if _bridge_lock.acquire(blocking=False):
+                try:
+                    rec.tick(sess.bridge.read_joints())
+                except Exception:  # noqa: BLE001 — a bad poll skips a waypoint, never kills the feed
+                    pass
+                finally:
+                    _bridge_lock.release()
+            time.sleep(0.1)
+
+    threading.Thread(target=_loop, daemon=True, name="calib-routine-ticker").start()
+
+
 def _calib_service():
     global _CALIB
     if _CALIB is not None:
@@ -1770,6 +1808,7 @@ def _calib_service():
                           accept_rot_sigma_deg=acc_rot, accept_trans_sigma_mm=acc_tr,
                           plan_items=items, targets=targets,
                           intrinsics={c: kv for c, kv in intrinsics.items() if kv[0] is not None})
+    _start_routine_ticker()   # feeds the routine recorder while a session is armed
     return _CALIB
 
 
@@ -2044,6 +2083,28 @@ def _calib_b2b_snapshot() -> dict:
     return {"type": "b2b_snapshot", "a": one(b2b.bridge_a), "b": one(b2b.bridge_b),
             "min_corners": int(b2b.min_corners), "collected": len(b2b.obs),
             "board_outline": _board_outline(b2b.board)}
+
+
+# --------------------------------------------------------------------------- #
+# Task protocol: /edge/task/<verb> -> task_engine TaskService (mirrors calib).  #
+# Off-robot verbs answer immediately; bridge-touching verbs (BRIDGE_VERBS)      #
+# serialize under the same _bridge_lock as calibration (G14 discipline).        #
+# --------------------------------------------------------------------------- #
+_task_service = None
+
+
+def _task_handle(verb: str, body: dict) -> dict:
+    global _task_service
+    try:
+        from task_engine.service import BRIDGE_VERBS, TaskService
+    except Exception as e:  # noqa: BLE001 - stated, never a dead handler
+        return {"error": f"task_engine unavailable: {type(e).__name__}: {e}"}
+    if _task_service is None:
+        _task_service = TaskService()
+    if verb in BRIDGE_VERBS:
+        with _bridge_lock:
+            return _task_service.handle(verb, body)
+    return _task_service.handle(verb, body)
 
 
 def _calib_handle(verb: str, body: dict) -> dict:
@@ -2390,6 +2451,9 @@ class Handler(BaseHTTPRequestHandler):
         # Calibration protocol: /edge/calib/<verb> -> the stateful CalibService.
         if path.startswith("/edge/calib/"):
             return self._serve_json(_calib_handle(path[len("/edge/calib/"):], self._read_body()))
+        # Task protocol: /edge/task/<verb> -> the stateful TaskService.
+        if path.startswith("/edge/task/"):
+            return self._serve_json(_task_handle(path[len("/edge/task/"):], self._read_body()))
         if not route:
             self.send_response(404); self._cors(); self.end_headers(); self.wfile.write(b"not found"); return
         kind, fn = route

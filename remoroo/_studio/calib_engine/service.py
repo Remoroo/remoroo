@@ -155,6 +155,11 @@ class CalibService:
         if verb == "resnap":        return s.resnap(int(body.get("sample_id", -1)),
                                                      int(body.get("corner_id", -1)), body.get("uv"))
         if verb == "tip_test":      return s.tip_test()
+        # recorded-routine replay (automatic recalibration along the human-traversed path)
+        if verb == "routine_info":  return s.routine_info(self.calib_dir or ".")
+        if verb == "replay_start":  return s.replay_start(self.calib_dir or ".")
+        if verb == "replay_step":   return s.replay_step()
+        if verb == "replay_abort":  return s.replay_abort()
         if verb == "frames":        return s.frames()
         if verb == "frame_detail":  return s.frame_detail(int(body.get("index", -1)))
         if verb == "nudge":         return s.nudge(body.get("x_new"))

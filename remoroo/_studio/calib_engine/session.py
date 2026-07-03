@@ -33,6 +33,7 @@ from .metrics import (
     well_observed,
 )
 from .posegen import suggest_next_pose
+from .routine import ReplayCursor, Routine, RoutineRecorder
 from .solve import (
     _estimate_target_pose,
     solve_base_to_base_bundle,
@@ -61,6 +62,8 @@ class BridgeProtocol(Protocol):
     # motion_probe() -> {"joint": int, "delta": float} the RIG-SPECIFIC safe test motion for
     #   the pre-flight check, AUTHORED BY THE AGENT for THIS cell (which joint is safe to
     #   twitch, how far). Absent -> the engine computes the least-flange-effect joint.
+    # move_direct(joints) -> None a DIRECT (planner-free) joint move — routine REPLAY uses it
+    #   to re-follow the recorded human-traversed path in tiny hops; absent -> move_to_joints.
 
 
 def _T(x) -> list:
@@ -202,6 +205,13 @@ class CalibSession:
         self._sdk_T_lr = getattr(bridge, "sdk_T_lr", None)
         self._move_tcp = getattr(bridge, "move_tcp_to_world", None)
         self._motion_probe = getattr(bridge, "motion_probe", None)  # agent-authored {joint,delta}
+        # ROUTINE recording (arm-motion kinds only): passively logs the dense joint trajectory
+        # while the operator collects, so the whole calibration can later be REPLAYED (direct
+        # hops along the human-traversed path — never a planner). The edge feeds tick(); off-robot
+        # tests call it directly. Armed at confirm_seed (eye-in-hand) / detect (eye-to-hand).
+        self.recorder: Optional[RoutineRecorder] = None if self.static else \
+            RoutineRecorder(getattr(bridge, "joint_names", None))
+        self._replay: Optional[ReplayCursor] = None
 
     # ── C.0 pre-flight motion check (gates everything) ──────────────────────
     def motion_check(self, joint: Optional[int] = None, delta: float = 0.05, tol: float = 0.02) -> dict:
@@ -247,6 +257,10 @@ class CalibSession:
     def detect(self) -> dict:
         ids, uv = self.bridge.capture()
         seen = len(ids) >= self.min_corners
+        # An eye-to-hand (arm-presented) step has no seed-confirm phase — recording starts the
+        # moment the fixed camera sees the board (the operator begins hand-posing from here).
+        if seen and self.recorder is not None and self.kind == "eye_to_hand":
+            self.recorder.armed = True
         if seen and self.T_board_est is None and not self.static:
             s = CaptureSample(id=-1, joints=self.bridge.read_joints(),
                               fk_pose=self.bridge.read_pose(), corner_ids=ids, corners=uv)
@@ -363,6 +377,8 @@ class CalibSession:
         """The operator confirmed the seed visually → enter the collect phase (the look-at
         orbit refines X from here). The current X_est is frozen as the collection seed."""
         self.phase = "collect"
+        if self.recorder is not None:          # start logging the trajectory for future replay
+            self.recorder.armed = True
         return {"type": "confirm_seed", "phase": self.phase, "X": _T(self.X_est)}
 
     def _predict_uv(self, joints) -> Tuple[np.ndarray, np.ndarray]:
@@ -520,6 +536,8 @@ class CalibSession:
         accepted = len(ids) >= self.min_corners
         if accepted:
             bucket.append(s)
+            if self.recorder is not None:      # tie this capture to the recorded trajectory
+                self.recorder.mark_capture(joints)
             # F9: also grab the RIGHT stereo lens (same instant) for the left/right self-check.
             if not held_out and self._capture_right is not None:
                 try:
@@ -849,6 +867,110 @@ class CalibSession:
                 "X": _T(self.result.T_optical),
                 "heldout_px": None if heldout is None else round(float(heldout), 3)}
 
+    # ── recorded ROUTINE: save on accept, replay for automatic recalibration ─
+    def _routine_path(self, calib_dir: str) -> str:
+        name = self.item.id or self.item.camera_link
+        safe = name.replace("/", "_").replace("[", "_").replace("]", "_").replace("|", "_")
+        return str(Path(calib_dir) / "routines" / f"{safe}.json")
+
+    def routine_info(self, calib_dir: str) -> dict:
+        """Does a saved routine exist for THIS step (→ the Auto-recalibrate card), and is the
+        recorder currently logging (→ the '● recording' chip)?"""
+        out = {"type": "routine_info", "exists": False,
+               "recording": bool(self.recorder is not None and self.recorder.armed),
+               "recorded_waypoints": 0 if self.recorder is None else self.recorder.n_waypoints,
+               "recorded_captures": 0 if self.recorder is None else len(self.recorder.capture_marks)}
+        p = self._routine_path(calib_dir)
+        if Path(p).exists():
+            try:
+                r = Routine.load(p)
+                out.update({"exists": True, "waypoints": int(np.asarray(r.waypoints).shape[0]),
+                            "captures": len(r.capture_marks), "created_at": r.created_at})
+            except Exception as e:  # noqa: BLE001 — a corrupt file reads as absent, loudly
+                out.update({"exists": False, "error": f"routine unreadable: {e}"})
+        return out
+
+    def replay_start(self, calib_dir: str) -> dict:
+        """Begin an automatic recalibration by REPLAYING the recorded routine — direct joint
+        hops along the path the arm already physically traversed under supervision, NEVER a
+        planner. Guards: motion-check passed, E-stop live, joints/schema/hop validation, and
+        the arm must already be jogged NEAR the routine's first waypoint (we don't plan an
+        approach). Resets the sample set — this is a fresh calibration."""
+        if self.static:
+            return {"type": "replay_start", "ok": False, "error": "arm-motion steps only"}
+        if not self.motion_ok:
+            return {"type": "replay_start", "ok": False, "error": "run the motion check first"}
+        if not self.bridge.estop_ok():
+            return {"type": "replay_start", "ok": False, "error": "E-stop not OK"}
+        p = self._routine_path(calib_dir)
+        if not Path(p).exists():
+            return {"type": "replay_start", "ok": False, "error": "no recorded routine for this step"}
+        r = Routine.load(p)
+        err = r.validate_against(getattr(self.bridge, "joint_names", []) or [], self.chain.n)
+        if err:
+            return {"type": "replay_start", "ok": False, "error": err}
+        cursor = ReplayCursor(r)
+        ok, deltas = cursor.start_check(self.bridge.read_joints())
+        if not ok:
+            return {"type": "replay_start", "ok": False,
+                    "error": "arm is not at the routine's start pose — jog it there first",
+                    "start_joints": _T(np.asarray(r.waypoints)[0]), "deltas_rad": deltas}
+        # fresh recalibration: clear the collection; don't re-record while replaying
+        self.samples, self.heldout, self.result = [], [], None
+        if self.recorder is not None:
+            self.recorder.armed = False
+        self._replay = cursor
+        return {"type": "replay_start", "ok": True, "segments": len(cursor.segments),
+                "captures": len(r.capture_marks)}
+
+    def replay_step(self) -> dict:
+        """Execute ONE segment: hop through its dense waypoints (move_direct when the bridge
+        offers it — the planner-free path — else the plain joint move), then capture at the
+        mark. Every 4th capture is held out so validate(recollect=False) scores it with NO new
+        motion. Short per call (HTTP-friendly); the Studio loop drives it with a Stop button."""
+        cur = self._replay
+        if cur is None:
+            return {"type": "replay_step", "error": "replay not started"}
+        seg = cur.next_segment()
+        if seg is None:
+            self._replay = None
+            return {"type": "replay_step", "done": True, "collected": len(self.samples),
+                    "heldout": len(self.heldout)}
+        W, dts = seg
+        move = getattr(self.bridge, "move_direct", None) or self.bridge.move_to_joints
+        for q, dt in zip(W, dts):
+            if not self.bridge.estop_ok():
+                self._replay = None
+                return {"type": "replay_step", "error": "E-stop tripped — replay aborted",
+                        "segment": cur.i, "collected": len(self.samples)}
+            move(q)
+            if dt > 0:
+                import time
+                time.sleep(min(float(dt), 0.25))    # roughly the recorded pacing, capped
+        held_out = (cur.i - 1) % 4 == 3             # every 4th capture → the held-out set
+        cap = self.capture(held_out=held_out)
+        out = {"type": "replay_step", "segment": cur.i, "segments": len(cur.segments),
+               "accepted": bool(cap.get("accepted")), "held_out": held_out,
+               "collected": len(self.samples), "heldout": len(self.heldout),
+               "done": cur.done}
+        if cur.done:
+            self._replay = None
+        # live meter: a cheap running solve once enough poses (same payload observe() gives)
+        if len(self.samples) >= max(6, self.min_corners):
+            try:
+                r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+                self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
+                self._note_observability(r)
+                out["observability"] = {k: round(float(v), 4) for k, v in observability(r).items()}
+            except Exception:  # noqa: BLE001 — the meter is best-effort mid-replay
+                pass
+        return out
+
+    def replay_abort(self) -> dict:
+        """Stop in place (no retreat motion) and forget the cursor."""
+        self._replay = None
+        return {"type": "replay_abort", "ok": True, "collected": len(self.samples)}
+
     # ── accept: write body->optical back to the URDF + the calibration json ──
     def accept(self, urdf_path: str, out_path: Optional[str] = None, provenance: str = "measured",
                calib_dir: Optional[str] = None, force: bool = False) -> dict:
@@ -895,6 +1017,17 @@ class CalibSession:
             json_path = _write_calib_json(calib_dir, self.item.camera_link, self.result, provenance)
             _write_hand_eye_summary(calib_dir, self.item.camera_link, self.item.flange_link,
                                     self.kind, self.result.T_optical, provenance, self.result)
+            # An ACCEPTED calibration's recorded trajectory is worth keeping: save it as the
+            # step's ROUTINE so recalibration can replay it automatically (latest accepted wins).
+            # A replay run records nothing (recorder disarmed) → the original routine survives.
+            if self.recorder is not None and len(self.recorder.capture_marks) >= 2:
+                try:
+                    self.recorder.to_routine(
+                        step_id=self.item.id or self.item.camera_link, camera=self.item.camera_link,
+                        arm=self.item.arm, target={"type": getattr(self.board, "type", "")},
+                    ).save(self._routine_path(calib_dir))
+                except Exception:  # noqa: BLE001 — never block the accept on the routine write
+                    pass
         out = {"type": "accept", "ok": True, "urdf": dst, "camera": self.item.camera_link,
                "optical_frame": self.item.optical_frame, "provenance": provenance,
                "calib_json": json_path, "body_to_optical": _T(body_optical),

@@ -76,15 +76,31 @@ class LocalWorkerContext:
         """
         import requests
 
+        # Never raises — but a swallowed failure here is exactly how zombie
+        # runs happen, so say what happened either way (guarded print: stdout
+        # may already be gone on SIGHUP teardown).
+        outcome = ""
         try:
-            requests.post(
+            r = requests.post(
                 f"{self.api_url}/runs/{self.remote_run_id}/abort",
                 headers={"Authorization": f"Bearer {self.session_key}"},
                 timeout=10.0,
             )
-        except Exception:
-            # Never let a teardown abort failure mask the user's stop intent;
-            # the stale-reservation reconciler is the backstop.
+            if r.ok:
+                outcome = f"run {self.remote_run_id} terminated on the control plane ({reason})"
+            else:
+                outcome = (
+                    f"⚠ could not terminate run {self.remote_run_id}: HTTP {r.status_code} — "
+                    "the server-side zombie sweep will bill+fail it within minutes"
+                )
+        except Exception as e:  # noqa: BLE001
+            outcome = (
+                f"⚠ could not reach the control plane to terminate run {self.remote_run_id} ({e}) — "
+                "the server-side zombie sweep will bill+fail it within minutes"
+            )
+        try:
+            print(outcome, flush=True)
+        except Exception:  # noqa: BLE001
             pass
 
 

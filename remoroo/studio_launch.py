@@ -392,4 +392,21 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
         if spawn_edge:
             _stop_edge_quietly(project_dir, echo)  # stop the managed edge daemon too
 
+    # Ctrl+C is not the only way operators end a session: closing the terminal
+    # window (SIGHUP) or a plain `kill` (SIGTERM) would terminate Python without
+    # running _serve_loop's finally — no abort, and the run lingers RUNNING on
+    # the CP until the brain's zombie sweep bills+fails it. Map both onto
+    # KeyboardInterrupt so every exit goes through the same tested stop path.
+    import signal as _signal
+
+    def _sig_to_interrupt(signum, frame):  # noqa: ARG001
+        raise KeyboardInterrupt
+
+    try:
+        _signal.signal(_signal.SIGTERM, _sig_to_interrupt)
+        if hasattr(_signal, "SIGHUP"):
+            _signal.signal(_signal.SIGHUP, _sig_to_interrupt)
+    except ValueError:
+        pass  # not the main thread (embedded use) — keep default handling
+
     return _serve_loop(studio_proc, [], on_stop=_on_stop, echo=echo)
