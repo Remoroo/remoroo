@@ -36,6 +36,7 @@ from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
 from .world import WorldInputs, load_world, mask_robot_points
 from .live_world import observed_extent, esdf_resolution, union_extent, obstacle_bboxes
+from .mtrace import heartbeat, span, stamp
 
 # a pose: (position xyz [m], quaternion wxyz). Helpers below also accept a 7-list or a dict.
 Pose = Tuple[Sequence[float], Sequence[float]]
@@ -232,11 +233,16 @@ class MotionStack:
     def from_cell(cls, cell_dir: str, bridge=None, *, planner_factory: Optional[PlannerFactory] = None) -> "MotionStack":
         """Build from the on-disk cell: the AUTHORED config (cell.yaml groups) + collision_spheres.yml
         + world/ + safety."""
-        config = load_robot_config(cell_dir)
-        spheres, buffer = load_spheres(cell_dir)
-        authored_ignore = load_self_collision_ignore(cell_dir)
-        safety = load_safety(cell_dir)
-        world = load_world(cell_dir)
+        with span("from_cell: load_robot_config"):
+            config = load_robot_config(cell_dir)
+        with span("from_cell: load_spheres"):
+            spheres, buffer = load_spheres(cell_dir)
+        with span("from_cell: load_self_collision_ignore"):
+            authored_ignore = load_self_collision_ignore(cell_dir)
+        with span("from_cell: load_safety"):
+            safety = load_safety(cell_dir)
+        with span("from_cell: load_world"):
+            world = load_world(cell_dir)
         # ABSOLUTE path — cuRobo resolves a relative `urdf_path` against its OWN content/assets dir
         # (the "curobo/content/assets/robot.urdf is not a file" failure), never the cell.
         urdf_path = str((Path(cell_dir) / "robot_model" / "robot.urdf").resolve())
@@ -371,6 +377,10 @@ class MotionStack:
         return ext, ctr
 
     def update_world_live(self, frames, tcp: Optional[str] = None) -> dict:
+        with span("update_world_live", frames=len(frames) if frames is not None else 0):
+            return self._update_world_live_impl(frames, tcp)
+
+    def _update_world_live_impl(self, frames, tcp: Optional[str] = None) -> dict:
         """Refresh the LIVE collision world from N camera depth frames (ANY rig — the agent's
         commission pipeline calls this each cycle). cuRobo does the heavy lifting: each frame is
         cleaned (`FilterDepth`) and robot-MASKED at the live config (`RobotSegmenter`, so the robot is
@@ -647,12 +657,18 @@ class MotionStack:
             self._group(a)                     # KeyError on an unknown group, before any build
         key = frozenset(active_groups)
         if key not in self._planners:
-            planner = self._factory(self._robot_cfg_for(active_groups), self.world,
-                                    limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
-            if self._self_mask_world(planner):     # masked the cloud → rebuild from the masked world
+            with span("planner build #1", groups=",".join(sorted(active_groups))):
                 planner = self._factory(self._robot_cfg_for(active_groups), self.world,
                                         limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
+            with span("self-mask world check"):
+                masked = self._self_mask_world(planner)
+            if masked:     # masked the cloud → rebuild from the masked world
+                with span("planner REBUILD #2 (self-mask changed the world — full build cost paid TWICE)"):
+                    planner = self._factory(self._robot_cfg_for(active_groups), self.world,
+                                            limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
             self._planners[key] = planner
+        else:
+            stamp("planner cache HIT", groups=",".join(sorted(active_groups)))
         return self._planners[key]
 
     # --- health -----------------------------------------------------------
@@ -688,15 +704,24 @@ class MotionStack:
         the default 0.0, the plan would command them to fly home. Prefer the bridge's full
         `get_observation().joint_positions` (covers grippers too), falling back to per-group reads."""
         if self.bridge is None:
+            stamp("seed_positions: NO BRIDGE — planner defaults will seed (fly-home hazard)")
             return {}
-        try:
-            obs = self.bridge.get_observation()
-            jp = getattr(obs, "joint_positions", None)
-            if jp:
-                return {str(n): float(v) for n, v in dict(jp).items()}
-        except Exception:  # noqa: BLE001
-            pass
-        return self._current_positions(list(self._groups.keys()))
+        with span("seed_positions (get_observation)"):
+            try:
+                obs = self.bridge.get_observation()
+                jp = getattr(obs, "joint_positions", None)
+                if jp:
+                    out = {str(n): float(v) for n, v in dict(jp).items()}
+                    stamp("seed_positions from observation", joints=len(out))
+                    return out
+            except Exception as e:  # noqa: BLE001
+                stamp("seed_positions: observation FAILED", error=f"{type(e).__name__}: {e}")
+        out = self._current_positions(list(self._groups.keys()))
+        if not out:
+            stamp("seed_positions EMPTY — un-goaled joints will target planner DEFAULTS (fly-home hazard)")
+        else:
+            stamp("seed_positions from per-group reads", joints=len(out))
+        return out
 
     # --- the verbs --------------------------------------------------------
     def move_to_pose(self, tcp: str, pose, *, execute: bool = True, max_attempts: int = 3) -> MoveResult:
@@ -728,21 +753,23 @@ class MotionStack:
         an incomplete seed must surface as a refusal, never as a limb flying to a default)."""
         if not goal:
             return MoveResult(False, "no goal joints given")
-        active = list(groups) if groups else list(self._groups.keys())
-        planner = self._planner_for(active)
-        known = {n for g in active for n in self._group(g)["joint_names"]}
-        unknown = [n for n in goal if n not in known]
-        if unknown:
-            return MoveResult(False, f"goal names joints outside groups {active}: {unknown}")
-        res = planner.plan_joints(dict(goal), self._seed_positions(), max_attempts=max_attempts)
-        if getattr(res, "success", False) and getattr(res, "trajectory", None) is not None:
-            moved = _foreign_motion(res.trajectory, set(goal))
-            if moved:
-                return MoveResult(False,
-                                  "REFUSED: the plan moves joints the goal never named — "
-                                  f"{moved} (an incomplete seed / stale observation; nothing was executed)",
-                                  trajectory=res.trajectory)
-        return self._finish(res, execute)
+        with span("goto_joints", named=len(goal), execute=execute):
+            active = list(groups) if groups else list(self._groups.keys())
+            planner = self._planner_for(active)
+            known = {n for g in active for n in self._group(g)["joint_names"]}
+            unknown = [n for n in goal if n not in known]
+            if unknown:
+                return MoveResult(False, f"goal names joints outside groups {active}: {unknown}")
+            res = planner.plan_joints(dict(goal), self._seed_positions(), max_attempts=max_attempts)
+            if getattr(res, "success", False) and getattr(res, "trajectory", None) is not None:
+                moved = _foreign_motion(res.trajectory, set(goal))
+                if moved:
+                    stamp("FOREIGN-MOTION GUARD refused the plan", moved=moved)
+                    return MoveResult(False,
+                                      "REFUSED: the plan moves joints the goal never named — "
+                                      f"{moved} (an incomplete seed / stale observation; nothing was executed)",
+                                      trajectory=res.trajectory)
+            return self._finish(res, execute)
 
     def prewarm(self, *, groups: Optional[Sequence[str]] = None) -> dict:
         """Build (and cache) the WHOLE-BODY planner up front — planner build + cuRobo warmup
@@ -751,7 +778,8 @@ class MotionStack:
         import time as _time
         t0 = _time.time()
         active = list(groups) if groups else list(self._groups.keys())
-        self._planner_for(active)
+        with span("prewarm whole-body planner", groups=",".join(active)):
+            self._planner_for(active)
         return {"groups": active, "seconds": round(_time.time() - t0, 1)}
 
     def move_through_poses(self, tcp: str, poses: Sequence[object], *, execute: bool = True,
@@ -1740,10 +1768,12 @@ class MotionStack:
         the per-arm executor with a `should_abort` poll. The audit is vs BUGS only (NaN, a velocity
         spike, a waypoint out of bounds) — never a re-judgement of cuRobo's already-safe plan."""
         if not getattr(plan, "success", False) or getattr(plan, "trajectory", None) is None:
+            stamp("plan FAILED", message=getattr(plan, "message", "planning failed"))
             return MoveResult(False, getattr(plan, "message", "planning failed"))
         traj: Trajectory = plan.trajectory
-        reasons = audit_trajectory(traj, bounds_m=self.safety.bounds_m,
-                                   max_velocity=self.safety.max_velocity)
+        with span("defensive audit", waypoints=len(traj), dof=len(traj.joint_names)):
+            reasons = audit_trajectory(traj, bounds_m=self.safety.bounds_m,
+                                       max_velocity=self.safety.max_velocity)
         if reasons:
             return MoveResult(False, "trajectory failed the defensive audit (likely a planner bug)",
                               trajectory=traj, audit=reasons, total_time=plan.total_time)
@@ -1754,10 +1784,15 @@ class MotionStack:
             return MoveResult(False, "no bridge.execute_trajectory — cannot replay", trajectory=traj)
 
         should_abort = self._abort_poll()
+        movers = [n for i, n in enumerate(traj.joint_names)
+                  if float(np.max(np.abs(traj.positions[:, i] - traj.positions[0, i]))) > 0.02]
+        info = f"{len(traj)} wp × {len(traj.joint_names)} joints · movers={movers} · planned {traj.duration:.1f}s"
         try:
-            ok = self.bridge.execute_trajectory(traj, should_abort=should_abort)
-        except TypeError:
-            ok = self.bridge.execute_trajectory(traj)  # driver that doesn't accept should_abort
+            with span("bridge.execute_trajectory", detail=info), heartbeat("execute_trajectory", info=info):
+                try:
+                    ok = self.bridge.execute_trajectory(traj, should_abort=should_abort)
+                except TypeError:
+                    ok = self.bridge.execute_trajectory(traj)  # driver that doesn't accept should_abort
         except Exception as e:
             return MoveResult(False, f"executor raised: {e}", trajectory=traj)
         aborted = bool(should_abort()) if should_abort else False

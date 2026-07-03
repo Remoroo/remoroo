@@ -1005,6 +1005,8 @@ class CalibSession:
         cur = self._replay
         if cur is None:
             return {"type": "replay_step", "error": "replay not started"}
+        import time as _time
+        _t0 = _time.time()
         seg = cur.next_segment()
         if seg is None:
             self._replay = None
@@ -1021,8 +1023,12 @@ class CalibSession:
             if dt > 0:
                 import time
                 time.sleep(min(float(dt), 0.25))    # roughly the recorded pacing, capped
+        _t_moved = _time.time()
         held_out = (cur.i - 1) % 4 == 3             # every 4th capture → the held-out set
         cap = self.capture(held_out=held_out)
+        print(f"[replay] segment {cur.i}/{len(cur.segments)} · {len(W)} hops moved in "
+              f"{_t_moved - _t0:.2f}s · capture {'ok' if cap.get('accepted') else 'MISSED'} in "
+              f"{_time.time() - _t_moved:.2f}s", flush=True)
         out = {"type": "replay_step", "segment": cur.i, "segments": len(cur.segments),
                "accepted": bool(cap.get("accepted")), "held_out": held_out,
                "collected": len(self.samples), "heldout": len(self.heldout),

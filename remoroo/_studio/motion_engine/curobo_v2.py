@@ -345,9 +345,11 @@ class CuroboV2Planner:
         self_collision_check: bool = True,
         enable_graph: bool = True,
     ) -> None:
-        import torch  # noqa: F401  (lazy GPU import; presence validated by the toolchain gate)
-        _ensure_warp_torch()                       # force-load Warp's torch interop or fail CLEARLY
-        from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
+        from .mtrace import span
+        with span("torch+warp import"):
+            import torch  # noqa: F401  (lazy GPU import; presence validated by the toolchain gate)
+            _ensure_warp_torch()                   # force-load Warp's torch interop or fail CLEARLY
+            from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 
         self._device = device
         limits = limits or {}
@@ -369,20 +371,23 @@ class CuroboV2Planner:
         from .live_world import ESDF_AXIS_VOXELS
         _cap_axis = int(ESDF_AXIS_VOXELS * 1.4)
         voxel_cache = {"layers": 1, "dims": [_cap_axis * 0.05] * 3, "voxel_size": 0.05}
-        cfg = MotionPlannerCfg.create(
-            robot=robot_cfg,
-            scene_model=scene or None,
-            collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid), "voxel": voxel_cache},
-            max_goalset=int(max_goalset),
-            self_collision_check=bool(self_collision_check),   # False = diagnostic probe (isolate self-collision)
-        )
-        self.planner = MotionPlanner(cfg)
+        with span("MotionPlannerCfg.create", joints=len((robot_cfg.get("robot_cfg", {}).get("kinematics", {}).get("cspace", {}) or {}).get("joint_names", []))):
+            cfg = MotionPlannerCfg.create(
+                robot=robot_cfg,
+                scene_model=scene or None,
+                collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid), "voxel": voxel_cache},
+                max_goalset=int(max_goalset),
+                self_collision_check=bool(self_collision_check),   # False = diagnostic probe (isolate self-collision)
+            )
+        with span("MotionPlanner(cfg) build"):
+            self.planner = MotionPlanner(cfg)
         # enable_graph builds cuRobo's CUDA-graph capture (faster plans). Turn it OFF for the realtime
         # gate: a graph capture puts a CUDA stream in capture mode, and a CUDA-native camera (e.g. the
         # ZED) cannot do GPU work (cudaCreateTextureObject) while a stream is capturing
         # (cudaErrorStreamCaptureUnsupported 900). Graph-free = no capture = the camera and cuRobo coexist.
         if warmup:
-            self.planner.warmup(enable_graph=bool(enable_graph), num_warmup_iterations=5)
+            with span("planner.warmup", enable_graph=bool(enable_graph), iters=5):
+                self.planner.warmup(enable_graph=bool(enable_graph), num_warmup_iterations=5)
 
         # Load input 2 (the modeled obstacles) as the planner's world at build. Once a live build runs,
         # update_voxel_world REPLACES this with the ESDF (which already has the obstacles fused in), so
@@ -739,9 +744,11 @@ class CuroboV2Planner:
         if not goals:
             return PlanResult(False, None, "no goals given")
         try:
+            from .mtrace import span as _span
             goal = self._goal(goals)
             start = self._start_js(start_positions)
-            result = self.planner.plan_pose(goal, start, use_implicit_goal=True, max_attempts=max_attempts)
+            with _span("plan_pose", frames=len(goals), attempts=max_attempts):
+                result = self.planner.plan_pose(goal, start, use_implicit_goal=True, max_attempts=max_attempts)
         except Exception as e:  # a planner exception is a failure to surface, not a crash
             return PlanResult(False, None, f"plan_pose raised: {e}")
         if result is None or not bool(result.success.any()):
@@ -797,8 +804,10 @@ class CuroboV2Planner:
         clamped a hair inside the limits (same rationale as `_start_js`)."""
         from curobo.types import JointState
 
+        from .mtrace import span
         try:
-            start = self._start_js(start_positions)
+            with span("plan_joints._start_js"):
+                start = self._start_js(start_positions)
             q = start.position.detach().clone()          # (1, n) — hold-by-default
             names = list(self.planner.joint_names)
             lims = self.joint_limits()
@@ -813,12 +822,14 @@ class CuroboV2Planner:
                         v = min(max(v, lo + 1e-4), hi - 1e-4)
                     q[0, i] = v
             goal = JointState.from_position(q, joint_names=names)
-            result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
+            with span("plan_cspace", attempts=max_attempts, named=len(goal_positions)):
+                result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
         except Exception as e:
             return PlanResult(False, None, f"plan_cspace raised: {e}")
         if result is None or not bool(result.success.any()):
             return PlanResult(False, None, _plan_failure_message(result))
-        traj = self._to_trajectory(result.interpolated_trajectory)
+        with span("interpolate→Trajectory"):
+            traj = self._to_trajectory(result.interpolated_trajectory)
         return PlanResult(True, traj, "ok", traj.duration)
 
     def update_obstacle_pose(self, name: str, pose: Sequence[float]) -> None:

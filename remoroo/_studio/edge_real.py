@@ -1780,7 +1780,11 @@ _MOTION_WARM = {"state": "off", "error": None}   # off | warming | error (alive 
 
 
 def h_motion_status(_q):
-    """The motion stack lifecycle for the header chip: alive | warming | error | off."""
+    """The motion stack lifecycle for the header chip: alive | warming | error | off.
+    WARMING WINS over the stack object existing — `motion_stack()` returns in seconds but the
+    planner prewarm runs for minutes after; reporting alive early was the lying chip."""
+    if _MOTION_WARM["state"] == "warming":
+        return {"ok": True, "state": "warming", "groups": [], "error": None}
     if _MOTION_STACK is not None:
         try:
             groups = list(_MOTION_STACK.group_names)
@@ -1801,12 +1805,14 @@ def h_motion_warmup(_q):
 
     def _build():
         try:
+            from motion_engine.mtrace import span as _mspan
             with _bridge_lock:
-                st = motion_stack()
-                warm = st.prewarm()                       # the WHOLE-BODY planner, built up front
+                with _mspan("warmup: MotionStack.from_cell (artifact loads)"):
+                    st = motion_stack()
+                with _mspan("warmup: prewarm (planner build + cuRobo warmup)"):
+                    warm = st.prewarm()                   # the WHOLE-BODY planner, built up front
             _MOTION_WARM.update(state="off", error=None)   # alive is derived from the stack itself
-            print(f"[edge] motion stack alive (operator warmup) · whole-body planner built in "
-                  f"{warm.get('seconds')}s for groups {warm.get('groups')}")
+            print(f"[edge] motion stack ALIVE · prewarm {warm.get('seconds')}s · groups {warm.get('groups')}")
         except Exception as e:  # noqa: BLE001
             _MOTION_WARM.update(state="error", error=f"{type(e).__name__}: {e}")
             print(f"[edge] motion stack warmup FAILED: {type(e).__name__}: {e}")
@@ -1828,6 +1834,13 @@ def _replay_goto_start() -> dict:
     import numpy as _np
     from calib_engine.routine import HOP_TOL_RAD
 
+    t0 = time.time()
+
+    def _lap(tag, **kv):
+        kvs = (" · " + " ".join(f"{k}={v}" for k, v in kv.items())) if kv else ""
+        print(f"[goto] +{time.time() - t0:6.2f}s {tag}{kvs}", flush=True)
+
+    _lap("verb entry")
     svc = _calib_service()
     s = svc.session
     if s is None:
@@ -1837,6 +1850,7 @@ def _replay_goto_start() -> dict:
         gates = (_json.loads(st_file.read_text(encoding="utf-8")).get("gates") or {}) if st_file.exists() else {}
     except Exception:  # noqa: BLE001
         gates = {}
+    _lap("gates read", commission=gates.get("commission"))
     if gates.get("commission") != "done":
         return {"ok": False, "error": "commission gate not done — automatic planned motion is only "
                 "allowed once the motion stack was PROVEN live; jog the arm to the start manually"}
@@ -1845,6 +1859,8 @@ def _replay_goto_start() -> dict:
     if not s.bridge.estop_ok():
         return {"ok": False, "error": "E-stop not OK"}
     sp = s.routine_start_pose(svc.calib_dir or ".")
+    _lap("routine start pose", ok=sp.get("ok"), joints=len(sp.get("joints") or []),
+         at_start=sp.get("at_start"))
     if not sp.get("ok"):
         return {"ok": False, "error": sp.get("error", "no recorded routine")}
     if sp.get("at_start"):
@@ -1858,8 +1874,11 @@ def _replay_goto_start() -> dict:
     # ONE body — no group resolution, no held-at-seed limbs; the routine says where EVERYTHING
     # belongs, and the foreign-motion guard refuses any plan that moves an un-goaled joint.
     goal = {n: float(v) for n, v in zip(jnames, sp["joints"])}
+    _lap("goal built — calling goto_joints (bridge lock)", named=len(goal))
     with _bridge_lock:
         res = _MOTION_STACK.goto_joints(goal, execute=True)
+    _lap("goto_joints returned", ok=res.ok, executed=getattr(res, "executed", None),
+         message=res.message)
     out = {"ok": bool(res.ok), "message": res.message}
     try:
         traj = getattr(res, "trajectory", None)
@@ -1873,12 +1892,19 @@ def _replay_goto_start() -> dict:
     except Exception:  # noqa: BLE001 — diagnostics only
         pass
     try:
-        d = _np.abs(_np.asarray(s.bridge.read_joints(), float).reshape(-1)
-                    - _np.asarray(sp["joints"], float))
+        chain_names = list(getattr(s.bridge, "joint_names", []) or [])
+        start_map = dict(zip(jnames, sp["joints"]))
+        if chain_names and all(n in start_map for n in chain_names):
+            w0 = _np.asarray([start_map[n] for n in chain_names], float)
+        else:
+            w0 = _np.asarray(sp["joints"], float)
+        d = _np.abs(_np.asarray(s.bridge.read_joints(), float).reshape(-1) - w0)
         out["deltas_rad"] = d.round(4).tolist()
         out["at_start"] = bool(d.max() <= HOP_TOL_RAD)
-    except Exception:  # noqa: BLE001 — proximity is advisory; replay_start re-gates it
-        pass
+        _lap("post-move proximity", at_start=out["at_start"], worst=round(float(d.max()), 3))
+    except Exception as e:  # noqa: BLE001 — proximity is advisory; replay_start re-gates it
+        _lap("post-move proximity FAILED", error=f"{type(e).__name__}: {e}")
+    _lap("done", ok=out.get("ok"))
     return out
 
 
