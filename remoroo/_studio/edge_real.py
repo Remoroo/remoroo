@@ -1489,6 +1489,19 @@ class RealBridge:
 
     def _direct_move(self, joints):
         q = [float(x) for x in joints]
+        self._issue_direct(q)
+        # ROUTINE recording: engine-commanded motion runs with _bridge_lock held for the WHOLE
+        # move, so the edge's poll ticker is blind during it. The commanded waypoints ARE the
+        # traversed path — report each one to the session's recorder (set as `on_move`), so the
+        # recorded routine has the full safe passage, not a blind jump the replay guard refuses.
+        hook = getattr(self, "on_move", None)
+        if callable(hook):
+            try:
+                hook(q)
+            except Exception:  # noqa: BLE001 — recording must never break a motion
+                pass
+
+    def _issue_direct(self, q):
         # Per-arm routing (the multi-arm SAFETY fix). When the step bound an arm, drive THAT
         # arm explicitly: prefer an arm-aware move, then the multi-arm primitive, then a
         # single-arm fallback. This removes the `_calib_arm` side-channel the engine never set.

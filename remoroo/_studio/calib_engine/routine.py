@@ -11,6 +11,7 @@ planner. Pure numpy + json: engine-testable off-robot; the edge only feeds `tick
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -112,6 +113,10 @@ class RoutineRecorder:
         self._dt: List[float] = []
         self._t_last: Optional[float] = None
         self.capture_marks: List[int] = []
+        # Two feeders share this recorder — the edge's poll ticker (its own thread) and the
+        # bridge's on_move hook (the verb thread, fired mid-move) — so appends + mark indices
+        # must not interleave.
+        self._mu = threading.Lock()
 
     @property
     def n_waypoints(self) -> int:
@@ -141,9 +146,10 @@ class RoutineRecorder:
         if not self.armed:
             return False
         q = np.asarray(joints, float).reshape(-1)
-        if self._w and np.max(np.abs(q - self._w[-1])) < self.dedup_rad:
-            return False
-        self._append(q, time.time() if t is None else float(t))
+        with self._mu:
+            if self._w and np.max(np.abs(q - self._w[-1])) < self.dedup_rad:
+                return False
+            self._append(q, time.time() if t is None else float(t))
         return True
 
     def mark_capture(self, joints, t: Optional[float] = None) -> None:
@@ -151,8 +157,9 @@ class RoutineRecorder:
         if not self.armed:
             return
         q = np.asarray(joints, float).reshape(-1)
-        self._append(q, time.time() if t is None else float(t))
-        self.capture_marks.append(len(self._w) - 1)
+        with self._mu:
+            self._append(q, time.time() if t is None else float(t))
+            self.capture_marks.append(len(self._w) - 1)
 
     def to_routine(self, *, step_id: str, camera: str, arm: str, target: Optional[dict] = None) -> Routine:
         return Routine(

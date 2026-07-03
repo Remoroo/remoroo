@@ -212,6 +212,15 @@ class CalibSession:
         self.recorder: Optional[RoutineRecorder] = None if self.static else \
             RoutineRecorder(getattr(bridge, "joint_names", None))
         self._replay: Optional[ReplayCursor] = None
+        # Engine-COMMANDED motion happens with the bridge lock held for the whole move, so the
+        # edge's poll ticker is blind during it. The bridge reports each commanded waypoint via
+        # this hook — the commanded path IS the traversed path, so the routine records the full
+        # safe passage instead of a blind jump the replay guard would refuse.
+        if self.recorder is not None:
+            try:
+                bridge.on_move = self.recorder.tick     # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 — a hook-less bridge just relies on the ticker
+                pass
 
     # ── C.0 pre-flight motion check (gates everything) ──────────────────────
     def motion_check(self, joint: Optional[int] = None, delta: float = 0.05, tol: float = 0.02) -> dict:
