@@ -583,12 +583,22 @@ def sse_live_joints(_q):
     # "disconnected" with no reason — the exact failure operators hit at the calibrate gate. Instead
     # keep the stream OPEN, retry (get_bridge backs off internally), and HEARTBEAT the current
     # bridge error so the Studio can say "edge up · robot bridge not ready: <reason>".
-    js = _joint_stream()
+    def _stream_or_reason():
+        """The SSE must NEVER die on an internal error (a dead SSE reconnect-loops as a
+        SILENT orange 'not connected'): any exception building the stream — a module missing
+        from the bundle, a broken bridge attribute — becomes the heartbeat's visible reason."""
+        try:
+            return _joint_stream(), None
+        except Exception as e:  # noqa: BLE001
+            print(f"[edge] joint stream unavailable: {type(e).__name__}: {e}")
+            return None, f"joint stream unavailable: {type(e).__name__}: {e}"
+
+    js, reason = _stream_or_reason()
     while js is None:
         yield {"t": time.time() - t0, "joints": {}, "waiting": True,
-               "error": _bridge_err or "robot bridge not connected yet"}
+               "error": reason or _bridge_err or "robot bridge not connected yet"}
         time.sleep(1.0)
-        js = _joint_stream()
+        js, reason = _stream_or_reason()
     while True:
         evt = js.latest
         if evt is None:
@@ -1836,7 +1846,10 @@ def _calib_service():
                           accept_rot_sigma_deg=acc_rot, accept_trans_sigma_mm=acc_tr,
                           plan_items=items, targets=targets,
                           intrinsics={c: kv for c, kv in intrinsics.items() if kv[0] is not None})
-    _joint_stream()   # the independent joint stream feeds the routine recorder (+ the mirror)
+    try:
+        _joint_stream()   # the independent joint stream feeds the routine recorder (+ the mirror)
+    except Exception as e:  # noqa: BLE001 — telemetry down must never block calibration itself
+        print(f"[edge] joint stream unavailable (recorder will be sparse): {type(e).__name__}: {e}")
     return _CALIB
 
 
