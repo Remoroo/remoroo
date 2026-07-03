@@ -33,7 +33,7 @@ from .metrics import (
     well_observed,
 )
 from .posegen import suggest_next_pose
-from .routine import ReplayCursor, Routine, RoutineRecorder
+from .routine import HOP_TOL_RAD, ReplayCursor, Routine, RoutineRecorder
 from .solve import (
     _estimate_target_pose,
     solve_base_to_base_bundle,
@@ -900,6 +900,29 @@ class CalibSession:
                             "captures": len(r.capture_marks), "created_at": r.created_at})
             except Exception as e:  # noqa: BLE001 — a corrupt file reads as absent, loudly
                 out.update({"exists": False, "error": f"routine unreadable: {e}"})
+        return out
+
+    def routine_start_pose(self, calib_dir: str) -> dict:
+        """The saved routine's START configuration + identity — what the edge's drive-to-start
+        (the commission-proven motion stack) needs: the joint vector, its NAMES (the group is
+        resolved from the joint SET, never the arm label), and how far the live arm is from it.
+        Pure read; no motion, no motion_engine import (the edge owns that fusion)."""
+        p = self._routine_path(calib_dir)
+        if not Path(p).exists():
+            return {"type": "routine_start_pose", "ok": False, "error": "no recorded routine for this step"}
+        r = Routine.load(p).densified()
+        W = np.asarray(r.waypoints, float)
+        if W.ndim != 2 or W.shape[0] < 1:
+            return {"type": "routine_start_pose", "ok": False, "error": "routine has no trajectory"}
+        out = {"type": "routine_start_pose", "ok": True, "joints": _T(W[0]),
+               "joint_names": list(r.joint_names) or list(getattr(self.bridge, "joint_names", []) or []),
+               "arm": r.arm or self.item.arm}
+        try:
+            d = np.abs(np.asarray(self.bridge.read_joints(), float).reshape(-1) - W[0])
+            out["deltas_rad"] = d.round(4).tolist()
+            out["at_start"] = bool(d.max() <= HOP_TOL_RAD)
+        except Exception:  # noqa: BLE001 — proximity is advisory here; replay_start re-gates it
+            pass
         return out
 
     def replay_start(self, calib_dir: str) -> dict:

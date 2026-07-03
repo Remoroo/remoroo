@@ -1774,6 +1774,109 @@ def _joint_stream():
     return _JSTREAM
 
 
+# ── the motion stack's LIFECYCLE (the Studio header's ⚡ chip) ────────────────
+# The commission-proven MotionStack is expensive to bring alive (planner build + cuRobo
+# warmup, tens of seconds) so it is NEVER built implicitly — the operator starts it from the
+# header, and consumers (drive-to-start) refuse until it's alive.
+_MOTION_WARM = {"state": "off", "error": None}   # off | warming | error (alive = stack != None)
+
+
+def h_motion_status(_q):
+    """The motion stack lifecycle for the header chip: alive | warming | error | off."""
+    if _MOTION_STACK is not None:
+        try:
+            groups = list(_MOTION_STACK.group_names)
+        except Exception:  # noqa: BLE001
+            groups = []
+        return {"ok": True, "state": "alive", "groups": groups, "error": None}
+    return {"ok": True, "state": _MOTION_WARM["state"], "groups": [], "error": _MOTION_WARM["error"]}
+
+
+def h_motion_warmup(_q):
+    """Bring the COMMISSIONED motion stack alive on a background thread (build + warmup holds
+    the bridge lock for tens of seconds — an explicit operator action, never implicit)."""
+    if _MOTION_STACK is not None:
+        return {"ok": True, "state": "alive"}
+    if _MOTION_WARM["state"] == "warming":
+        return {"ok": True, "state": "warming"}
+    _MOTION_WARM.update(state="warming", error=None)
+
+    def _build():
+        try:
+            with _bridge_lock:
+                motion_stack()
+            _MOTION_WARM.update(state="off", error=None)   # alive is derived from the stack itself
+            print("[edge] motion stack alive (operator warmup)")
+        except Exception as e:  # noqa: BLE001
+            _MOTION_WARM.update(state="error", error=f"{type(e).__name__}: {e}")
+            print(f"[edge] motion stack warmup FAILED: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_build, daemon=True, name="motion-warmup").start()
+    return {"ok": True, "state": "warming"}
+
+
+def _replay_goto_start() -> dict:
+    """Drive the arm to the selected step's routine START with the COMMISSION-PROVEN motion
+    stack (collision-free joint-space plan through the commissioned executor) — the automatic
+    'jog it there'. Every guard refuses LOUDLY: (1) the commission gate must be DONE
+    (setup_state.json — the trust line: automatic planned motion only after the stack was
+    proven live; the UI gates too, this is the server-side enforcement), (2) the stack must be
+    ALIVE (the header ⚡ chip), (3) a saved routine must exist, and (4) the GROUP is resolved
+    from the routine's JOINT SET (data over labels — any morphology), cross-checked against the
+    stack's groups. The tape replay itself stays planner-free (move_direct) after this."""
+    import json as _json
+    import numpy as _np
+    from calib_engine.routine import HOP_TOL_RAD, resolve_group
+    from calib_engine import urdf_io
+
+    svc = _calib_service()
+    s = svc.session
+    if s is None:
+        return {"ok": False, "error": "no calibration selected — select the step first"}
+    st_file = CELL_DIR / "setup_state.json"
+    try:
+        gates = (_json.loads(st_file.read_text(encoding="utf-8")).get("gates") or {}) if st_file.exists() else {}
+    except Exception:  # noqa: BLE001
+        gates = {}
+    if gates.get("commission") != "done":
+        return {"ok": False, "error": "commission gate not done — automatic planned motion is only "
+                "allowed once the motion stack was PROVEN live; jog the arm to the start manually"}
+    if _MOTION_STACK is None:
+        return {"ok": False, "error": "motion stack not running — start it from the header (⚡ Motion), then retry"}
+    if not s.bridge.estop_ok():
+        return {"ok": False, "error": "E-stop not OK"}
+    sp = s.routine_start_pose(svc.calib_dir or ".")
+    if not sp.get("ok"):
+        return {"ok": False, "error": sp.get("error", "no recorded routine")}
+    if sp.get("at_start"):
+        return {"ok": True, "message": "already at the start pose", "at_start": True,
+                "deltas_rad": sp.get("deltas_rad")}
+    urdf = str(CELL_DIR / "robot_model" / "robot.urdf")
+    groups = urdf_io.robot_config(load_cell_yaml(), urdf).get("groups", [])
+    gname, gerr = resolve_group(groups, sp.get("joint_names") or [])
+    if gerr:
+        return {"ok": False, "error": gerr}
+    try:
+        stack_groups = set(_MOTION_STACK.group_names)
+    except Exception:  # noqa: BLE001
+        stack_groups = set()
+    if gname not in stack_groups:
+        return {"ok": False, "error": f"group {gname!r} is not in the motion stack "
+                f"({sorted(stack_groups)}) — rebuild the stack (header ⚡)"}
+    goal = {n: float(v) for n, v in zip(sp["joint_names"], sp["joints"])}
+    with _bridge_lock:
+        res = _MOTION_STACK.goto_joints(gname, goal, execute=True)
+    out = {"ok": bool(res.ok), "message": res.message, "group": gname}
+    try:
+        d = _np.abs(_np.asarray(s.bridge.read_joints(), float).reshape(-1)
+                    - _np.asarray(sp["joints"], float))
+        out["deltas_rad"] = d.round(4).tolist()
+        out["at_start"] = bool(d.max() <= HOP_TOL_RAD)
+    except Exception:  # noqa: BLE001 — proximity is advisory; replay_start re-gates it
+        pass
+    return out
+
+
 def _calib_service():
     global _CALIB
     if _CALIB is not None:
@@ -2180,6 +2283,10 @@ def _calib_handle_locked(verb: str, body: dict) -> dict:
         if verb == "b2b_snapshot":
             # dual-arm: BOTH wrist cameras' frames + detection, so base-to-base isn't blind.
             return _calib_b2b_snapshot()
+        if verb == "replay_goto_start":
+            # drive-to-start via the COMMISSION-PROVEN motion stack (edge-level: the engine
+            # never imports motion_engine — gate fusion is the edge's job).
+            return _replay_goto_start()
         return _calib_service().handle(verb, body)
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
@@ -2413,6 +2520,8 @@ ROUTES = {
     "/edge/motion/commission": ("sse", sse_commission),
     "/edge/realtime/run": ("sse", sse_realtime),   # the realtime gate (replaces the deleted demo gate)
     "/edge/motion/plan_move": ("sse", sse_plan_move),
+    "/edge/motion/status": ("json", h_motion_status),
+    "/edge/motion/warmup": ("json", h_motion_warmup),
     "/edge/motion/tcp_pose": ("json", h_tcp_pose),
     "/edge/motion/suggest_targets": ("json", h_suggest_targets),
     "/edge/motion/diagnose": ("json", h_diagnose_motion),

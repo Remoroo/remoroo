@@ -137,6 +137,28 @@ class Routine:
         return None
 
 
+def resolve_group(groups: Sequence[dict], joint_names: Sequence[str]):
+    """Which authored kinematic group (cell.yaml: groups) does a routine's JOINT SET belong to?
+    DATA OVER LABELS — the routine's recorded joint names are ground truth; the `arm` field is a
+    UI hint only. Morphology-agnostic by construction: works for one arm, N arms, a humanoid
+    limb, a gantry — any chain the agent declared as a group. Rules: the group must COVER the
+    routine's joints (⊇); with several covering groups (e.g. whole_body ⊃ left_arm) the
+    SMALLEST (most specific) wins; an exact tie or no cover is a LOUD refusal, never a guess.
+    Returns (group_name, None) or (None, error)."""
+    want = {str(n) for n in joint_names}
+    if not want:
+        return None, "routine carries no joint names — re-record it (older recording?)"
+    covering = [g for g in groups if want <= {str(j) for j in (g.get("joint_names") or [])}]
+    if not covering:
+        return None, (f"no authored group covers the routine's joints {sorted(want)} — "
+                      "fix cell.yaml groups or re-record the routine")
+    covering.sort(key=lambda g: len(g.get("joint_names") or []))
+    if len(covering) > 1 and len(covering[0].get("joint_names") or []) == len(covering[1].get("joint_names") or []):
+        return None, (f"ambiguous: groups {covering[0].get('name')!r} and {covering[1].get('name')!r} "
+                      "both cover the routine's joints equally — fix cell.yaml groups")
+    return str(covering[0].get("name")), None
+
+
 class RoutineRecorder:
     """Passively accumulates dense joint waypoints while ARMED. The edge feeds `tick()` at
     ~10 Hz from its poll loop; off-robot tests call it directly. `mark_capture()` force-appends

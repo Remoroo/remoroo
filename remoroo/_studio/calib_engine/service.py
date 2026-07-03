@@ -157,6 +157,7 @@ class CalibService:
         if verb == "tip_test":      return s.tip_test()
         # recorded-routine replay (automatic recalibration along the human-traversed path)
         if verb == "routine_info":  return s.routine_info(self.calib_dir or ".")
+        if verb == "routine_start_pose": return s.routine_start_pose(self.calib_dir or ".")
         if verb == "replay_start":  return s.replay_start(self.calib_dir or ".")
         if verb == "replay_step":   return s.replay_step()
         if verb == "replay_abort":  return s.replay_abort()

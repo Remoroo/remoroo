@@ -701,6 +701,25 @@ class MotionStack:
         res = planner.plan_pose(goals, self._seed_positions(), max_attempts=max_attempts)
         return self._finish(res, execute)
 
+    def goto_joints(self, group: str, goal: Dict[str, float], *, execute: bool = True,
+                    max_attempts: int = 5) -> MoveResult:
+        """Plan ONE group to a JOINT-SPACE goal ({joint_name: rad}) and (default) execute it —
+        collision-free via the group's planner (`plan_joints` → V2 plan_cspace, the same call
+        retract rides) through the SAME defensive-audit + executor tail as every commissioned
+        move. No TCP is involved — a joint goal has none. Group joints NOT named in `goal`
+        HOLD their current position; every OTHER group's joints are locked by the per-group
+        robot cfg. Morphology-agnostic: `group` is any authored cell.yaml group (an arm, a
+        humanoid limb, a gantry axis…)."""
+        if not goal:
+            return MoveResult(False, "no goal joints given")
+        planner = self._planner_for([group])
+        names = set(self._group(group)["joint_names"])
+        unknown = [n for n in goal if n not in names]
+        if unknown:
+            return MoveResult(False, f"goal names joints outside group {group!r}: {unknown}")
+        res = planner.plan_joints(dict(goal), self._seed_positions(), max_attempts=max_attempts)
+        return self._finish(res, execute)
+
     def move_through_poses(self, tcp: str, poses: Sequence[object], *, execute: bool = True,
                            max_attempts: int = 3) -> MoveResult:
         """Drive one TCP through a sequence of poses (one concatenated collision-free path)."""

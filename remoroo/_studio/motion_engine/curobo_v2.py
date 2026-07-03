@@ -787,6 +787,40 @@ class CuroboV2Planner:
         traj = self._to_trajectory(result.interpolated_trajectory)
         return PlanResult(True, traj, "ok", traj.duration)
 
+    def plan_joints(self, goal_positions: Dict[str, float],
+                    start_positions: Optional[Dict[str, float]] = None,
+                    *, max_attempts: int = 5) -> PlanResult:
+        """Plan a collision-free path to a JOINT-SPACE goal — V2 `plan_cspace`, the SAME call
+        `plan_retract` (a commissioned move) rides, with a named goal instead of home. There is
+        no TCP: a joint goal has none. `goal_positions` is name-keyed over any subset of this
+        planner's joints; joints NOT named HOLD their start value (never a default). Goals are
+        clamped a hair inside the limits (same rationale as `_start_js`)."""
+        from curobo.types import JointState
+
+        try:
+            start = self._start_js(start_positions)
+            q = start.position.detach().clone()          # (1, n) — hold-by-default
+            names = list(self.planner.joint_names)
+            lims = self.joint_limits()
+            unknown = [n for n in goal_positions if n not in names]
+            if unknown:
+                return PlanResult(False, None, f"goal names joints this planner doesn't drive: {unknown}")
+            for i, n in enumerate(names):
+                if n in goal_positions:
+                    v = float(goal_positions[n])
+                    if n in lims:
+                        lo, hi = lims[n]
+                        v = min(max(v, lo + 1e-4), hi - 1e-4)
+                    q[0, i] = v
+            goal = JointState.from_position(q, joint_names=names)
+            result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
+        except Exception as e:
+            return PlanResult(False, None, f"plan_cspace raised: {e}")
+        if result is None or not bool(result.success.any()):
+            return PlanResult(False, None, _plan_failure_message(result))
+        traj = self._to_trajectory(result.interpolated_trajectory)
+        return PlanResult(True, traj, "ok", traj.duration)
+
     def update_obstacle_pose(self, name: str, pose: Sequence[float]) -> None:
         """Reposition a known obstacle (cuRobo pose `[x,y,z,qw,qx,qy,qz]`) without a rebuild."""
         from curobo.types import Pose
