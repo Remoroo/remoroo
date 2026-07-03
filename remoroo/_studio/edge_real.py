@@ -1744,13 +1744,21 @@ def _joint_stream():
     if b is None:
         return None
     from joint_stream import DEGRADED_HZ, JointStream
+
+    def read():
+        obs = b.get_observation()
+        return {name: _joint_value(val) for name, val in (obs.joint_positions or {}).items()}
+
     if callable(getattr(b, "stream_joints", None)):
-        js = JointStream(subscribe=b.stream_joints, name="joint-stream-push")
+        # Push primary + poll fallback: a cell may carry a STUB stream_joints (the seed
+        # template's TODO), so the stream probes BEHAVIOR — no samples within probe_s →
+        # falls back to observation polling and says so in the edge log (never silent).
+        js = JointStream(read, subscribe=b.stream_joints, hz=DEGRADED_HZ, lock=_bridge_lock,
+                         name="joint-stream-push")
+        print("[edge] joint stream: push mode (stream_joints) with observation-poll fallback")
     else:
-        def read():
-            obs = b.get_observation()
-            return {name: _joint_value(val) for name, val in (obs.joint_positions or {}).items()}
         js = JointStream(read, hz=DEGRADED_HZ, lock=_bridge_lock, name="joint-stream-degraded")
+        print("[edge] joint stream: degraded observation polling (cell has no stream_joints)")
     js.subscribe(_feed_calib_recorder)
     _JSTREAM = js.start()
     return _JSTREAM
