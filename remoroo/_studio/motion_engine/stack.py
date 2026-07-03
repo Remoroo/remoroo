@@ -36,6 +36,9 @@ from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
 from .world import WorldInputs, load_world, mask_robot_points
 from .live_world import observed_extent, esdf_resolution, union_extent, obstacle_bboxes
+import threading
+import time
+
 from .mtrace import heartbeat, span, stamp
 
 # a pose: (position xyz [m], quaternion wxyz). Helpers below also accept a 7-list or a dict.
@@ -205,6 +208,7 @@ class MotionStack:
         self._planners: Dict[frozenset, object] = {}
         self._groups = {g["name"]: g for g in config.get("groups", [])}
         self._limits = safety.planner_limits()
+        self._track_check_s = 5.0   # tracking-watchdog cadence (tests shrink it)
         # parent↔child adjacency so cuRobo ignores always-touching links (the loader doesn't auto-gen).
         # This is the FALLBACK; `_self_collision_ignore()` upgrades it with cuRobo's default-config
         # generation (the link-pairs that overlap at rest — grippers, dual-arm bases) on first build.
@@ -241,6 +245,12 @@ class MotionStack:
             authored_ignore = load_self_collision_ignore(cell_dir)
         with span("from_cell: load_safety"):
             safety = load_safety(cell_dir)
+        lim = safety.planner_limits()
+        stamp("SAFETY ENVELOPE (as loaded — the speed rule in force)",
+              max_joint_speed_frac=safety.max_joint_speed_frac,
+              velocity_scale=lim.get("velocity_scale"),
+              acceleration_scale=lim.get("acceleration_scale"),
+              max_velocity=lim.get("max_velocity", "URDF×frac"))
         with span("from_cell: load_world"):
             world = load_world(cell_dir)
         # ABSOLUTE path — cuRobo resolves a relative `urdf_path` against its OWN content/assets dir
@@ -833,9 +843,11 @@ class MotionStack:
                        max_attempts: int = 2) -> Tuple[MoveResult, Optional[List[float]]]:
         """Auto-find ONE small collision-free move from the CURRENT pose: offset the live TCP a few cm
         along each axis (up first, then lateral, then down), keeping orientation, and return the first
-        that cuRobo can plan. A legible default verification that needs no operator input and avoids
-        the colliding home — and a deterministic floor under stage 2's agent target search. Returns
-        (result, chosen_point) so the caller/UI can show WHERE it moved."""
+        that cuRobo can plan. A legible default verification that needs no operator input and never
+        ASSUMES a config is safe — the cspace home is unvalidated on any given rig (fine on one,
+        inside the table on another), so nothing drives there unplanned; every candidate here is
+        collision-checked before it is offered. Also a deterministic floor under stage 2's agent
+        target search. Returns (result, chosen_point) so the caller/UI can show WHERE it moved."""
         cur = self.current_tool_pose(tcp)
         if not cur:
             return MoveResult(False, "planner cannot FK the current pose — cannot pick a safe demo move"), None
@@ -1582,15 +1594,17 @@ class MotionStack:
                    frames: Optional[Callable[[], Sequence]] = None) -> dict:
         """Build the stack and VERIFY the end-to-end chain once: spheres healthy → planner builds →
         the LIVE collision world is built from the cameras → ONE collision-free plan → trajectory →
-        (optionally) the per-arm executor replays it. This is what the commission gate runs so G8
+        (optionally) the bridge's whole-robot executor replays it. This is what the commission gate runs so G8
         exercises a PROVEN stack, not an assumed one.
 
         `frames` is a callable returning the per-camera `DepthFrame`s (the agent's rig-specific grab —
         see commission.md); when given, the verify plans against the LIVE ESDF (robot auto-masked,
         modeled cuboids fused) rather than just the modeled cuboids. The verification move is a
-        REACHABLE target, never the cspace home (commonly inside the table): an explicit 3D `target`
-        is planned (keeping the current orientation); otherwise `safe_demo_move` auto-finds a small
-        collision-free nudge from the live pose. Both prove the same fused stack, supervised."""
+        VALIDATED target, never an ASSUMED one: whether the cspace home is safe is UNKNOWN on any
+        given rig (fine on one, inside the table on another), so commission never drives there on
+        assumption — an explicit 3D `target` is planned (keeping the current orientation); otherwise
+        `safe_demo_move` auto-finds a small collision-free nudge from the live pose. Both prove the
+        same fused stack, supervised."""
         def emit(**kw):
             if progress:
                 progress(kw)
@@ -1617,7 +1631,15 @@ class MotionStack:
         emit(step="build_planner", ok=True, note="warming cuRobo (one-time)")
         try:
             self._planner_for([first])
-            step("build_planner", True, tcp=first)
+            # ALSO warm the WHOLE-BODY planner (a different cache key: frozenset(all groups)) —
+            # ⚡ drive-to-start / goto_joints ride THAT key, so without this commission "proves the
+            # planner" on one key and the first recalibration still pays the full build (~minutes).
+            # Same cspace either way (no lock_joints); single-group cells hit the same key (no cost).
+            warmed_whole_body = False
+            if len(self._groups) > 1:
+                self.prewarm()
+                warmed_whole_body = True
+            step("build_planner", True, tcp=first, warmed_whole_body=warmed_whole_body)
         except Exception as e:
             step("build_planner", False, error=str(e))
             report["message"] = f"planner build failed: {e}"
@@ -1765,7 +1787,7 @@ class MotionStack:
     # --- plan → audit → execute → supervise ------------------------------
     def _finish(self, plan, execute: bool) -> MoveResult:
         """The shared tail: defensive audit of the planned trajectory, then hand the FULL path to
-        the per-arm executor with a `should_abort` poll. The audit is vs BUGS only (NaN, a velocity
+        the bridge's whole-robot executor with a `should_abort` poll. The audit is vs BUGS only (NaN, a velocity
         spike, a waypoint out of bounds) — never a re-judgement of cuRobo's already-safe plan."""
         if not getattr(plan, "success", False) or getattr(plan, "trajectory", None) is None:
             stamp("plan FAILED", message=getattr(plan, "message", "planning failed"))
@@ -1787,6 +1809,43 @@ class MotionStack:
         movers = [n for i, n in enumerate(traj.joint_names)
                   if float(np.max(np.abs(traj.positions[:, i] - traj.positions[0, i]))) > 0.02]
         info = f"{len(traj)} wp × {len(traj.joint_names)} joints · movers={movers} · planned {traj.duration:.1f}s"
+        stamp("trajectory → executor", dt=round(traj.dt, 4),
+              joint_names=list(traj.joint_names))   # the exact row width/order the cell executor receives
+        # TRACKING WATCHDOG (the "it thinks it's moving" guard): compare COMMANDED vs MEASURED
+        # joints while the executor runs (measured via the edge's lock-free joint stream, injected
+        # as bridge.latest_joints). If the plan has commanded real motion and the arm hasn't
+        # budged, ABORT through the executor's own should_abort — a driver silently dropping
+        # commands (xArm not in servo mode, swallowed error codes) must fail in seconds, LOUDLY,
+        # not "succeed" after 134s of nothing.
+        tracking = {"failed": False, "detail": ""}
+        watch = getattr(self.bridge, "latest_joints", None)
+        stop_watch = threading.Event()
+        if callable(watch) and movers:
+            base = dict(watch() or {})
+            t_start = time.time()
+
+            def _track():
+                while not stop_watch.wait(self._track_check_s):
+                    el = time.time() - t_start
+                    idx = min(int(el / max(traj.dt, 1e-6)), len(traj) - 1)
+                    now = dict(watch() or {})
+                    worst_cmd, worst_meas, worst_j = 0.0, 0.0, ""
+                    for i, n in enumerate(traj.joint_names):
+                        cmd = abs(float(traj.positions[idx, i] - traj.positions[0, i]))
+                        if cmd > worst_cmd and n in now and n in base:
+                            worst_cmd, worst_meas, worst_j = cmd, abs(float(now[n] - base[n])), n
+                    stamp("tracking", t=f"{el:.0f}s", joint=worst_j,
+                          commanded=round(worst_cmd, 3), measured=round(worst_meas, 3))
+                    if worst_cmd > 0.1 and worst_meas < 0.02:
+                        tracking["failed"] = True
+                        tracking["detail"] = (f"commanded {worst_j} to move {worst_cmd:.2f} rad by "
+                                              f"t={el:.0f}s but it measured {worst_meas:.3f} rad")
+                        stamp("TRACKING FAILURE — aborting the executor", detail=tracking["detail"])
+                        return
+
+            threading.Thread(target=_track, daemon=True, name="track-watchdog").start()
+        base_abort = should_abort
+        should_abort = (lambda: bool((base_abort() if base_abort else False) or tracking["failed"]))
         try:
             with span("bridge.execute_trajectory", detail=info), heartbeat("execute_trajectory", info=info):
                 try:
@@ -1795,6 +1854,14 @@ class MotionStack:
                     ok = self.bridge.execute_trajectory(traj)  # driver that doesn't accept should_abort
         except Exception as e:
             return MoveResult(False, f"executor raised: {e}", trajectory=traj)
+        finally:
+            stop_watch.set()
+        if tracking["failed"]:
+            return MoveResult(False,
+                              "ABORTED: the arm is NOT TRACKING the trajectory — " + tracking["detail"] +
+                              ". The driver is dropping commands (check primitives.py execute_trajectory: "
+                              "xArm servo mode/state and UNCHECKED SDK return codes).",
+                              trajectory=traj, executed=True, aborted=True)
         aborted = bool(should_abort()) if should_abort else False
         return MoveResult(bool(ok) and not aborted,
                           "executed" if ok and not aborted else ("aborted (E-stop)" if aborted else "executor reported failure"),

@@ -354,6 +354,11 @@ class CuroboV2Planner:
         self._device = device
         limits = limits or {}
         self._vel_scale = float(np.clip(limits.get("velocity_scale", 1.0), 1e-3, 1.0))
+        from .mtrace import stamp as _stamp
+        _stamp("planner limits (applied to URDF joint limits)",
+               velocity_scale=self._vel_scale,
+               acceleration_scale=limits.get("acceleration_scale"),
+               max_velocity=limits.get("max_velocity", "URDF×scale"))
 
         # The collision world has exactly TWO inputs: (1) the live camera ESDF and (2) the operator's
         # MODELED static obstacles. Cache slots: a cuboid/mesh slot for the modeled obstacles (input 2)
@@ -791,7 +796,7 @@ class CuroboV2Planner:
             return PlanResult(False, None, f"plan_cspace raised: {e}")
         if result is None or not bool(result.success.any()):
             return PlanResult(False, None, _plan_failure_message(result, home=True))
-        traj = self._to_trajectory(result.interpolated_trajectory)
+        traj = self._to_trajectory(self._trimmed_plan(result))   # trimmed, never the padded buffer
         return PlanResult(True, traj, "ok", traj.duration)
 
     def plan_joints(self, goal_positions: Dict[str, float],
@@ -829,8 +834,22 @@ class CuroboV2Planner:
         if result is None or not bool(result.success.any()):
             return PlanResult(False, None, _plan_failure_message(result))
         with span("interpolate→Trajectory"):
-            traj = self._to_trajectory(result.interpolated_trajectory)
+            traj = self._to_trajectory(self._trimmed_plan(result))
+        from .mtrace import stamp
+        stamp("plan_joints trajectory", wp=len(traj), dt=round(traj.dt, 4),
+              duration_s=round(traj.duration, 1), vel_scale=self._vel_scale)
         return PlanResult(True, traj, "ok", traj.duration)
+
+    @staticmethod
+    def _trimmed_plan(result):
+        """The interpolated plan TRIMMED to its real length — `get_interpolated_plan()` (the
+        accessor `plan_pose`/commission validated). `result.interpolated_trajectory` is the RAW
+        interpolation buffer, PADDED to capacity (the live '5000 wp × 125 s crawl to a goal
+        1.8 rad away' failure) — never feed that to an executor."""
+        fn = getattr(result, "get_interpolated_plan", None)
+        if callable(fn):
+            return fn()
+        return result.interpolated_trajectory
 
     def update_obstacle_pose(self, name: str, pose: Sequence[float]) -> None:
         """Reposition a known obstacle (cuRobo pose `[x,y,z,qw,qx,qy,qz]`) without a rebuild."""

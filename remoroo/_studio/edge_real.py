@@ -678,6 +678,10 @@ def motion_stack(force: bool = False):
     from motion_engine import MotionStack  # sibling of this file in server/, like calib_engine
 
     _MOTION_STACK = MotionStack.from_cell(str(CELL_DIR), bridge=get_bridge())
+    try:
+        _joint_stream()   # the tracking watchdog's measured-joints tap (bridge.latest_joints)
+    except Exception as e:  # noqa: BLE001 — watchdog degrades to post-move checks only
+        print(f"[edge] joint stream unavailable for motion tracking: {type(e).__name__}: {e}")
     return _MOTION_STACK
 
 
@@ -1769,6 +1773,13 @@ def _joint_stream():
         print("[edge] joint stream: degraded observation polling (cell has no stream_joints)")
     js.subscribe(_feed_calib_recorder)
     _JSTREAM = js.start()
+    # The MEASURED-joints tap for the motion stack's tracking watchdog: lock-free (reads the
+    # stream's cached latest), name-keyed — how "the arm is NOT actually moving" gets caught
+    # DURING execution instead of after 134 silent seconds.
+    try:
+        b.latest_joints = lambda: (_JSTREAM.latest[1] if _JSTREAM and _JSTREAM.latest else {})
+    except Exception:  # noqa: BLE001 — watchdog degrades to post-move proximity only
+        pass
     return _JSTREAM
 
 

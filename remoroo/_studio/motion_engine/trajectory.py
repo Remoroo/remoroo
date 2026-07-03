@@ -1,4 +1,4 @@
-"""The SDK-agnostic `Trajectory` — the seam between the cuRobo planner and the per-arm executor.
+"""The SDK-agnostic `Trajectory` — the seam between the cuRobo planner and the cell's executor.
 
 cuRoboV2 does NOT output "a joint angle to move to"; it outputs a dynamics-aware, time-parameterised
 PATH: a position/velocity/acceleration time-series sampled at a fixed `dt`. The whole point of the
@@ -7,10 +7,12 @@ REPLAY the full series, not jump to the endpoint. This class is that path, in pl
 no cuRobo import, JSON-round-trippable so it can travel over SSE to the Studio and back.
 
 `curobo_v2.py` builds one of these from a V2 plan (`result.get_interpolated_plan()` →
-`.position/.velocity (..,T,dof)`, `.dt`, `.joint_names`). The cell's `bridge.execute_trajectory(traj)`
-receives it and streams `traj.positions[i]` to the arm's controller every `traj.dt` seconds. It is
-deliberately the ONLY shape the executor needs to understand — every arm SDK differs in HOW it
-follows a path, never in WHAT the path is.
+`.position/.velocity (..,T,dof)`, `.dt`, `.joint_names`). The stack plans the WHOLE robot as one
+body, so the trajectory handed to `bridge.execute_trajectory(traj)` spans EVERY actuated joint on
+one `dt` clock; the cell's authored executor maps its columns onto that rig's controller(s) and
+replays them together (bridge_primitives.md). A per-controller driver then sees the same shape,
+scoped to its own joints. It is deliberately the ONLY shape any executor needs to understand —
+every arm SDK differs in HOW it follows a path, never in WHAT the path is.
 """
 from __future__ import annotations
 
@@ -24,8 +26,9 @@ import numpy as np
 class Trajectory:
     """A time-parameterised joint path. `positions` is the contract; the rest is advisory.
 
-    - `joint_names`   : the joints `positions` columns correspond to, in order (the executor maps
-                        these onto its controller; a subset of the robot's joints for one arm).
+    - `joint_names`   : the joints `positions` columns correspond to, in order. From the stack this
+                        is EVERY actuated joint (whole-robot plan); a per-controller driver receives
+                        a version scoped to its own joints (the bridge's executor slices it).
     - `positions`     : (T, dof) radians — the path to replay, waypoint by waypoint.
     - `velocities`    : (T, dof) rad/s — for SDKs that take feed-forward velocity (servoJ, ROS2);
                         zeros if the planner didn't provide them.
@@ -61,6 +64,23 @@ class Trajectory:
     def duration(self) -> float:
         """Wall-clock seconds to replay the whole path at `dt`."""
         return max(0, len(self) - 1) * self.dt
+
+    def select(self, joint_names) -> "Trajectory":
+        """A per-controller SLICE: the columns for `joint_names` (in the given order) as a new
+        Trajectory on the same clock — what the Bridge's whole-robot executor hands each driver
+        ("each controller gets ONLY its own columns", bridge_primitives.md/robot_adapters.md).
+        Raises on a name this trajectory doesn't carry (a mis-mapped rig must fail loudly)."""
+        idx = {n: i for i, n in enumerate(self.joint_names)}
+        missing = [n for n in joint_names if n not in idx]
+        if missing:
+            raise KeyError(f"trajectory does not carry joints {missing} (has {self.joint_names})")
+        cols = [idx[n] for n in joint_names]
+        return Trajectory(
+            list(joint_names), self.positions[:, cols], self.dt,
+            velocities=self.velocities[:, cols] if self.velocities is not None else None,
+            accelerations=self.accelerations[:, cols] if getattr(self, "accelerations", None) is not None else None,
+            meta=dict(self.meta or {}),
+        )
 
     def waypoint(self, i: int) -> np.ndarray:
         """The i-th joint configuration (dof,) — what the executor sends to the controller."""

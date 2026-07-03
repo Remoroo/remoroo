@@ -4,7 +4,8 @@ Travels with the Studio edge bundle (like `calib_engine`). It FUSES every prior 
 — the calibrated URDF, the collision spheres, the scanned world, the safety envelope — into ONE
 warmed cuRoboV2 planner and exposes high-level, TCP-keyed motion verbs (`move_to_pose`,
 `move_to_poses`, `move_through_poses`, `retract`, …). The cell's bridge wires it up and supplies the
-per-arm executor (`execute_trajectory`); cuRobo PLANS, the bridge REPLAYS.
+whole-robot executor (`execute_trajectory` — the authored per-rig column→controller mapping);
+cuRobo PLANS, the bridge REPLAYS.
 
 Public surface:
     MotionStack          — orchestration: from_cell + the motion verbs + commission()/demo_run()
