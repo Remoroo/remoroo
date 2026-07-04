@@ -353,12 +353,12 @@ class CuroboV2Planner:
 
         self._device = device
         limits = limits or {}
-        self._vel_scale = float(np.clip(limits.get("velocity_scale", 1.0), 1e-3, 1.0))
-        from .mtrace import stamp as _stamp
-        _stamp("planner limits (applied to URDF joint limits)",
-               velocity_scale=self._vel_scale,
-               acceleration_scale=limits.get("acceleration_scale"),
-               max_velocity=limits.get("max_velocity", "URDF×scale"))
+        # NOTE: the planner applies NO speed scaling here. The dynamics caps (max_acceleration /
+        # max_jerk) were already baked into the robot_cfg's cspace by robotcfg; URDF joint velocity
+        # limits are used UNSCALED, and the operator's speed fraction governs the bridge's DIRECT
+        # SDK moves only (see robotcfg: scaling planned velocity down made a 5 cm move take 13 s).
+        self._tool_frames = list(((robot_cfg.get("robot_cfg", {}) or {})
+                                  .get("kinematics", {}) or {}).get("tool_frames") or [])
 
         # The collision world has exactly TWO inputs: (1) the live camera ESDF and (2) the operator's
         # MODELED static obstacles. Cache slots: a cuboid/mesh slot for the modeled obstacles (input 2)
@@ -744,10 +744,33 @@ class CuroboV2Planner:
     def plan_pose(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]] = None,
                   *, max_attempts: int = 3) -> PlanResult:
         """Plan ONE synchronous collision-free trajectory driving every frame in `goals` to its
-        pose. `goals` keys are ee_links from this planner's `tool_frames`. Safe by construction
-        (collision-free + within the dynamics envelope baked into the robot cfg)."""
+        pose. `goals` keys are ee_links from this planner's `tool_frames` — a SUBSET is fine (THE
+        robot planner carries every group's tip; a one-arm move goals one tip and the un-goaled
+        limbs ride cuRobo's minimal-motion cost). If cuRobo rejects the partial GoalToolPose, we
+        retry ONCE with FK HOLD-goals filled for the missing tips ("stay where you are" — the
+        semantic of not goaling a limb, made explicit). Safe by construction (collision-free +
+        within the dynamics envelope baked into the robot cfg)."""
         if not goals:
             return PlanResult(False, None, "no goals given")
+        from .mtrace import span as _span, stamp as _stamp
+        res = self._plan_pose_once(goals, start_positions, max_attempts)
+        missing = [t for t in self._tool_frames if t not in goals]
+        if not res.success and missing:
+            holds = {}
+            for t in missing:
+                fk = self.link_pose(t, start_positions)
+                if fk is None:
+                    return res                      # cannot FK a hold — surface the original failure
+                holds[t] = (list(fk[0]), list(fk[1]))
+            _stamp("plan_pose retry: holding un-goaled tips at their current pose", held=missing)
+            with _span("plan_pose (hold-goal retry)", frames=len(goals) + len(holds)):
+                held_res = self._plan_pose_once({**goals, **holds}, start_positions, max_attempts)
+            if held_res.success:
+                return held_res
+        return res
+
+    def _plan_pose_once(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]],
+                        max_attempts: int) -> PlanResult:
         try:
             from .mtrace import span as _span
             goal = self._goal(goals)
@@ -837,7 +860,7 @@ class CuroboV2Planner:
             traj = self._to_trajectory(self._trimmed_plan(result))
         from .mtrace import stamp
         stamp("plan_joints trajectory", wp=len(traj), dt=round(traj.dt, 4),
-              duration_s=round(traj.duration, 1), vel_scale=self._vel_scale)
+              duration_s=round(traj.duration, 1))
         return PlanResult(True, traj, "ok", traj.duration)
 
     @staticmethod
@@ -862,16 +885,15 @@ class CuroboV2Planner:
     # --- trajectory conversion -------------------------------------------
     def _to_trajectory(self, interp) -> Trajectory:
         """V2 interpolated plan → the SDK-agnostic `Trajectory` (numpy). cuRobo already interpolated it
-        at `interpolation_dt` (~25 ms) AND planned it at the operator's setup speed (the cspace
-        `velocity_scale`/`acceleration_scale`), so it is SMOOTH and slow NATIVELY — a fine, dense
-        cadence the bridge streams. We do NOT stretch `dt` post-hoc: that kept cuRobo's few coarse
-        knots and replayed them at a few Hz, which is the visible jerk."""
+        at `interpolation_dt` (~25 ms) AND bounded it by the cspace dynamics caps (max_acceleration /
+        max_jerk from the robot cfg; URDF velocity limits unscaled), so it is SMOOTH natively — a
+        fine, dense cadence the bridge streams. We do NOT stretch `dt` post-hoc: that kept cuRobo's
+        few coarse knots and replayed them at a few Hz, which is the visible jerk."""
         pos = self._np2d(interp.position)
         names = list(getattr(interp, "joint_names", None) or self.planner.joint_names)
         dt = float(getattr(interp, "dt", None) or self._interp_dt)
         vel = self._np2d(interp.velocity) if getattr(interp, "velocity", None) is not None else None
-        return Trajectory(names, pos, dt, velocities=vel,
-                          meta={"interp_dt": self._interp_dt, "vel_scale": self._vel_scale})
+        return Trajectory(names, pos, dt, velocities=vel, meta={"interp_dt": self._interp_dt})
 
     @staticmethod
     def _np2d(t) -> np.ndarray:

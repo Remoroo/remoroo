@@ -246,11 +246,13 @@ class MotionStack:
         with span("from_cell: load_safety"):
             safety = load_safety(cell_dir)
         lim = safety.planner_limits()
-        stamp("SAFETY ENVELOPE (as loaded — the speed rule in force)",
-              max_joint_speed_frac=safety.max_joint_speed_frac,
-              velocity_scale=lim.get("velocity_scale"),
-              acceleration_scale=lim.get("acceleration_scale"),
-              max_velocity=lim.get("max_velocity", "URDF×frac"))
+        # EXACTLY the dynamics the planner applies — nothing else is scaled or applied anywhere.
+        stamp("PLANNER DYNAMICS (all that is applied)",
+              max_acceleration_rad_s2=round(lim["max_acceleration"], 2),
+              max_jerk_rad_s3=round(lim["max_jerk"], 2),
+              joint_velocity_limits="URDF, unscaled",
+              note=f"operator max_joint_speed_frac={round(safety.max_joint_speed_frac, 3)} "
+                   "applies to direct bridge moves only, never to planned trajectories")
         with span("from_cell: load_world"):
             world = load_world(cell_dir)
         # ABSOLUTE path — cuRobo resolves a relative `urdf_path` against its OWN content/assets dir
@@ -416,30 +418,36 @@ class MotionStack:
             # extent centres the grid on the robot and the real OBJECT falls OUTSIDE the grid: it gets
             # integrated but CLIPPED → 0 occupied voxels (the empty-ESDF bug). Union with the modeled
             # obstacles so they're always covered too.
-            scene = self._scene_extent(frames, tcp)
+            with span("scene extent (robot-removed depth, first frames)"):
+                scene = self._scene_extent(frames, tcp)
             ext, ctr = union_extent(scene or observed_extent(frames), obstacle_bboxes(self.world.scene))
             esdf_vs, voxel_sz = esdf_resolution(ext)
-            self._mapper = (self._mapper_factory or _default_mapper_factory)(
-                ext, ctr, robot_cfg, esdf_vs, voxel_sz)
+            with span("mapper build (ONE-TIME — Mapper + RobotSegmenter + FilterDepth)",
+                      esdf_voxel_size=round(float(esdf_vs), 4)):
+                self._mapper = (self._mapper_factory or _default_mapper_factory)(
+                    ext, ctr, robot_cfg, esdf_vs, voxel_sz)
             self._grid_meta = {"extent": [round(v, 3) for v in ext], "center": [round(v, 3) for v in ctr],
                                "esdf_voxel_size": round(float(esdf_vs), 4), "from_scene": scene is not None}
         self._mapper.reset()
         q = self._seed_positions()                 # FALLBACK mask config (live "now") — used only for a
                                                    # frame that carries no capture-time config (commission).
         total_px, n_masked = 0, 0
-        for f in frames:
-            # Mask THIS frame at the joints it was CAPTURED at (f.q), NOT "now". The depth + cam_pose are
-            # placed at the capture instant, so a MOVING arm is masked correctly only if the mask uses the
-            # SAME capture-time config; using "now" leaves the arm (moved since capture) unmasked and it
-            # fuses into the world — the "world goes wrong the moment the arm moves" bug. `q` (now) is the
-            # right fallback only when the arm is still (commission).
-            qf = getattr(f, "q", None) or q
-            n_masked += int(self._mapper.integrate(f.depth, f.intrinsics, f.cam_pose_in_base, qf) or 0)
-            total_px += int(np.asarray(f.depth).size)
+        with span("mask + integrate", frames=len(frames)):
+            for f in frames:
+                # Mask THIS frame at the joints it was CAPTURED at (f.q), NOT "now". The depth + cam_pose
+                # are placed at the capture instant, so a MOVING arm is masked correctly only if the mask
+                # uses the SAME capture-time config; using "now" leaves the arm (moved since capture)
+                # unmasked and it fuses into the world — the "world goes wrong the moment the arm moves"
+                # bug. `q` (now) is the right fallback only when the arm is still (commission).
+                qf = getattr(f, "q", None) or q
+                n_masked += int(self._mapper.integrate(f.depth, f.intrinsics, f.cam_pose_in_base, qf) or 0)
+                total_px += int(np.asarray(f.depth).size)
         if hasattr(self._mapper, "fuse_static"):   # one canonical world: live depth + modeled cuboids
-            self._mapper.fuse_static(getattr(planner, "modeled_scene", None))
-        voxelgrid = self._mapper.compute_esdf()
-        planner.update_voxel_world(voxelgrid)
+            with span("fuse modeled obstacles"):
+                self._mapper.fuse_static(getattr(planner, "modeled_scene", None))
+        with span("compute ESDF + apply to planner"):
+            voxelgrid = self._mapper.compute_esdf()
+            planner.update_voxel_world(voxelgrid)
         self._live_voxels = np.asarray(self._mapper.occupied_voxels(), dtype=float).reshape(-1, 3)
 
         # GROUND TRUTH side-by-side: OUR masking (the one that keeps the object GREEN in the debug view)
@@ -662,23 +670,29 @@ class MotionStack:
         return planner.link_pose(link, joints if joints is not None else self._seed_positions())
 
     def _planner_for(self, active_groups: Sequence[str]):
-        """Get/build (and cache) the planner whose tool_frames = these groups' tips."""
+        """THE ROBOT PLANNER — one planner for the whole rig. `active_groups` only validates the
+        caller's group names (a typo fails here, before any build); the planner is ALWAYS built with
+        tool_frames = EVERY group's tips, because the cspace is identical for any subset (robotcfg
+        drives ALL actuated joints — lock_joints breaks V2). Keying planners by group subset built
+        the SAME ~2-minute planner once per subset (a dual-arm commission paid 131s + 110s back to
+        back for two planners differing only in the tool_frames list). A pose goal for a subset of
+        tips rides cuRobo's minimal-motion cost on the un-goaled limbs — same mechanics as before;
+        if cuRobo rejects a partial GoalToolPose, plan_pose fills FK hold-goals (curobo_v2)."""
         for a in active_groups:
             self._group(a)                     # KeyError on an unknown group, before any build
-        key = frozenset(active_groups)
+        key = frozenset(self._groups.keys())   # ONE key: the robot planner
         if key not in self._planners:
-            with span("planner build #1", groups=",".join(sorted(active_groups))):
-                planner = self._factory(self._robot_cfg_for(active_groups), self.world,
+            all_groups = list(self._groups.keys())
+            with span("robot planner build #1", groups=",".join(sorted(all_groups))):
+                planner = self._factory(self._robot_cfg_for(all_groups), self.world,
                                         limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
             with span("self-mask world check"):
                 masked = self._self_mask_world(planner)
             if masked:     # masked the cloud → rebuild from the masked world
-                with span("planner REBUILD #2 (self-mask changed the world — full build cost paid TWICE)"):
-                    planner = self._factory(self._robot_cfg_for(active_groups), self.world,
+                with span("robot planner REBUILD #2 (self-mask changed the world — full build cost paid TWICE)"):
+                    planner = self._factory(self._robot_cfg_for(all_groups), self.world,
                                             limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
             self._planners[key] = planner
-        else:
-            stamp("planner cache HIT", groups=",".join(sorted(active_groups)))
         return self._planners[key]
 
     # --- health -----------------------------------------------------------
@@ -766,13 +780,25 @@ class MotionStack:
         with span("goto_joints", named=len(goal), execute=execute):
             active = list(groups) if groups else list(self._groups.keys())
             planner = self._planner_for(active)
-            known = {n for g in active for n in self._group(g)["joint_names"]}
-            unknown = [n for n in goal if n not in known]
-            if unknown:
-                return MoveResult(False, f"goal names joints outside groups {active}: {unknown}")
-            res = planner.plan_joints(dict(goal), self._seed_positions(), max_attempts=max_attempts)
+            # PLAN EVERY PLANNABLE JOINT, DROP THE UNPLANNABLE LOUDLY. A whole-body routine
+            # honestly records mimic/passive joints (gripper fingers/knuckles that mechanically
+            # FOLLOW their drive joint) — nothing can plan those independently, so they are
+            # dropped, not grounds for refusal. Plannable = the planner's cspace (which is wider
+            # than the groups: it carries the gripper DRIVE joints, so the opening IS restored)
+            # ∪ the groups' chain joints. An all-unplannable goal still refuses.
+            group_names = {n for g in active for n in self._group(g)["joint_names"]}
+            plannable = set(getattr(planner, "joint_names", []) or []) | group_names
+            goal_planned = {n: float(v) for n, v in goal.items() if n in plannable}
+            dropped = sorted(set(goal) - set(goal_planned))
+            if dropped:
+                stamp("goto_joints: dropping unplannable goal joints (mimic/passive — they follow "
+                      "their drive joint)", dropped=dropped)
+            if not goal_planned:
+                return MoveResult(False, f"no plannable joints in the goal for groups {active} "
+                                         f"(all {len(goal)} named joints are outside them: {dropped})")
+            res = planner.plan_joints(goal_planned, self._seed_positions(), max_attempts=max_attempts)
             if getattr(res, "success", False) and getattr(res, "trajectory", None) is not None:
-                moved = _foreign_motion(res.trajectory, set(goal))
+                moved = _foreign_motion(res.trajectory, set(goal_planned))
                 if moved:
                     stamp("FOREIGN-MOTION GUARD refused the plan", moved=moved)
                     return MoveResult(False,
@@ -782,13 +808,14 @@ class MotionStack:
             return self._finish(res, execute)
 
     def prewarm(self, *, groups: Optional[Sequence[str]] = None) -> dict:
-        """Build (and cache) the WHOLE-BODY planner up front — planner build + cuRobo warmup
-        is tens of seconds-to-minutes, and paying it lazily on the first goto (inside the
-        bridge lock) froze the Studio for minutes. Called by the header ⚡ warmup."""
+        """Build (and cache) THE robot planner up front — planner build + cuRobo warmup is tens of
+        seconds-to-minutes, and paying it lazily on the first goto (inside the bridge lock) froze
+        the Studio for minutes. Called by the header ⚡ warmup. There is only ONE planner for the
+        rig (_planner_for), so a commissioned stack returns instantly here."""
         import time as _time
         t0 = _time.time()
         active = list(groups) if groups else list(self._groups.keys())
-        with span("prewarm whole-body planner", groups=",".join(active)):
+        with span("prewarm the robot planner"):
             self._planner_for(active)
         return {"groups": active, "seconds": round(_time.time() - t0, 1)}
 
@@ -1628,18 +1655,13 @@ class MotionStack:
             report["message"] = "no kinematic groups in the cell — nothing to commission"
             return report
 
-        emit(step="build_planner", ok=True, note="warming cuRobo (one-time)")
+        emit(step="build_planner", ok=True, note="building + warming THE robot planner (one-time)")
         try:
+            # ONE planner for the whole rig (_planner_for) — the verify move, ⚡ drive-to-start,
+            # goto_joints, and every later verb all share it, so this single build is the only
+            # planner cost the cell ever pays (until a world/graph invalidation).
             self._planner_for([first])
-            # ALSO warm the WHOLE-BODY planner (a different cache key: frozenset(all groups)) —
-            # ⚡ drive-to-start / goto_joints ride THAT key, so without this commission "proves the
-            # planner" on one key and the first recalibration still pays the full build (~minutes).
-            # Same cspace either way (no lock_joints); single-group cells hit the same key (no cost).
-            warmed_whole_body = False
-            if len(self._groups) > 1:
-                self.prewarm()
-                warmed_whole_body = True
-            step("build_planner", True, tcp=first, warmed_whole_body=warmed_whole_body)
+            step("build_planner", True)
         except Exception as e:
             step("build_planner", False, error=str(e))
             report["message"] = f"planner build failed: {e}"

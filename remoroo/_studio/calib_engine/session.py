@@ -229,6 +229,7 @@ class CalibSession:
         # restore all). Off-robot (no stream) the vector path records the chain, as before.
         self.recorder: Optional[RoutineRecorder] = None if self.static else RoutineRecorder()
         self._replay: Optional[ReplayCursor] = None
+        self._marks: Optional[dict] = None      # PLANNED replay state (cuRobo drives; edge owns motion)
         # Engine-COMMANDED motion happens with the bridge lock held for the whole move, so the
         # edge's poll ticker is blind during it. The bridge reports each commanded waypoint via
         # this hook — the commanded path IS the traversed path, so the routine records the full
@@ -1046,9 +1047,81 @@ class CalibSession:
                 pass
         return out
 
+    # ── PLANNED replay (post-commission): the routine's CAPTURE MARKS are the pose set; the
+    #    EDGE drives each with the commissioned stack (one smooth streamed trajectory per pose)
+    #    instead of walking the dense tape (hundreds of ramped micro-hops — shaky and slow).
+    #    The tape verbs above remain the planner-free fallback. The engine never moves here:
+    #    it only serves goals and captures — motion is the edge's fusion (like drive-to-start).
+    def replay_start_planned(self, calib_dir: str) -> dict:
+        if self.static:
+            return {"type": "replay_start_planned", "ok": False, "error": "arm-motion steps only"}
+        if not self.bridge.estop_ok():
+            return {"type": "replay_start_planned", "ok": False, "error": "E-stop not OK"}
+        p = self._routine_path(calib_dir)
+        if not Path(p).exists():
+            return {"type": "replay_start_planned", "ok": False, "error": "no recorded routine for this step"}
+        r = Routine.load(p)                      # marks only — no tape densify needed
+        if not r.joint_names:
+            return {"type": "replay_start_planned", "ok": False,
+                    "error": "routine carries no joint names (older chain-only recording) — planned "
+                             "replay plans the WHOLE body; use tape replay or re-record once"}
+        W = np.asarray(r.waypoints, float)
+        marks = [i for i in sorted(set(int(m) for m in r.capture_marks)) if 0 <= i < W.shape[0]]
+        if len(marks) < 2:
+            return {"type": "replay_start_planned", "ok": False, "error": "routine has fewer than 2 capture marks — re-record"}
+        # fresh recalibration: clear the collection; don't re-record while replaying
+        self.samples, self.heldout, self.result = [], [], None
+        if self.recorder is not None:
+            self.recorder.armed = False
+        self._marks = {"rows": [W[m] for m in marks], "names": list(r.joint_names),
+                       "idx": 0, "awaiting": False}
+        return {"type": "replay_start_planned", "ok": True, "marks": len(marks),
+                "joint_names": list(r.joint_names)}
+
+    def replay_next_goal(self) -> dict:
+        """The next capture mark's WHOLE-BODY goal (the edge plans+drives it), or done."""
+        st = self._marks
+        if st is None:
+            return {"type": "replay_next_goal", "error": "planned replay not started"}
+        if st["idx"] >= len(st["rows"]):
+            self._marks = None
+            return {"type": "replay_next_goal", "done": True,
+                    "collected": len(self.samples), "heldout": len(self.heldout)}
+        st["awaiting"] = True
+        return {"type": "replay_next_goal", "done": False,
+                "mark": st["idx"] + 1, "marks": len(st["rows"]),
+                "held_out": st["idx"] % 4 == 3,
+                "joints": _T(st["rows"][st["idx"]]), "joint_names": list(st["names"])}
+
+    def replay_capture_mark(self) -> dict:
+        """Capture at the mark the edge just drove to (every 4th held out — the no-motion
+        validate split), plus the live observability payload for the meter."""
+        st = self._marks
+        if st is None or not st.get("awaiting"):
+            return {"type": "replay_capture_mark", "error": "no pending mark — call replay_next_goal first"}
+        held_out = st["idx"] % 4 == 3
+        cap = self.capture(held_out=held_out)
+        st["awaiting"] = False
+        st["idx"] += 1
+        done = st["idx"] >= len(st["rows"])
+        out = {"type": "replay_capture_mark", "mark": st["idx"], "marks": len(st["rows"]),
+               "accepted": bool(cap.get("accepted")), "held_out": held_out,
+               "collected": len(self.samples), "heldout": len(self.heldout), "done": done}
+        # _marks is cleared by replay_next_goal's done (both exit styles stay valid)
+        if len(self.samples) >= max(6, self.min_corners):
+            try:
+                r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+                self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
+                self._note_observability(r)
+                out["observability"] = {k: round(float(v), 4) for k, v in observability(r).items()}
+            except Exception:  # noqa: BLE001 — the meter is best-effort mid-replay
+                pass
+        return out
+
     def replay_abort(self) -> dict:
-        """Stop in place (no retreat motion) and forget the cursor."""
+        """Stop in place (no retreat motion) and forget the cursor (tape AND planned)."""
         self._replay = None
+        self._marks = None
         return {"type": "replay_abort", "ok": True, "collected": len(self.samples)}
 
     # ── accept: write body->optical back to the URDF + the calibration json ──

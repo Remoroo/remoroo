@@ -1832,6 +1832,56 @@ def h_motion_warmup(_q):
     return {"ok": True, "state": "warming"}
 
 
+def _planned_motion_gate():
+    """The trust line for AUTOMATIC planned motion (shared by drive-to-start + planned replay):
+    the commission gate must be DONE (setup_state.json — server-side enforcement; the UI gates
+    too) and the commission-proven stack must be ALIVE (the header ⚡). Returns an error string
+    or None."""
+    import json as _json
+    st_file = CELL_DIR / "setup_state.json"
+    try:
+        gates = (_json.loads(st_file.read_text(encoding="utf-8")).get("gates") or {}) if st_file.exists() else {}
+    except Exception:  # noqa: BLE001
+        gates = {}
+    if gates.get("commission") != "done":
+        return ("commission gate not done — automatic planned motion is only allowed once the "
+                "motion stack was PROVEN live; use the tape replay or jog manually")
+    if _MOTION_STACK is None:
+        return "motion stack not running — start it from the header (⚡ Motion), then retry"
+    return None
+
+
+def _replay_step_planned() -> dict:
+    """One PLANNED replay step: fetch the next capture mark from the session, drive it with the
+    commissioned stack (one smooth streamed whole-body trajectory — not the tape's ramped
+    micro-hops), then capture. The session owns collection state; the edge owns motion — the
+    same boundary as drive-to-start."""
+    err = _planned_motion_gate()
+    if err:
+        return {"ok": False, "error": err}
+    svc = _calib_service()
+    s = svc.session
+    if s is None:
+        return {"ok": False, "error": "no calibration selected — select the step first"}
+    g = s.replay_next_goal()
+    if g.get("error"):
+        return {"ok": False, "error": g["error"]}
+    if g.get("done"):
+        return {"ok": True, "done": True, "collected": g.get("collected"), "heldout": g.get("heldout")}
+    goal = {n: float(v) for n, v in zip(g["joint_names"], g["joints"])}
+    t0 = time.time()
+    with _bridge_lock:
+        res = _MOTION_STACK.goto_joints(goal, execute=True)
+    if not res.ok:
+        return {"ok": False, "error": f"mark {g['mark']}/{g['marks']}: {res.message}"}
+    cap = s.replay_capture_mark()
+    if cap.get("error"):
+        return {"ok": False, "error": cap["error"]}
+    print(f"[replay-planned] mark {g['mark']}/{g['marks']} · goto {time.time() - t0:.1f}s · "
+          f"capture {'ok' if cap.get('accepted') else 'MISSED'}", flush=True)
+    return {"ok": True, **cap}
+
+
 def _replay_goto_start() -> dict:
     """Drive the arm to the selected step's routine START with the COMMISSION-PROVEN motion
     stack (collision-free joint-space plan through the commissioned executor) — the automatic
@@ -2325,6 +2375,13 @@ def _calib_handle_locked(verb: str, body: dict) -> dict:
         if verb == "b2b_snapshot":
             # dual-arm: BOTH wrist cameras' frames + detection, so base-to-base isn't blind.
             return _calib_b2b_snapshot()
+        if verb == "replay_step_planned":
+            return _replay_step_planned()
+        if verb == "replay_start_planned":
+            gate_err = _planned_motion_gate()
+            if gate_err:
+                return {"ok": False, "error": gate_err}
+            return _calib_service().handle(verb, body)
         if verb == "replay_goto_start":
             # drive-to-start via the COMMISSION-PROVEN motion stack (edge-level: the engine
             # never imports motion_engine — gate fusion is the edge's job).

@@ -3,8 +3,10 @@
 The operator's safety is fed INTO the planner so every trajectory is safe BY CONSTRUCTION, not
 judged after the fact:
 
-  - joint **acceleration / jerk** caps + a **speed scale** (`max_joint_speed_frac`) → the robot
-    cspace, so the optimised B-spline respects the dynamics envelope.
+  - joint **acceleration / jerk** caps → the robot cspace, so the optimised B-spline respects the
+    dynamics envelope. URDF joint VELOCITY limits are used UNSCALED — there is deliberately no
+    planner speed scale (scaling it made a 5 cm move take 13 s; see robotcfg). The operator's
+    `max_joint_speed_frac` governs the bridge's DIRECT SDK moves (move_joints / calibration).
   - **keep-out** boxes + **workspace bounds** → scene obstacles (handled in `world.py`).
 
 cuRobo then returns a path that is collision-free AND within every limit. The only thing left at
@@ -44,28 +46,23 @@ def _f(v, default: float) -> float:
 class Safety:
     """The normalised envelope. `bounds_m`/`keep_out` go to `world.py`; the rest to the planner."""
 
-    max_joint_speed_frac: float = 0.10      # fraction of rated joint speed (0..1)
+    max_joint_speed_frac: float = 0.10      # fraction of rated joint speed — DIRECT SDK moves only
     max_cartesian_speed_mps: float = 0.10   # safety-rated monitored cartesian speed
-    max_acceleration: Optional[float] = None  # rad/s^2 cap (None → planner/URDF default)
-    max_jerk: Optional[float] = None          # rad/s^3 cap
-    max_velocity: Optional[float] = None      # rad/s absolute cap (None → URDF * speed_frac)
+    max_acceleration: Optional[float] = None  # rad/s^2 cap (None → 15.0 default)
+    max_jerk: Optional[float] = None          # rad/s^3 cap (None → 500.0 default)
+    max_velocity: Optional[float] = None      # authored but NOT consumed by the planner today
     bounds_m: Optional[dict] = None           # {"min":[x,y,z], "max":[x,y,z]} workspace box
     keep_out: Optional[List[dict]] = None     # [{min,max,note}]
 
     def planner_limits(self) -> dict:
-        """The `limits` dict `robotcfg.build_v2_robot_cfg` + the adapter consume. `velocity_scale`
-        is applied by the adapter to the URDF-derived joint velocity limits (slow, safe setup
-        speed); acceleration scales with the square so the slowdown stays physically consistent."""
-        frac = float(np.clip(self.max_joint_speed_frac, 1e-3, 1.0))
-        out = {
-            "velocity_scale": frac,
-            "acceleration_scale": float(frac ** 2),
+        """The `limits` dict `robotcfg.build_v2_robot_cfg` consumes — EXACTLY what the planner
+        applies, nothing more: cspace `max_acceleration` / `max_jerk`. URDF joint VELOCITY limits
+        are unscaled by design (a velocity scale here made a 5 cm move take 13 s / 500+ waypoints —
+        see robotcfg); `max_joint_speed_frac` caps the bridge's DIRECT SDK moves instead."""
+        return {
             "max_acceleration": _f(self.max_acceleration, 15.0),
             "max_jerk": _f(self.max_jerk, 500.0),
         }
-        if self.max_velocity is not None:
-            out["max_velocity"] = float(self.max_velocity)
-        return out
 
     def world_kwargs(self) -> dict:
         """What `world.load_world(safety=...)` reads for keep-out/bounds obstacles."""

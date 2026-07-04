@@ -50,14 +50,16 @@ def build_v2_robot_cfg(
     self_collision_ignore: Optional[Dict[str, List[str]]] = None,
     actuated_joints: Optional[Sequence[str]] = None,
 ) -> dict:
-    """A cuRoboV2 `robot_cfg` planning the `active_groups` (default: ALL groups in the config).
+    """A cuRoboV2 `robot_cfg` whose `tool_frames` = the `active_groups`' tips (default: ALL groups).
 
-    `base_link` is the shared root; `tool_frames` = each active group's `tip_links`;
-    `cspace.joint_names` = the union of those groups' joints; every other group's joints are
-    `lock_joints` (held, still collision). `collision_spheres` cover ALL links so locked limbs and
-    the body are obstacles. `limits` (from `safety.py`) caps acceleration/jerk so the planner's
-    trajectory is dynamics-safe BY CONSTRUCTION. Morphology-agnostic: arm/leg/wheel/head are the
-    same code path. Raises on an empty config (no chain = no plan)."""
+    `base_link` is the shared root. `cspace.joint_names` is ALWAYS every independent actuated
+    joint — active_groups selects tool frames ONLY, never the cspace (`lock_joints` breaks the V2
+    loader; un-goaled limbs ride the minimal-motion cost — see the comment below). Because the
+    cspace is identical for any subset, the stack builds ONE robot planner with ALL tips rather
+    than one per subset. `collision_spheres` cover ALL links so every limb and the body are
+    obstacles. `limits` (from `safety.py`) caps acceleration/jerk so the planner's trajectory is
+    dynamics-safe BY CONSTRUCTION; URDF velocity limits are used unscaled. Morphology-agnostic:
+    arm/leg/wheel/head are the same code path. Raises on an empty config (no chain = no plan)."""
     groups = config.get("groups") or []
     if not groups:
         raise ValueError("config has no groups — cannot build a V2 robot_cfg (no kinematic chain)")
