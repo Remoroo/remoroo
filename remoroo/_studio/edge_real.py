@@ -1935,7 +1935,16 @@ def _replay_step_planned() -> dict:
     with _bridge_lock:
         res = _MOTION_STACK.goto_joints(goal, execute=True)
     if not res.ok:
-        return {"ok": False, "error": f"mark {g['mark']}/{g['marks']}: {res.message}"}
+        # PLAN refused (never moved) → the world changed under a recorded pose: SKIP the mark
+        # and calibrate from the rest. EXECUTION failure (the arm was moving) → stop the run.
+        if res.executed or res.aborted:
+            return {"ok": False, "error": f"mark {g['mark']}/{g['marks']}: {res.message}"}
+        sk = s.replay_skip_mark(res.message)
+        if sk.get("error"):
+            return {"ok": False, "error": sk["error"]}
+        print(f"[replay-planned] mark {g['mark']}/{g['marks']} SKIPPED (unplannable in the "
+              f"current world): {res.message}", flush=True)
+        return {"ok": True, "skipped": True, **sk}
     cap = s.replay_capture_mark()
     if cap.get("error"):
         return {"ok": False, "error": cap["error"]}
@@ -1971,7 +1980,17 @@ def _active_step() -> dict:
     with _bridge_lock:
         res = _MOTION_STACK.goto_joints(goal, execute=True)
     if not res.ok:
-        return {"ok": False, "error": f"pose {g['added'] + 1}/{g['max']}: {res.message}"}
+        # PLAN refused (never moved) → drop this suggestion, active_next picks another (the
+        # session ends the loop after 3 refusals in a row). EXECUTION failure → stop the run.
+        if res.executed or res.aborted:
+            return {"ok": False, "error": f"pose {g['added'] + 1}/{g['max']}: {res.message}"}
+        fr = s.active_goto_failed(res.message)
+        if fr.get("error"):
+            return {"ok": False, "error": fr["error"]}
+        print(f"[active] suggestion unplannable ({fr.get('fails', '?')}/3 in a row) — "
+              f"{'ending: workspace too constrained' if fr.get('done') else 'trying another'}: "
+              f"{res.message}", flush=True)
+        return {"ok": True, **fr}
     cap = s.active_capture()
     if cap.get("error"):
         return {"ok": False, "error": cap["error"]}
@@ -2045,6 +2064,11 @@ def _replay_goto_start() -> dict:
     _lap("goto_joints returned", ok=res.ok, executed=getattr(res, "executed", None),
          message=res.message)
     out = {"ok": bool(res.ok), "message": res.message}
+    if not res.ok and not (res.executed or res.aborted):
+        # PLAN refused, never moved — the recorded START may now sit inside a new obstacle.
+        # Flag it so the Studio can still run the PLANNED replay (its marks are absolute
+        # goals; only the TAPE needs start proximity, and that path refuses on its own).
+        out["plan_refused"] = True
     try:
         traj = getattr(res, "trajectory", None)
         if traj is not None:

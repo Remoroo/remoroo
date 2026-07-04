@@ -414,13 +414,20 @@ class CuroboV2Planner:
             )
         with span("MotionPlanner(cfg) build"):
             self.planner = MotionPlanner(cfg)
-        # warmup's enable_graph = warm the PRM graph planner (the trajopt fallback roadmap) — a big
-        # slice of warmup cost, only worth paying when graph seeding will actually be used
-        # (deliberate commission/demo plans). Graph-free realtime skips it; PRM then builds lazily
-        # IF a plan ever falls back (slow once, correct always).
+        # Warmup, split in TWO so the rig log attributes it (round-1 log: one opaque 128 s):
+        # (1) the solve warmup — 5 fake plans that JIT the warp kernels and capture the IK/trajopt
+        #     CUDA graphs (upstream warmup's loop, enable_graph=False = loop only);
+        # (2) the PRM graph-planner roadmap (upstream warmup's tail) — only worth paying when
+        #     graph seeding will actually be used (deliberate commission/demo plans). Graph-free
+        #     realtime skips it; PRM then builds lazily IF a plan ever falls back (slow once,
+        #     correct always). Same behavior as upstream warmup(enable_graph=…), just spanned.
         if warmup:
-            with span("planner.warmup", enable_graph=bool(enable_graph), iters=5):
-                self.planner.warmup(enable_graph=bool(enable_graph), num_warmup_iterations=5)
+            with span("planner.warmup (IK/trajopt: warp JIT + CUDA-graph capture)", iters=5):
+                self.planner.warmup(enable_graph=False, num_warmup_iterations=5)
+            gp = getattr(self.planner, "graph_planner", None)
+            if enable_graph and gp is not None:
+                with span("planner.warmup (PRM graph-planner roadmap)"):
+                    gp.warmup(num_warmup_iterations=5)
         stamp("cubin disk cache stats (hits = compiles skipped this process)",
               **kernel_disk_cache.stats())
 

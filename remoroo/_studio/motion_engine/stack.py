@@ -1882,7 +1882,9 @@ class MotionStack:
                 except TypeError:
                     ok = self.bridge.execute_trajectory(traj)  # driver that doesn't accept should_abort
         except Exception as e:
-            return MoveResult(False, f"executor raised: {e}", trajectory=traj)
+            # executed=True: the executor was ENTERED (the arm may have moved) — callers use
+            # this to tell "plan refused, safe to skip" from "execution failed, stop the run"
+            return MoveResult(False, f"executor raised: {e}", trajectory=traj, executed=True)
         finally:
             stop_watch.set()
         if tracking["failed"]:

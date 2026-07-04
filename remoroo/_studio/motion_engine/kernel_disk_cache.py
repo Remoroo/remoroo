@@ -34,7 +34,17 @@ from typing import Optional
 from .mtrace import stamp
 
 _installed = False
-_STATS = {"hits": 0, "misses": 0, "saves": 0, "load_errors": 0, "save_errors": 0}
+_STATS = {"hits": 0, "misses": 0, "saves": 0, "load_errors": 0, "save_errors": 0,
+          "hook_failures": 0, "capture_missed": 0, "no_code_bytes": 0}
+_stamped_once: set = set()
+
+
+def _once(tag: str, **kv) -> None:
+    """Stamp a diagnostic ONCE per process — these fire per-kernel (dozens), and one line is
+    enough to name the failure mode in the rig log without drowning it."""
+    if tag not in _stamped_once:
+        _stamped_once.add(tag)
+        stamp(tag, **kv)
 
 
 def stats() -> dict:
@@ -72,13 +82,28 @@ def _symbol_map(mod) -> dict:
     return {}
 
 
+def _module_bytes(mod) -> Optional[bytes]:
+    """The compiled module's cubin bytes, wherever the installed cuda.core keeps them. First rig
+    run showed saves=0 with NO error — the silent case this hunts: when no known attribute has
+    bytes, a ONE-TIME stamp lists the module's real attributes so the next log names the fix."""
+    for attr in ("code", "_module", "_code", "module"):
+        v = getattr(mod, attr, None)
+        if isinstance(v, (bytes, bytearray)) and v:
+            return bytes(v)
+    return None
+
+
 def _save(mod, key: str, kernel_name: str) -> bool:
     """Write the compiled module's cubin + its symbol-mapping sidecar. Atomic (tmp+rename) so a
     crash mid-write never leaves a half cubin the next process would trust."""
     try:
-        code = getattr(mod, "code", None)
-        if not isinstance(code, (bytes, bytearray)) or not code:
-            return False                     # this cuda.core doesn't expose module bytes — no cache
+        code = _module_bytes(mod)
+        if code is None:                     # this cuda.core doesn't expose module bytes — no cache
+            _STATS["no_code_bytes"] += 1
+            _once("cubin disk cache: compiled module exposes no cubin bytes — cache stays read-only",
+                  mod_type=type(mod).__name__,
+                  attrs=",".join(a for a in dir(mod) if not a.startswith("__"))[:300])
+            return False
         d = cache_dir()
         d.mkdir(parents=True, exist_ok=True)
         tmp = d / f".{key}.cubin.tmp"
@@ -168,7 +193,11 @@ def install() -> bool:
         # ObjectCode (the original returns only the kernel; the cubin bytes live on the module).
         # The hook is process-global for the duration of ONE compile; kernel compilation here is
         # serial (planner build), and even a concurrent capture only saves an extra valid cubin.
+        # Each way the capture can silently fail is COUNTED + one-time-stamped: the first rig run
+        # showed saves=0 with zero errors, which this exact instrumentation disambiguates.
         captured: dict = {}
+        hooked = False
+        orig_compile = None
         try:
             from cuda.core import Program
             orig_compile = Program.compile
@@ -179,14 +208,27 @@ def install() -> bool:
                 return mod
 
             Program.compile = compile_hook
-            try:
-                kernel = original(self, source_files, kernel_name, include_dirs, compile_flags)
-            finally:
-                Program.compile = orig_compile
-        except Exception:  # noqa: BLE001 — hook plumbing failed → stock compile, no save
-            return original(self, source_files, kernel_name, include_dirs, compile_flags)
+            hooked = True
+        except Exception as e:  # noqa: BLE001 — hook plumbing failed → stock compile, no save
+            _STATS["hook_failures"] += 1
+            _once("cubin disk cache: Program.compile hook failed — compiles won't be persisted",
+                  error=f"{type(e).__name__}: {e}")
+        try:
+            kernel = original(self, source_files, kernel_name, include_dirs, compile_flags)
+        finally:
+            if hooked:
+                try:
+                    Program.compile = orig_compile
+                except Exception:  # noqa: BLE001
+                    pass
 
-        if captured.get("mod") is not None and _save(captured["mod"], key, kernel_name):
+        mod = captured.get("mod")
+        if mod is None:
+            if hooked:
+                _STATS["capture_missed"] += 1
+                _once("cubin disk cache: hook active but no module captured "
+                      "(cuRobo compiled via a different path?)", kernel=kernel_name)
+        elif _save(mod, key, kernel_name):
             _STATS["saves"] += 1
         return kernel
 

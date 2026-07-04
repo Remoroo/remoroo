@@ -1084,7 +1084,7 @@ class CalibSession:
         if self.recorder is not None:
             self.recorder.armed = False
         self._marks = {"rows": [W[m] for m in marks], "names": list(r.joint_names),
-                       "idx": 0, "awaiting": False}
+                       "idx": 0, "awaiting": False, "skipped": []}
         return {"type": "replay_start_planned", "ok": True, "marks": len(marks),
                 "joint_names": list(r.joint_names)}
 
@@ -1096,7 +1096,8 @@ class CalibSession:
         if st["idx"] >= len(st["rows"]):
             self._marks = None
             return {"type": "replay_next_goal", "done": True,
-                    "collected": len(self.samples), "heldout": len(self.heldout)}
+                    "collected": len(self.samples), "heldout": len(self.heldout),
+                    "skipped_marks": len(st.get("skipped") or [])}
         st["awaiting"] = True
         return {"type": "replay_next_goal", "done": False,
                 "mark": st["idx"] + 1, "marks": len(st["rows"]),
@@ -1134,6 +1135,22 @@ class CalibSession:
                         "drift_px": None if drift is None else round(drift, 2)}
             last = cur
 
+    def replay_skip_mark(self, reason: str = "") -> dict:
+        """A mark whose goal the CURRENT world refuses (a new obstacle sits on a recorded pose)
+        is SKIPPED, not fatal: log it, advance, calibrate from the marks that remain. The run
+        only dies for execution failures (the arm was moving) — the edge decides which is which
+        via MoveResult.executed. Every-4th held-out keeps using the mark INDEX, so the split
+        stays deterministic whatever gets skipped."""
+        st = self._marks
+        if st is None or not st.get("awaiting"):
+            return {"type": "replay_skip_mark", "error": "no pending mark — call replay_next_goal first"}
+        st["awaiting"] = False
+        st.setdefault("skipped", []).append({"mark": st["idx"] + 1, "reason": str(reason)[:200]})
+        st["idx"] += 1
+        return {"type": "replay_skip_mark", "mark": st["idx"], "marks": len(st["rows"]),
+                "skipped_marks": len(st["skipped"]), "collected": len(self.samples),
+                "heldout": len(self.heldout), "done": st["idx"] >= len(st["rows"])}
+
     def replay_capture_mark(self) -> dict:
         """Capture at the mark the edge just drove to — after the SETTLE gate (the arm rings
         when a streamed trajectory stops; capture only once the image is still). Every 4th
@@ -1149,7 +1166,8 @@ class CalibSession:
         done = st["idx"] >= len(st["rows"])
         out = {"type": "replay_capture_mark", "mark": st["idx"], "marks": len(st["rows"]),
                "accepted": bool(cap.get("accepted")), "held_out": held_out, "settle": settle,
-               "collected": len(self.samples), "heldout": len(self.heldout), "done": done}
+               "collected": len(self.samples), "heldout": len(self.heldout), "done": done,
+               "skipped_marks": len(st.get("skipped") or [])}
         # _marks is cleared by replay_next_goal's done (both exit styles stay valid)
         if len(self.samples) >= max(6, self.min_corners):
             try:
@@ -1234,6 +1252,27 @@ class CalibSession:
                 "held_out": st["added"] % 4 == 3,
                 "gain_deg": sp.get("diversity_gain_deg")}
 
+    def active_goto_failed(self, reason: str = "") -> dict:
+        """The edge couldn't PLAN to the pending suggestion (a new obstacle boxes it in) — not
+        fatal: drop it and let active_next pick a different candidate (the rng advances, the
+        feasibility filter culls config-collisions; a path-blocked pose won't recur verbatim).
+        Three REFUSALS IN A ROW (no capture between) means the workspace is too constrained to
+        keep trying — end the loop honestly instead of thrashing. Execution failures never come
+        here: the edge stops the run for those (the arm was moving)."""
+        st = self._active
+        if st is None or not st.get("awaiting"):
+            return {"type": "active_goto_failed", "error": "no pending pose — call active_next first"}
+        st["awaiting"] = False
+        st["goto_fails"] = int(st.get("goto_fails", 0)) + 1
+        if st["goto_fails"] >= 3:
+            self._active = None
+            return {"type": "active_goto_failed", "done": True, "reason": "blocked",
+                    "converged": False, "added": st["added"],
+                    "collected": len(self.samples), "heldout": len(self.heldout),
+                    "detail": f"3 consecutive suggestions unplannable — last: {str(reason)[:200]}"}
+        return {"type": "active_goto_failed", "done": False, "retry": True,
+                "fails": st["goto_fails"], "added": st["added"], "max": st["max"]}
+
     def active_capture(self) -> dict:
         """Capture at the pose the edge just drove to (settle-gated), re-solve, and report the
         meter — the loop's observe step. Every 4th ADDED pose feeds the held-out set."""
@@ -1244,6 +1283,7 @@ class CalibSession:
         held_out = st["added"] % 4 == 3
         cap = self.capture(held_out=held_out)
         st["awaiting"] = False
+        st["goto_fails"] = 0                     # a reached pose ends any refusal streak
         if cap.get("accepted"):
             st["added"] += 1
         out = {"type": "active_capture", "accepted": bool(cap.get("accepted")),
