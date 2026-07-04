@@ -1877,8 +1877,11 @@ def _replay_step_planned() -> dict:
     cap = s.replay_capture_mark()
     if cap.get("error"):
         return {"ok": False, "error": cap["error"]}
+    st = cap.get("settle") or {}
+    settle_txt = (f"settled {st.get('waited_s')}s/{st.get('drift_px')}px" if st.get("settled")
+                  else f"UNSETTLED after {st.get('waited_s')}s (drift {st.get('drift_px')}px)")
     print(f"[replay-planned] mark {g['mark']}/{g['marks']} · goto {time.time() - t0:.1f}s · "
-          f"capture {'ok' if cap.get('accepted') else 'MISSED'}", flush=True)
+          f"{settle_txt} · capture {'ok' if cap.get('accepted') else 'MISSED'}", flush=True)
     return {"ok": True, **cap}
 
 

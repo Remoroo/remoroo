@@ -230,6 +230,14 @@ class CalibSession:
         self.recorder: Optional[RoutineRecorder] = None if self.static else RoutineRecorder()
         self._replay: Optional[ReplayCursor] = None
         self._marks: Optional[dict] = None      # PLANNED replay state (cuRobo drives; edge owns motion)
+        # POST-MOTION SETTLE (automatic captures only): the arm RINGS after a streamed
+        # trajectory stops — structural oscillation the joint encoders don't see but sub-pixel
+        # corners do. Capturing immediately smears the fit (the measured reason the first
+        # planned recalibration scored worse than manual — a human's click delay was a natural
+        # settle). Wait until the IMAGE is stable: consecutive detections must agree.
+        self.settle_max_wait_s = 2.0
+        self.settle_interval_s = 0.15
+        self.settle_drift_px = 0.8   # ringing is >1px; detection noise ~0.2–0.5px sits below
         # Engine-COMMANDED motion happens with the bridge lock held for the whole move, so the
         # edge's poll ticker is blind during it. The bridge reports each commanded waypoint via
         # this hook — the commanded path IS the traversed path, so the routine records the full
@@ -1025,13 +1033,14 @@ class CalibSession:
                 import time
                 time.sleep(min(float(dt), 0.25))    # roughly the recorded pacing, capped
         _t_moved = _time.time()
+        settle = self._settle_for_capture()          # the arm rings after motion — capture still
         held_out = (cur.i - 1) % 4 == 3             # every 4th capture → the held-out set
         cap = self.capture(held_out=held_out)
         print(f"[replay] segment {cur.i}/{len(cur.segments)} · {len(W)} hops moved in "
               f"{_t_moved - _t0:.2f}s · capture {'ok' if cap.get('accepted') else 'MISSED'} in "
               f"{_time.time() - _t_moved:.2f}s", flush=True)
         out = {"type": "replay_step", "segment": cur.i, "segments": len(cur.segments),
-               "accepted": bool(cap.get("accepted")), "held_out": held_out,
+               "accepted": bool(cap.get("accepted")), "held_out": held_out, "settle": settle,
                "collected": len(self.samples), "heldout": len(self.heldout),
                "done": cur.done}
         if cur.done:
@@ -1093,19 +1102,52 @@ class CalibSession:
                 "held_out": st["idx"] % 4 == 3,
                 "joints": _T(st["rows"][st["idx"]]), "joint_names": list(st["names"])}
 
+    def _settle_for_capture(self) -> dict:
+        """Wait until the IMAGE is stable before an AUTOMATIC capture: detect twice per interval
+        and require the common corners to drift < settle_drift_px. Gives up (capture proceeds,
+        flagged UNSETTLED) after settle_max_wait_s — a noisy scene must not hang the run.
+        Manual captures don't need this: the human's click delay is the settle."""
+        import time as _t
+        t0 = _t.time()
+        try:
+            ids0, uv0 = self.bridge.capture()
+        except Exception:  # noqa: BLE001 — no detection yet; capture() will judge for real
+            return {"settled": False, "waited_s": 0.0, "drift_px": None}
+        last = {int(i): np.asarray(u, float) for i, u in zip(ids0, uv0)}
+        drift = None
+        while True:
+            _t.sleep(self.settle_interval_s)
+            try:
+                ids1, uv1 = self.bridge.capture()
+            except Exception:  # noqa: BLE001
+                ids1, uv1 = np.zeros(0, int), np.zeros((0, 2))
+            cur = {int(i): np.asarray(u, float) for i, u in zip(ids1, uv1)}
+            common = set(last) & set(cur)
+            if len(common) >= max(4, self.min_corners // 2):
+                drift = float(np.mean([np.linalg.norm(cur[i] - last[i]) for i in common]))
+                if drift < self.settle_drift_px:
+                    return {"settled": True, "waited_s": round(_t.time() - t0, 2),
+                            "drift_px": round(drift, 2)}
+            if _t.time() - t0 > self.settle_max_wait_s:
+                return {"settled": False, "waited_s": round(_t.time() - t0, 2),
+                        "drift_px": None if drift is None else round(drift, 2)}
+            last = cur
+
     def replay_capture_mark(self) -> dict:
-        """Capture at the mark the edge just drove to (every 4th held out — the no-motion
-        validate split), plus the live observability payload for the meter."""
+        """Capture at the mark the edge just drove to — after the SETTLE gate (the arm rings
+        when a streamed trajectory stops; capture only once the image is still). Every 4th
+        capture held out (the no-motion validate split) + the live observability payload."""
         st = self._marks
         if st is None or not st.get("awaiting"):
             return {"type": "replay_capture_mark", "error": "no pending mark — call replay_next_goal first"}
+        settle = self._settle_for_capture()
         held_out = st["idx"] % 4 == 3
         cap = self.capture(held_out=held_out)
         st["awaiting"] = False
         st["idx"] += 1
         done = st["idx"] >= len(st["rows"])
         out = {"type": "replay_capture_mark", "mark": st["idx"], "marks": len(st["rows"]),
-               "accepted": bool(cap.get("accepted")), "held_out": held_out,
+               "accepted": bool(cap.get("accepted")), "held_out": held_out, "settle": settle,
                "collected": len(self.samples), "heldout": len(self.heldout), "done": done}
         # _marks is cleared by replay_next_goal's done (both exit styles stay valid)
         if len(self.samples) >= max(6, self.min_corners):

@@ -861,6 +861,14 @@ class CuroboV2Planner:
         from .mtrace import stamp
         stamp("plan_joints trajectory", wp=len(traj), dt=round(traj.dt, 4),
               duration_s=round(traj.duration, 1))
+        # WHY does a warm joint-space plan take 3.5–7s (quantized ~1.75s)? Name the thief:
+        # cuRobo results carry solve diagnostics when available — surface whatever exists.
+        diag = {k: getattr(result, k) for k in ("solve_time", "trajopt_time", "finetune_time",
+                                                "graph_time", "attempts", "optimized_dt")
+                if getattr(result, k, None) is not None}
+        if diag:
+            stamp("plan_cspace diagnostics", **{k: (round(float(v), 3) if isinstance(v, (int, float)) else v)
+                                                for k, v in diag.items()})
         return PlanResult(True, traj, "ok", traj.duration)
 
     @staticmethod
