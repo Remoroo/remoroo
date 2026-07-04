@@ -184,6 +184,14 @@ class CalibSession:
         # cell.yaml by the service; defaults are sane for a wrist-cam eye-in-hand.
         self.accept_rot_sigma_deg = float(accept_rot_sigma_deg)
         self.accept_trans_sigma_mm = float(accept_trans_sigma_mm)
+        # ACTIVE-REFINE targets — deliberately much tighter than the accept gate. The accept
+        # gate (0.5°/2mm) is the MINIMUM-trust floor for saving at all; the refine loop chases
+        # the statistical floor the rig can actually deliver (ChArUco corner noise ~0.1-0.3px
+        # over ~20 poses ⇒ σ well under 0.1°/0.2mm in the Fisher model). Stopping the loop at
+        # the accept σ would declare "converged" the moment a decent replay lands. σ is
+        # PRECISION — the held-out validate stays the accuracy anchor (FK bias never shows in σ).
+        self.refine_rot_sigma_deg = 0.05
+        self.refine_trans_sigma_mm = 0.15
         # A WORLD-FIXED camera has no hand-eye rotation coupling, so its weak DOF is the optical-axis
         # (depth) translation — a near-frontal / single placement leaves it under-constrained. This is
         # the hard depth-σ limit (mm) the static accept refuses past (unless the operator forces it).
@@ -1208,7 +1216,8 @@ class CalibSession:
         try:  # a fresh solve so the NBV ranks against the CURRENT covariance
             r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
             self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
-            converged = self._note_observability(r)
+            self._note_observability(r)                      # accept-gate meter (unchanged)
+            converged = self._refine_converged(r)            # the loop chases REFINE targets
         except Exception as e:  # noqa: BLE001
             return {"type": "active_start", "ok": False, "error": f"solve failed: {e}"}
         worst = r.metrics.get("worst_trans_sigma_mm")
@@ -1216,9 +1225,21 @@ class CalibSession:
                         "names": names, "sigma_hist": [float(worst) if worst is not None else float("inf")]}
         return {"type": "active_start", "ok": True, "converged": bool(converged),
                 "max_poses": int(max_poses),
-                "targets": {"rot_sigma_deg": self.accept_rot_sigma_deg,
-                            "trans_sigma_mm": self.accept_trans_sigma_mm},
+                "targets": {"rot_sigma_deg": self.refine_rot_sigma_deg,
+                            "trans_sigma_mm": self.refine_trans_sigma_mm},
                 "observability": {k: round(float(v), 4) for k, v in observability(r).items()}}
+
+    def _refine_converged(self, result) -> bool:
+        """Every DOF of X under the REFINE σ targets (tighter than the accept gate — see
+        __init__). A degenerate covariance reads as not-converged, never as a crash."""
+        if result is None:
+            return False
+        try:
+            ok, _ = well_observed(result, rot_sigma_deg=self.refine_rot_sigma_deg,
+                                  trans_sigma_mm=self.refine_trans_sigma_mm)
+            return bool(ok)
+        except Exception:  # noqa: BLE001
+            return False
 
     def active_next(self) -> dict:
         """Converged/budget/plateau check, then the next NBV goal for the edge — or done."""
@@ -1227,8 +1248,8 @@ class CalibSession:
             return {"type": "active_next", "error": "active collection not started"}
         st["awaiting"] = False
         done_reason = None
-        if self.result is not None and self.result.metrics.get("observable"):
-            done_reason = "converged"                     # every DOF of X under the σ targets
+        if self._refine_converged(self.result):
+            done_reason = "converged"                     # every DOF of X under the REFINE σ targets
         elif st["added"] >= st["max"]:
             done_reason = "budget"
         else:
@@ -1292,7 +1313,8 @@ class CalibSession:
         try:
             r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
             self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
-            out["converged"] = self._note_observability(r)
+            self._note_observability(r)                  # accept-gate meter (unchanged)
+            out["converged"] = self._refine_converged(r)
             worst = r.metrics.get("worst_trans_sigma_mm")
             if cap.get("accepted"):
                 st["sigma_hist"].append(float(worst) if worst is not None else float("inf"))

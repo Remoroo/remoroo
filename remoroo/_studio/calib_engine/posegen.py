@@ -199,6 +199,12 @@ def suggest_next_pose(
     # 12°-wrong-seed regression test pins this).
     if result is not None:
         fill_band = (0.35, max(0.40, 1.0 - 2.0 * visible_margin - 0.06))
+        # Hand-eye information grows with ROTATION magnitude and axis diversity (the classic
+        # Tsai-Lenz error bounds; the NBV literature's main lever) — and roll about the optical
+        # axis is FREE (the marker stays framed). With a trusted X, sample a wider rotation
+        # envelope; IK + visibility + the collision filter still cull what the rig can't do.
+        el_max_deg = max(el_max_deg, 60.0)
+        roll_max_deg = max(roll_max_deg, 60.0)
     else:
         fill_band = (0.20, 0.40)
     dist_size = size_aware_dist_range(board, K, wh, fill_lo=fill_band[0], fill_hi=fill_band[1])

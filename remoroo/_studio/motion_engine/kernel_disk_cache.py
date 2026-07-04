@@ -133,10 +133,17 @@ def _load(key: str, kernel_name: str):
             sym = dict(meta.get("symbol_mapping") or {})
         except Exception:  # noqa: BLE001 — no/broken sidecar: still try (extern-C names need none)
             sym = {}
+        # Round-3 rig log: from_cubin wants the cubin BYTES, not a path ("expected bytes, str
+        # found") — read the file and pass bytes; the str-path form stays as a last resort for
+        # other cuda.core versions. symbol_mapping kwarg first; fall back to the private attr.
+        data = cub.read_bytes()
         try:
-            mod = ObjectCode.from_cubin(str(cub), symbol_mapping=sym)  # newer cuda.core
+            mod = ObjectCode.from_cubin(data, symbol_mapping=sym)
         except TypeError:
-            mod = ObjectCode.from_cubin(str(cub))
+            try:
+                mod = ObjectCode.from_cubin(data)
+            except TypeError:
+                mod = ObjectCode.from_cubin(str(cub))      # oldest form: a filesystem path
             if sym:
                 try:
                     mod._sym_map = dict(sym)               # the pre-kwarg cuda.core keeps it here

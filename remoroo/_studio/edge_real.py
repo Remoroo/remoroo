@@ -1812,11 +1812,15 @@ def _warm_motion_stack():
 
       stage 1 (bridge lock): stack build + planner build + IK/trajopt warmup → mark ALIVE.
         The planner is fully usable here — a plan's attempt 0 never graph-seeds.
-      stage 2 (same thread, AFTER alive): the PRM roadmap warm (pure GPU, deliberately OFF the
-        bridge lock so an operator's first move is never blocked behind it), then the perception
-        pre-build (one live world; needs the bridge → locked — an immediate move can wait up to
-        ~1 min behind it, still far better than paying it inside the first commission call).
-        Stage-2 failures are stamped, never fatal: everything it pre-pays also builds lazily."""
+      stage 2 (same thread, AFTER alive, UNDER the bridge lock): the PRM roadmap warm, then the
+        perception WARM-ONLY build (mapper/segmenter/ESDF kernels paid; the planner's world is
+        restored to the modeled obstacles — see MotionStack.prewarm_perception). An operator's
+        first move can queue up to ~2 min behind stage 2; that's the price of the LOCK INVARIANT
+        the round-3 rig log enforced the hard way: ALL CUDA-graph capture must serialize with
+        ALL camera grabs under _bridge_lock — an off-lock PRM warm let a ZED grab collide with
+        capture ("operation not permitted when stream is capturing"), and the failed capture
+        POISONED the CUDA context (every later plan died with "Offset increment outside graph
+        capture"). Stage-2 failures are stamped, never fatal: everything also builds lazily."""
     try:
         from motion_engine.mtrace import span as _mspan, stamp as _mstamp
         with _bridge_lock:
@@ -1832,10 +1836,12 @@ def _warm_motion_stack():
         print(f"[edge] motion stack warmup FAILED: {type(e).__name__}: {e}")
         return
 
-    # ── stage 2: the stack is ALIVE; pre-pay the rest without blocking anyone ────────────
+    # ── stage 2: the stack is ALIVE; pre-pay the rest. UNDER the bridge lock — CUDA-graph
+    # capture (PRM warm, mapper build) must never overlap a camera grab (see docstring).
     try:
-        if hasattr(st, "finish_warmup"):
-            st.finish_warmup()                        # PRM roadmap — pure GPU, no bridge lock
+        with _bridge_lock:
+            if hasattr(st, "finish_warmup"):
+                st.finish_warmup()                    # PRM roadmap (captures graphs)
     except Exception as e:  # noqa: BLE001
         _mstamp("warmup: PRM roadmap warm failed (non-fatal — roadmap stays lazy)",
                 error=f"{type(e).__name__}: {e}")
@@ -1844,17 +1850,19 @@ def _warm_motion_stack():
             b = get_bridge()
             frames, reasons = (_live_frames(st, b) if b is not None else ([], ["no bridge"]))
             if frames:
-                with _mspan("warmup: perception pre-build (first live world — one-time "
-                            "mapper/segmenter build paid HERE, not on the first move)",
-                            cameras=len(frames)):
-                    st.update_world_live(frames)
+                with _mspan("warmup: perception pre-build (WARM-ONLY — kernels/mapper paid, "
+                            "the modeled world stays the planner's world)", cameras=len(frames)):
+                    if hasattr(st, "prewarm_perception"):
+                        st.prewarm_perception(frames)
+                    else:
+                        st.update_world_live(frames)
             else:
                 _mstamp("warmup: perception pre-build skipped (live world will build lazily)",
                         reasons="; ".join(reasons) or "no frames")
     except Exception as e:  # noqa: BLE001 — perception pre-build is opportunistic
         _mstamp("warmup: perception pre-build failed (non-fatal — lazy build remains)",
                 error=f"{type(e).__name__}: {e}")
-    print("[edge] motion deep-warm complete (PRM roadmap + live world)")
+    print("[edge] motion deep-warm complete (PRM roadmap + perception kernels)")
 
 
 def h_motion_warmup(_q):

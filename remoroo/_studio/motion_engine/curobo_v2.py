@@ -754,6 +754,32 @@ class CuroboV2Planner:
                 except Exception:  # noqa: BLE001 — best-effort hygiene, never fatal
                     pass
 
+    # errors that mean a CUDA-graph CAPTURE was corrupted mid-flight (a camera grab collided with
+    # it) and the solver graphs are now permanently broken in this process — round-3 rig log.
+    _CAPTURE_POISON_MARKERS = ("graph capture", "during capture", "captures_underway",
+                               "stream is capturing")
+
+    def _recover_if_capture_poisoned(self, e: Exception) -> str:
+        """Round-3 rig failure: a ZED grab collided with a CUDA-graph capture → the capture
+        failed → EVERY later plan raised 'Offset increment outside graph capture' instantly; the
+        planner was alive-but-lobotomized until an edge restart. When a plan exception carries a
+        capture-poison marker, reset the solver CUDA graphs (they recapture on the next plan) and
+        say so in the failure message, so the very next retry can succeed instead of the operator
+        restarting the edge. Returns a note to append to the message ('' when not this case)."""
+        msg = str(e)
+        if not any(m in msg for m in self._CAPTURE_POISON_MARKERS):
+            return ""
+        try:
+            self.reset_cuda_graph()
+            from .mtrace import stamp
+            stamp("CUDA-graph state was POISONED (a camera grab collided with capture) — solver "
+                  "graphs reset; the next plan recaptures")
+            return (" [recovered: the CUDA-graph state was poisoned by a camera grab colliding "
+                    "with capture; solver graphs were reset — RETRY the move]")
+        except Exception:  # noqa: BLE001
+            return (" [CUDA-graph state is poisoned (camera grab × capture) and the reset failed "
+                    "— restart the edge]")
+
     def _start_js(self, start_positions: Optional[Dict[str, float]]):
         """A JointState over the planner's active joints; missing joints take the robot default. The
         start is CLAMPED to the joint limits: a marginally out-of-range seed (sensor noise, or the arm
@@ -827,7 +853,7 @@ class CuroboV2Planner:
             with _span("plan_pose", frames=len(goals), attempts=max_attempts):
                 result = self.planner.plan_pose(goal, start, use_implicit_goal=True, max_attempts=max_attempts)
         except Exception as e:  # a planner exception is a failure to surface, not a crash
-            return PlanResult(False, None, f"plan_pose raised: {e}")
+            return PlanResult(False, None, f"plan_pose raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
             return PlanResult(False, None, _plan_failure_message(result))
         traj = self._to_trajectory(result.get_interpolated_plan())
@@ -865,7 +891,7 @@ class CuroboV2Planner:
                 joint_names=self.planner.joint_names)
             result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
         except Exception as e:
-            return PlanResult(False, None, f"plan_cspace raised: {e}")
+            return PlanResult(False, None, f"plan_cspace raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
             return PlanResult(False, None, _plan_failure_message(result, home=True))
         traj = self._to_trajectory(self._trimmed_plan(result))   # trimmed, never the padded buffer
@@ -902,7 +928,7 @@ class CuroboV2Planner:
             with span("plan_cspace", attempts=max_attempts, named=len(goal_positions)):
                 result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
         except Exception as e:
-            return PlanResult(False, None, f"plan_cspace raised: {e}")
+            return PlanResult(False, None, f"plan_cspace raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
             return PlanResult(False, None, _plan_failure_message(result))
         with span("interpolate→Trajectory"):

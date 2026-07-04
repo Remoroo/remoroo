@@ -842,6 +842,29 @@ class MotionStack:
                       error=f"{type(e).__name__}: {e}")
         return {"ok": True, "n_warmed": n}
 
+    def prewarm_perception(self, frames) -> dict:
+        """WARM-ONLY world build: pay the one-time perception cost (mapper/segmenter build +
+        first integrate + the ESDF kernels — ~70 s on the Orin) WITHOUT changing what the
+        planner plans against. `update_world_live` flips the planner's collision world to the
+        live ESDF; doing that at WARMUP silently changed semantics (round-3 rig: replay marks
+        planned against a warm-up ESDF where they used to see the modeled obstacles, and failed
+        start-in-collision) — so after the warm build the MODELED world is RESTORED. The mapper
+        stays built: the next real `update_world_live` (commission/realtime) is ~3 s and applies
+        its own fresh ESDF."""
+        rep = self.update_world_live(frames)
+        try:
+            tcp = next(iter(self._groups), None)
+            planner = self._planner_for([tcp]) if tcp else None
+            if planner is not None and hasattr(planner, "set_world"):
+                planner.set_world(self.world)      # modeled world back; the live flag drops
+                stamp("prewarm_perception: MODELED world restored (warm-only build — the live "
+                      "ESDF applies when commission/realtime refreshes it)")
+        except Exception as e:  # noqa: BLE001 — a failed restore must be loud, never fatal
+            stamp("prewarm_perception: world restore FAILED — the planner may still hold the "
+                  "warm-up ESDF", error=f"{type(e).__name__}: {e}")
+        rep["warm_only"] = True
+        return rep
+
     def move_through_poses(self, tcp: str, poses: Sequence[object], *, execute: bool = True,
                            max_attempts: int = 3) -> MoveResult:
         """Drive one TCP through a sequence of poses (one concatenated collision-free path)."""
