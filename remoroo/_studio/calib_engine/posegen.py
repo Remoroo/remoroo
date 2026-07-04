@@ -175,10 +175,12 @@ def suggest_next_pose(
     el_max_deg: float = 50.0,
     roll_max_deg: float = 35.0,
     visible_margin: float = 0.18,
-) -> Tuple[Optional[np.ndarray], float]:
-    """Return (joints, score) for the next pose, or (None, 0.0) if nothing reachable+visible
-    was found. `score` is the chosen pose's rotation diversity vs the collected set (rad), so
-    the UI's "next-pose gain" stays meaningful in BOTH selection regimes.
+) -> Tuple[Optional[np.ndarray], float, dict]:
+    """Return (joints, score, diag) for the next pose — (None, 0.0, diag) if nothing
+    reachable+visible was found, where `diag` counts WHY candidates died (ik_fail /
+    not_visible / infeasible) per the instrumentation mandate. `score` is the chosen pose's
+    rotation diversity vs the collected set (rad), so the UI's "next-pose gain" stays
+    meaningful in BOTH selection regimes.
 
     Selection: with a solve (`result`), pick the pose MINIMISING the predicted worst
     translation σ of X (true next-best-view, `metrics.predicted_sigma_after`); before any
@@ -198,38 +200,65 @@ def suggest_next_pose(
     # margin; before any solve the seed may be degrees wrong, so keep a wide buffer (the
     # 12°-wrong-seed regression test pins this).
     if result is not None:
-        fill_band = (0.35, max(0.40, 1.0 - 2.0 * visible_margin - 0.06))
-        # Hand-eye information grows with ROTATION magnitude and axis diversity (the classic
-        # Tsai-Lenz error bounds; the NBV literature's main lever) — and roll about the optical
-        # axis is FREE (the marker stays framed). With a trusted X, sample a wider rotation
-        # envelope; IK + visibility + the collision filter still cull what the rig can't do.
-        el_max_deg = max(el_max_deg, 60.0)
-        roll_max_deg = max(roll_max_deg, 60.0)
+        # Trusted X (NBV): the look-at miss is bounded by the SOLVED X's tiny error, so the
+        # visibility buffer shrinks — that's what lets the camera come close at all. The fill
+        # cap divides by √2: an in-plane ROLL grows the projected bounding box up to √2×, so
+        # "close + rolled" candidates must still fit inside the margins — without this, big
+        # rolls and near distances were MUTUALLY EXCLUSIVE and every info-rich candidate was
+        # culled (the live "no reachable informative pose" failure, 0/32 kept).
+        visible_margin = min(visible_margin, 0.10)
+        hi = max(0.35, (1.0 - 2.0 * visible_margin - 0.04) / 1.42)
+        # A LADDER of attempts, most informative first (Tsai-Lenz: information grows with
+        # rotation magnitude/axis diversity; roll about the optical axis is free). Each rung
+        # gives up some information for reachability; the last anchors at the CURRENT viewing
+        # distance with gentle rotations — known-good geometry, so an empty result means the
+        # workspace truly offers nothing, not that the sampler aimed too high.
+        attempts = [((0.30, hi), max(el_max_deg, 60.0), max(roll_max_deg, 60.0)),
+                    ((0.30, hi), el_max_deg, roll_max_deg),
+                    (None, 45.0, 25.0)]
     else:
-        fill_band = (0.20, 0.40)
-    dist_size = size_aware_dist_range(board, K, wh, fill_lo=fill_band[0], fill_hi=fill_band[1])
+        attempts = [((0.20, 0.40), el_max_deg, roll_max_deg),
+                    (None, el_max_deg, roll_max_deg)]
     # the visible face points toward the camera side (never orbit behind the marker)
     normal = T_board_est[:3, 2].copy()
     if float(normal @ (cam0 - c)) < 0:
         normal = -normal
     collected_R = [(chain.fk(np.asarray(q, float)) @ X_est)[:3, :3] for q in collected_joints]
+    # IK is a local solver — a far-rotated target often needs a second basin to converge
+    ik_seeds = [q_seed]
+    if nominal_joints is not None and not np.allclose(np.asarray(nominal_joints, float), q_seed):
+        ik_seeds.append(np.asarray(nominal_joints, float))
+    # WHY each candidate died — mandatory legibility: "no reachable informative pose" without
+    # these counts is undebuggable on a live rig (IK? visibility? the new obstacle?).
+    diag = {"attempts": 0, "n_cand": 0, "ik_fail": 0, "not_visible": 0, "infeasible": 0, "kept": 0}
 
-    def _gather(dist_range):
+    def _gather(band, el_deg, roll_deg):
+        dist_range = (size_aware_dist_range(board, K, wh, fill_lo=band[0], fill_hi=band[1])
+                      if band is not None else (0.85 * dist0, 1.2 * dist0))
         cam_poses = _orbit_camera_poses(T_board_est, normal, n=n_cand, dist_range=dist_range,
-                                        el_max_deg=el_max_deg, roll_max_deg=roll_max_deg, rng=rng)
+                                        el_max_deg=el_deg, roll_max_deg=roll_deg, rng=rng)
         out = []   # (q, T_bc, diversity_rad)
         for T_cam_des in cam_poses:
+            diag["n_cand"] += 1
             T_flange_des = T_cam_des @ inv_T(X_est)        # camera = flange ∘ X  ->  flange = cam ∘ X⁻¹
-            q, ok = chain.ik(T_flange_des, q_seed, iters=45, pos_tol=2e-4, rot_tol=3e-3)
-            if not ok:
+            q = None
+            for seed in ik_seeds:
+                qi, ok = chain.ik(T_flange_des, seed, iters=45, pos_tol=2e-4, rot_tol=3e-3)
+                if ok:
+                    q = qi
+                    break
+            if q is None:
+                diag["ik_fail"] += 1
                 continue
             T_bc = chain.fk(q) @ X_est                     # ACHIEVED camera pose (under the seed)
             # A GENEROUS margin here is deliberate: the pose is checked against the (possibly
             # wrong) seed X, so a wide buffer keeps the marker in frame under the TRUE X too —
             # the residual miss is bounded by f·tan(seed_error), so we leave room for it.
             if not _board_fully_visible(T_bc, T_board_est, board, K, wh, margin_frac=visible_margin):
+                diag["not_visible"] += 1
                 continue
             if feasible is not None and not feasible(q):
+                diag["infeasible"] += 1
                 continue
             div = min((rotation_angle(R.T @ T_bc[:3, :3]) for R in collected_R), default=float(np.pi))
             out.append((q, T_bc, div))
@@ -237,11 +266,15 @@ def suggest_next_pose(
                 break
         return out
 
-    candidates = _gather(dist_size)
-    if not candidates:                                     # size-band unreachable → seed anchor
-        candidates = _gather((0.85 * dist0, 1.2 * dist0))
+    candidates = []
+    for band, el_deg, roll_deg in attempts:
+        diag["attempts"] += 1
+        candidates = _gather(band, el_deg, roll_deg)
+        if candidates:
+            break
+    diag["kept"] = len(candidates)
     if not candidates:
-        return None, 0.0
+        return None, 0.0, diag
 
     if result is not None:
         # NBV: choose the candidate that most pins the under-observed DOF of X.
@@ -259,7 +292,7 @@ def suggest_next_pose(
                      - 0.01 * min(_fill_frac(T_bc, T_board_est, board, K, wh) / 0.6, 1.0))
             if score < best_sigma:
                 best_sigma, best = score, (q, div)
-        return best[0], float(best[1])
+        return best[0], float(best[1]), diag
 
     # pre-solve: rotation diversity × centring × FILL (see most of the board, large)
     best_q, best_score, best_div = None, -1.0, 0.0
@@ -268,4 +301,4 @@ def suggest_next_pose(
         s = div * (0.4 + 0.6 * _centering(T_bc, T_board_est, board, K, wh)) * (0.5 + 0.5 * fill)
         if s > best_score:
             best_score, best_q, best_div = s, q, div
-    return best_q, float(best_div)
+    return best_q, float(best_div), diag

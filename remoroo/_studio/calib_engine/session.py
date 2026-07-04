@@ -550,7 +550,7 @@ class CalibSession:
         except Exception:  # noqa: BLE001 — fall back to the centred viewing config
             q_seed = self.nominal_joints
         weak = weak_rotation_axis(self.result) if self.result is not None else None
-        q, score = suggest_next_pose(
+        q, score, diag = suggest_next_pose(
             self.chain, self.X_est, self.T_board_est, self.board, self.K, self.wh,
             [s.joints for s in self.samples], rng=self.rng, nominal_joints=self.nominal_joints,
             q_seed=q_seed, feasible=self._feasible, weak_axis=weak, result=self.result,
@@ -559,7 +559,8 @@ class CalibSession:
         return {"type": "suggest_pose", "feasible": q is not None,
                 "joints": _T(q) if q is not None else None,
                 "ghost_pose": _T(self.chain.fk(q) @ self.X_est) if q is not None else None,
-                "diversity_gain_deg": round(float(np.degrees(score)), 2)}
+                "diversity_gain_deg": round(float(np.degrees(score)), 2),
+                "posegen": diag}
 
     def move_to(self, joints: Optional[Sequence[float]] = None) -> dict:
         if not self.motion_ok:
@@ -1266,7 +1267,8 @@ class CalibSession:
             self._active = None
             return {"type": "active_next", "done": True, "reason": "no reachable informative pose",
                     "converged": False, "added": st["added"],
-                    "collected": len(self.samples), "heldout": len(self.heldout)}
+                    "collected": len(self.samples), "heldout": len(self.heldout),
+                    "posegen": sp.get("posegen")}
         st["awaiting"] = True
         return {"type": "active_next", "done": False, "added": st["added"], "max": st["max"],
                 "joints": sp["joints"], "joint_names": list(st["names"]),

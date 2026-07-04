@@ -74,12 +74,30 @@ def _cubin(key: str) -> Path:
 def _symbol_map(mod) -> dict:
     """The name-expression → mangled-symbol mapping off a freshly compiled ObjectCode, wherever
     the installed cuda.core keeps it. Empty dict when not found (a plain extern-C kernel name
-    still resolves without it)."""
+    still resolves without it). The VALUES are mangled symbol names that cuda.core keeps as
+    BYTES (nvrtc returns bytes) — `str(bytes)` would write "b'_Z…'" garbage into the sidecar.
+    That exact bug shipped in round 4 and produced `get_kernel` failing "expected bytes, str
+    found" — the SAME error text as round 3's from_cubin path bug, from a DIFFERENT line, which
+    misled the diagnosis a full release cycle. Decode properly."""
     for attr in ("_sym_map", "symbol_mapping", "_symbol_mapping"):
         m = getattr(mod, attr, None)
         if isinstance(m, dict) and m:
-            return {str(k): str(v) for k, v in m.items()}
+            return {str(k): (v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v))
+                    for k, v in m.items()}
     return {}
+
+
+def _sym_bytes(sym: dict) -> dict:
+    """Sidecar symbol values → the BYTES cuda.core's `get_kernel` hands to cuModuleGetFunction
+    (str raises TypeError: expected bytes). Also REPAIRS sidecars written by the buggy
+    str(bytes) encoder ("b'_Z…'" wrappers) so cubins already on disk load without a recompile."""
+    out = {}
+    for k, v in (sym or {}).items():
+        s = str(v)
+        if s.startswith("b'") and s.endswith("'"):
+            s = s[2:-1]
+        out[str(k)] = s.encode("utf-8")
+    return out
 
 
 def _module_bytes(mod) -> Optional[bytes]:
@@ -120,22 +138,27 @@ def _save(mod, key: str, kernel_name: str) -> bool:
 
 
 def _load(key: str, kernel_name: str):
-    """Load a cached cubin → a launchable kernel, or None (miss OR any load problem → compile)."""
+    """Load a cached cubin → a launchable kernel, or None (miss OR any load problem → compile).
+    Every step is PHASE-tagged in the failure stamp: the round-3→4 misdiagnosis happened because
+    two different lines raise the same TypeError text ("expected bytes, str found" — from_cubin
+    given a path, and get_kernel given str mangled names) and the stamp didn't say which."""
     cub = _cubin(key)
     if not cub.exists():
         return None
+    phase = "import cuda.core"
     try:
         from cuda.core import ObjectCode
 
+        phase = "read sidecar"
         sym: dict = {}
         try:
             meta = json.loads(_sidecar(key).read_text(encoding="utf-8"))
-            sym = dict(meta.get("symbol_mapping") or {})
+            sym = _sym_bytes(meta.get("symbol_mapping") or {})   # bytes values; repairs "b'…'"
         except Exception:  # noqa: BLE001 — no/broken sidecar: still try (extern-C names need none)
             sym = {}
-        # Round-3 rig log: from_cubin wants the cubin BYTES, not a path ("expected bytes, str
-        # found") — read the file and pass bytes; the str-path form stays as a last resort for
-        # other cuda.core versions. symbol_mapping kwarg first; fall back to the private attr.
+        # from_cubin wants the cubin BYTES, not a path (round-3 log: "expected bytes, str
+        # found"); the str-path form stays as a last resort for other cuda.core versions.
+        phase = "from_cubin"
         data = cub.read_bytes()
         try:
             mod = ObjectCode.from_cubin(data, symbol_mapping=sym)
@@ -149,16 +172,18 @@ def _load(key: str, kernel_name: str):
                     mod._sym_map = dict(sym)               # the pre-kwarg cuda.core keeps it here
                 except Exception:  # noqa: BLE001
                     pass
+        phase = "get_kernel"
         kernel = mod.get_kernel(kernel_name)
         # Same rationale as cuRobo's own post-compile sync: get_kernel loads the binary into the
         # context (cuModuleLoadData); launching before the load completes can fail.
+        phase = "cuda synchronize"
         import torch
         torch.cuda.synchronize()
         return kernel
     except Exception as e:  # noqa: BLE001 — any load problem = a miss, never an error
         _STATS["load_errors"] += 1
         stamp("cubin disk cache: load failed — falling back to compile",
-              kernel=kernel_name, error=f"{type(e).__name__}: {e}")
+              kernel=kernel_name, phase=phase, error=f"{type(e).__name__}: {e}")
         return None
 
 

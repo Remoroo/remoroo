@@ -1997,7 +1997,8 @@ def _active_step() -> dict:
     if g.get("error"):
         return {"ok": False, "error": g["error"]}
     if g.get("done"):
-        print(f"[active] done · reason={g.get('reason')} · added {g.get('added')} poses", flush=True)
+        print(f"[active] done · reason={g.get('reason')} · added {g.get('added')} poses"
+              + (f" · posegen culls {g['posegen']}" if g.get("posegen") else ""), flush=True)
         return {"ok": True, **g}
     goal = {n: float(v) for n, v in zip(g["joint_names"], g["joints"])}
     t0 = time.time()
