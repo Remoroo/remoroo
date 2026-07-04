@@ -189,36 +189,47 @@ def install() -> bool:
         except Exception:  # noqa: BLE001 — ANY cache-path problem → stock behavior
             return original(self, source_files, kernel_name, include_dirs, compile_flags)
 
-        # Miss → compile via cuRobo's own path, transiently hooking Program.compile to capture the
-        # ObjectCode (the original returns only the kernel; the cubin bytes live on the module).
-        # The hook is process-global for the duration of ONE compile; kernel compilation here is
-        # serial (planner build), and even a concurrent capture only saves an extra valid cubin.
-        # Each way the capture can silently fail is COUNTED + one-time-stamped: the first rig run
-        # showed saves=0 with zero errors, which this exact instrumentation disambiguates.
+        # Miss → compile via cuRobo's own path, transiently capturing the ObjectCode (the original
+        # returns only the kernel; the cubin bytes live on the module). Round-2 rig log: patching
+        # `Program.compile` on the CLASS fails — "cannot set 'compile' attribute of immutable type
+        # 'cuda.core._program.Program'" (a closed C-extension type). So we swap the MODULE
+        # attribute instead: cuRobo's `_compile_kernel` does `from cuda.core import Program` at
+        # every call, which reads `sys.modules['cuda.core'].Program` — always assignable. The
+        # wrapper is behaviorally identical (construct + compile pass through), so a concurrent
+        # compile seeing it is harmless. Each way the capture can still fail is COUNTED +
+        # one-time-stamped (round-1 showed saves=0 with zero errors; never silent again).
         captured: dict = {}
         hooked = False
-        orig_compile = None
+        cc_mod = None
+        real_program = None
         try:
-            from cuda.core import Program
-            orig_compile = Program.compile
+            import cuda.core as cc_mod
+            real_program = cc_mod.Program
 
-            def compile_hook(prog_self, *a, **kw):
-                mod = orig_compile(prog_self, *a, **kw)
-                captured["mod"] = mod
-                return mod
+            class _CapturingProgram:
+                def __init__(self, *a, **kw):
+                    self._p = real_program(*a, **kw)
 
-            Program.compile = compile_hook
+                def compile(self, *a, **kw):
+                    mod = self._p.compile(*a, **kw)
+                    captured["mod"] = mod
+                    return mod
+
+                def __getattr__(self, name):
+                    return getattr(self._p, name)
+
+            cc_mod.Program = _CapturingProgram
             hooked = True
         except Exception as e:  # noqa: BLE001 — hook plumbing failed → stock compile, no save
             _STATS["hook_failures"] += 1
-            _once("cubin disk cache: Program.compile hook failed — compiles won't be persisted",
+            _once("cubin disk cache: Program capture hook failed — compiles won't be persisted",
                   error=f"{type(e).__name__}: {e}")
         try:
             kernel = original(self, source_files, kernel_name, include_dirs, compile_flags)
         finally:
             if hooked:
                 try:
-                    Program.compile = orig_compile
+                    cc_mod.Program = real_program
                 except Exception:  # noqa: BLE001
                     pass
 

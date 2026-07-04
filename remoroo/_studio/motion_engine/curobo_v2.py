@@ -414,20 +414,17 @@ class CuroboV2Planner:
             )
         with span("MotionPlanner(cfg) build"):
             self.planner = MotionPlanner(cfg)
-        # Warmup, split in TWO so the rig log attributes it (round-1 log: one opaque 128 s):
-        # (1) the solve warmup — 5 fake plans that JIT the warp kernels and capture the IK/trajopt
-        #     CUDA graphs (upstream warmup's loop, enable_graph=False = loop only);
-        # (2) the PRM graph-planner roadmap (upstream warmup's tail) — only worth paying when
-        #     graph seeding will actually be used (deliberate commission/demo plans). Graph-free
-        #     realtime skips it; PRM then builds lazily IF a plan ever falls back (slow once,
-        #     correct always). Same behavior as upstream warmup(enable_graph=…), just spanned.
+        # Warmup is TWO-STAGE (round-2 rig attribution: IK/trajopt 42 s, PRM roadmap 87 s):
+        # stage 1 (HERE) — 5 fake plans that JIT the warp kernels and capture the IK/trajopt CUDA
+        # graphs; after this the planner is FULLY usable (a plan_pose attempt 0 never graph-seeds).
+        # Stage 2 — the PRM graph-planner roadmap — is DEFERRED to `finish_warmup()`, which the
+        # stack runs in the background AFTER reporting alive: it's only consulted when an attempt
+        # falls back to graph seeding, and an un-warmed roadmap then just builds lazily (slow
+        # once, correct always). This is what puts time-to-usable at ~85 s instead of ~170 s.
         if warmup:
             with span("planner.warmup (IK/trajopt: warp JIT + CUDA-graph capture)", iters=5):
                 self.planner.warmup(enable_graph=False, num_warmup_iterations=5)
-            gp = getattr(self.planner, "graph_planner", None)
-            if enable_graph and gp is not None:
-                with span("planner.warmup (PRM graph-planner roadmap)"):
-                    gp.warmup(num_warmup_iterations=5)
+        self._graph_warmup_pending = bool(warmup and enable_graph)
         stamp("cubin disk cache stats (hits = compiles skipped this process)",
               **kernel_disk_cache.stats())
 
@@ -442,6 +439,21 @@ class CuroboV2Planner:
         self.planner.update_world(self._full_scene(world))
 
         self._interp_dt = float(self.planner.trajopt_solver.config.interpolation_dt)
+
+    def finish_warmup(self) -> bool:
+        """Deferred warmup stage 2: the PRM graph-planner roadmap (~87 s on the Orin — the
+        single biggest slice of the build). Idempotent; pure GPU (no bridge). Returns whether a
+        roadmap warmup actually ran."""
+        if not getattr(self, "_graph_warmup_pending", False):
+            return False
+        self._graph_warmup_pending = False
+        gp = getattr(self.planner, "graph_planner", None)
+        if gp is None:
+            return False
+        from .mtrace import span
+        with span("planner.finish_warmup (PRM graph-planner roadmap — deferred stage 2)"):
+            gp.warmup(num_warmup_iterations=5)
+        return True
 
     # --- forward kinematics for ANY link (e.g. a camera's calibrated optical frame) --------
     def _fk_for(self, link: str):

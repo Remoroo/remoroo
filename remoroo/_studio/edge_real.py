@@ -1807,38 +1807,54 @@ def h_motion_status(_q):
 
 def _warm_motion_stack():
     """The warm-up BODY (shared by the operator ⚡ and the boot auto-warm; caller sets
-    _MOTION_WARM to "warming" first): build the stack, build + warm THE robot planner, then
-    BEST-EFFORT pre-build the perception side — one live world from the cameras — so the first
-    commission/realtime call doesn't pay the mapper/segmenter's one-time build (~80 s on an
-    Orin). Perception pre-build is strictly optional: no cameras / no calibration just skips it
-    and the live world builds lazily exactly as before. Holds the bridge lock throughout (the
-    planner cfg seeds its cspace default from LIVE joints; the frame grab reads the cameras)."""
+    _MOTION_WARM to "warming" first). TWO-STAGE, per the round-2 rig attribution (fast path
+    ~85 s · PRM roadmap 87 s · first live world 66 s):
+
+      stage 1 (bridge lock): stack build + planner build + IK/trajopt warmup → mark ALIVE.
+        The planner is fully usable here — a plan's attempt 0 never graph-seeds.
+      stage 2 (same thread, AFTER alive): the PRM roadmap warm (pure GPU, deliberately OFF the
+        bridge lock so an operator's first move is never blocked behind it), then the perception
+        pre-build (one live world; needs the bridge → locked — an immediate move can wait up to
+        ~1 min behind it, still far better than paying it inside the first commission call).
+        Stage-2 failures are stamped, never fatal: everything it pre-pays also builds lazily."""
     try:
         from motion_engine.mtrace import span as _mspan, stamp as _mstamp
         with _bridge_lock:
             with _mspan("warmup: MotionStack.from_cell (artifact loads)"):
                 st = motion_stack()
-            with _mspan("warmup: prewarm (planner build + cuRobo warmup)"):
+            with _mspan("warmup: prewarm (planner build + IK/trajopt warmup — the fast path)"):
                 warm = st.prewarm()                   # THE robot planner, built up front
-            try:
-                b = get_bridge()
-                frames, reasons = (_live_frames(st, b) if b is not None else ([], ["no bridge"]))
-                if frames:
-                    with _mspan("warmup: perception pre-build (first live world — one-time "
-                                "mapper/segmenter build paid HERE, not on the first move)",
-                                cameras=len(frames)):
-                        st.update_world_live(frames)
-                else:
-                    _mstamp("warmup: perception pre-build skipped (live world will build lazily)",
-                            reasons="; ".join(reasons) or "no frames")
-            except Exception as e:  # noqa: BLE001 — perception pre-build is opportunistic
-                _mstamp("warmup: perception pre-build failed (non-fatal — lazy build remains)",
-                        error=f"{type(e).__name__}: {e}")
-        _MOTION_WARM.update(state="off", error=None)   # alive is derived from the stack itself
-        print(f"[edge] motion stack ALIVE · prewarm {warm.get('seconds')}s · groups {warm.get('groups')}")
+        _MOTION_WARM.update(state="off", error=None)   # ALIVE (derived from the stack itself)
+        print(f"[edge] motion stack ALIVE · prewarm {warm.get('seconds')}s · groups {warm.get('groups')}"
+              " · deep-warm (PRM roadmap + live world) continuing in the background")
     except Exception as e:  # noqa: BLE001
         _MOTION_WARM.update(state="error", error=f"{type(e).__name__}: {e}")
         print(f"[edge] motion stack warmup FAILED: {type(e).__name__}: {e}")
+        return
+
+    # ── stage 2: the stack is ALIVE; pre-pay the rest without blocking anyone ────────────
+    try:
+        if hasattr(st, "finish_warmup"):
+            st.finish_warmup()                        # PRM roadmap — pure GPU, no bridge lock
+    except Exception as e:  # noqa: BLE001
+        _mstamp("warmup: PRM roadmap warm failed (non-fatal — roadmap stays lazy)",
+                error=f"{type(e).__name__}: {e}")
+    try:
+        with _bridge_lock:
+            b = get_bridge()
+            frames, reasons = (_live_frames(st, b) if b is not None else ([], ["no bridge"]))
+            if frames:
+                with _mspan("warmup: perception pre-build (first live world — one-time "
+                            "mapper/segmenter build paid HERE, not on the first move)",
+                            cameras=len(frames)):
+                    st.update_world_live(frames)
+            else:
+                _mstamp("warmup: perception pre-build skipped (live world will build lazily)",
+                        reasons="; ".join(reasons) or "no frames")
+    except Exception as e:  # noqa: BLE001 — perception pre-build is opportunistic
+        _mstamp("warmup: perception pre-build failed (non-fatal — lazy build remains)",
+                error=f"{type(e).__name__}: {e}")
+    print("[edge] motion deep-warm complete (PRM roadmap + live world)")
 
 
 def h_motion_warmup(_q):

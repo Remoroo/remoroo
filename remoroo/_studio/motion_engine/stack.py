@@ -826,6 +826,22 @@ class MotionStack:
             self._planner_for(active)
         return {"groups": active, "seconds": round(_time.time() - t0, 1)}
 
+    def finish_warmup(self) -> dict:
+        """Warmup stage 2 for every cached planner — the deferred PRM graph-planner roadmap
+        (~87 s on the Orin; see CuroboV2Planner.finish_warmup). Pure GPU, touches no bridge, so
+        the edge runs it OFF the bridge lock after reporting alive: the fast plan path is usable
+        the whole time, and a plan that graph-falls-back before this finishes just builds the
+        roadmap lazily (slow once, correct always)."""
+        n = 0
+        for p in self._planners.values():
+            try:
+                if hasattr(p, "finish_warmup") and p.finish_warmup():
+                    n += 1
+            except Exception as e:  # noqa: BLE001 — stage 2 is opportunistic, never fatal
+                stamp("finish_warmup failed for a planner (roadmap stays lazy)",
+                      error=f"{type(e).__name__}: {e}")
+        return {"ok": True, "n_warmed": n}
+
     def move_through_poses(self, tcp: str, poses: Sequence[object], *, execute: bool = True,
                            max_attempts: int = 3) -> MoveResult:
         """Drive one TCP through a sequence of poses (one concatenated collision-free path)."""
