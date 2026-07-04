@@ -83,6 +83,28 @@ class CalibService:
         """The authored pipeline if the agent provided one, else the URDF-derived fallback."""
         return list(self._authored) if self._authored is not None else build_plan(self.urdf_path)
 
+    def _world_base(self, flange_link: Optional[str]) -> dict:
+        """world→chain-base for the selected step, so the Studio stage can mount CHAIN-FRAME
+        overlays (marker, seed gizmo, ghost, pose cloud) at the right spot in the WORLD.
+        The session's chain trims the fixed world→base prefix (chain_from_urdf), so every
+        pose it emits — T_board_est included — is in the ARM'S BASE frame; rendering it at
+        the world root displaced the marker by exactly that mounting transform (the
+        'marker is a bit wrong most of the time' bug on any rig whose arm isn't at origin)."""
+        if not flange_link or not self.urdf_path:
+            return {}
+        try:
+            from .session import _world_links
+            from .urdf_io import chain_from_urdf, link_chain_transform
+            _, _, base_link = chain_from_urdf(self.urdf_path, flange_link)
+            roots = _world_links(self.urdf_path)
+            T = np.eye(4)
+            if base_link not in roots:
+                T = link_chain_transform(self.urdf_path, sorted(roots)[0], base_link)
+            return {"base_link": base_link,
+                    "t_world_base": [[float(v) for v in row] for row in T]}
+        except Exception:  # noqa: BLE001 — viz aid only; identity fallback = old behavior
+            return {}
+
     def handle(self, verb: str, body: Optional[dict] = None) -> dict:
         body = body or {}
         if verb in ("plan", "pipeline"):
@@ -115,7 +137,8 @@ class CalibService:
             self.b2b = None
             self.session = executor
             return {"type": "select", "camera_link": item.camera_link, "kind": item.kind,
-                    "flange_link": item.flange_link, "id": item.id or item.camera_link}
+                    "flange_link": item.flange_link, "id": item.id or item.camera_link,
+                    **self._world_base(item.flange_link)}
 
         # base_to_base verbs run against the dedicated dual-arm session
         if verb in ("b2b_capture", "b2b_observe", "b2b_solve", "b2b_validate", "b2b_verify", "b2b_accept"):
@@ -164,6 +187,10 @@ class CalibService:
         if verb == "replay_capture_mark":  return s.replay_capture_mark()
         if verb == "replay_step":   return s.replay_step()
         if verb == "replay_abort":  return s.replay_abort()
+        # active NBV collection (edge drives motion, like planned replay)
+        if verb == "active_start":  return s.active_start(max_poses=int(body.get("max_poses", 24)))
+        if verb == "active_next":   return s.active_next()
+        if verb == "active_capture": return s.active_capture()
         if verb == "frames":        return s.frames()
         if verb == "frame_detail":  return s.frame_detail(int(body.get("index", -1)))
         if verb == "nudge":         return s.nudge(body.get("x_new"))

@@ -113,6 +113,32 @@ def _board_fully_visible(T_bc: np.ndarray, T_board: np.ndarray, board: BoardMode
                 and uv[:, 1].min() >= my and uv[:, 1].max() < H - my)
 
 
+def size_aware_dist_range(board: BoardModel, K: np.ndarray, wh: Tuple[int, int],
+                          *, fill_lo: float = 0.35, fill_hi: float = 0.75) -> Tuple[float, float]:
+    """The camera-to-board DISTANCE range derived from the BOARD'S PHYSICAL SIZE and the
+    camera optics — the board should span fill_lo..fill_hi of the frame's minor dimension
+    (large board in frame = sub-pixel corners worth capturing). Pixels spanned at distance d
+    ≈ f·extent/d, so d = f·extent/(fill·minor). Replaces anchoring on wherever the camera
+    happened to be (a far seed pose kept every candidate far → a small, information-poor board)."""
+    pts = np.asarray(board.points, float)
+    extent = max(float(np.max(pts.max(0) - pts.min(0))), 1e-3)
+    f = float(min(K[0, 0], K[1, 1]))
+    minor = float(min(wh))
+    return f * extent / (fill_hi * minor), f * extent / (fill_lo * minor)
+
+
+def _fill_frac(T_bc: np.ndarray, T_board: np.ndarray, board: BoardModel,
+               K: np.ndarray, wh: Tuple[int, int]) -> float:
+    """How much of the frame's minor dimension the projected board spans (0..~1) — bigger
+    board = better corner signal-to-noise, so candidates that SEE MORE of it score higher."""
+    pc = transform_points(inv_T(T_bc), transform_points(T_board, board.points))
+    if np.any(pc[:, 2] <= 1e-6):
+        return 0.0
+    uv = project(K, pc)
+    span = max(float(uv[:, 0].max() - uv[:, 0].min()), float(uv[:, 1].max() - uv[:, 1].min()))
+    return span / float(min(wh))
+
+
 def _centering(T_bc: np.ndarray, T_board: np.ndarray, board: BoardModel,
                K: np.ndarray, wh: Tuple[int, int]) -> float:
     """1.0 when the target centroid is at image centre, → 0 toward the edge (the safest
@@ -164,35 +190,50 @@ def suggest_next_pose(
     cam0 = (chain.fk(q_seed) @ X_est)[:3, 3]
     dist0 = float(np.linalg.norm(cam0 - c))
     dist0 = dist0 if dist0 > 0.05 else 0.4
-    dist_range = (0.85 * dist0, 1.2 * dist0)
+    # SIZE-AWARE distance: derived from the board's physical extent + optics (the board fills
+    # a healthy fraction of the frame), NOT from wherever the camera happens to be. The seed
+    # anchor survives only as the fallback when nothing in the size-aware band is reachable.
+    # The band depends on how much we trust X: with a solve in hand (NBV mode) the look-at
+    # miss is small, so go CLOSE — board large, corners sharp, capped by the visibility
+    # margin; before any solve the seed may be degrees wrong, so keep a wide buffer (the
+    # 12°-wrong-seed regression test pins this).
+    if result is not None:
+        fill_band = (0.35, max(0.40, 1.0 - 2.0 * visible_margin - 0.06))
+    else:
+        fill_band = (0.20, 0.40)
+    dist_size = size_aware_dist_range(board, K, wh, fill_lo=fill_band[0], fill_hi=fill_band[1])
     # the visible face points toward the camera side (never orbit behind the marker)
     normal = T_board_est[:3, 2].copy()
     if float(normal @ (cam0 - c)) < 0:
         normal = -normal
-
-    cam_poses = _orbit_camera_poses(T_board_est, normal, n=n_cand, dist_range=dist_range,
-                                    el_max_deg=el_max_deg, roll_max_deg=roll_max_deg, rng=rng)
     collected_R = [(chain.fk(np.asarray(q, float)) @ X_est)[:3, :3] for q in collected_joints]
 
-    candidates = []   # (q, T_bc, diversity_rad)
-    for T_cam_des in cam_poses:
-        T_flange_des = T_cam_des @ inv_T(X_est)            # camera = flange ∘ X  ->  flange = cam ∘ X⁻¹
-        q, ok = chain.ik(T_flange_des, q_seed, iters=45, pos_tol=2e-4, rot_tol=3e-3)
-        if not ok:
-            continue
-        T_bc = chain.fk(q) @ X_est                         # ACHIEVED camera pose (under the seed)
-        # A GENEROUS margin here is deliberate: the pose is checked against the (possibly
-        # wrong) seed X, so a wide buffer keeps the marker in frame under the TRUE X too —
-        # the residual miss is bounded by f·tan(seed_error), so we leave room for it.
-        if not _board_fully_visible(T_bc, T_board_est, board, K, wh, margin_frac=visible_margin):
-            continue
-        if feasible is not None and not feasible(q):
-            continue
-        div = min((rotation_angle(R.T @ T_bc[:3, :3]) for R in collected_R), default=float(np.pi))
-        candidates.append((q, T_bc, div))
-        if len(candidates) >= max_keep:                    # enough to rank — stop IK'ing
-            break
+    def _gather(dist_range):
+        cam_poses = _orbit_camera_poses(T_board_est, normal, n=n_cand, dist_range=dist_range,
+                                        el_max_deg=el_max_deg, roll_max_deg=roll_max_deg, rng=rng)
+        out = []   # (q, T_bc, diversity_rad)
+        for T_cam_des in cam_poses:
+            T_flange_des = T_cam_des @ inv_T(X_est)        # camera = flange ∘ X  ->  flange = cam ∘ X⁻¹
+            q, ok = chain.ik(T_flange_des, q_seed, iters=45, pos_tol=2e-4, rot_tol=3e-3)
+            if not ok:
+                continue
+            T_bc = chain.fk(q) @ X_est                     # ACHIEVED camera pose (under the seed)
+            # A GENEROUS margin here is deliberate: the pose is checked against the (possibly
+            # wrong) seed X, so a wide buffer keeps the marker in frame under the TRUE X too —
+            # the residual miss is bounded by f·tan(seed_error), so we leave room for it.
+            if not _board_fully_visible(T_bc, T_board_est, board, K, wh, margin_frac=visible_margin):
+                continue
+            if feasible is not None and not feasible(q):
+                continue
+            div = min((rotation_angle(R.T @ T_bc[:3, :3]) for R in collected_R), default=float(np.pi))
+            out.append((q, T_bc, div))
+            if len(out) >= max_keep:                       # enough to rank — stop IK'ing
+                break
+        return out
 
+    candidates = _gather(dist_size)
+    if not candidates:                                     # size-band unreachable → seed anchor
+        candidates = _gather((0.85 * dist0, 1.2 * dist0))
     if not candidates:
         return None, 0.0
 
@@ -206,16 +247,19 @@ def suggest_next_pose(
                                  corner_ids=board.point_ids,
                                  corners=_predict_corners(chain, X_est, T_board_est, board, K, q))
             sigma = predicted_sigma_after(result, cand, board.points, K, chain)
-            # tiny centring tiebreak so near-equal candidates prefer a safe framing
-            score = sigma - 0.01 * _centering(T_bc, T_board_est, board, K, wh)
+            # tiny tiebreaks so near-equal candidates prefer a safe framing AND a LARGE board
+            # (bigger board in frame = better corner signal-to-noise)
+            score = (sigma - 0.01 * _centering(T_bc, T_board_est, board, K, wh)
+                     - 0.01 * min(_fill_frac(T_bc, T_board_est, board, K, wh) / 0.6, 1.0))
             if score < best_sigma:
                 best_sigma, best = score, (q, div)
         return best[0], float(best[1])
 
-    # pre-solve: rotation diversity × centring (no seed-dependent joint-magnitude hack)
+    # pre-solve: rotation diversity × centring × FILL (see most of the board, large)
     best_q, best_score, best_div = None, -1.0, 0.0
     for q, T_bc, div in candidates:
-        s = div * (0.4 + 0.6 * _centering(T_bc, T_board_est, board, K, wh))
+        fill = min(_fill_frac(T_bc, T_board_est, board, K, wh) / 0.6, 1.0)
+        s = div * (0.4 + 0.6 * _centering(T_bc, T_board_est, board, K, wh)) * (0.5 + 0.5 * fill)
         if s > best_score:
             best_score, best_q, best_div = s, q, div
     return best_q, float(best_div)

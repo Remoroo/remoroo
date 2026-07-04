@@ -137,6 +137,8 @@ def generate_self_collision_ignore(urdf_path: str, spheres_by_link: dict,
     and nothing plans. We feed our already-fitted spheres in (no refit) and return the full matrix;
     those by-design pairs collide at ~every config, so the default-config check catches them while
     leaving real, config-dependent self-collisions intact. GPU — call on the robot PC."""
+    from . import kernel_disk_cache
+    kernel_disk_cache.install()                    # RobotBuilder compiles kernels too — cache them
     from curobo._src.robot.builder.builder_robot import RobotBuilder
 
     rb = RobotBuilder(str(urdf_path), tool_frames=list(tool_frames) if tool_frames else None)
@@ -162,6 +164,8 @@ class CuroboMapper:
                  robot_cfg: Optional[dict] = None, voxel_size: float = 0.02,
                  esdf_voxel_size: float = 0.03, segment_distance: float = 0.05,
                  device: str = "cuda") -> None:
+        from . import kernel_disk_cache
+        kernel_disk_cache.install()    # perception (segmenter/mapper/PBA-ESDF) kernels cache too
         self._device = device
         self._voxel_size = float(voxel_size)
         self._esdf_voxel_size = float(esdf_voxel_size)
@@ -345,11 +349,25 @@ class CuroboV2Planner:
         self_collision_check: bool = True,
         enable_graph: bool = True,
     ) -> None:
-        from .mtrace import span
+        from .mtrace import span, stamp
         with span("torch+warp import"):
             import torch  # noqa: F401  (lazy GPU import; presence validated by the toolchain gate)
             _ensure_warp_torch()                   # force-load Warp's torch interop or fail CLEARLY
             from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
+        # Persist runtime-compiled kernels across edge restarts (see kernel_disk_cache), and NAME
+        # the kernel backend in the log: `cuda_core` = NVRTC compiles kernels per process (the
+        # bring-up dominator the disk cache attacks); `pybind` = precompiled at install (nothing
+        # to cache). One line that attributes minutes of build time.
+        from . import kernel_disk_cache
+        disk_cache_on = kernel_disk_cache.install()
+        try:
+            from curobo._src.curobolib.backends import get_backend, get_backend_name
+            get_backend()                          # force selection so the name is real, not None
+            backend = get_backend_name()
+        except Exception as e:  # noqa: BLE001 — introspection must never fail a build
+            backend = f"unknown ({type(e).__name__})"
+        stamp("curobo kernel backend", backend=backend,
+              cubin_disk_cache="on" if disk_cache_on else "off")
 
         self._device = device
         limits = limits or {}
@@ -383,16 +401,28 @@ class CuroboV2Planner:
                 collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid), "voxel": voxel_cache},
                 max_goalset=int(max_goalset),
                 self_collision_check=bool(self_collision_check),   # False = diagnostic probe (isolate self-collision)
+                # THE capture switch. cuRobo has two separately-named "graph" knobs and our one flag
+                # must drive BOTH: cfg-level `use_cuda_graph` is CUDA-graph CAPTURE in the IK/trajopt/
+                # rollout solvers (what actually puts a stream into capture mode); warmup's
+                # `enable_graph` below is merely "also warm the PRM graph planner". The old code set
+                # only the warmup flag, so a "graph-free" rebuild still captured on every solve and
+                # the ZED conflict it existed to prevent (cudaCreateTextureObject →
+                # cudaErrorStreamCaptureUnsupported 900 inside grab()) could still fire at the first
+                # realtime plan. Cost of False: steady-state solves ~5x slower (cuRobo's own number) —
+                # accepted for the realtime gate, where the camera must coexist with the planner.
+                use_cuda_graph=bool(enable_graph),
             )
         with span("MotionPlanner(cfg) build"):
             self.planner = MotionPlanner(cfg)
-        # enable_graph builds cuRobo's CUDA-graph capture (faster plans). Turn it OFF for the realtime
-        # gate: a graph capture puts a CUDA stream in capture mode, and a CUDA-native camera (e.g. the
-        # ZED) cannot do GPU work (cudaCreateTextureObject) while a stream is capturing
-        # (cudaErrorStreamCaptureUnsupported 900). Graph-free = no capture = the camera and cuRobo coexist.
+        # warmup's enable_graph = warm the PRM graph planner (the trajopt fallback roadmap) — a big
+        # slice of warmup cost, only worth paying when graph seeding will actually be used
+        # (deliberate commission/demo plans). Graph-free realtime skips it; PRM then builds lazily
+        # IF a plan ever falls back (slow once, correct always).
         if warmup:
             with span("planner.warmup", enable_graph=bool(enable_graph), iters=5):
                 self.planner.warmup(enable_graph=bool(enable_graph), num_warmup_iterations=5)
+        stamp("cubin disk cache stats (hits = compiles skipped this process)",
+              **kernel_disk_cache.stats())
 
         # Load input 2 (the modeled obstacles) as the planner's world at build. Once a live build runs,
         # update_voxel_world REPLACES this with the ESDF (which already has the obstacles fused in), so

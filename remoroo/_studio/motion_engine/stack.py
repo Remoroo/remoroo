@@ -329,7 +329,14 @@ class MotionStack:
             try:
                 from .curobo_v2 import generate_self_collision_ignore
                 tips = [t for g in self._groups.values() for t in (g.get("tip_links") or [])]
-                full = generate_self_collision_ignore(self.urdf_path, self.spheres, tool_frames=tips or None)
+                # This RobotBuilder pass is a REAL slice of the first planner build (it FKs +
+                # sphere-checks on the GPU) that only runs for cells predating the matrix-authoring
+                # spheres gate — named here so the build log attributes it instead of burying it
+                # inside "robot planner build #1". Re-running the spheres gate authors the matrix
+                # into collision_spheres.yml and this cost disappears.
+                with span("self-collision ignore REGENERATION (cuRobo RobotBuilder — "
+                          "authored matrix missing; re-run the spheres gate to skip this)"):
+                    full = generate_self_collision_ignore(self.urdf_path, self.spheres, tool_frames=tips or None)
                 if full:
                     ig = full
                 else:

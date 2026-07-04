@@ -1805,31 +1805,93 @@ def h_motion_status(_q):
     return {"ok": True, "state": _MOTION_WARM["state"], "groups": [], "error": _MOTION_WARM["error"]}
 
 
+def _warm_motion_stack():
+    """The warm-up BODY (shared by the operator ⚡ and the boot auto-warm; caller sets
+    _MOTION_WARM to "warming" first): build the stack, build + warm THE robot planner, then
+    BEST-EFFORT pre-build the perception side — one live world from the cameras — so the first
+    commission/realtime call doesn't pay the mapper/segmenter's one-time build (~80 s on an
+    Orin). Perception pre-build is strictly optional: no cameras / no calibration just skips it
+    and the live world builds lazily exactly as before. Holds the bridge lock throughout (the
+    planner cfg seeds its cspace default from LIVE joints; the frame grab reads the cameras)."""
+    try:
+        from motion_engine.mtrace import span as _mspan, stamp as _mstamp
+        with _bridge_lock:
+            with _mspan("warmup: MotionStack.from_cell (artifact loads)"):
+                st = motion_stack()
+            with _mspan("warmup: prewarm (planner build + cuRobo warmup)"):
+                warm = st.prewarm()                   # THE robot planner, built up front
+            try:
+                b = get_bridge()
+                frames, reasons = (_live_frames(st, b) if b is not None else ([], ["no bridge"]))
+                if frames:
+                    with _mspan("warmup: perception pre-build (first live world — one-time "
+                                "mapper/segmenter build paid HERE, not on the first move)",
+                                cameras=len(frames)):
+                        st.update_world_live(frames)
+                else:
+                    _mstamp("warmup: perception pre-build skipped (live world will build lazily)",
+                            reasons="; ".join(reasons) or "no frames")
+            except Exception as e:  # noqa: BLE001 — perception pre-build is opportunistic
+                _mstamp("warmup: perception pre-build failed (non-fatal — lazy build remains)",
+                        error=f"{type(e).__name__}: {e}")
+        _MOTION_WARM.update(state="off", error=None)   # alive is derived from the stack itself
+        print(f"[edge] motion stack ALIVE · prewarm {warm.get('seconds')}s · groups {warm.get('groups')}")
+    except Exception as e:  # noqa: BLE001
+        _MOTION_WARM.update(state="error", error=f"{type(e).__name__}: {e}")
+        print(f"[edge] motion stack warmup FAILED: {type(e).__name__}: {e}")
+
+
 def h_motion_warmup(_q):
     """Bring the COMMISSIONED motion stack alive on a background thread (build + warmup holds
-    the bridge lock for tens of seconds — an explicit operator action, never implicit)."""
+    the bridge lock for tens of seconds; the header chip shows 'warming' meanwhile)."""
     if _MOTION_STACK is not None:
         return {"ok": True, "state": "alive"}
     if _MOTION_WARM["state"] == "warming":
         return {"ok": True, "state": "warming"}
     _MOTION_WARM.update(state="warming", error=None)
-
-    def _build():
-        try:
-            from motion_engine.mtrace import span as _mspan
-            with _bridge_lock:
-                with _mspan("warmup: MotionStack.from_cell (artifact loads)"):
-                    st = motion_stack()
-                with _mspan("warmup: prewarm (planner build + cuRobo warmup)"):
-                    warm = st.prewarm()                   # the WHOLE-BODY planner, built up front
-            _MOTION_WARM.update(state="off", error=None)   # alive is derived from the stack itself
-            print(f"[edge] motion stack ALIVE · prewarm {warm.get('seconds')}s · groups {warm.get('groups')}")
-        except Exception as e:  # noqa: BLE001
-            _MOTION_WARM.update(state="error", error=f"{type(e).__name__}: {e}")
-            print(f"[edge] motion stack warmup FAILED: {type(e).__name__}: {e}")
-
-    threading.Thread(target=_build, daemon=True, name="motion-warmup").start()
+    threading.Thread(target=_warm_motion_stack, daemon=True, name="motion-warmup").start()
     return {"ok": True, "state": "warming"}
+
+
+def _autowarm_on_boot():
+    """AUTO-prewarm at edge boot, in the background: when the cell is already COMMISSIONED,
+    start the exact warm-up the ⚡ chip triggers without waiting for an operator. WHY: cuRobo's
+    design amortizes a large fixed cost (runtime kernel compile + CUDA-graph capture + warmup
+    plans) over a resident process, but our workflow restarts the edge after every authored-cell
+    fix — so the fixed cost kept landing on the first MOVEMENT request, minutes of dead air.
+    Paying it at boot (contention-free: no operator is mid-flow yet) makes the common case
+    "already warm". Motion itself stays exactly as gated (commission gate + alive check) — only
+    the passive GPU build becomes implicit. Kill-switch: REMOROO_EDGE_AUTOWARM=0.
+
+    Waits for the BRIDGE first: the planner cfg seeds its cspace default from live joints, and a
+    bridgeless build would bake zeros (the fly-home hazard `_seed_positions` guards against)."""
+    if os.environ.get("REMOROO_EDGE_AUTOWARM", "1").lower() in ("0", "false", "off"):
+        print("[edge] auto-warmup disabled (REMOROO_EDGE_AUTOWARM=0)")
+        return
+
+    def _wait_and_warm():
+        st_file = CELL_DIR / "setup_state.json"
+        try:
+            gates = (json.loads(st_file.read_text(encoding="utf-8")).get("gates") or {}) if st_file.exists() else {}
+        except Exception:  # noqa: BLE001
+            gates = {}
+        if gates.get("commission") != "done":
+            return                       # not commissioned — warm-up stays operator-triggered (⚡)
+        deadline = time.time() + 180.0
+        while time.time() < deadline:
+            if get_bridge() is not None:
+                break
+            time.sleep(3.0)
+        else:
+            print("[edge] auto-warmup: bridge never came up within 3 min — skipping (⚡ still works)")
+            return
+        if _MOTION_STACK is not None or _MOTION_WARM["state"] == "warming":
+            return                       # an operator beat us to it
+        _MOTION_WARM.update(state="warming", error=None)
+        print("[edge] auto-warmup: commissioned cell + bridge up — warming the motion stack in the background")
+        _warm_motion_stack()
+
+    threading.Thread(target=_wait_and_warm, daemon=True, name="motion-autowarm").start()
 
 
 def _planned_motion_gate():
@@ -1882,6 +1944,45 @@ def _replay_step_planned() -> dict:
                   else f"UNSETTLED after {st.get('waited_s')}s (drift {st.get('drift_px')}px)")
     print(f"[replay-planned] mark {g['mark']}/{g['marks']} · goto {time.time() - t0:.1f}s · "
           f"{settle_txt} · capture {'ok' if cap.get('accepted') else 'MISSED'}", flush=True)
+    return {"ok": True, **cap}
+
+
+def _active_step() -> dict:
+    """One ACTIVE calibration step: the session picks the next-best-view pose (posegen's
+    predicted-σ ranking, board-size-aware framing), the edge drives it with the commissioned
+    stack, then the session captures + re-solves. Loops from the Studio until the covariance
+    converges — the closed loop beyond the recorded marks. Same boundary as planned replay:
+    the engine never moves; motion is the edge's fusion, behind the commission gate."""
+    err = _planned_motion_gate()
+    if err:
+        return {"ok": False, "error": err}
+    svc = _calib_service()
+    s = svc.session
+    if s is None:
+        return {"ok": False, "error": "no calibration selected — select the step first"}
+    g = s.active_next()
+    if g.get("error"):
+        return {"ok": False, "error": g["error"]}
+    if g.get("done"):
+        print(f"[active] done · reason={g.get('reason')} · added {g.get('added')} poses", flush=True)
+        return {"ok": True, **g}
+    goal = {n: float(v) for n, v in zip(g["joint_names"], g["joints"])}
+    t0 = time.time()
+    with _bridge_lock:
+        res = _MOTION_STACK.goto_joints(goal, execute=True)
+    if not res.ok:
+        return {"ok": False, "error": f"pose {g['added'] + 1}/{g['max']}: {res.message}"}
+    cap = s.active_capture()
+    if cap.get("error"):
+        return {"ok": False, "error": cap["error"]}
+    st = cap.get("settle") or {}
+    settle_txt = (f"settled {st.get('waited_s')}s/{st.get('drift_px')}px" if st.get("settled")
+                  else f"UNSETTLED after {st.get('waited_s')}s (drift {st.get('drift_px')}px)")
+    obs = cap.get("observability") or {}
+    worst_t = max((v for k, v in obs.items() if k.startswith("t")), default=None)
+    print(f"[active] pose {cap.get('added')}/{cap.get('max')} · goto {time.time() - t0:.1f}s · "
+          f"{settle_txt} · capture {'ok' if cap.get('accepted') else 'MISSED'} · "
+          f"worst trans σ {worst_t if worst_t is None else round(worst_t, 2)}mm", flush=True)
     return {"ok": True, **cap}
 
 
@@ -2380,6 +2481,13 @@ def _calib_handle_locked(verb: str, body: dict) -> dict:
             return _calib_b2b_snapshot()
         if verb == "replay_step_planned":
             return _replay_step_planned()
+        if verb == "active_step":
+            return _active_step()
+        if verb == "active_start":
+            gate_err = _planned_motion_gate()
+            if gate_err:
+                return {"ok": False, "error": gate_err}
+            return _calib_service().handle(verb, body)
         if verb == "replay_start_planned":
             gate_err = _planned_motion_gate()
             if gate_err:
@@ -2755,6 +2863,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     print(f"[remoroo-edge] REAL edge on http://127.0.0.1:{PORT}  cell={CELL_DIR}")
     print(f"[remoroo-edge] then: EDGE_URL=http://127.0.0.1:{PORT} npm run serve")
+    _autowarm_on_boot()      # commissioned cell → warm the motion stack in the background NOW
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 

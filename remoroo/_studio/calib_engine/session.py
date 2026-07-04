@@ -230,6 +230,7 @@ class CalibSession:
         self.recorder: Optional[RoutineRecorder] = None if self.static else RoutineRecorder()
         self._replay: Optional[ReplayCursor] = None
         self._marks: Optional[dict] = None      # PLANNED replay state (cuRobo drives; edge owns motion)
+        self._active: Optional[dict] = None     # ACTIVE NBV collection state (edge owns motion)
         # POST-MOTION SETTLE (automatic captures only): the arm RINGS after a streamed
         # trajectory stops — structural oscillation the joint encoders don't see but sub-pixel
         # corners do. Capturing immediately smears the fit (the measured reason the first
@@ -1161,10 +1162,104 @@ class CalibSession:
         return out
 
     def replay_abort(self) -> dict:
-        """Stop in place (no retreat motion) and forget the cursor (tape AND planned)."""
+        """Stop in place (no retreat motion) and forget the cursor (tape, planned AND active)."""
         self._replay = None
         self._marks = None
+        self._active = None
         return {"type": "replay_abort", "ok": True, "collected": len(self.samples)}
+
+    # ── ACTIVE calibration (post-commission): close the loop — beyond the first N poses,
+    #    KEEP SAMPLING next-best-view poses (posegen's predicted-σ ranking, board-size-aware
+    #    framing) until the covariance CONVERGES. Same engine/edge boundary as planned replay:
+    #    the session serves goals + captures, the EDGE plans+drives each with the commissioned
+    #    stack. Stops on: every DOF of X under the accept σ targets, a σ plateau (more poses
+    #    stopped helping), or the pose budget.
+    def active_start(self, max_poses: int = 24) -> dict:
+        if self.static:
+            return {"type": "active_start", "ok": False, "error": "arm-motion steps only"}
+        if not self.bridge.estop_ok():
+            return {"type": "active_start", "ok": False, "error": "E-stop not OK"}
+        if len(self.samples) < max(6, self.min_corners):
+            return {"type": "active_start", "ok": False,
+                    "error": "not enough poses collected yet — active refinement EXTENDS an "
+                             "existing set (collect or replay first)"}
+        names = list(getattr(self.bridge, "joint_names", []) or [])
+        if not names:
+            return {"type": "active_start", "ok": False,
+                    "error": "bridge exposes no joint names — planned motion needs named joints"}
+        try:  # a fresh solve so the NBV ranks against the CURRENT covariance
+            r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+            self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
+            converged = self._note_observability(r)
+        except Exception as e:  # noqa: BLE001
+            return {"type": "active_start", "ok": False, "error": f"solve failed: {e}"}
+        worst = r.metrics.get("worst_trans_sigma_mm")
+        self._active = {"added": 0, "max": int(max_poses), "awaiting": False,
+                        "names": names, "sigma_hist": [float(worst) if worst is not None else float("inf")]}
+        return {"type": "active_start", "ok": True, "converged": bool(converged),
+                "max_poses": int(max_poses),
+                "targets": {"rot_sigma_deg": self.accept_rot_sigma_deg,
+                            "trans_sigma_mm": self.accept_trans_sigma_mm},
+                "observability": {k: round(float(v), 4) for k, v in observability(r).items()}}
+
+    def active_next(self) -> dict:
+        """Converged/budget/plateau check, then the next NBV goal for the edge — or done."""
+        st = self._active
+        if st is None:
+            return {"type": "active_next", "error": "active collection not started"}
+        st["awaiting"] = False
+        done_reason = None
+        if self.result is not None and self.result.metrics.get("observable"):
+            done_reason = "converged"                     # every DOF of X under the σ targets
+        elif st["added"] >= st["max"]:
+            done_reason = "budget"
+        else:
+            h = st["sigma_hist"]                          # more poses stopped helping (<2% over 3)
+            if len(h) >= 4 and h[-4] - h[-1] < 0.02 * h[-4]:
+                done_reason = "plateau"
+        if done_reason is not None:
+            self._active = None
+            return {"type": "active_next", "done": True, "reason": done_reason,
+                    "converged": done_reason == "converged", "added": st["added"],
+                    "collected": len(self.samples), "heldout": len(self.heldout)}
+        sp = self.suggest_pose()                          # NBV: predicted-σ ranked, size-aware
+        if not sp.get("feasible"):
+            self._active = None
+            return {"type": "active_next", "done": True, "reason": "no reachable informative pose",
+                    "converged": False, "added": st["added"],
+                    "collected": len(self.samples), "heldout": len(self.heldout)}
+        st["awaiting"] = True
+        return {"type": "active_next", "done": False, "added": st["added"], "max": st["max"],
+                "joints": sp["joints"], "joint_names": list(st["names"]),
+                "held_out": st["added"] % 4 == 3,
+                "gain_deg": sp.get("diversity_gain_deg")}
+
+    def active_capture(self) -> dict:
+        """Capture at the pose the edge just drove to (settle-gated), re-solve, and report the
+        meter — the loop's observe step. Every 4th ADDED pose feeds the held-out set."""
+        st = self._active
+        if st is None or not st.get("awaiting"):
+            return {"type": "active_capture", "error": "no pending pose — call active_next first"}
+        settle = self._settle_for_capture()
+        held_out = st["added"] % 4 == 3
+        cap = self.capture(held_out=held_out)
+        st["awaiting"] = False
+        if cap.get("accepted"):
+            st["added"] += 1
+        out = {"type": "active_capture", "accepted": bool(cap.get("accepted")),
+               "held_out": held_out, "settle": settle, "added": st["added"], "max": st["max"],
+               "collected": len(self.samples), "heldout": len(self.heldout)}
+        try:
+            r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+            self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
+            out["converged"] = self._note_observability(r)
+            worst = r.metrics.get("worst_trans_sigma_mm")
+            if cap.get("accepted"):
+                st["sigma_hist"].append(float(worst) if worst is not None else float("inf"))
+            out["observability"] = {k: round(float(v), 4) for k, v in observability(r).items()}
+        except Exception:  # noqa: BLE001 — the meter is best-effort mid-loop
+            pass
+        return out
 
     # ── accept: write body->optical back to the URDF + the calibration json ──
     def accept(self, urdf_path: str, out_path: Optional[str] = None, provenance: str = "measured",
