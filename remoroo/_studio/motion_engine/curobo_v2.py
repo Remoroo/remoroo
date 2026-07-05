@@ -137,7 +137,8 @@ def generate_self_collision_ignore(urdf_path: str, spheres_by_link: dict,
     and nothing plans. We feed our already-fitted spheres in (no refit) and return the full matrix;
     those by-design pairs collide at ~every config, so the default-config check catches them while
     leaving real, config-dependent self-collisions intact. GPU — call on the robot PC."""
-    from . import kernel_disk_cache
+    from . import capture_mode, kernel_disk_cache
+    capture_mode.install()
     kernel_disk_cache.install()                    # RobotBuilder compiles kernels too — cache them
     from curobo._src.robot.builder.builder_robot import RobotBuilder
 
@@ -166,6 +167,8 @@ class CuroboMapper:
                  device: str = "cuda") -> None:
         from . import kernel_disk_cache
         kernel_disk_cache.install()    # perception (segmenter/mapper/PBA-ESDF) kernels cache too
+        from . import capture_mode
+        capture_mode.install()         # segmenter captures graphs too — keep it camera-safe
         self._device = device
         self._voxel_size = float(voxel_size)
         self._esdf_voxel_size = float(esdf_voxel_size)
@@ -354,11 +357,13 @@ class CuroboV2Planner:
             import torch  # noqa: F401  (lazy GPU import; presence validated by the toolchain gate)
             _ensure_warp_torch()                   # force-load Warp's torch interop or fail CLEARLY
             from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
-        # Persist runtime-compiled kernels across edge restarts (see kernel_disk_cache), and NAME
-        # the kernel backend in the log: `cuda_core` = NVRTC compiles kernels per process (the
-        # bring-up dominator the disk cache attacks); `pybind` = precompiled at install (nothing
-        # to cache). One line that attributes minutes of build time.
-        from . import kernel_disk_cache
+        # Persist runtime-compiled kernels across edge restarts (see kernel_disk_cache), make
+        # CUDA-graph capture camera-safe (see capture_mode — thread_local lets a ZED grab run
+        # while cuRobo captures, so warmup no longer needs the bridge lock), and NAME the kernel
+        # backend in the log: `cuda_core` = NVRTC compiles kernels per process; `pybind` =
+        # precompiled at install (nothing to cache). One line that attributes minutes of build.
+        from . import capture_mode, kernel_disk_cache
+        capture_mode.install()
         disk_cache_on = kernel_disk_cache.install()
         try:
             from curobo._src.curobolib.backends import get_backend, get_backend_name
@@ -414,6 +419,23 @@ class CuroboV2Planner:
             )
         with span("MotionPlanner(cfg) build"):
             self.planner = MotionPlanner(cfg)
+        # COUNT real PRM graph-fallback usage (a plan's attempt ≥1). The roadmap warmup costs
+        # ~88 s; whether it earns its keep on this rig has never been measured — this stamp is
+        # the measurement. Warmup's own find_path calls are suppressed via _in_prm_warmup.
+        self._graph_fallbacks = 0
+        self._in_prm_warmup = False
+        gp0 = getattr(self.planner, "graph_planner", None)
+        if gp0 is not None and hasattr(gp0, "find_path"):
+            _orig_find_path = gp0.find_path
+
+            def _counted_find_path(*a, **kw):
+                if not self._in_prm_warmup:
+                    self._graph_fallbacks += 1
+                    stamp("PRM graph fallback USED (a plan's attempt 0 failed — the roadmap is "
+                          "earning its keep)", count=self._graph_fallbacks)
+                return _orig_find_path(*a, **kw)
+
+            gp0.find_path = _counted_find_path
         # Warmup is TWO-STAGE (round-2 rig attribution: IK/trajopt 42 s, PRM roadmap 87 s):
         # stage 1 (HERE) — 5 fake plans that JIT the warp kernels and capture the IK/trajopt CUDA
         # graphs; after this the planner is FULLY usable (a plan_pose attempt 0 never graph-seeds).
@@ -451,8 +473,15 @@ class CuroboV2Planner:
         if gp is None:
             return False
         from .mtrace import span
-        with span("planner.finish_warmup (PRM graph-planner roadmap — deferred stage 2)"):
-            gp.warmup(num_warmup_iterations=5)
+        # 2 iterations, not 5: the roadmap RESETS between iterations (reset_buffer), so the
+        # lasting value is the kernel/CUDA-graph capture from iteration 1 — the extra iterations
+        # were mostly redundant find_path re-runs (~18 s apiece on the Orin).
+        self._in_prm_warmup = True                    # don't count warmup's own find_path calls
+        try:
+            with span("planner.finish_warmup (PRM graph-planner roadmap — deferred stage 2)"):
+                gp.warmup(num_warmup_iterations=2)
+        finally:
+            self._in_prm_warmup = False
         return True
 
     # --- forward kinematics for ANY link (e.g. a camera's calibrated optical frame) --------

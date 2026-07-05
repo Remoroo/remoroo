@@ -144,6 +144,29 @@ _bridge_last_try: float = 0.0
 # live mirror and the supervised flow take turns on the one physical device (G14).
 _bridge_lock = threading.RLock()
 
+
+class _LockedBridge:
+    """A bridge proxy that takes `_bridge_lock` around EVERY call. The motion stack holds this
+    (not the raw bridge) so its internal device touches — `_seed_positions` reads during a
+    lock-free background warmup, the executor's streaming — are always serialized with operator
+    traffic, without any caller having to hold the lock across long GPU work. RLock: handlers
+    that already hold the lock re-enter for free, so nothing about the locked verbs changes."""
+
+    def __init__(self, b):
+        self._b = b
+
+    def __getattr__(self, name):
+        attr = getattr(self._b, name)
+        if not callable(attr):
+            return attr
+
+        def locked(*a, **kw):
+            with _bridge_lock:
+                return attr(*a, **kw)
+
+        return locked
+
+
 # While a STANDALONE realtime.py subprocess is running, IT owns the devices (the ZED is single-open) and
 # its own CUDA context. The edge yields: get_bridge() returns None so nothing here opens the camera/robot
 # behind the child's back. `_realtime_proc` lets the E-stop terminate the child.
@@ -677,7 +700,12 @@ def motion_stack(force: bool = False):
         return _MOTION_STACK
     from motion_engine import MotionStack  # sibling of this file in server/, like calib_engine
 
-    _MOTION_STACK = MotionStack.from_cell(str(CELL_DIR), bridge=get_bridge())
+    # The stack gets the LOCKING bridge proxy: its internal device reads (seed_positions during
+    # a lock-free warmup) serialize per-call with operator traffic instead of requiring the
+    # caller to hold _bridge_lock across minutes of GPU work.
+    b = get_bridge()
+    _MOTION_STACK = MotionStack.from_cell(str(CELL_DIR),
+                                          bridge=(_LockedBridge(b) if b is not None else None))
     try:
         _joint_stream()   # the tracking watchdog's measured-joints tap (bridge.latest_joints)
     except Exception as e:  # noqa: BLE001 — watchdog degrades to post-move checks only
@@ -1807,58 +1835,60 @@ def h_motion_status(_q):
 
 def _warm_motion_stack():
     """The warm-up BODY (shared by the operator ⚡ and the boot auto-warm; caller sets
-    _MOTION_WARM to "warming" first). TWO-STAGE, per the round-2 rig attribution (fast path
-    ~85 s · PRM roadmap 87 s · first live world 66 s):
+    _MOTION_WARM to "warming" first). LOCK-FREE: the bridge lock is held only for the brief
+    frame grab — never across GPU work — so the operator can jog/calibrate/watch the mirror
+    seconds after boot while the full warm proceeds in the background.
 
-      stage 1 (bridge lock): stack build + planner build + IK/trajopt warmup → mark ALIVE.
-        The planner is fully usable here — a plan's attempt 0 never graph-seeds.
-      stage 2 (same thread, AFTER alive, UNDER the bridge lock): the PRM roadmap warm, then the
-        perception WARM-ONLY build (mapper/segmenter/ESDF kernels paid; the planner's world is
-        restored to the modeled obstacles — see MotionStack.prewarm_perception). An operator's
-        first move can queue up to ~2 min behind stage 2; that's the price of the LOCK INVARIANT
-        the round-3 rig log enforced the hard way: ALL CUDA-graph capture must serialize with
-        ALL camera grabs under _bridge_lock — an off-lock PRM warm let a ZED grab collide with
-        capture ("operation not permitted when stream is capturing"), and the failed capture
-        POISONED the CUDA context (every later plan died with "Offset increment outside graph
-        capture"). Stage-2 failures are stamped, never fatal: everything also builds lazily."""
+    WHY this is safe now (it was NOT in round 3): cuRobo captures CUDA graphs in PyTorch's
+    default `capture_error_mode="global"`, which forbids CUDA calls in EVERY thread during a
+    capture — that's what killed the ZED grab and poisoned the process. `capture_mode.install()`
+    (run at every cuRobo entry point) switches capture to "thread_local": only the capturing
+    thread is restricted, camera grabs in other threads are legal. The documented residual —
+    a cross-thread call can still INVALIDATE the capture itself — fails SAFE: the warmup step
+    errors, `_recover_if_capture_poisoned` resets the solver graphs, the next plan recaptures.
+
+    The stack's own bridge is the `_LockedBridge` proxy, so its seed reads serialize per-call
+    with operator traffic; concurrent gotos can't double-build (MotionStack._build_lock) — they
+    WAIT for the planner build, exactly as they used to wait for the ⚡ click. Warm order:
+    planner build + IK/trajopt warmup → ALIVE → PRM roadmap → perception WARM-ONLY build
+    (mapper/segmenter/ESDF kernels paid; the planner keeps planning against the modeled world —
+    see MotionStack.prewarm_perception). Post-ALIVE failures are stamped, never fatal."""
     try:
         from motion_engine.mtrace import span as _mspan, stamp as _mstamp
-        with _bridge_lock:
-            with _mspan("warmup: MotionStack.from_cell (artifact loads)"):
-                st = motion_stack()
-            with _mspan("warmup: prewarm (planner build + IK/trajopt warmup — the fast path)"):
-                warm = st.prewarm()                   # THE robot planner, built up front
+        with _mspan("warmup: MotionStack.from_cell (artifact loads)"):
+            st = motion_stack()
+        with _mspan("warmup: prewarm (planner build + IK/trajopt warmup — the fast path, "
+                    "bridge lock NOT held)"):
+            warm = st.prewarm()                       # THE robot planner, built up front
         _MOTION_WARM.update(state="off", error=None)   # ALIVE (derived from the stack itself)
         print(f"[edge] motion stack ALIVE · prewarm {warm.get('seconds')}s · groups {warm.get('groups')}"
-              " · deep-warm (PRM roadmap + live world) continuing in the background")
+              " · deep-warm (PRM roadmap + perception) continuing in the background")
     except Exception as e:  # noqa: BLE001
         _MOTION_WARM.update(state="error", error=f"{type(e).__name__}: {e}")
         print(f"[edge] motion stack warmup FAILED: {type(e).__name__}: {e}")
         return
 
-    # ── stage 2: the stack is ALIVE; pre-pay the rest. UNDER the bridge lock — CUDA-graph
-    # capture (PRM warm, mapper build) must never overlap a camera grab (see docstring).
+    # ── stage 2: the stack is ALIVE; pre-pay the rest in the background, lock-free.
     try:
-        with _bridge_lock:
-            if hasattr(st, "finish_warmup"):
-                st.finish_warmup()                    # PRM roadmap (captures graphs)
+        if hasattr(st, "finish_warmup"):
+            st.finish_warmup()                        # PRM roadmap (thread_local capture)
     except Exception as e:  # noqa: BLE001
         _mstamp("warmup: PRM roadmap warm failed (non-fatal — roadmap stays lazy)",
                 error=f"{type(e).__name__}: {e}")
     try:
-        with _bridge_lock:
+        with _bridge_lock:                            # ONLY the grab holds the lock (~2 s)
             b = get_bridge()
             frames, reasons = (_live_frames(st, b) if b is not None else ([], ["no bridge"]))
-            if frames:
-                with _mspan("warmup: perception pre-build (WARM-ONLY — kernels/mapper paid, "
-                            "the modeled world stays the planner's world)", cameras=len(frames)):
-                    if hasattr(st, "prewarm_perception"):
-                        st.prewarm_perception(frames)
-                    else:
-                        st.update_world_live(frames)
-            else:
-                _mstamp("warmup: perception pre-build skipped (live world will build lazily)",
-                        reasons="; ".join(reasons) or "no frames")
+        if frames:
+            with _mspan("warmup: perception pre-build (WARM-ONLY — kernels/mapper paid, "
+                        "the modeled world stays the planner's world)", cameras=len(frames)):
+                if hasattr(st, "prewarm_perception"):
+                    st.prewarm_perception(frames)
+                else:
+                    st.update_world_live(frames)
+        else:
+            _mstamp("warmup: perception pre-build skipped (live world will build lazily)",
+                    reasons="; ".join(reasons) or "no frames")
     except Exception as e:  # noqa: BLE001 — perception pre-build is opportunistic
         _mstamp("warmup: perception pre-build failed (non-fatal — lazy build remains)",
                 error=f"{type(e).__name__}: {e}")

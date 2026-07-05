@@ -672,12 +672,7 @@ class CalibSession:
         # INTRINSICS (K) are refined jointly only for a MULTI-POINT board (>=8 points, not a
         # single 4-corner marker, where K is degenerate with scale/distance) over enough views —
         # this is the v3 fix for a wrong factory K / unrectified image (the 9%-scale failure).
-        n = len(self.samples)
-        many_points = int(getattr(self.board, "n", 0)) >= 8
-        est_intr = many_points and n >= 12
-        self.result = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain,
-                                        mode=self.kind, estimate_fk=(n >= 10),
-                                        estimate_scale=(n >= 10), estimate_intrinsics=est_intr)
+        self.result = self._gated_solve()
         self.X_est = self.result.T_optical
         self.T_board_est = self.result.T_board
         self._note_observability(self.result)
@@ -800,6 +795,20 @@ class CalibSession:
                 "heldout_before": round(float(before), 3), "heldout_after": round(float(after), 3),
                 "improved": improved}
 
+    def _gated_solve(self, **kw):
+        """THE eye-in-hand estimator policy — the over-parametrisation guard in ONE place:
+        FK correction + board scale only with enough poses (thin sets overfit — absorbing
+        noise into FK shrinks the covariance and lies to the convergence check), K refined
+        only for a multi-point board over enough views. solve(), observe() AND every mid-loop
+        meter (replay/active) go through here, so the refine loop can never converge on a σ
+        the final displayed solve won't reproduce (the live 0.148-meter-vs-0.17-panel bug)."""
+        n = len(self.samples)
+        many_points = int(getattr(self.board, "n", 0)) >= 8
+        return solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain,
+                                 mode=self.kind, estimate_fk=(n >= 10),
+                                 estimate_scale=(n >= 10),
+                                 estimate_intrinsics=(many_points and n >= 12), **kw)
+
     # ── observe: live observability DURING collection (6.2) — a cheap solve, no motion ──
     def observe(self) -> dict:
         """Solve on the running set so the operator sees the per-DOF observability meter
@@ -817,9 +826,7 @@ class CalibSession:
                     "train_rms_px": round(r.residual_px, 3), **self._static_obs_json(r)}
         if len(self.samples) < max(6, self.min_corners):
             return {"type": "observe", "ready": False, "collected": len(self.samples)}
-        n = len(self.samples)
-        r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind,
-                              estimate_fk=(n >= 10), estimate_scale=(n >= 10))
+        r = self._gated_solve()
         self.result = r                       # so the next suggest_pose can target the weak axis
         self.X_est = r.T_optical
         self.T_board_est = r.T_board
@@ -851,7 +858,7 @@ class CalibSession:
                 pass
         ci = list(s.corner_ids.astype(int)).index(int(corner_id))
         s.corners[ci] = uv
-        self.result = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+        self.result = self._gated_solve()
         self.X_est, self.T_board_est = self.result.T_optical, self.result.T_board
         heldout = held_out_reprojection(self.result, self.heldout, self.board.points, self.K, self.chain) \
             if self.heldout else None
@@ -910,7 +917,7 @@ class CalibSession:
         minimum. Held-out is re-reported so a worse nudge is visible, never silent."""
         assert self.samples, "collect + solve before nudging"
         Xn = np.asarray(x_new, float).reshape(4, 4)
-        self.result = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, X_init=Xn)
+        self.result = self._gated_solve(X_init=Xn)
         self.X_est = self.result.T_optical
         self.T_board_est = self.result.T_board
         heldout = held_out_reprojection(self.result, self.heldout, self.board.points, self.K, self.chain) \
@@ -1058,7 +1065,7 @@ class CalibSession:
         # live meter: a cheap running solve once enough poses (same payload observe() gives)
         if len(self.samples) >= max(6, self.min_corners):
             try:
-                r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+                r = self._gated_solve()
                 self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
                 self._note_observability(r)
                 out["observability"] = {k: round(float(v), 4) for k, v in observability(r).items()}
@@ -1180,7 +1187,7 @@ class CalibSession:
         # _marks is cleared by replay_next_goal's done (both exit styles stay valid)
         if len(self.samples) >= max(6, self.min_corners):
             try:
-                r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+                r = self._gated_solve()
                 self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
                 self._note_observability(r)
                 out["observability"] = {k: round(float(v), 4) for k, v in observability(r).items()}
@@ -1215,7 +1222,7 @@ class CalibSession:
             return {"type": "active_start", "ok": False,
                     "error": "bridge exposes no joint names — planned motion needs named joints"}
         try:  # a fresh solve so the NBV ranks against the CURRENT covariance
-            r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+            r = self._gated_solve()
             self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
             self._note_observability(r)                      # accept-gate meter (unchanged)
             converged = self._refine_converged(r)            # the loop chases REFINE targets
@@ -1313,7 +1320,7 @@ class CalibSession:
                "held_out": held_out, "settle": settle, "added": st["added"], "max": st["max"],
                "collected": len(self.samples), "heldout": len(self.heldout)}
         try:
-            r = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain, mode=self.kind)
+            r = self._gated_solve()
             self.result, self.X_est, self.T_board_est = r, r.T_optical, r.T_board
             self._note_observability(r)                  # accept-gate meter (unchanged)
             out["converged"] = self._refine_converged(r)

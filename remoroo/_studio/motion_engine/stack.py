@@ -206,6 +206,11 @@ class MotionStack:
         self._factory = planner_factory or _default_planner_factory
         self._enable_graph = True              # cuRobo CUDA-graph capture; OFF for realtime (see set_graph_capture)
         self._planners: Dict[frozenset, object] = {}
+        # Serialize planner BUILDS: the warmup thread now runs OFF the edge's bridge lock (the
+        # thread_local capture mode made that safe), so a goto arriving mid-warmup would
+        # otherwise start a SECOND ~90 s build of the same planner. RLock: build-path re-entry
+        # (e.g. update_world_live→_scene_extent→_planner_for) must not deadlock.
+        self._build_lock = threading.RLock()
         self._groups = {g["name"]: g for g in config.get("groups", [])}
         self._limits = safety.planner_limits()
         self._track_check_s = 5.0   # tracking-watchdog cadence (tests shrink it)
@@ -688,18 +693,19 @@ class MotionStack:
         for a in active_groups:
             self._group(a)                     # KeyError on an unknown group, before any build
         key = frozenset(self._groups.keys())   # ONE key: the robot planner
-        if key not in self._planners:
-            all_groups = list(self._groups.keys())
-            with span("robot planner build #1", groups=",".join(sorted(all_groups))):
-                planner = self._factory(self._robot_cfg_for(all_groups), self.world,
-                                        limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
-            with span("self-mask world check"):
-                masked = self._self_mask_world(planner)
-            if masked:     # masked the cloud → rebuild from the masked world
-                with span("robot planner REBUILD #2 (self-mask changed the world — full build cost paid TWICE)"):
+        with self._build_lock:                 # a goto during warmup WAITS here, never double-builds
+            if key not in self._planners:
+                all_groups = list(self._groups.keys())
+                with span("robot planner build #1", groups=",".join(sorted(all_groups))):
                     planner = self._factory(self._robot_cfg_for(all_groups), self.world,
                                             limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
-            self._planners[key] = planner
+                with span("self-mask world check"):
+                    masked = self._self_mask_world(planner)
+                if masked:     # masked the cloud → rebuild from the masked world
+                    with span("robot planner REBUILD #2 (self-mask changed the world — full build cost paid TWICE)"):
+                        planner = self._factory(self._robot_cfg_for(all_groups), self.world,
+                                                limits=self._limits, max_goalset=1, enable_graph=self._enable_graph)
+                self._planners[key] = planner
         return self._planners[key]
 
     # --- health -----------------------------------------------------------
