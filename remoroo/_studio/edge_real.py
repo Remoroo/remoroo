@@ -1948,21 +1948,6 @@ def _autowarm_on_boot():
     threading.Thread(target=_wait_and_warm, daemon=True, name="motion-autowarm").start()
 
 
-def h_diagnose_config(_q, body=None):
-    """WHY is a configuration in collision — the operator/Studio diagnosis verb. Body:
-    `{joints?: {name: rad}}` (overrides over the LIVE config; omit for "diagnose where the
-    robot is now"). Returns curobo_v2.diagnose_config's drawable report: per-sphere world hits
-    with link names + per-obstacle attribution (modeled name vs the live camera world) +
-    self-collision pairs + joint-limit violations + a one-line verdict. Bridge-locked: the
-    ablation briefly mutates the shared collision scene."""
-    if _MOTION_STACK is None:
-        return {"ok": False, "error": "motion stack not running — start it from the header (⚡ Motion)"}
-    named = (body or {}).get("joints") or None
-    with _bridge_lock:
-        rep = _MOTION_STACK.diagnose_config(named=named)
-    return {"ok": "error" not in rep, **rep}
-
-
 def _planned_motion_gate():
     """The trust line for AUTOMATIC planned motion (shared by drive-to-start + planned replay):
     the commission gate must be DONE (setup_state.json — server-side enforcement; the UI gates
@@ -2134,8 +2119,6 @@ def _replay_goto_start() -> dict:
     _lap("goto_joints returned", ok=res.ok, executed=getattr(res, "executed", None),
          message=res.message)
     out = {"ok": bool(res.ok), "message": res.message}
-    if getattr(res, "diagnosis", None):
-        out["diagnosis"] = res.diagnosis     # drawable WHY (per-sphere hits, obstacle names)
     if not res.ok and not (res.executed or res.aborted):
         # PLAN refused, never moved — the recorded START may now sit inside a new obstacle.
         # Flag it so the Studio can still run the PLANNED replay (its marks are absolute
@@ -2839,7 +2822,6 @@ ROUTES = {
     "/edge/motion/debug_world": ("json", h_debug_world),
     "/edge/motion/debug_dump": ("json", h_debug_dump),
     "/edge/motion/diagnose_plan": ("json", h_diagnose_plan),
-    "/edge/motion/diagnose_config": ("json_body", h_diagnose_config),
     "/edge/calib/bake": ("json", h_calib_bake),
     "/edge/motion/world_alignment": ("json", h_world_alignment),
     "/edge/motion/world_collision_at_seed": ("json", h_world_collision_at_seed),

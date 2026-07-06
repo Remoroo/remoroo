@@ -66,99 +66,6 @@ class PlanResult:
     trajectory: Optional[Trajectory]
     message: str = ""
     total_time: float = 0.0
-    # WHY the plan failed, machine-readable (diagnose_config output for start/goal) — the wire
-    # payload the Studio draws: ghost config, penetrating spheres, per-obstacle attribution.
-    diagnosis: Optional[dict] = None
-
-
-def _bound_violations(positions: Dict[str, float], limits: Dict[str, Tuple[float, float]]) -> List[dict]:
-    """Joints whose RAW value sits outside its position limits — checked before the planner's
-    clamping (which would hide exactly this fault). Pure — unit-tested off-GPU."""
-    out: List[dict] = []
-    for n, v in (positions or {}).items():
-        if n in limits:
-            lo, hi = limits[n]
-            if not (lo <= float(v) <= hi):
-                out.append({"joint": n, "value": round(float(v), 4),
-                            "lo": round(float(lo), 4), "hi": round(float(hi), 4)})
-    return out
-
-
-def _self_collision_pairs(spheres: np.ndarray, links: Sequence[str],
-                          ignore: Dict[str, Sequence[str]], *, max_pairs: int = 10) -> List[dict]:
-    """NAME the self-colliding link pairs. cuRobo's GPU self-collision distance says THAT the
-    config self-collides but not which links; the pair names come free CPU-side: pairwise
-    overlap of the FK spheres (true radii), skipping same-link pairs and the authored ignore
-    matrix — the same semantics the planner enforces. `spheres` is (n,4)=x,y,z,r; `links[i]` is
-    sphere i's link. Pure numpy — unit-tested off-GPU."""
-    a = np.asarray(spheres, dtype=float).reshape(-1, 4)
-    n = min(len(a), len(links))
-    ig = {k: set(v or []) for k, v in (ignore or {}).items()}
-
-    def ignored(la: str, lb: str) -> bool:
-        return lb in ig.get(la, ()) or la in ig.get(lb, ())
-
-    hits: List[dict] = []
-    for i in range(n):
-        if a[i, 3] <= 0:
-            continue
-        for j in range(i + 1, n):
-            if a[j, 3] <= 0 or links[i] == links[j] or ignored(links[i], links[j]):
-                continue
-            depth = float(a[i, 3] + a[j, 3] - np.linalg.norm(a[i, :3] - a[j, :3]))
-            if depth > 0:
-                hits.append({"links": sorted((links[i], links[j])), "depth_mm": round(depth * 1000, 1)})
-    # one entry per link PAIR (the deepest), most-penetrating first
-    best: Dict[tuple, dict] = {}
-    for h in hits:
-        key = tuple(h["links"])
-        if key not in best or h["depth_mm"] > best[key]["depth_mm"]:
-            best[key] = h
-    return sorted(best.values(), key=lambda h: -h["depth_mm"])[:max_pairs]
-
-
-def _config_verdict(rep: dict) -> str:
-    """One customer-readable sentence for one diagnosed config. Pure — unit-tested off-GPU."""
-    label = str(rep.get("label", "config")).upper()
-    if rep.get("error"):
-        return f"{label}: diagnosis unavailable ({rep['error']})"
-    if rep.get("valid"):
-        return f"{label} is collision-free and within limits"
-    parts: List[str] = []
-    hits = rep.get("world_hits") or []
-    if hits:
-        by_link: Dict[str, List[float]] = {}
-        for h in hits:
-            by_link.setdefault(h["link"], []).append(h["depth_mm"])
-        links = ", ".join(f"{l} ×{len(d)} ≤{max(d):.0f}mm" for l, d in
-                          sorted(by_link.items(), key=lambda kv: -max(kv[1])))
-        obs = rep.get("obstacles") or {}
-        live = [n for n, o in obs.items() if o.get("kind") == "live_world"]
-        modeled = [n for n, o in obs.items() if o.get("kind") == "modeled_obstacle"]
-        if modeled and not live:
-            what = f"MODELED OBSTACLE{'S' if len(modeled) > 1 else ''} {', '.join(repr(m) for m in modeled)}"
-        elif live and not modeled:
-            what = "the LIVE CAMERA WORLD"
-        elif live and modeled:
-            what = f"the LIVE CAMERA WORLD + modeled {', '.join(repr(m) for m in modeled)}"
-        else:
-            what = "the WORLD"
-        parts.append(f"in collision with {what}: {links}")
-    for p in (rep.get("self_pairs") or [])[:3]:
-        parts.append(f"SELF-COLLIDES {p['links'][0]} ↔ {p['links'][1]} ({p['depth_mm']:.0f}mm)")
-    for b in (rep.get("bound_violations") or [])[:3]:
-        parts.append(f"joint {b['joint']}={b['value']} outside limits [{b['lo']}, {b['hi']}]")
-    return f"{label} " + "; ".join(parts)
-
-
-def _diagnosis_verdict(start: dict, goal: dict) -> str:
-    """The failure message for a plan whose START/GOAL diagnosis found the fault. Pure."""
-    bad = [r for r in (start, goal) if r and not r.get("valid") and not r.get("error")]
-    if not bad:
-        return ("start and goal are both collision-free and within limits — the failure is the "
-                "PATH between them (a blocked/narrow corridor) or the dynamics limits")
-    return ". ".join(_config_verdict(r) for r in bad) + \
-        ". Fix the configuration/world above — no path can exist while an endpoint is invalid."
 
 
 def _ensure_warp_torch() -> None:
@@ -562,10 +469,6 @@ class CuroboV2Planner:
         if not getattr(self, "_graph_warmup_pending", False):
             return False
         self._graph_warmup_pending = False
-        try:
-            self._collision_checker()      # pre-build the shared-scene diagnostic checker
-        except Exception:  # noqa: BLE001 — it lazily builds on the first precheck instead
-            pass
         gp = getattr(self.planner, "graph_planner", None)
         if gp is None:
             return False
@@ -778,22 +681,21 @@ class CuroboV2Planner:
                 "checks": checks}
 
     def _collision_checker(self):
-        """A PUBLIC `RobotCollisionChecker` SHARING this planner's own `scene_collision_checker`
-        (cuRobo's `load_from_config(scene_collision_checker=…)` binds the costs to an existing
-        SceneCollision instead of building a new scene). That makes every query here answer
-        against the world the planner ACTUALLY plans with — modeled obstacles or the live ESDF,
-        whichever is loaded — where the old per-checker scene silently answered
-        modeled-obstacles-only and made born-collision verdicts misleading next to a live world.
-        Built once, lazily (Kinematics+costs ≈ seconds on an Orin; finish_warmup pre-builds it)."""
+        """A PUBLIC, tested `RobotCollisionChecker` over THIS planner's world — built once, lazily.
+        cuRobo's supported born-collision API (validate / per-sphere distance / sample); we no longer
+        reach into `scene_collision_checker.get_sphere_distance` with a hand-built CollisionBuffer."""
         if getattr(self, "_coll_checker", None) is None:
             import torch
             from curobo.collision_checking import RobotCollisionChecker, RobotCollisionCheckerCfg
             from curobo.types import DeviceCfg
 
+            scene = self._world.scene or None
+            n_cub = len((scene or {}).get("cuboid", {})) + 8
+            n_mesh = len((scene or {}).get("mesh", {})) + 4
             cfg = RobotCollisionCheckerCfg.load_from_config(
-                robot_config=self._robot_cfg,
-                scene_collision_checker=self.planner.scene_collision_checker,  # THE live world
+                robot_config=self._robot_cfg, scene_model=scene,
                 device_cfg=DeviceCfg(device=torch.device(self._device), dtype=torch.float32),
+                n_cuboids=int(n_cub), n_meshes=int(n_mesh),
                 collision_activation_distance=0.0)          # 0 = exact penetration verdict
             self._coll_checker = RobotCollisionChecker(cfg)
         return self._coll_checker
@@ -818,91 +720,11 @@ class CuroboV2Planner:
         d = checker.get_collision_distance(state).detach().cpu().numpy()
         sph = state.robot_spheres.detach().cpu().numpy().reshape(-1, 4)
         rep = _collision_report(d, sph, collision_free=valid)
-        # The checker SHARES the planner's scene (see _collision_checker) — this verdict is
-        # against the SAME world the planner plans with, live ESDF included.
-        rep["checker_world"] = "the planner's CURRENT world (live ESDF when loaded)"
+        # IMPORTANT: this checker holds the MODELED obstacles only (input 2) — it does NOT see the live
+        # ESDF (input 1). So a "clear" verdict here does NOT mean clear of the live world the planner
+        # actually plans against; the stack runs a plan-ablation (`_world_blocks_exit`) for that.
+        rep["checker_world"] = "modeled-obstacles-only (NOT the live ESDF)"
         return rep
-
-    def _sphere_links(self) -> List[str]:
-        """Sphere index → owning link name. cuRobo assembles the FK sphere tensor in the robot
-        cfg's `collision_spheres` link order (our authored dict, insertion-ordered), N spheres
-        per link — the same order `robot_spheres`/`get_collision_distance` index by."""
-        kin = (self._robot_cfg.get("robot_cfg", self._robot_cfg)).get("kinematics", {})
-        out: List[str] = []
-        for link, lst in (kin.get("collision_spheres") or {}).items():
-            out += [link] * len(lst or [])
-        return out
-
-    def diagnose_config(self, positions: Dict[str, float], *, label: str = "config",
-                        ablate: bool = True, max_hits: int = 20) -> dict:
-        """WHY is this configuration invalid — against the planner's CURRENT collision world
-        (live ESDF included), with per-obstacle attribution a customer can read.
-
-        Three causes, each named: (1) WORLD collision — per-sphere penetration (which link,
-        where, how deep), attributed to the specific obstacle by ABLATION: each named obstacle
-        (modeled cuboids/meshes AND the live voxel layer — cuRobo names + can disable all three
-        types) is disabled, the distance re-queried, re-enabled in a `finally`; a sphere whose
-        penetration vanishes is hitting that obstacle. (2) SELF-collision — the GPU distance
-        gates it, the PAIR NAMES come from the CPU pairwise check with the authored ignore
-        matrix. (3) BOUNDS — raw values vs joint limits (checked pre-clamp, where the planner
-        would silently hide it). Never raises — a diagnosis must not crash the failure path it
-        explains. The ablation briefly mutates the SHARED scene: only call from a plan-failure
-        path / operator verb, never concurrently with planning."""
-        report: dict = {"label": label, "valid": True, "world_hits": [], "self_pairs": [],
-                        "bound_violations": [], "obstacles": {}}
-        try:
-            report["bound_violations"] = _bound_violations(positions, self.joint_limits())
-            js = self._start_js(positions)               # clamped — exactly what the planner FKs
-            q = js.position.view(1, 1, -1)
-            chk = self._collision_checker()
-            d_world, d_self = chk.get_scene_self_collision_distance_from_joints(q)
-            sph = chk.get_kinematics(q).robot_spheres.detach().cpu().numpy().reshape(-1, 4)
-            d = d_world.detach().cpu().numpy().reshape(-1)
-            links = self._sphere_links()
-            n = min(len(d), len(sph), len(links) or len(sph))
-            link_of = links if links else [f"sphere_{i}" for i in range(n)]
-            pen = [i for i in range(n) if sph[i, 3] > 0 and d[i] > 0]
-            hits = sorted(({"i": int(i), "link": link_of[i],
-                            "xyz": [round(float(v), 3) for v in sph[i, :3]],
-                            "r": round(float(sph[i, 3]), 3),
-                            "depth_mm": round(float(d[i]) * 1000, 1)} for i in pen),
-                          key=lambda h: -h["depth_mm"])
-            report["world_hits"] = hits[:max_hits]
-            if float(d_self.detach().max().item()) > 0:
-                kin = (self._robot_cfg.get("robot_cfg", self._robot_cfg)).get("kinematics", {})
-                report["self_pairs"] = _self_collision_pairs(
-                    sph[:n], link_of[:n], kin.get("self_collision_ignore") or {})
-
-            if ablate and pen:
-                scc = self.planner.scene_collision_checker
-                scene = self._world.scene or {}
-                modeled = set(scene.get("cuboid", {})) | set(scene.get("mesh", {}))
-                for name in list(scc.get_obstacle_names() or []):
-                    try:
-                        scc.enable_obstacle(name, False)
-                        d2 = (chk.get_scene_self_collision_distance_from_joints(q)[0]
-                              .detach().cpu().numpy().reshape(-1))
-                        relieved = [i for i in pen if d2[i] <= 0]
-                    except Exception:  # noqa: BLE001 — an unqueryable obstacle: skip, keep going
-                        relieved = []
-                    finally:
-                        try:
-                            scc.enable_obstacle(name, True)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    if relieved:
-                        report["obstacles"][str(name)] = {
-                            "kind": "modeled_obstacle" if name in modeled else "live_world",
-                            "n_spheres": len(relieved),
-                            "links": sorted({link_of[i] for i in relieved}),
-                        }
-            report["valid"] = not (report["world_hits"] or report["self_pairs"]
-                                   or report["bound_violations"])
-        except Exception as e:  # noqa: BLE001 — diagnosis is best-effort, never a crash
-            report["error"] = f"{type(e).__name__}: {e}"
-            report["valid"] = None
-        report["verdict"] = _config_verdict(report)
-        return report
 
     def free_config(self, n: int = 1) -> np.ndarray:
         """cuRobo's tested rejection sampler → up to `n` collision-free, in-bounds configs `[k, dof]`
@@ -1038,15 +860,6 @@ class CuroboV2Planner:
         if not goals:
             return PlanResult(False, None, "no goals given")
         from .mtrace import span as _span, stamp as _stamp
-        # Fail fast when the START itself is invalid (the goal here is a POSE — its validity is
-        # IK's job): no attempt can succeed from an in-collision start, and the diagnosis names
-        # the exact link/obstacle instead of the generic trajopt paragraph.
-        ds = self.diagnose_config(dict(start_positions or {}), label="start", ablate=False)
-        if ds.get("valid") is False:
-            ds = self.diagnose_config(dict(start_positions or {}), label="start")
-            verdict = _diagnosis_verdict(ds, {})
-            _stamp("plan_pose REFUSED at precheck (start invalid — no attempts burned)", verdict=verdict)
-            return PlanResult(False, None, verdict, diagnosis={"start": ds})
         res = self._plan_pose_once(goals, start_positions, max_attempts)
         missing = [t for t in self._tool_frames if t not in goals]
         if not res.success and missing:
@@ -1118,22 +931,15 @@ class CuroboV2Planner:
 
     def plan_joints(self, goal_positions: Dict[str, float],
                     start_positions: Optional[Dict[str, float]] = None,
-                    *, max_attempts: int = 5, precheck: bool = True) -> PlanResult:
+                    *, max_attempts: int = 5) -> PlanResult:
         """Plan a collision-free path to a JOINT-SPACE goal — V2 `plan_cspace`, the SAME call
         `plan_retract` (a commissioned move) rides, with a named goal instead of home. There is
         no TCP: a joint goal has none. `goal_positions` is name-keyed over any subset of this
         planner's joints; joints NOT named HOLD their start value (never a default). Goals are
-        clamped a hair inside the limits (same rationale as `_start_js`).
-
-        FAIL-FAST DIAGNOSIS (`precheck`): an endpoint that is ITSELF invalid cannot be planned
-        around — every attempt (incl. the PRM fallbacks) fails identically (~12 s of doomed
-        retries per goal in the round-7 replay log) and the operator got a generic paragraph.
-        So both endpoint configs are validated against the planner's LIVE world FIRST; when one
-        is invalid we return in ~1 s with a NAMED verdict (which config, which link, which
-        obstacle — see diagnose_config) + the machine-readable report the Studio can draw."""
+        clamped a hair inside the limits (same rationale as `_start_js`)."""
         from curobo.types import JointState
 
-        from .mtrace import span, stamp
+        from .mtrace import span
         try:
             with span("plan_joints._start_js"):
                 start = self._start_js(start_positions)
@@ -1150,33 +956,13 @@ class CuroboV2Planner:
                         lo, hi = lims[n]
                         v = min(max(v, lo + 1e-4), hi - 1e-4)
                     q[0, i] = v
-            if precheck:
-                merged = dict(start_positions or {})
-                merged.update({n: float(v) for n, v in goal_positions.items()})
-                with span("endpoint precheck (start+goal vs the LIVE world)"):
-                    ds = self.diagnose_config(dict(start_positions or {}), label="start", ablate=False)
-                    dg = self.diagnose_config(merged, label="goal", ablate=False)
-                if ds.get("valid") is False or dg.get("valid") is False:
-                    # re-diagnose the invalid endpoint(s) WITH per-obstacle attribution
-                    if ds.get("valid") is False:
-                        ds = self.diagnose_config(dict(start_positions or {}), label="start")
-                    if dg.get("valid") is False:
-                        dg = self.diagnose_config(merged, label="goal")
-                    verdict = _diagnosis_verdict(ds, dg)
-                    stamp("plan REFUSED at precheck (no attempts burned)", verdict=verdict)
-                    return PlanResult(False, None, verdict, diagnosis={"start": ds, "goal": dg})
             goal = JointState.from_position(q, joint_names=names)
             with span("plan_cspace", attempts=max_attempts, named=len(goal_positions)):
                 result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
         except Exception as e:
             return PlanResult(False, None, f"plan_cspace raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
-            # endpoints were valid (precheck) — say so, so the operator looks at the PATH
-            msg = _plan_failure_message(result)
-            if precheck:
-                msg += (" [start and goal are both collision-free — the failure is the PATH "
-                        "between them (a blocked/narrow corridor) or the dynamics limits]")
-            return PlanResult(False, None, msg)
+            return PlanResult(False, None, _plan_failure_message(result))
         with span("interpolate→Trajectory"):
             traj = self._to_trajectory(self._trimmed_plan(result))
         from .mtrace import stamp
