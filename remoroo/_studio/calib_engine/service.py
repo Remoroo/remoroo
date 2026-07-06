@@ -8,6 +8,7 @@ One calibration at a time (the gate is supervised, one item after another — F2
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -83,6 +84,42 @@ class CalibService:
         """The authored pipeline if the agent provided one, else the URDF-derived fallback."""
         return list(self._authored) if self._authored is not None else build_plan(self.urdf_path)
 
+    def _load_saved_accepted(self) -> None:
+        """Accepted calibrations PERSIST (`calibration/<camera>.json` — written exactly so
+        base_to_base can reuse each camera's X without re-running the solve). Load them for
+        any camera NOT accepted in this session, so redoing one step never forces redoing its
+        already-solved dependencies (the "can't reach base_to_base without re-calibrating both
+        wrists" complaint). In-session accepts stay authoritative (fresher than disk). The
+        loaded stub carries exactly what the b2b builder consumes: X + its matched fk_offsets."""
+        import json
+        from types import SimpleNamespace
+        if not self.calib_dir:
+            return
+        for p in self.plan_items:
+            if p.kind == "base_to_base" or p.camera_link in self.accepted:
+                continue
+            safe = p.camera_link.replace("/", "_").replace("[", "_").replace("]", "_").replace("|", "_")
+            f = Path(self.calib_dir) / f"{safe}.json"
+            if not f.exists():
+                continue
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+                self.accepted[p.camera_link] = SimpleNamespace(
+                    T_optical=np.asarray(d["T_optical"], float),
+                    fk_offsets=np.asarray(d.get("fk_offsets") or [], float),
+                    kind=d.get("kind"), from_disk=True)
+            except Exception:  # noqa: BLE001 — a corrupt json just stays locked (honest)
+                continue
+
+    def _saved_flags(self, items: list) -> list:
+        """Annotate each pipeline item with `saved` — an accepted calibration exists (this
+        session or on disk) — so the Studio unlocks dependents instead of demanding a redo."""
+        b2b_saved = bool(self.calib_dir and (Path(self.calib_dir) / "base_to_base.json").exists())
+        for it in items:
+            it["saved"] = b2b_saved if it["kind"] == "base_to_base" \
+                else it["camera_link"] in self.accepted
+        return items
+
     def _world_base(self, flange_link: Optional[str]) -> dict:
         """world→chain-base for the selected step, so the Studio stage can mount CHAIN-FRAME
         overlays (marker, seed gizmo, ghost, pose cloud) at the right spot in the WORLD.
@@ -109,11 +146,14 @@ class CalibService:
         body = body or {}
         if verb in ("plan", "pipeline"):
             self.plan_items = self._resolve_plan()
-            return {"type": "pipeline", "items": [_planitem_json(p) for p in self.plan_items]}
+            self._load_saved_accepted()
+            return {"type": "pipeline",
+                    "items": self._saved_flags([_planitem_json(p) for p in self.plan_items])}
 
         if verb == "select":
             if not self.plan_items:
                 self.plan_items = self._resolve_plan()
+            self._load_saved_accepted()      # deps solved in an earlier session count
             # The Studio selects a step by its authored ID (e.g. "arm1_cam1"); older callers
             # pass the camera link. Match on EITHER so both work.
             sel = body.get("camera_link")

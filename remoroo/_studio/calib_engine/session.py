@@ -1504,6 +1504,7 @@ class BaseToBaseSession:
     def __init__(self, item: PlanItem, board: BoardModel, K: np.ndarray,
                  chain_a: Chain, chain_b: Chain, bridge_a, bridge_b,
                  X_a: np.ndarray, X_b: np.ndarray, *,
+                 fk_a: Optional[np.ndarray] = None, fk_b: Optional[np.ndarray] = None,
                  accept_agreement_mm: float = 3.0,
                  accept_rot_sigma_deg: float = 0.5, accept_trans_sigma_mm: float = 2.0):
         self.item = item
@@ -1512,6 +1513,14 @@ class BaseToBaseSession:
         self.chain_a, self.chain_b = chain_a, chain_b
         self.bridge_a, self.bridge_b = bridge_a, bridge_b
         self.X_a, self.X_b = np.asarray(X_a, float), np.asarray(X_b, float)
+        # Each hand-eye X was solved JOINTLY with per-joint FK corrections (estimate_fk) — X
+        # and its offsets are a matched pair. Evaluating X on the NOMINAL chain reintroduces
+        # exactly the FK bias the bundle removed (a chunk of the live 35mm inter-arm error).
+        # Zeros when the hand-eye solved without corrections or the DOF doesn't line up.
+        def _fk(v, n):
+            a = np.asarray(v, float).ravel() if v is not None else np.zeros(0)
+            return a if a.size == n else np.zeros(n)
+        self.fk_a, self.fk_b = _fk(fk_a, chain_a.n), _fk(fk_b, chain_b.n)
         self.obs: List[dict] = []
         self.result: Optional[CalibResult] = None
         self.min_corners = int(board.min_points)
@@ -1548,7 +1557,7 @@ class BaseToBaseSession:
 
     def _bundle(self, obs: List[dict]) -> CalibResult:
         return solve_base_to_base_bundle(obs, self.X_a, self.X_b, self.chain_a, self.chain_b,
-                                         self.board.points)
+                                         self.board.points, fk_a=self.fk_a, fk_b=self.fk_b)
 
     def observe(self) -> dict:
         """Live feedback during collection (the b2b analog of CalibSession.observe): once ≥2
@@ -1572,7 +1581,8 @@ class BaseToBaseSession:
         agreement_mm = float(self.result.metrics.get("agreement_mm", float("nan")))
         # Self-consistency: spread of the per-obs closed-form solves vs the bundle (rotation deg
         # AND translation mm) — a free quality signal alongside the covariance.
-        ts = [solve_base_to_base([o], self.X_a, self.X_b, self.chain_a, self.chain_b) for o in self.obs]
+        ts = [solve_base_to_base([o], self.X_a, self.X_b, self.chain_a, self.chain_b,
+                                 fk_a=self.fk_a, fk_b=self.fk_b) for o in self.obs]
         spreads = [transform_geodesic(T_AB, t) for t in ts]
         cons_deg = max((s[0] for s in spreads), default=0.0)
         cons_trans_mm = max((s[1] for s in spreads), default=0.0) * 1000.0
@@ -1602,7 +1612,8 @@ class BaseToBaseSession:
         if self.result is None:
             self.result = self._bundle(self.obs)
         held = heldout_interarm_agreement_mm(self.obs, self.X_a, self.X_b, self.chain_a,
-                                             self.chain_b, self.board.points, n_test=n_heldout)
+                                             self.chain_b, self.board.points, n_test=n_heldout,
+                                             fk_a=self.fk_a, fk_b=self.fk_b)
         train_mm = float(self.result.metrics.get("agreement_mm", float("nan")))
         score = held if held == held else train_mm   # NaN-safe: fall back to training agreement
         observable = self._observable()
@@ -1626,7 +1637,8 @@ class BaseToBaseSession:
                     "tracks": False}
         o.pop("_n_a", None); o.pop("_n_b", None)
         mm = interarm_agreement_mm(self.result.T_optical, [o], self.X_a, self.X_b,
-                                   self.chain_a, self.chain_b, self.board.points)
+                                   self.chain_a, self.chain_b, self.board.points,
+                                   fk_a=self.fk_a, fk_b=self.fk_b)
         return {"type": "b2b_verify", "ok": True, "tracks": bool(mm < self.accept_agreement_mm),
                 "agreement_mm": round(float(mm), 3), "thresh_mm": self.accept_agreement_mm}
 

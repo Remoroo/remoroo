@@ -128,7 +128,7 @@ def interarm_agreement_mm(
 
 def heldout_interarm_agreement_mm(
     obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
-    board_points: np.ndarray, *, n_test: int = 0,
+    board_points: np.ndarray, *, n_test: int = 0, fk_a=None, fk_b=None,
 ) -> float:
     """Generalisation of the base-to-base solve: fit T_AB on a subset of the shared views and
     score inter-arm agreement (mm) on the held-OUT ones — the b2b analog of held-out
@@ -139,8 +139,10 @@ def heldout_interarm_agreement_mm(
         return float("nan")
     k = max(1, n // 3) if n_test <= 0 else int(n_test)
     train, test = list(obs[: n - k]), list(obs[n - k:])
-    res = solve_base_to_base_bundle(train, X_a, X_b, chain_a, chain_b, board_points)
-    return interarm_agreement_mm(res.T_optical, test, X_a, X_b, chain_a, chain_b, board_points)
+    res = solve_base_to_base_bundle(train, X_a, X_b, chain_a, chain_b, board_points,
+                                    fk_a=fk_a, fk_b=fk_b)
+    return interarm_agreement_mm(res.T_optical, test, X_a, X_b, chain_a, chain_b, board_points,
+                                 fk_a=fk_a, fk_b=fk_b)
 
 
 def reprojection_detail(

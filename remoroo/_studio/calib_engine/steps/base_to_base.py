@@ -23,6 +23,8 @@ def _build(item, ctx: StepContext) -> BaseToBaseSession:
         ctx.chain_provider(pa.flange_link), ctx.chain_provider(pb.flange_link),
         ctx.bridge_factory(pa), ctx.bridge_factory(pb),
         ra.T_optical, rb.T_optical,
+        # the FK corrections each hand-eye was solved WITH — X and offsets travel together
+        fk_a=getattr(ra, "fk_offsets", None), fk_b=getattr(rb, "fk_offsets", None),
         # the task-space agreement gate reuses the tip-landing mm budget; the observability gate
         # reuses the same per-DOF σ limits as the supervised cameras (operator-tuned in cell.yaml).
         accept_agreement_mm=ctx.accept_tip_mm,
