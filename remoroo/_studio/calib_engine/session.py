@@ -1399,11 +1399,17 @@ class CalibSession:
         return out
 
 
+def safe_camera_name(camera: str) -> str:
+    """The persisted-calibration filename for a camera link — THE one sanitize rule, shared by
+    the writer, the cross-session loader and the saved-flag stamping (a drifted copy = a
+    silently-invisible saved calibration)."""
+    return camera.replace("/", "_").replace("[", "_").replace("]", "_").replace("|", "_")
+
+
 def _write_calib_json(calib_dir: str, camera: str, result: CalibResult, provenance: str) -> str:
     import json
     Path(calib_dir).mkdir(parents=True, exist_ok=True)
-    safe = camera.replace("/", "_").replace("[", "_").replace("]", "_").replace("|", "_")
-    dst = str(Path(calib_dir) / f"{safe}.json")
+    dst = str(Path(calib_dir) / f"{safe_camera_name(camera)}.json")
     Path(dst).write_text(json.dumps({
         "camera": camera, "kind": result.kind, "provenance": provenance,
         "T_optical": _T(result.T_optical), "T_board": _T(result.T_board),

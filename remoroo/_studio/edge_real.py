@@ -2457,7 +2457,12 @@ def _pipeline_for_ui() -> dict:
             it.target_id = "default"
         target_specs = {"default": spec} if spec else {}
     links = [l.get("name") for l in ET.parse(urdf_path).getroot().findall("link")]
-    return {"type": "pipeline", "items": [_planitem_json(p) for p in items],
+    from calib_engine.service import saved_calib_flags
+    # `saved` from the PERSISTED calibrations — the edge answers `pipeline` itself (this
+    # lightweight pre-camera path), so the flags must be stamped HERE too, same function as
+    # the service, or saved steps stay locked in the Studio (the "redo everything" complaint).
+    items_json = saved_calib_flags(str(CELL_DIR / "calibration"), [_planitem_json(p) for p in items])
+    return {"type": "pipeline", "items": items_json,
             "links": links, "urdf": urdf_path, "targets": target_specs}
 
 

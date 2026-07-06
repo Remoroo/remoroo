@@ -15,8 +15,24 @@ import numpy as np
 
 from . import steps
 from .geometry import Chain
-from .session import BaseToBaseSession, CalibSession, build_plan
+from .session import BaseToBaseSession, CalibSession, build_plan, safe_camera_name
 from .types import BoardModel, CalibResult, PlanItem, Target
+
+
+def saved_calib_flags(calib_dir: Optional[str], items: List[dict],
+                      accepted: Optional[dict] = None) -> List[dict]:
+    """Stamp `saved` on pipeline-item json: an accepted calibration EXISTS for the step —
+    persisted in calib_dir by any session, or accepted in-memory this one. FILE EXISTENCE is
+    the durable truth; module-level because the EDGE's lightweight pipeline path
+    (_pipeline_for_ui — no service built) must produce the same answer as the service."""
+    for it in items:
+        if it.get("kind") == "base_to_base":
+            it["saved"] = bool(calib_dir and (Path(calib_dir) / "base_to_base.json").exists())
+        else:
+            cam = it.get("camera_link") or ""
+            it["saved"] = bool(accepted and cam in accepted) or bool(
+                calib_dir and (Path(calib_dir) / f"{safe_camera_name(cam)}.json").exists())
+    return items
 
 
 def _planitem_json(p: PlanItem) -> dict:
@@ -98,8 +114,7 @@ class CalibService:
         for p in self.plan_items:
             if p.kind == "base_to_base" or p.camera_link in self.accepted:
                 continue
-            safe = p.camera_link.replace("/", "_").replace("[", "_").replace("]", "_").replace("|", "_")
-            f = Path(self.calib_dir) / f"{safe}.json"
+            f = Path(self.calib_dir) / f"{safe_camera_name(p.camera_link)}.json"
             if not f.exists():
                 continue
             try:
@@ -112,13 +127,7 @@ class CalibService:
                 continue
 
     def _saved_flags(self, items: list) -> list:
-        """Annotate each pipeline item with `saved` — an accepted calibration exists (this
-        session or on disk) — so the Studio unlocks dependents instead of demanding a redo."""
-        b2b_saved = bool(self.calib_dir and (Path(self.calib_dir) / "base_to_base.json").exists())
-        for it in items:
-            it["saved"] = b2b_saved if it["kind"] == "base_to_base" \
-                else it["camera_link"] in self.accepted
-        return items
+        return saved_calib_flags(self.calib_dir, items, self.accepted)
 
     def _world_base(self, flange_link: Optional[str]) -> dict:
         """world→chain-base for the selected step, so the Studio stage can mount CHAIN-FRAME
