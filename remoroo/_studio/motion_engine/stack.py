@@ -71,6 +71,9 @@ class MoveResult:
     aborted: bool = False
     total_time: float = 0.0
     audit: List[str] = field(default_factory=list)
+    # WHY a plan failed, machine-readable (curobo_v2.diagnose_config for start/goal) — flows to
+    # the edge JSON so the Studio can DRAW the fault (ghost config, red spheres, obstacle names).
+    diagnosis: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -847,6 +850,23 @@ class MotionStack:
                 stamp("finish_warmup failed for a planner (roadmap stays lazy)",
                       error=f"{type(e).__name__}: {e}")
         return {"ok": True, "n_warmed": n}
+
+    def diagnose_config(self, named: Optional[Dict[str, float]] = None,
+                        tcp: Optional[str] = None) -> dict:
+        """Operator/Studio verb: WHY is this configuration (default: the LIVE one) invalid —
+        which link hits which named obstacle / the live camera world / itself / a joint limit,
+        with the drawable per-sphere report. `named` overrides individual joints over the live
+        seed (e.g. a recorded mark's values). Serialize with planning (bridge lock on the edge):
+        the per-obstacle ablation briefly mutates the shared collision scene."""
+        tcp = tcp or next(iter(self._groups), None)
+        if tcp is None:
+            return {"error": "no kinematic groups"}
+        planner = self._planner_for([tcp])
+        if not hasattr(planner, "diagnose_config"):
+            return {"error": "this planner has no diagnostics (test factory)"}
+        merged = dict(self._seed_positions())
+        merged.update({n: float(v) for n, v in (named or {}).items()})
+        return planner.diagnose_config(merged, label="query")
 
     def prewarm_perception(self, frames) -> dict:
         """WARM-ONLY world build: pay the one-time perception cost (mapper/segmenter build +
@@ -1865,7 +1885,8 @@ class MotionStack:
         spike, a waypoint out of bounds) — never a re-judgement of cuRobo's already-safe plan."""
         if not getattr(plan, "success", False) or getattr(plan, "trajectory", None) is None:
             stamp("plan FAILED", message=getattr(plan, "message", "planning failed"))
-            return MoveResult(False, getattr(plan, "message", "planning failed"))
+            return MoveResult(False, getattr(plan, "message", "planning failed"),
+                              diagnosis=getattr(plan, "diagnosis", None))
         traj: Trajectory = plan.trajectory
         with span("defensive audit", waypoints=len(traj), dof=len(traj.joint_names)):
             reasons = audit_trajectory(traj, bounds_m=self.safety.bounds_m,
