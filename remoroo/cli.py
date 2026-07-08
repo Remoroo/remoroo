@@ -15,9 +15,14 @@ from .aliases_cmd import aliases
 from .init_cmd import init
 from .setup_cmd import setup
 from .studio_cmd import studio
-from .task_cmd import task, task_report, task_status
+from .task_cmd import models_install, models_status, task, task_report, task_status
 from .robot_cmd import robot_app
 from .edge_cmd import edge_app
+
+models_app = typer.Typer(no_args_is_help=True,
+                         help="Pinned perception models on this cell (install once).")
+models_app.command(name="install")(models_install)
+models_app.command(name="status")(models_status)
 app = typer.Typer(no_args_is_help=True)
 app.command(name="worker")(worker)
 app.command(name="block")(block)
@@ -32,6 +37,7 @@ app.command(name="task")(task)
 app.command(name="task-status")(task_status)
 app.command(name="task-report")(task_report)
 app.add_typer(robot_app, name="robot")
+app.add_typer(models_app, name="models")
 app.add_typer(edge_app, name="edge")
 
 @app.command()

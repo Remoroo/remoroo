@@ -156,6 +156,20 @@ class TaskService:
         return {"trial_id": rec.trial_id, "old": rec.verdict,
                 "new": replay_score(rec, env.judge_fn)}
 
+    # ---- perception models (install ONCE per cell; never inside a task run) -----------
+    def v_models_status(self, body: dict) -> dict:
+        from .perceive.loaders import models_status
+        return {"weights_dir": str(self.data_dir / "weights"),
+                "models": models_status(str(self.data_dir / "weights"))}
+
+    def v_models_install(self, body: dict) -> dict:
+        """Fetch + hash-verify the pinned checkpoints (GBs; minutes on first run).
+        Idempotent — `remoroo models install` calls this at setup time so the agent
+        never spends tokens discovering or fetching weights."""
+        from .perceive.loaders import models_install
+        return {"weights_dir": str(self.data_dir / "weights"),
+                "models": models_install(str(self.data_dir / "weights"))}
+
     # ---- VLA verbs (ENG 8.3): the cold-start policy as smart probe / whole stage -------
     def v_vla_load(self, body: dict) -> dict:
         """Load a policy runtime on this cell. 'fake' is the CI/dry-run policy; 'openpi'

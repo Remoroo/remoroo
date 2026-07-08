@@ -106,9 +106,13 @@ def descend(ctx: Ctx, tcp: str, to_z: float, *, speed: Optional[float] = None,
     steps = 0
     cause = STOP_TIMEOUT
     while steps < max_steps:
-        if stop_on in (STOP_CURRENT, STOP_FT) and ctx.bridge.stop_signal(stop_on, tcp):
-            cause = stop_on
-            break
+        if stop_on in (STOP_CURRENT, STOP_FT):
+            # stop_signal is OPTIONAL bridge instrumentation (the authored contract does
+            # not require it): without it, contact stops degrade to the z target.
+            sig = getattr(ctx.bridge, "stop_signal", None)
+            if callable(sig) and sig(stop_on, tcp):
+                cause = stop_on
+                break
         if z <= to_z + 1e-9:
             cause = STOP_Z
             break
@@ -129,13 +133,22 @@ def grasp(ctx: Ctx, tcp: str, *, width: float, force_hint: Optional[float] = Non
     arm = ctx.arm_of(tcp)
     h = ctx.trace.begin("grasp", tcp=tcp, width=width, force_hint=force_hint)
     ctx.bridge.set_gripper(arm, width)
-    state = ctx.bridge.gripper_state(arm) or {}
-    closed = float(state.get("closed_width", 0.0))
-    held = bool(state.get("holding", closed > 1e-3))
-    ev = GraspEvidence(held=held, closed_width=closed)
-    h.done(ok=held, stop_cause=None if held else "grasp_empty", **ev.to_dict())
-    return AtomResult(ok=held, stop_cause=None if held else "grasp_empty",
-                      evidence=ev.to_dict())
+    gs = getattr(ctx.bridge, "gripper_state", None)   # OPTIONAL instrumentation
+    if callable(gs):
+        state = gs(arm) or {}
+        closed = float(state.get("closed_width", 0.0))
+        held = bool(state.get("holding", closed > 1e-3))
+        ev = GraspEvidence(held=held, closed_width=closed)
+        h.done(ok=held, stop_cause=None if held else "grasp_empty", **ev.to_dict())
+        return AtomResult(ok=held, stop_cause=None if held else "grasp_empty",
+                          evidence=ev.to_dict())
+    # No gripper feedback on this bridge: the grasp PROCEEDS (the verifier judges the
+    # outcome from perception — the actual truth); evidence states held=UNKNOWN so the
+    # judge's proprioceptive channel abstains instead of lying.
+    h.done(ok=True, stop_cause=None, held=None, closed_width=None, instrumented=False)
+    return AtomResult(ok=True, stop_cause=None,
+                      evidence={"held": None, "closed_width": None,
+                                "instrumented": False})
 
 
 def release(ctx: Ctx, tcp: str, *, open_width: float = 0.04,

@@ -27,12 +27,12 @@ def slug_of(sentence: str) -> str:
     return f"{stem}_{hashlib.sha1(sentence.encode()).hexdigest()[:6]}"
 
 
-def _edge(verb: str, body: dict, port: int) -> dict:
+def _edge(verb: str, body: dict, port: int, timeout: int = 10) -> dict:
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/edge/task/{verb}",
         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:  # noqa: BLE001
         return {"error": f"edge unreachable on :{port} ({type(e).__name__}): "
@@ -269,6 +269,28 @@ def task(
 def task_status(port: int = typer.Option(EDGE_PORT_DEFAULT, "--port")):
     """Cell-side task service status (supervisor, bank, reversibility)."""
     typer.echo(json.dumps(_edge("status", {}, port), indent=1))
+
+
+def models_install(port: int = typer.Option(EDGE_PORT_DEFAULT, "--port")):
+    """Install the pinned perception checkpoints on this cell (once; GBs, minutes).
+    Run it right after setup so task runs find the models warm — the agent never
+    spends tokens fetching weights."""
+    typer.secho("Downloading + hash-verifying pinned perception models "
+                "(SAM 2.1, GroundingDINO)…", fg=typer.colors.CYAN)
+    out = _edge("models_install", {}, port, timeout=1800)
+    typer.echo(json.dumps(out, indent=1))
+    models = out.get("models") or {}
+    bad = {k: v for k, v in models.items() if not v.get("ok")}
+    if bad or "error" in out:
+        typer.secho("Some models did not install — task runs will use geometric "
+                    "perception (stated, not fatal).", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+    typer.secho("✓ models installed + verified.", fg=typer.colors.GREEN)
+
+
+def models_status(port: int = typer.Option(EDGE_PORT_DEFAULT, "--port")):
+    """Which pinned perception checkpoints are present + verified on this cell."""
+    typer.echo(json.dumps(_edge("models_status", {}, port), indent=1))
 
 
 def task_report(

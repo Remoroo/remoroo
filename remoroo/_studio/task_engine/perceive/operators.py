@@ -23,10 +23,30 @@ class PerceptionOps:
 
     # capture ------------------------------------------------------------------
     def capture(self, camera: str) -> Dict[str, Any]:
-        frame = self.bridge.camera_frame(camera)
+        """Normalized frame dict from WHATEVER the authored Bridge returns: a rich
+        grab_camera(camera) dict when the bridge has one, else camera_frame(camera) —
+        which per the authored contract is the tuple (depth_m, K_3x3, t_capture); rgb
+        may be absent (depth-only rigs are normal, the geometric ops still work)."""
+        grab = getattr(self.bridge, "grab_camera", None)
+        frame = grab(camera) if callable(grab) else self.bridge.camera_frame(camera)
         if frame is None:
             raise RuntimeError(f"camera {camera!r} returned no frame")
-        return frame
+        if isinstance(frame, dict):
+            frame.setdefault("camera", camera)
+            frame.setdefault("rgb", None)
+            frame.setdefault("depth", None)
+            frame.setdefault("t_capture", 0.0)
+            return frame
+        seq = tuple(frame)
+        out: Dict[str, Any] = {
+            "rgb": None,
+            "depth": seq[0] if len(seq) > 0 else None,
+            "camera": camera,
+            "t_capture": float(seq[2]) if len(seq) > 2 and seq[2] is not None else 0.0,
+        }
+        if len(seq) > 1 and seq[1] is not None:
+            out["K"] = seq[1]
+        return out
 
     # learned proposals ------------------------------------------------------------
     def segment(self, prompt: Any, frame: Dict[str, Any]) -> List[np.ndarray]:
