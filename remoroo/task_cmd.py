@@ -147,14 +147,19 @@ def task(
                                              "Omit it: known tasks reuse their skill "
                                              "automatically, new ones get a picker."),
     budget_trials: int = typer.Option(200, "--budget", help="Max real trials this run."),
+    budget_hours: float = typer.Option(10.0, "--hours",
+                                       help="Wall-clock budget in hours (our cost "
+                                            "control; never billed)."),
     model: Optional[str] = typer.Option(None, "--model"),
     brain_url: Optional[str] = typer.Option(None, "--brain-url"),
     yes: bool = typer.Option(True, "-y/--confirm", help="No prompts; the run is autonomous."),
 ):
     """Run + learn a task autonomously on the set-up cell (Setup must be complete)."""
     from .auth import ensure_logged_in
+    from .configs import get_api_url, get_default_engine
+    from .engine.utils.doctor import ensure_ready, resolve_execution_engine
     from .ids import new_run_id
-    from .paths import resolve_repo_path
+    from .paths import resolve_out_dir, resolve_repo_path
     from .tui_launch_config import LaunchConfig, exit_code_for_result
     from .run_local import run_local_worker_headless
 
@@ -164,6 +169,11 @@ def task(
                     fg=typer.colors.RED)
         raise typer.Exit(code=2)
     client = ensure_logged_in()
+    ensure_ready()
+    if brain_url is None:
+        brain_url = get_api_url()
+    engine_resolved = resolve_execution_engine(get_default_engine().lower(),
+                                               explicit_docker=False)
     slug = slug_of(sentence)
     run_id = new_run_id()
 
@@ -185,15 +195,35 @@ def task(
     typer.secho("    Autonomous: no gates. Watch (optional): Studio task window / "
                 "sibling feed. Morning report lands in .remoroo/task/reports/.",
                 fg=typer.colors.YELLOW)
+    # Autonomous heavyweight reasoning: same flagship default as `remoroo setup`.
+    if not model:
+        model = "anthropic/claude-opus-4.8"
+
     cfg = LaunchConfig(
-        repo=repo_path, out=None, brain_url=brain_url, engine=None, verbose=False,
-        cache_env=True, in_place=True, agentic=True, engine_version="v2",
-        max_wall_time_s=None, allow_overage=False, yes=yes, no_patch=False,
+        mode="new",
+        repo_path=repo_path,
+        out_dir=resolve_out_dir(None, repo_path),
+        brain_url=brain_url,
+        engine=engine_resolved,
+        verbose=False,
+        cache_env=True,
+        in_place=True,
+        agentic=True,
+        engine_version="v2",
+        max_wall_time_s=int(budget_hours * 3600),
+        allow_overage=False,
+        yes=yes,
+        no_patch=False,
         pick_model=False,
         goal=f"@robot_task {sentence}",
-        metrics_list=[], model=model, resume_run_id=None, run_id_display=run_id,
-        attach_status="", attach_goal_preview="", metrics_option_provided=True,
-        interactive=False,
+        metrics_list=[],
+        model=model,
+        resume_run_id=None,
+        run_id_display=run_id,
+        attach_status="",
+        attach_goal_preview="",
+        metrics_option_provided=True,      # alias default_metrics fill in server-side
+        interactive=False,                 # DEC-04: no gates, no ask_human
         operator_note=(f"task_slug={slug} budget_trials={budget_trials}"
                        + (f" skill_id={skill_id}" if skill_id else "")),
     )
