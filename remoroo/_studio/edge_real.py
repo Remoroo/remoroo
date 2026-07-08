@@ -1491,6 +1491,18 @@ class RealBridge:
     def read_pose(self):
         return self.chain.fk(self.read_joints())
 
+    def read_joints_map(self):
+        """EVERY joint the cell reports, by name — the motion check's crossed-binding diag
+        (which arm actually moved) needs the whole rig, not just this step's chain."""
+        import numpy as np
+        jp = (self._observation().joint_positions) or {}
+        out = {}
+        for n, v in jp.items():
+            arr = np.asarray(v, float).reshape(-1)
+            if arr.size:
+                out[str(n)] = float(arr[0])
+        return out
+
     def move_to_joints(self, joints):
         q = [float(x) for x in joints]
         # 'cuRobo for everything': with a world model loaded, drive a COLLISION-FREE planned path

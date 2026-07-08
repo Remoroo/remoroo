@@ -245,6 +245,7 @@ class CalibSession:
         # planned recalibration scored worse than manual — a human's click delay was a natural
         # settle). Wait until the IMAGE is stable: consecutive detections must agree.
         self.settle_max_wait_s = 2.0
+        self.motion_wait_s = 4.0        # motion-check arrival wait (async cell primitives)
         self.settle_interval_s = 0.15
         self.settle_drift_px = 0.8   # ringing is >1px; detection noise ~0.2–0.5px sits below
         # Engine-COMMANDED motion happens with the bridge lock held for the whole move, so the
@@ -292,16 +293,63 @@ class CalibSession:
             step = float(target - q0[j])     # q0[j] is np.float64 → keep step a python float
         q1 = q0.copy()
         q1[j] += step
+        map0 = self._joints_map()                         # full-rig snapshot (foreign-motion diag)
         self.bridge.move_to_joints(q1)
-        obs = self.bridge.read_joints() - q0
-        self.bridge.move_to_joints(q0)                    # return to start
+        # WAIT FOR ARRIVAL, never an instant read: a cell move primitive may return before the
+        # motion completes (async controller) — judging from one immediate sample fails a move
+        # that is still happening ("arm didn't move" while the operator watches it move).
+        obs_q = self._wait_until_reached(q1, tol, timeout_s=self.motion_wait_s)
+        obs = obs_q - q0
         cmd = q1 - q0
         max_err = float(np.max(np.abs(obs - cmd)))
+        # THE crossed-binding diagnosis: our chain read no motion — did OTHER joints move? The
+        # command routes by the authored arm LABEL (primitives.py), the measurement by the
+        # authored group's chain (cell.yaml tip_links); if those two point at different arms,
+        # the moved joints show up here BY NAME instead of a dead-end "didn't move".
+        moved_elsewhere = {}
+        if max_err >= tol and map0:
+            map1 = self._joints_map()
+            ours = set(getattr(self.bridge, "joint_names", []) or [])
+            moved_elsewhere = {n: round(float(map1[n] - map0[n]), 4)
+                               for n in map1 if n in map0 and n not in ours
+                               and abs(float(map1[n] - map0[n])) > tol}
+        self.bridge.move_to_joints(q0)                    # return to start
         estop = bool(self.bridge.estop_ok())
         # need a real commanded motion (a clamped-to-zero nudge can't prove anything)
         self.motion_ok = bool((max_err < tol) and estop and (abs(step) > 1e-4))
-        return {"type": "motion_check", "ok": self.motion_ok, "max_err_rad": round(max_err, 5),
-                "joint": j, "estop_ok": estop, "commanded": _T(cmd), "observed": _T(obs)}
+        out = {"type": "motion_check", "ok": self.motion_ok, "max_err_rad": round(max_err, 5),
+               "joint": j, "estop_ok": estop, "commanded": _T(cmd), "observed": _T(obs)}
+        if moved_elsewhere:
+            out["moved_elsewhere"] = moved_elsewhere
+            out["error"] = ("this step's chain read NO motion but these joints moved: "
+                            + ", ".join(f"{n} ({d:+.3f} rad)" for n, d in moved_elsewhere.items())
+                            + " — the step's arm label and its chain point at DIFFERENT arms "
+                              "(cell.yaml groups tip_links vs primitives.py arm routing); fix "
+                              "the authored mapping, don't retry")
+        return out
+
+    def _joints_map(self) -> dict:
+        """The WHOLE rig's joints by name (not just this step's chain) — optional bridge hook;
+        {} when the bridge can't provide it (off-robot fakes without it lose only the diag)."""
+        fn = getattr(self.bridge, "read_joints_map", None)
+        if not callable(fn):
+            return {}
+        try:
+            return {str(k): float(v) for k, v in (fn() or {}).items()}
+        except Exception:  # noqa: BLE001 — a diag helper must never break the check
+            return {}
+
+    def _wait_until_reached(self, target: np.ndarray, tol: float,
+                            timeout_s: float = 4.0, interval_s: float = 0.1) -> np.ndarray:
+        """Poll until the joints arrive at `target` (within tol) or timeout — zero extra
+        latency for a synchronous primitive (the first read is already there)."""
+        import time as _t
+        t0 = _t.time()
+        cur = self.bridge.read_joints()
+        while float(np.max(np.abs(cur - target))) >= tol and _t.time() - t0 < timeout_s:
+            _t.sleep(interval_s)
+            cur = self.bridge.read_joints()
+        return cur
 
     # ── detect (board seen?) + bootstrap the board pose estimate ────────────
     def detect(self) -> dict:
