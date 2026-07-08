@@ -94,6 +94,9 @@ def ensure_rig_activated(repo_path: Path, client, base: str,
             return None
         out = _post(base, client.get_token() or "",
                     {**_payload(repo_path), "claim_serial": claim})
+    if out.get("status") == "billing_required":
+        _print_billing_required(out)
+        return None
     if out.get("serial"):
         rid.save_serial(repo_path, out["serial"])
         if out.get("status") == "activated":
@@ -108,6 +111,14 @@ def ensure_rig_activated(repo_path: Path, client, base: str,
         return out["serial"]
     typer.secho(f"activation did not complete: {out}", fg=typer.colors.RED)
     return None
+
+
+def _print_billing_required(out: dict) -> None:
+    typer.secho(out.get("message") or "Activation needs a payment method on file "
+                "(your first robot is still free).", fg=typer.colors.YELLOW)
+    url = out.get("setup_url")
+    if url:
+        typer.echo(f"Add one here, then rerun: {url}")
 
 
 @robot_app.command("activate")
@@ -143,6 +154,9 @@ def activate(
         raise typer.Exit(code=2)
 
     status = out.get("status")
+    if status == "billing_required":
+        _print_billing_required(out)
+        raise typer.Exit(code=4)
     if status == "recognized":
         rid.save_serial(repo_path, out["serial"])
         typer.secho(f"✓ rig recognized: {out['serial']} (leg: {out.get('leg')}). "

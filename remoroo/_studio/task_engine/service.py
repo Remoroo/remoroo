@@ -10,6 +10,7 @@ returns a stated error, never a crash.
 from __future__ import annotations
 
 import importlib
+import inspect
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -26,13 +27,15 @@ BRIDGE_VERBS = {"trial_run", "vla_rollout"}   # edge_real wraps these in its _br
 class TaskService:
     def __init__(self, *, data_dir: str = ".remoroo/task",
                  env_builder: Optional[Callable[[str], Any]] = None,
-                 bridge: Optional[Any] = None) -> None:
+                 bridge: Optional[Any] = None,
+                 stack_provider: Optional[Callable[[], Any]] = None) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.bank = RegressionBank.load(str(self.data_dir / "bank.jsonl"))
         self.reversibility = ReversibilityTable.load(str(self.data_dir / "reversibility.json"))
         self.supervisor: Optional[Supervisor] = None
         self._bridge = bridge
+        self._stack_provider = stack_provider
         self._env_builder = env_builder or self._default_env_builder
         self._stores: Dict[str, TrialStore] = {}
 
@@ -42,9 +45,25 @@ class TaskService:
             self._stores[task_slug] = TrialStore(str(self.data_dir / "trials" / task_slug))
         return self._stores[task_slug]
 
+    def _shared(self) -> Dict[str, Any]:
+        """THE handoff to the authored cell package: build_env(shared) receives the LIVE
+        surfaces here — the Bridge and the MotionStack — plus the task data dir. This is
+        the contract; the package never reaches into the edge for accessors."""
+        stack = None
+        if self._stack_provider is not None:
+            stack = self._stack_provider()             # may build/warm: that's the point
+        return {"bridge": self._bridge, "stack": stack,
+                "data_dir": str(self.data_dir)}
+
     def _default_env_builder(self, task_slug: str) -> Any:
         mod = importlib.import_module(f"remoroo_cell.task_{task_slug}")
-        return mod.build_env(), getattr(mod, "actor")
+        build = mod.build_env
+        # build_env(shared) is the contract; a zero-arg build_env stays supported.
+        takes_shared = any(
+            p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            for p in inspect.signature(build).parameters.values())
+        env = build(self._shared()) if takes_shared else build()
+        return env, getattr(mod, "actor")
 
     # ---- dispatch --------------------------------------------------------------------
     def handle(self, verb: str, body: Dict[str, Any]) -> Dict[str, Any]:

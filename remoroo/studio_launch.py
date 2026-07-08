@@ -292,9 +292,15 @@ def serve_studio(project_dir: Path, port: int = 7777, token: Optional[str] = Non
 
 
 def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, edge_url: str = "",
-                        agent_url: str = "", port: int = 7777) -> bool:
-    """Create the real @robot_setup run + local worker, serve the Studio, and
-    proxy the run API to the control plane so the browser is the entire UX."""
+                        agent_url: str = "", port: int = 7777, mode: str = "setup",
+                        extra_env: Optional[dict] = None) -> bool:
+    """Create the real run + local worker, serve the RUN-BOUND Studio, and proxy the run
+    API to the control plane so the browser is the entire UX.
+
+    mode="setup": the gate wizard (interactive, operator-supervised).
+    mode="task":  the TASK COCKPIT — same binding, zero gates: the Studio renders the
+    agent stream, live robot mirror, trials, engine state, and the sibling feed. The
+    task phase is autonomous in CONTROL, total in VISIBILITY (nothing runs dark)."""
     from .run_local import (
         prepare_local_worker_context,
         finalize_local_worker_session,
@@ -314,7 +320,8 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
     project_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. create the run on the control plane + prepare the local worker context
-    echo("Starting the @robot_setup run on the control plane…")
+    echo(f"Starting the {'@robot_task' if mode == 'task' else '@robot_setup'} run "
+         "on the control plane…")
     try:
         ctx = prepare_local_worker_context(
             repo_path=cfg.repo_path, goal=cfg.goal, metrics=cfg.metrics_list, brain_url=cfg.brain_url,
@@ -340,7 +347,10 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
         "BRAIN_URL": (agent_url or ctx.api_url or cfg.brain_url or "").rstrip("/"),
         "RUN_ID": ctx.remote_run_id,
         "SESSION_KEY": ctx.session_key or "",
+        "STUDIO_MODE": mode,
     })
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items() if v})
     if edge_url:
         env["EDGE_URL"] = edge_url
     studio_proc = _spawn_studio(studio, env, echo)
@@ -350,7 +360,11 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
 
     url = f"http://{lan_ip()}:{port}/?token={token}"
     _banner(echo, url, port, token, project_dir, edge_url, env["BRAIN_URL"], ctx.remote_run_id)
-    echo("  The agent is now driving setup — watch + answer it in the browser.")
+    if mode == "task":
+        echo("  The agent is running the task autonomously — the browser is the "
+             "cockpit: decisions, trials, engine state, sibling feed. No gates.")
+    else:
+        echo("  The agent is now driving setup — watch + answer it in the browser.")
 
     # 3. run the worker loop in the background (executes the agent's gate tools here)
     def _worker_loop():
@@ -372,7 +386,8 @@ def launch_setup_studio(cfg, echo: Echo = print, *, spawn_edge: bool = False, ed
                 "success": outcome.success, "partial_success": outcome.partial_success,
                 "_cleanup_worker": worker,
             })
-            echo(f"\n✅ Setup run finished: {outcome.outcome}. Studio still serving for review — Ctrl+C to stop.")
+            echo(f"\n✅ {'Task' if mode == 'task' else 'Setup'} run finished: {outcome.outcome}. "
+                 "Studio still serving for review — Ctrl+C to stop.")
         except Exception as e:  # noqa: BLE001
             echo(f"\n⚠ Worker loop error: {e}")
         finally:

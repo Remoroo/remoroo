@@ -135,6 +135,12 @@ def post_activate(base_url: str, token: str, payload: Dict[str, Any],
                   timeout: float = 30.0) -> Dict[str, Any]:
     r = requests.post(f"{base_url.rstrip('/')}/rigs/activate", json=payload,
                       headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    if r.status_code == 402:
+        # No payment method on file yet: activation needs the billing signup first.
+        detail = (r.json() or {}).get("detail")
+        if isinstance(detail, dict):
+            return {"status": "billing_required", **detail}
+        return {"status": "billing_required", "message": str(detail or "")}
     r.raise_for_status()
     return r.json()
 

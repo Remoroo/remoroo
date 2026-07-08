@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -516,8 +517,25 @@ class Handler(BaseHTTPRequestHandler):
             ok, _info = auth_reason(q, self.headers)
             self._json({"authed": ok, "version": os.environ.get("STUDIO_VERSION", "")})
         elif p == "/studio/session":
+            # mode: "setup" (gate wizard) | "task" (the cockpit — window, never a gate).
             self._json({"run_id": RUN_ID, "edge": "real" if EDGE_URL else "none", "brain": bool(BRAIN_URL),
-                        "version": os.environ.get("STUDIO_VERSION", "")})
+                        "version": os.environ.get("STUDIO_VERSION", ""),
+                        "mode": os.environ.get("STUDIO_MODE", "setup"),
+                        "task": {"slug": os.environ.get("TASK_SLUG", ""),
+                                 "sentence": os.environ.get("TASK_SENTENCE", ""),
+                                 "skill_name": os.environ.get("SKILL_NAME", ""),
+                                 "skill_id": os.environ.get("SKILL_ID", "")}})
+        elif p == "/project/task_report":
+            # The morning report markdown for a slug (read-only; the operator surface).
+            slug = (q.get("slug", [""])[0] or "").strip()
+            if not re.fullmatch(r"[a-z0-9_]+", slug or ""):
+                self._json({"error": "bad slug"}, 400)
+            else:
+                rp = PROJECT / ".remoroo" / "task" / "reports" / f"{slug}.md"
+                try:
+                    self._json({"slug": slug, "markdown": rp.read_text(encoding="utf-8")})
+                except Exception:                        # noqa: BLE001 - not written yet
+                    self._json({"slug": slug, "markdown": ""})
         elif p == "/control/edge/log":
             self._edge_log(q)
         elif p == "/api/robotics/summary":

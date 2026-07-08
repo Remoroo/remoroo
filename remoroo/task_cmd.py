@@ -152,6 +152,12 @@ def task(
                                             "control; never billed)."),
     model: Optional[str] = typer.Option(None, "--model"),
     brain_url: Optional[str] = typer.Option(None, "--brain-url"),
+    headless: bool = typer.Option(False, "--headless",
+                                  help="No Studio: terminal stream only. Default is "
+                                       "the TASK COCKPIT in the browser — the run is "
+                                       "autonomous either way (the Studio is a window, "
+                                       "never a gate)."),
+    port: int = typer.Option(7777, "--port", help="Studio port (cockpit mode)."),
     yes: bool = typer.Option(True, "-y/--confirm", help="No prompts; the run is autonomous."),
 ):
     """Run + learn a task autonomously on the set-up cell (Setup must be complete)."""
@@ -202,8 +208,12 @@ def task(
         pass
     typer.secho(f"🤖  remoroo task → @robot_task  (slug: {slug}, run: {run_id})",
                 fg=typer.colors.CYAN)
-    typer.secho("    Autonomous: no gates. Watch (optional): Studio task window / "
-                "sibling feed. Morning report lands in .remoroo/task/reports/.",
+    typer.secho("    Autonomous: no gates. "
+                + ("Terminal stream only (--headless)."
+                   if headless else
+                   "Opening the task cockpit: agent decisions, live robot, trials, "
+                   "engine state, sibling feed.")
+                + " Morning report lands in .remoroo/task/reports/.",
                 fg=typer.colors.YELLOW)
     # Autonomous heavyweight reasoning: same flagship default as `remoroo setup`.
     if not model:
@@ -237,6 +247,21 @@ def task(
         operator_note=(f"task_slug={slug} budget_trials={budget_trials}"
                        + (f" skill_id={skill_id}" if skill_id else "")),
     )
+
+    if not headless:
+        # The DEFAULT: the run-bound Studio in TASK COCKPIT mode — same binding as
+        # setup (CP run + session key + edge), zero gates. Nothing runs dark: agent
+        # stream, live robot mirror, trials, engine state, sibling feed.
+        from .studio_launch import launch_setup_studio
+
+        mapping = _load_skill_map(repo_path)
+        skill_name = (mapping.get(slug) or {}).get("name") or (skill or "")
+        ok = launch_setup_studio(
+            cfg, spawn_edge=True, port=port, mode="task",
+            extra_env={"TASK_SLUG": slug, "TASK_SENTENCE": sentence,
+                       "SKILL_NAME": skill_name, "SKILL_ID": skill_id or ""})
+        raise typer.Exit(code=0 if ok else 1)
+
     lr = run_local_worker_headless(cfg)
     raise typer.Exit(code=exit_code_for_result(lr.success, lr.partial_success))
 

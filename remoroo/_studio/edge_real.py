@@ -2524,7 +2524,10 @@ def _task_handle(verb: str, body: dict) -> dict:
     except Exception as e:  # noqa: BLE001 - stated, never a dead handler
         return {"error": f"task_engine unavailable: {type(e).__name__}: {e}"}
     if _task_service is None:
-        _task_service = TaskService()
+        # stack_provider hands the LIVE MotionStack to build_env(shared) — the authored
+        # task package composes its GenericEnv from shared["stack"]/shared["bridge"],
+        # never by reaching into this module.
+        _task_service = TaskService(stack_provider=lambda: motion_stack())
     if _task_service._bridge is None:
         # The cell Bridge comes up mid-session (primitives.py is authored at G2), so bind
         # lazily on every call until it exists — same discipline as the live mirror.
