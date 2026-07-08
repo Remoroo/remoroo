@@ -178,16 +178,26 @@ def task(
     run_id = new_run_id()
 
     base = brain_url or client.base_url
+
+    # Everything robotics requires an activated rig. Recognized rigs (token /
+    # rolling fingerprint) pass silently; an unknown rig gets the once-per-lifetime
+    # question here — never an invoice.
+    from .robot_cmd import ensure_rig_activated
+    serial = ensure_rig_activated(repo_path, client, base)
+    if not serial:
+        typer.secho("Task runs need an activated rig: run `remoroo robot activate` "
+                    "once on this machine (existing rigs re-bind for free).",
+                    fg=typer.colors.RED)
+        raise typer.Exit(code=3)
+
     skill_id = _resolve_skill(client, base, repo_path, sentence=sentence, slug=slug,
                               flag_value=skill)
     try:                                                # rig liveness, best-effort
         from . import rig_identity as rid
-        serial = rid.saved_serial(repo_path)
-        if serial:
-            rid.post_heartbeat(base, client.get_token() or "", serial,
-                               {"rig_token": rid.rig_token(repo_path),
-                                "host": rid.compute_fingerprint(repo_path)
-                                ["components"]["host"][0]})
+        rid.post_heartbeat(base, client.get_token() or "", serial,
+                           {"rig_token": rid.rig_token(repo_path),
+                            "host": rid.compute_fingerprint(repo_path)
+                            ["components"]["host"][0]})
     except Exception:                                   # noqa: BLE001 - never blocks a run
         pass
     typer.secho(f"🤖  remoroo task → @robot_task  (slug: {slug}, run: {run_id})",
