@@ -32,6 +32,12 @@ class PerceptionOps:
         if frame is None:
             raise RuntimeError(f"camera {camera!r} returned no frame")
         if isinstance(frame, dict):
+            # Key-normalize authored dialects: bridges commonly say depth_m /
+            # intrinsics; the operator contract says depth / K.
+            if "depth" not in frame and "depth_m" in frame:
+                frame["depth"] = frame["depth_m"]
+            if "K" not in frame and "intrinsics" in frame:
+                frame["K"] = frame["intrinsics"]
             frame.setdefault("camera", camera)
             frame.setdefault("rgb", None)
             frame.setdefault("depth", None)

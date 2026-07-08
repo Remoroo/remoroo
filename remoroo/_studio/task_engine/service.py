@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -56,7 +57,18 @@ class TaskService:
                 "data_dir": str(self.data_dir)}
 
     def _default_env_builder(self, task_slug: str) -> Any:
-        mod = importlib.import_module(f"remoroo_cell.task_{task_slug}")
+        # HOT RELOAD: every trial imports the authored package FRESH, so the agent's
+        # edit -> task_trial cycle needs NO edge restart (a restart also costs the
+        # cuRobo warmup). Only the tiny task package reloads; the Bridge
+        # (primitives.py) holds live device handles and still needs a real restart.
+        pkg = f"remoroo_cell.task_{task_slug}"
+        for name in [m for m in list(sys.modules)
+                     if m == pkg or m.startswith(pkg + ".")]:
+            del sys.modules[name]
+        # The package is AUTHORED mid-session (after this process started): without this,
+        # the FileFinder's directory cache can miss brand-new files entirely.
+        importlib.invalidate_caches()
+        mod = importlib.import_module(pkg)
         build = mod.build_env
         # build_env(shared) is the contract; a zero-arg build_env stays supported.
         takes_shared = any(

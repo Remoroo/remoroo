@@ -43,6 +43,41 @@ def _headers(client) -> dict:
     return {"Authorization": f"Bearer {client.get_token() or ''}"}
 
 
+# ---- evolution resume (the task's state lives ON THE CELL; runs come and go) ----------
+_TASK_RUNS_PTR = ".remoroo/task/last_runs.json"
+
+_ARTIFACTS = ("perception_task.py", "perception_judge.py", "verifier.py",
+              "resetter.py", "actor.py", "skills_task.py")
+
+
+def _read_last_task_run(repo_path: Path, slug: str) -> Optional[str]:
+    try:
+        return json.loads((repo_path / _TASK_RUNS_PTR).read_text()).get(slug) or None
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _write_last_task_run(repo_path: Path, slug: str, run_id: str) -> None:
+    p = repo_path / _TASK_RUNS_PTR
+    try:
+        data = json.loads(p.read_text()) if p.exists() else {}
+    except Exception:                                   # noqa: BLE001
+        data = {}
+    data[slug] = run_id
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+
+def _evolution_state(repo_path: Path, slug: str) -> dict:
+    """What already exists for this task on the cell: authored artifacts + trials.
+    This is what makes re-running the same sentence a RESUME, never a restart."""
+    pkg = repo_path / "remoroo_cell" / f"task_{slug}"
+    artifacts = [a for a in _ARTIFACTS if (pkg / a).exists()] if pkg.is_dir() else []
+    trials_dir = repo_path / ".remoroo" / "task" / "trials" / slug
+    trials = len(list(trials_dir.glob("*.json"))) if trials_dir.is_dir() else 0
+    return {"exists": pkg.is_dir(), "artifacts": artifacts, "trials": trials}
+
+
 def _skill_map_path(repo_path: Path) -> Path:
     return repo_path / ".remoroo" / "task" / "skill_map.json"
 
@@ -152,6 +187,11 @@ def task(
                                             "control; never billed)."),
     model: Optional[str] = typer.Option(None, "--model"),
     brain_url: Optional[str] = typer.Option(None, "--brain-url"),
+    cont: bool = typer.Option(False, "-c", "--continue",
+                              help="Also carry the CONVERSATION from this task's last "
+                                   "run (checkpoint seed). The evolution itself (your "
+                                   "artifacts, trials, bank) always resumes from the "
+                                   "cell regardless of this flag."),
     headless: bool = typer.Option(False, "--headless",
                                   help="No Studio: terminal stream only. Default is "
                                        "the TASK COCKPIT in the browser — the run is "
@@ -198,6 +238,35 @@ def task(
 
     skill_id = _resolve_skill(client, base, repo_path, sentence=sentence, slug=slug,
                               flag_value=skill)
+
+    # RESUME: the evolution lives on the cell (artifacts + trials + bank), so the same
+    # sentence continues where it left off. --continue additionally carries the agent's
+    # conversation from the last run of this slug.
+    evo = _evolution_state(repo_path, slug)
+    resume_note = ""
+    if evo["exists"] or evo["trials"] > 0:
+        typer.secho(f"    ↻ resuming evolution: {len(evo['artifacts'])}/6 artifacts, "
+                    f"{evo['trials']} trials recorded — the agent continues, not restarts.",
+                    fg=typer.colors.GREEN)
+        resume_note = (f" resume=yes artifacts={len(evo['artifacts'])}/6 "
+                       f"trials={evo['trials']}")
+    if cont:
+        from .setup_cmd import seed_checkpoint_from_prior
+        prior = _read_last_task_run(repo_path, slug)
+        if not prior:
+            typer.secho("    (--continue: no prior run recorded for this task; "
+                        "starting a fresh conversation over the existing evolution)",
+                        fg=typer.colors.YELLOW)
+        else:
+            carried = seed_checkpoint_from_prior(repo_path, prior, run_id)
+            if carried:
+                typer.secho(f"    ↻ conversation carried from {prior} "
+                            f"({carried} messages restored).", fg=typer.colors.GREEN)
+            else:
+                typer.secho(f"    (--continue: no usable checkpoint from {prior}; "
+                            "fresh conversation over the existing evolution)",
+                            fg=typer.colors.YELLOW)
+    _write_last_task_run(repo_path, slug, run_id)
     try:                                                # rig liveness, best-effort
         from . import rig_identity as rid
         rid.post_heartbeat(base, client.get_token() or "", serial,
@@ -245,7 +314,8 @@ def task(
         metrics_option_provided=True,      # alias default_metrics fill in server-side
         interactive=False,                 # DEC-04: no gates, no ask_human
         operator_note=(f"task_slug={slug} budget_trials={budget_trials}"
-                       + (f" skill_id={skill_id}" if skill_id else "")),
+                       + (f" skill_id={skill_id}" if skill_id else "")
+                       + resume_note),
     )
 
     if not headless:
