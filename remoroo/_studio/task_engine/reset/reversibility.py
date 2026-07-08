@@ -54,7 +54,7 @@ class ReversibilityTable:
 
 class IrreversibleBudget:
     """Actions whose class is not measured-reversible draw from this, like damage. Exhausted
-    means the night stops spending irreversible actions; it does NOT stop learning (mode 3/4,
+    means the session stops spending irreversible actions; it does NOT stop learning (mode 3/4,
     ENG 5.2)."""
 
     def __init__(self, units: int) -> None:

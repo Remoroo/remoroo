@@ -182,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _proxy(self, base: str, auth: str = ""):
+    def _proxy(self, base: str, auth: str = "", path: str | None = None):
         u = urlsplit(base)
         cls = HTTPSConnection if u.scheme == "https" else HTTPConnection
         conn = cls(u.hostname, u.port or (443 if u.scheme == "https" else 80), timeout=600)
@@ -194,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
         if body is not None:
             headers["Content-Length"] = str(len(body))
         try:
-            conn.request(self.command, self.path, body=body, headers=headers)
+            conn.request(self.command, path or self.path, body=body, headers=headers)
             resp = conn.getresponse()
         except Exception as e:
             self._json({"error": "upstream unreachable", "detail": str(e)}, 502)
@@ -520,6 +520,21 @@ class Handler(BaseHTTPRequestHandler):
                         "version": os.environ.get("STUDIO_VERSION", "")})
         elif p == "/control/edge/log":
             self._edge_log(q)
+        elif p == "/api/robotics/summary":
+            # Account view (read-only): rigs, skills, billing events from the CP.
+            if BRAIN_URL:
+                self._proxy(BRAIN_URL, SESSION_KEY, path="/robotics/summary")
+            else:
+                self._json({"error": "account view needs the control plane"}, 501)
+        elif p == "/api/sibling/events" or p == "/api/sibling/events_page":
+            # Sibling viz: the SPA never learns the GPU worker's address — the CP relays
+            # its events under this run's API and we proxy with a rewritten path.
+            if BRAIN_URL and RUN_ID:
+                tail = p.rsplit("/", 1)[-1]
+                qs = f"?{urlsplit(self.path).query}" if urlsplit(self.path).query else ""
+                self._proxy(BRAIN_URL, SESSION_KEY, path=f"/runs/{RUN_ID}/sibling/{tail}{qs}")
+            else:
+                self._json({"error": "sibling feed needs a control-plane run"}, 501)
         elif p == "/live/joints" or p.startswith("/edge/"):
             self._proxy(EDGE_URL) if EDGE_URL else self._json({"error": "edge not connected"}, 501)
         elif p.startswith("/runs/") or p.startswith("/agent/"):

@@ -20,7 +20,7 @@ from .reset.reversibility import ReversibilityTable
 from .run_trial import TrialBudget, run_trial
 from .supervisor import Supervisor, SupervisorConfig
 
-BRIDGE_VERBS = {"trial_run"}          # edge_real wraps these in its _bridge_lock
+BRIDGE_VERBS = {"trial_run", "vla_rollout"}   # edge_real wraps these in its _bridge_lock
 
 
 class TaskService:
@@ -136,3 +136,55 @@ class TaskService:
         env, _actor = self._env_builder(body["task_slug"])
         return {"trial_id": rec.trial_id, "old": rec.verdict,
                 "new": replay_score(rec, env.judge_fn)}
+
+    # ---- VLA verbs (ENG 8.3): the cold-start policy as smart probe / whole stage -------
+    def v_vla_load(self, body: dict) -> dict:
+        """Load a policy runtime on this cell. 'fake' is the CI/dry-run policy; 'openpi'
+        lazy-loads pi0.5 weights (GPU cell only — loading is the stated failure off-GPU)."""
+        kind = body.get("runtime", "fake")
+        if kind == "fake":
+            from .vla.runtime import FakeVLA
+            self._vla = FakeVLA(approach_steps=int(body.get("approach_steps", 3)))
+        elif kind == "openpi":
+            from .vla.runtime import OpenPiRuntime
+            self._vla = OpenPiRuntime(checkpoint=body.get("checkpoint", "pi05_base"),
+                                      tcp=body.get("tcp", "arm_a"))
+        else:
+            return {"error": f"unknown runtime {kind!r} (fake | openpi)"}
+        self._vla_kind = kind
+        return {"ok": True, "runtime": kind}
+
+    def v_vla_status(self, body: dict) -> dict:
+        kind = getattr(self, "_vla_kind", None)
+        return {"loaded": kind is not None, "runtime": kind}
+
+    def v_vla_rollout(self, body: dict) -> dict:
+        """One guarded VLA episode as a FULL trial: reset -> observe -> policy (every
+        action through GuardedExecutor clamps + envelope) -> judge -> record. The record
+        is judge-labeled probe footage — day-zero demonstrations and finetune data."""
+        runtime = getattr(self, "_vla", None)
+        if runtime is None:
+            return {"error": "no VLA runtime loaded; call vla_load first"}
+        slug = body["task_slug"]
+        instruction = body.get("instruction") or slug.replace("_", " ")
+        try:
+            env, _actor = self._env_builder(slug)
+        except Exception as e:                     # noqa: BLE001
+            return {"error": (f"cell task package not available for {slug!r}: "
+                              f"{type(e).__name__}: {e}")}
+        from .vla.skill import make_vla_skill
+        vla = make_vla_skill(runtime)
+        max_steps = int(body.get("max_steps", 30))
+
+        def actor(env_, ctx):
+            vla(env_, ctx, instruction, max_steps=max_steps)
+
+        rec = run_trial(env, actor, task_slug=slug,
+                        program_ref=f"vla:{getattr(self, '_vla_kind', '?')}",
+                        knobs=Knobs(body.get("knobs") or {}),
+                        seed=int(body.get("seed", 0)),
+                        budget=TrialBudget(**(body.get("budget") or {})),
+                        store=self._store(slug),
+                        skip_reset=bool(body.get("skip_reset", False)))
+        return {"trial_id": rec.trial_id, "outcome": rec.outcome, "verdict": rec.verdict,
+                "instruction": instruction, "runtime": getattr(self, "_vla_kind", "?")}

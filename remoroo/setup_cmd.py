@@ -274,9 +274,21 @@ def setup(
         explicit_docker=(engine_opt is not None and engine_resolved == "docker"),
     )
 
-    ensure_logged_in()
+    client = ensure_logged_in()
 
     repo_path = resolve_repo_path(repo)
+
+    # Activation gate: setup opens the Studio on a live rig, and unactivated rigs
+    # cannot open the Studio. Recognized rigs (token / rolling fingerprint — every
+    # previously activated rig) pass silently; an unknown rig gets the
+    # once-per-lifetime question here, never an invoice.
+    from .robot_cmd import ensure_rig_activated
+    if not ensure_rig_activated(repo_path, client, client.base_url):
+        typer.secho("Setup needs an activated rig: run `remoroo robot activate` once "
+                    "on this machine (existing rigs re-bind for free).",
+                    fg=typer.colors.RED)
+        raise typer.Exit(code=3)
+
     out_dir = resolve_out_dir(out, repo_path)
     run_id = new_run_id()
     max_wall_time_s = int(budget_hours * 3600)

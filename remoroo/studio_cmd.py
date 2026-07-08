@@ -39,6 +39,23 @@ def studio(
     from .studio_launch import serve_studio
 
     project_dir = Path(path).resolve() if path else Path.cwd()
+
+    # Activation gate: unactivated rigs cannot open the Studio. Recognized rigs
+    # (token or rolling fingerprint — every previously activated rig) pass silently;
+    # an unknown rig gets the once-per-lifetime question here, never an invoice.
+    if edge or edge_url:                # a live-rig cockpit needs the rig's identity
+        from .auth import ensure_logged_in
+        from .robot_cmd import ensure_rig_activated
+
+        client = ensure_logged_in()
+        serial = ensure_rig_activated(project_dir, client, client.base_url)
+        if not serial:
+            typer.secho("Studio needs an activated rig: run `remoroo robot activate` "
+                        "once on this machine (existing rigs re-bind for free), or use "
+                        "--no-edge for the hardware-free model viewer.",
+                        fg=typer.colors.RED)
+            raise typer.Exit(code=3)
+
     typer.secho(
         f"🎛  Remoroo Studio (operator cockpit) — project {project_dir}\n"
         "    No agent run: re-run calibration / commission / realtime and edit the model on "

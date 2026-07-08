@@ -1,4 +1,4 @@
-"""Damage budget (COMP-05) — a night has a finite allowance of bad events; exhaustion is a
+"""Damage budget (COMP-05) — a session has a finite allowance of bad events; exhaustion is a
 deterministic stop, not a judgment call."""
 from __future__ import annotations
 

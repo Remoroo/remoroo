@@ -2525,6 +2525,13 @@ def _task_handle(verb: str, body: dict) -> dict:
         return {"error": f"task_engine unavailable: {type(e).__name__}: {e}"}
     if _task_service is None:
         _task_service = TaskService()
+    if _task_service._bridge is None:
+        # The cell Bridge comes up mid-session (primitives.py is authored at G2), so bind
+        # lazily on every call until it exists — same discipline as the live mirror.
+        try:
+            _task_service._bridge = get_bridge()
+        except Exception:  # noqa: BLE001 - bridge not ready is a normal early state
+            pass
     if verb in BRIDGE_VERBS:
         with _bridge_lock:
             return _task_service.handle(verb, body)
