@@ -208,8 +208,9 @@ class TaskService:
         joints = body.get("joints")                    # tests/sim may inject
         if joints is None:
             stack = self._stack_provider() if self._stack_provider else None
-            reader = getattr(stack, "joint_positions", None) or getattr(
-                getattr(stack, "bridge", None), "joint_state", None)
+            reader = (getattr(stack, "joint_positions", None)
+                      or getattr(self._bridge, "joint_state", None)
+                      or getattr(stack, "_seed_positions", None))  # the real MotionStack's live config
             joints = dict(reader()) if callable(reader) else {}
         if not joints:
             return {"error": "no joints readable for RUN HOME — startup can't complete"}
@@ -294,11 +295,16 @@ class TaskService:
             from .perceive.operators import PerceptionOps
             frame = PerceptionOps(None, None, env.bridge).capture(body["camera"])
         from .probe_record import probe_and_record
-        return probe_and_record(
+        from .ritual import _goto_home
+        led = self._ledger(slug)
+        _goto_home(env, led.run_home)              # probe starts from RUN HOME ...
+        out = probe_and_record(
             body.get("kind", "touch"), env.new_ctx(), body.get("tcp", ""),
             record=self._record(slug), object_id=body["object_id"],
             library=self._library(), frame=frame,
             narrow=body.get("narrow"), params=body.get("params"))
+        _goto_home(env, led.run_home)              # ... and ends there: cameras clear
+        return out
 
     def v_scout_run(self, body: dict) -> dict:
         """The VLA scout (COMP-12): a guarded rollout that SWEEPS while saving

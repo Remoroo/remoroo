@@ -119,6 +119,7 @@ def load_config(project_dir: Path) -> Optional[dict]:
         "checkpoint": checkpoint,
         "port": str(pick("REMOROO_VLA_PORT", "port", VLA_PORT_DEFAULT)),
         "module": pick("REMOROO_VLA_MODULE", "module", VLA_MODULE_DEFAULT),
+        "qwen_path": pick("REMOROO_VLA_QWEN", "qwen_path"),
         "extra_args": [str(a) for a in extra],
         # env vars the SERVER process needs (QWEN3VL_PATH for the base model, CUDA/cuDNN
         # workarounds, …) — merged over the inherited environment at spawn.
@@ -364,6 +365,67 @@ def ensure_started(project_dir: Path, echo: Echo = print) -> dict:
     """`remoroo task`'s opportunistic hook: unconfigured rigs skip silently; configured
     ones get a non-blocking start (weights warm while the agent grounds the task).
     Failures are stated and never block the run — the geometric path doesn't need this."""
-    if not configured(project_dir):
+    if not configured(project_dir) and not ensure_declared(project_dir, echo):
         return {"skipped": "not_configured"}
     return start(project_dir, echo, wait=False)
+
+
+# --------------------------------------------------------------------------- #
+# Auto-discovery (v2 startup phase: "the operator never hand-writes a 5-flag   #
+# init"). Bounded scan, never a guess: every found piece is verified on disk.  #
+# --------------------------------------------------------------------------- #
+def discover(project_dir: Path) -> Optional[dict]:
+    """Find the LingBot install near the project: a dir containing
+    deploy/lingbot_vla_v2_policy.py in the project's parent or grandparent, a
+    python under it (venv/.venv) or in a sibling venv dir, weights inside
+    <repo>/weights. Returns a vla.yaml-shaped dict or None (stated by caller)."""
+    project_dir = Path(project_dir).resolve()
+    roots = [project_dir.parent, project_dir.parent.parent]
+    repo = None
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            if d.is_dir() and (d / "deploy" / "lingbot_vla_v2_policy.py").exists():
+                repo = d
+                break
+        if repo:
+            break
+    if repo is None:
+        return None
+    python = None
+    for cand in (repo / ".venv" / "bin" / "python", repo / "venv" / "bin" / "python",
+                 *sorted(repo.parent.glob("*lingbot*venv*/bin/python"))):
+        if Path(cand).exists():
+            python = str(cand)
+            break
+    if python is None:
+        return None                       # a repo without its venv can't serve
+    cfg: dict = {"runtime": "lingbot", "python": python, "workdir": str(repo),
+                 "port": int(VLA_PORT_DEFAULT), "extra_args": ["--use_compile"]}
+    weights = repo / "weights"
+    if weights.is_dir():
+        ckpts = sorted(weights.glob("*vla*"))
+        if ckpts:
+            cfg["checkpoint"] = str(ckpts[0])
+        qwen = sorted(weights.glob("Qwen3-VL*"))
+        if qwen:
+            cfg["qwen_path"] = str(qwen[0])
+            cfg["env"] = {"QWEN3VL_PATH": str(qwen[0])}
+    return cfg
+
+
+def ensure_declared(project_dir: Path, echo: Echo = print) -> bool:
+    """No vla.yaml -> try discovery and WRITE it (stated). True when declared."""
+    if configured(project_dir):
+        return True
+    cfg = discover(project_dir)
+    if cfg is None:
+        return False
+    import yaml
+
+    p = config_path(project_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    echo(f"  vla auto-discovered: {cfg['workdir']} (wrote {p})")
+    return True
