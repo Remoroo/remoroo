@@ -70,19 +70,29 @@ class EnsembleJudge:
                  geometric_fn: Optional[Callable[[Any, Any], Optional[float]]] = None,
                  semantic_fn: Optional[Callable[[Any, Any], Optional[float]]] = None,
                  ok_threshold: float = 0.85,
+                 min_scene_confidence: float = 0.5,
                  judge_version: str = "v0") -> None:
         self.geometric_fn = geometric_fn
         self.semantic_fn = semantic_fn
         self.ok_threshold = float(ok_threshold)
+        self.min_scene_confidence = float(min_scene_confidence)
         self.judge_version = judge_version
 
     def judge(self, pre_scene: Any, post_scene: Any, trace: Trace) -> Verdict:
         channels: Dict[str, float] = {"proprio": milestones(trace)}
-        for name, fn in (("geometric", self.geometric_fn), ("semantic", self.semantic_fn)):
-            if fn is not None:
-                v = fn(pre_scene, post_scene)
-                if v is not None:
-                    channels[name] = float(min(max(v, 0.0), 1.0))
+        # A low-confidence post OBSERVATION cannot claim an OUTCOME: an occluded/empty
+        # camera read scores exactly like "all objects picked" to a naive channel (a
+        # live run scored 0.75 with zero grasps this way). Below the floor, the outcome
+        # channels ABSTAIN — stated, and the score falls back to proprioception.
+        post_conf = getattr(getattr(post_scene, "confidence", None), "overall", None)
+        low_post = post_conf is not None and post_conf < self.min_scene_confidence
+        if not low_post:
+            for name, fn in (("geometric", self.geometric_fn),
+                             ("semantic", self.semantic_fn)):
+                if fn is not None:
+                    v = fn(pre_scene, post_scene)
+                    if v is not None:
+                        channels[name] = float(min(max(v, 0.0), 1.0))
         outcome_channels = [v for k, v in channels.items() if k != "proprio"]
         flags: List[str] = []
         if outcome_channels:
@@ -98,6 +108,7 @@ class EnsembleJudge:
             score = channels["proprio"]
             confidence = 0.3
             ok = False
-            flags.append("no_outcome_channel")
+            flags.append("low_confidence_post_observation" if low_post
+                         else "no_outcome_channel")
         return Verdict(score=score, ok=ok, confidence=confidence, channels=channels,
                        judge_version=self.judge_version, flags=flags)

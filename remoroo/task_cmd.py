@@ -78,6 +78,43 @@ def _evolution_state(repo_path: Path, slug: str) -> dict:
     return {"exists": pkg.is_dir(), "artifacts": artifacts, "trials": trials}
 
 
+def _archive_evolution(repo_path: Path, slug: str) -> Optional[Path]:
+    """Archive (never delete) one task's evolution so the machine starts clean:
+    the authored package, its trials/record/ledger/scout/audit/report, and the
+    resume pointer. KEPT on purpose: skill_map.json (skill identity = billing),
+    the ground-truth library, bank, reversibility (cell-wide EVIDENCE — probes and
+    touches stay true across restarts; only PROGRAMS and their state are retired)."""
+    import shutil
+    import time as _time
+
+    task_root = repo_path / ".remoroo" / "task"
+    targets = [
+        repo_path / "remoroo_cell" / f"task_{slug}",
+        task_root / "trials" / slug,
+        task_root / "record" / f"{slug}.json",
+        task_root / "state" / f"{slug}.json",
+        task_root / "scout" / slug,
+        task_root / "audit" / slug,
+        task_root / "reports" / f"{slug}.md",
+    ]
+    existing = [t for t in targets if t.exists()]
+    if not existing:
+        return None
+    dest = task_root / "archive" / f"{slug}_{_time.strftime('%Y%m%d_%H%M%S')}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for t in existing:
+        shutil.move(str(t), str(dest / t.name))
+    ptr = repo_path / _TASK_RUNS_PTR                 # forget the old conversation too
+    try:
+        data = json.loads(ptr.read_text())
+        if slug in data:
+            del data[slug]
+            ptr.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    except Exception:                                # noqa: BLE001
+        pass
+    return dest
+
+
 def _skill_map_path(repo_path: Path) -> Path:
     return repo_path / ".remoroo" / "task" / "skill_map.json"
 
@@ -192,6 +229,12 @@ def task(
                                    "run (checkpoint seed). The evolution itself (your "
                                    "artifacts, trials, bank) always resumes from the "
                                    "cell regardless of this flag."),
+    fresh: bool = typer.Option(False, "--fresh",
+                               help="Archive this task's previous evolution (authored "
+                                    "package, trials, scene record, phase ledger) and "
+                                    "start clean. Skill identity, ground truth, and "
+                                    "probe evidence are KEPT. Use after engine "
+                                    "upgrades that change the method."),
     headless: bool = typer.Option(False, "--headless",
                                   help="No Studio: terminal stream only. Default is "
                                        "the TASK COCKPIT in the browser — the run is "
@@ -238,6 +281,16 @@ def task(
 
     skill_id = _resolve_skill(client, base, repo_path, sentence=sentence, slug=slug,
                               flag_value=skill)
+
+    if fresh:
+        dest = _archive_evolution(repo_path, slug)
+        if dest:
+            typer.secho(f"    ⟲ previous evolution archived to {dest} "
+                        "(skill identity + probe evidence kept). Starting clean.",
+                        fg=typer.colors.YELLOW)
+        else:
+            typer.secho("    (--fresh: nothing to archive for this task)",
+                        fg=typer.colors.YELLOW)
 
     # RESUME: the evolution lives on the cell (artifacts + trials + bank), so the same
     # sentence continues where it left off. --continue additionally carries the agent's

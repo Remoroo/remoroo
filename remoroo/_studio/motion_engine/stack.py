@@ -300,9 +300,21 @@ class MotionStack:
         return list(self._groups)
 
     def _group(self, tcp: str) -> dict:
-        if tcp not in self._groups:
-            raise KeyError(f"unknown group/TCP {tcp!r}; cell has {list(self._groups)}")
-        return self._groups[tcp]
+        return self._groups[self.canon_group(tcp)]
+
+    def canon_group(self, tcp: str) -> str:
+        """THE ONE-NAME CONTRACT (2026-07-10): callers may say a GROUP name ('arm1') or
+        one of its TIP LINKS ('link_tcp') — both resolve. The task atoms pass a single
+        tcp string to BOTH the planning surface (group-keyed) and the FK surface
+        (link-keyed); a live run burned ~15 turns discovering that split, so the split
+        is gone: every public verb accepts either name."""
+        if tcp in self._groups:
+            return tcp
+        for g, spec in self._groups.items():
+            if tcp in (spec.get("tip_links") or []):
+                return g
+        raise KeyError(f"unknown group/TCP {tcp!r}; cell has {list(self._groups)} "
+                       f"(a group's tip link also works)")
 
     def _tip(self, tcp: str) -> str:
         """The group's primary tip link (the frame a pose targets). A group has 1+ tips."""
@@ -673,6 +685,8 @@ class MotionStack:
         general helper the agent's commission pipeline uses to resolve each camera's calibrated
         optical-frame pose for `update_world_live` (eye-in-hand: at the live joints; static: fixed).
         Returns None if the planner can't FK (a non-cuRobo test factory without link_pose)."""
+        if link in self._groups:               # one-name contract: a GROUP FKs its tip
+            link = self._tip(link)
         tcp = tcp or next(iter(self._groups), None)
         if tcp is None:
             return None

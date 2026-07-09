@@ -22,7 +22,7 @@ from .reset.reversibility import ReversibilityTable
 from .run_trial import TrialBudget, run_trial
 from .supervisor import Supervisor, SupervisorConfig
 
-BRIDGE_VERBS = {"trial_run", "vla_rollout"}   # edge_real wraps these in its _bridge_lock
+BRIDGE_VERBS = {"trial_run", "vla_rollout", "ritual_trial"}   # edge_real wraps these in its _bridge_lock
 
 
 class TaskService:
@@ -167,6 +167,223 @@ class TaskService:
         env, _actor = self._env_builder(body["task_slug"])
         return {"trial_id": rec.trial_id, "old": rec.verdict,
                 "new": replay_score(rec, env.judge_fn)}
+
+    # ---- scene record + phase spine + ritual (Task Engine v2, M0) ----------------------
+    def _record(self, task_slug: str):
+        from .scene_record.store import SceneRecord
+        return SceneRecord.load(str(self.data_dir / "record" / f"{task_slug}.json"),
+                                task_slug)
+
+    def _ledger(self, task_slug: str):
+        from .spine import PhaseLedger
+        return PhaseLedger.load(str(self.data_dir / "state" / f"{task_slug}.json"),
+                                task_slug)
+
+    def v_record_submit(self, body: dict) -> dict:
+        """The agent's perception submits a scene WITH capture provenance; the engine
+        merges and GRADES (two looks or a touch; arm-correlation bounce; calibration
+        attribution). Returns the grade — the agent iterates until it passes."""
+        rec = self._record(body["task_slug"])
+        return rec.submit(body.get("entities") or [], body.get("provenance") or {})
+
+    def v_record_get(self, body: dict) -> dict:
+        return self._record(body["task_slug"]).to_dict()
+
+    def v_record_confirm(self, body: dict) -> dict:
+        """Physical proof from a probe/trial: touch|lift|trial. Also narrows ranges."""
+        rec = self._record(body["task_slug"])
+        rec.confirm_touch(body["object_id"], kind=body.get("kind", "touch"),
+                          source=body.get("source", "probe"))
+        for n in body.get("narrow") or []:
+            rec.narrow(body["object_id"], n["param"], float(n["lo"]), float(n["hi"]))
+        return {"ok": True,
+                "proof_level": rec.objects[body["object_id"]].proof_level()}
+
+    def v_phase_status(self, body: dict) -> dict:
+        return self._ledger(body["task_slug"]).status()
+
+    def v_phase_start(self, body: dict) -> dict:
+        """Startup: capture RUN HOME from the live stack (COMP-09) + instrument notes."""
+        led = self._ledger(body["task_slug"])
+        joints = body.get("joints")                    # tests/sim may inject
+        if joints is None:
+            stack = self._stack_provider() if self._stack_provider else None
+            reader = getattr(stack, "joint_positions", None) or getattr(
+                getattr(stack, "bridge", None), "joint_state", None)
+            joints = dict(reader()) if callable(reader) else {}
+        if not joints:
+            return {"error": "no joints readable for RUN HOME — startup can't complete"}
+        led.set_run_home(joints)
+        led.instruments = body.get("instruments") or led.instruments
+        led.save()
+        return {"ok": True, "run_home_joints": len(joints)}
+
+    def v_phase_advance(self, body: dict) -> dict:
+        return self._ledger(body["task_slug"]).advance(body["to"],
+                                                       body.get("evidence") or {})
+
+    def v_phase_regress(self, body: dict) -> dict:
+        return self._ledger(body["task_slug"]).regress(body["to"],
+                                                       body.get("reason", ""))
+
+    def v_ritual_trial(self, body: dict) -> dict:
+        """A real trial under the ritual (home, drift check, act, home, look, compare).
+        This is how the search's promoted candidates touch hardware; the ledger must be
+        in the 'real' phase (the flow, not a guard: hardware is this phase's tool)."""
+        slug = body["task_slug"]
+        led = self._ledger(slug)
+        if led.phase != "real":
+            return {"error": f"ritual trials belong to the 'real' phase; ledger says "
+                             f"{led.phase!r} — the spine advances on evidence"}
+        try:
+            env, actor = self._env_builder(slug)
+        except Exception as e:                     # noqa: BLE001
+            return {"error": f"cell task package not available: "
+                             f"{type(e).__name__}: {e}"}
+        from .ritual import run_ritual_trial
+        out = run_ritual_trial(
+            env, actor, task_slug=slug,
+            program_ref=body.get("program_ref", f"{slug}@cell"),
+            record=self._record(slug), run_home=led.run_home,
+            sim_prediction=body.get("sim_prediction"),
+            knobs=Knobs(body.get("knobs") or {}), seed=int(body.get("seed", 0)),
+            budget=TrialBudget(**(body.get("budget") or {})),
+            store=self._store(slug))
+        rec = out["record"]
+        res = {"ritual": out["ritual"]}
+        if rec is not None:
+            from .expect import summarize
+            res.update(trial_id=rec.trial_id, outcome=rec.outcome,
+                       verdict=rec.verdict,
+                       expectations=summarize(rec.trace))
+        return res
+
+    # ---- ground truth + replay + probes + scout (Task Engine v2, M1) --------------------
+    def _library(self):
+        from .perceive.groundtruth import GroundTruthLibrary
+        return GroundTruthLibrary.load(str(self.data_dir / "groundtruth"))
+
+    def v_gt_stats(self, body: dict) -> dict:
+        lib = self._library()
+        return {"cases": len(lib.cases),
+                "by_provenance": {p: sum(1 for c in lib.cases
+                                         if c.provenance.startswith(p))
+                                  for p in {"probe", "trial"}}}
+
+    def v_replay_score(self, body: dict) -> dict:
+        """Score a perception program against every physically confirmed scene this
+        cell has ever recorded (IFACE-04) — the free fitness; no robot time."""
+        from .perceive.groundtruth import score_perception
+        lib = self._library()
+        if not lib.cases:
+            return {"error": "ground-truth library is empty — probe first (every "
+                             "touch/lift writes a case), then replay means something"}
+        return score_perception(body["program_src"], lib)
+
+    def v_probe_run(self, body: dict) -> dict:
+        """One probe on a RECORDED object; success writes proof + ground-truth case +
+        narrowed ranges in one call (rule 5). Bridge-locked (real motion)."""
+        slug = body["task_slug"]
+        try:
+            env, _actor = self._env_builder(slug)
+        except Exception as e:                     # noqa: BLE001
+            return {"error": f"cell task package not available: "
+                             f"{type(e).__name__}: {e}"}
+        frame = None
+        if body.get("camera"):
+            from .perceive.operators import PerceptionOps
+            frame = PerceptionOps(None, None, env.bridge).capture(body["camera"])
+        from .probe_record import probe_and_record
+        return probe_and_record(
+            body.get("kind", "touch"), env.new_ctx(), body.get("tcp", ""),
+            record=self._record(slug), object_id=body["object_id"],
+            library=self._library(), frame=frame,
+            narrow=body.get("narrow"), params=body.get("params"))
+
+    def v_scout_run(self, body: dict) -> dict:
+        """The VLA scout (COMP-12): a guarded rollout that SWEEPS while saving
+        keyframes for the agent's perception to process. Each keyframe carries a
+        distinct viewpoint tag, so submissions from these frames satisfy the two-look
+        rule. No VLA loaded -> stated fallback (PROB-12): use a look tour instead."""
+        runtime = getattr(self, "_vla", None)
+        if runtime is None:
+            return {"error": "no VLA runtime loaded (vla_load first); fallback: plan a "
+                             "look tour with atoms.look over 3-4 viewpoints and submit "
+                             "each view — same two-look effect, slower"}
+        slug = body["task_slug"]
+        try:
+            env, _actor = self._env_builder(slug)
+        except Exception as e:                     # noqa: BLE001
+            return {"error": f"cell task package not available: "
+                             f"{type(e).__name__}: {e}"}
+        camera = body.get("camera", "wrist")
+        every = int(body.get("keyframe_every", 3))
+        out_dir = self.data_dir / "scout" / slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+        from .perceive.operators import PerceptionOps
+        ops = PerceptionOps(None, None, env.bridge)
+        frames: list = []
+
+        base_observe = (getattr(self, "_vla_observe", None) or env.observe)
+        steps = [0]
+
+        def observe_and_tap():
+            obs = base_observe()
+            if steps[0] % every == 0:
+                f = ops.capture(camera)
+                k = len(frames)
+                ref = str(out_dir / f"kf_{k:03d}.json")
+                import json as _json
+                Path(ref).write_text(_json.dumps(
+                    {"camera": camera, "t": f.get("t_capture"),
+                     "viewpoint": f"scout_{k:03d}"}, default=str))
+                frames.append({"ref": ref, "viewpoint": f"scout_{k:03d}"})
+            steps[0] += 1
+            return obs
+
+        from .vla.skill import make_vla_skill
+        vla = make_vla_skill(runtime, observe_of=lambda _env: observe_and_tap)
+        ctx = env.new_ctx()
+        r = vla(env, ctx, body.get("instruction",
+                                   "find the objects and record their poses"),
+                max_steps=int(body.get("max_steps", 20)))
+        return {"ok": r.ok, "stopped_by": r.evidence.get("stopped_by"),
+                "keyframes": frames,
+                "note": "run your perception on each keyframe and record_submit with "
+                        "its viewpoint tag — that satisfies the two-look rule"}
+
+    def v_audit_bundle(self, body: dict) -> dict:
+        """The cert's audit bundle (ART-06): record + ledger + per-trial expectation
+        stats into .remoroo/task/audit/<slug>/bundle.json — what makes the
+        certificate a legible artifact."""
+        import json as _json
+        slug = body["task_slug"]
+        from .expect import summarize
+        trials = []
+        store = self._store(slug)
+        for tid in store.all_ids()[-50:]:
+            rec = store.load(tid)
+            trials.append({"trial_id": tid, "outcome": rec.outcome,
+                           "verdict": rec.verdict,
+                           "expectations": summarize(rec.trace)})
+        bundle = {"task_slug": slug,
+                  "record": self._record(slug).to_dict(),
+                  "ledger": self._ledger(slug).status(),
+                  "trials": trials}
+        out = self.data_dir / "audit" / slug / "bundle.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_json.dumps(bundle, indent=1, default=str), encoding="utf-8")
+        return {"ok": True, "path": str(out), "trials": len(trials)}
+
+    def v_look_plan(self, body: dict) -> dict:
+        """Ranked next-viewpoint proposals from the record's open questions (COMP-14):
+        look requests first, then unknown volumes by size, then single-look objects."""
+        from .scene_record.lookplan import propose
+        return {"proposals": propose(self._record(body["task_slug"]))}
+
+    def v_toolbox(self, body: dict) -> dict:
+        from .perceive.loaders import toolbox_catalog
+        return toolbox_catalog()
 
     # ---- perception models (install ONCE per cell; never inside a task run) -----------
     def v_models_status(self, body: dict) -> dict:

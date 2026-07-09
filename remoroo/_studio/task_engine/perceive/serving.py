@@ -37,3 +37,39 @@ class ModelRegistry:
 
     def versions(self) -> Dict[str, str]:
         return dict(self._versions)
+
+
+class RemoteModel:
+    """A model served from the GPU worker (DEC-13): the rig's VRAM is not the cap.
+    Same call surface as a locally loaded model; the worker exposes POST /serve
+    {model, inputs} and answers {outputs} (numpy travels msgpack-encoded when both
+    ends have it, JSON otherwise). Register like any loader:
+
+        registry.register("detector", "remote", lambda: RemoteModel("groundingdino",
+                                                                    worker_url))
+    Absence is stated: an unreachable worker raises with the fix in the message."""
+
+    def __init__(self, model: str, worker_url: str, timeout_s: float = 60.0) -> None:
+        self.model = model
+        self.worker_url = worker_url.rstrip("/")
+        self.timeout_s = timeout_s
+
+    def __call__(self, **inputs):
+        import json as _json
+        import urllib.request
+        body = _json.dumps({"model": self.model, "inputs": inputs},
+                           default=lambda o: getattr(o, "tolist", lambda: str(o))())
+        req = urllib.request.Request(
+            self.worker_url + "/serve", data=body.encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
+                out = _json.loads(r.read().decode())
+        except Exception as e:
+            raise RuntimeError(
+                f"remote model {self.model!r} unreachable at {self.worker_url} "
+                f"({type(e).__name__}: {e}) — serve it on the GPU worker or pin a "
+                f"local alternative from the toolbox") from e
+        if out.get("error"):
+            raise RuntimeError(f"remote model {self.model!r}: {out['error']}")
+        return out.get("outputs")

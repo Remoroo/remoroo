@@ -185,3 +185,40 @@ def register_default_models(registry: ModelRegistry, weights_dir: str) -> None:
                       make_segmenter_loader(weights_dir))
     registry.register("detector", PINS["detector"]["version"],
                       make_detector_loader(weights_dir))
+
+
+# --- The perception toolbox (COMP-11, v4.1): the agent composes from an ARSENAL, not
+# two models. This catalog is INFORMATION (served to the agent via the seed and the
+# toolbox verb); installation stays pin-based: file/hf_snapshot entries get pinned per
+# rig like PINS/vla above, pip entries install into the edge or serve from the GPU
+# worker (DEC-13). Composition doctrine (DEC-14): 3 to 6 tools per program,
+# disagreement between tools is signal, fiducials anchor learned ones.
+TOOLBOX = {
+    "what_is_where": ["sam2.1/sam3", "groundingdino-1.5", "yolo-world", "owlv2",
+                      "florence-2", "detectron2", "mmdetection", "semantic-sam",
+                      "efficientsam/mobilesam", "rt-detr", "clip/siglip",
+                      "dinov2/dinov3-features"],
+    "where_in_3d": ["depth-anything-v2", "metric3d-v2", "unidepth", "dust3r",
+                    "mast3r", "vggt", "colmap", "open3d", "pcl", "teaser++",
+                    "kiss-icp", "gaussian-splatting(gsplat)", "sugar/2dgs",
+                    "nerfstudio"],
+    "pose_and_grasp": ["foundationpose", "megapose", "sam-6d", "anygrasp",
+                       "graspnet-baseline", "contact-graspnet", "gpd"],
+    "tracking_and_flow": ["sam2-video", "cutie", "cotracker3", "tapir",
+                          "raft/sea-raft", "track-anything"],
+    "vlm_spatial": ["qwen3-vl(on-rig, lingbot base)", "molmo(points)", "internvl",
+                    "paligemma-2", "robopoint", "spatialrgpt"],
+    "complete_the_unseen": ["trellis-class image->3d", "instantmesh", "wonder3d",
+                            "zero123-xl", "stable-fast-3d"],
+    "never_lies": ["opencv(charuco/aruco/homography)", "apriltag", "scikit-image",
+                   "kornia", "ft/current sensors + microphone (contact events)"],
+}
+
+
+def toolbox_catalog() -> Dict[str, Any]:
+    """The 55-tool arsenal, grouped by the question each answers, with the doctrine."""
+    return {"groups": TOOLBOX,
+            "count": sum(len(v) for v in TOOLBOX.values()),
+            "doctrine": "compose 3-6 per program; disagreement is signal; fiducials "
+                        "anchor learned tools; heavy models serve from the GPU "
+                        "worker; pinned per rig once, never fetched mid-run"}

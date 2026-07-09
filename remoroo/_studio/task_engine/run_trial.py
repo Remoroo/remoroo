@@ -52,12 +52,26 @@ def run_trial(env: GenericEnv, actor: Callable[[Any, Ctx], None], *,
         except Exception as e:                          # noqa: BLE001 - stated, not silent
             outcome = "actor_exception"
             anomalies.append(f"{type(e).__name__}: {e}")
+            # The traceback TAIL travels in the record: trial_get shows the crashing
+            # file:line immediately (a live run spent turns hand-instrumenting the
+            # actor to recover exactly this).
+            import traceback
+            anomalies.append("traceback: "
+                             + " | ".join(traceback.format_exc().splitlines()[-8:]))
 
     ctx.trace.finalize()
     if hasattr(env.bridge, "estop_tripped") and env.bridge.estop_tripped():
         outcome = "supervisor_halt"
 
     post = env.observe()
+    # Universal honesty flag, judge-independent: a post observation far below the pre
+    # one (arm occluding the camera, perception dropout) makes every outcome channel
+    # unreliable — the anomaly travels in the record so trial_get and the TrialsPanel
+    # show it even when an authored judge gets fooled.
+    post_conf = getattr(getattr(post, "confidence", None), "overall", None)
+    if post_conf is not None and post_conf < 0.5:
+        anomalies.append(f"low_confidence_post_observation ({post_conf:.2f}) — "
+                         "clear the camera view before the trial ends")
     verdict = env.judge(pre, post, ctx.trace)
     t1 = time.monotonic()
 

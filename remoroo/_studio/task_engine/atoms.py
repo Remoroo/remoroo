@@ -31,6 +31,20 @@ def _xyzq(pose: Any) -> List[float]:
     raise ValueError(f"unrecognised pose shape: {pose!r}")
 
 
+def _live_pose(ctx: "Ctx", tcp: str) -> List[float]:
+    """The tcp's live pose via stack FK — STATED when the stack can't FK this name
+    (None used to surface as `TypeError: 'NoneType' object is not iterable`, which cost
+    a live run several turns to trace)."""
+    pose = ctx.stack.link_pose(tcp)
+    if pose is None:
+        raise RuntimeError(f"stack.link_pose({tcp!r}) returned None — this stack can't "
+                           f"FK that name; use the cell's planner group name (the stack "
+                           f"accepts a group or its tip link)")
+    if isinstance(pose, tuple) and len(pose) == 2:      # (xyz, wxyz) stack convention
+        return list(pose[0])[:3] + list(pose[1])[:4]
+    return _xyzq(pose)
+
+
 def _quat_mul(a: Sequence[float], b: Sequence[float]) -> List[float]:
     aw, ax, ay, az = a
     bw, bx, by, bz = b
@@ -100,7 +114,7 @@ def descend(ctx: Ctx, tcp: str, to_z: float, *, speed: Optional[float] = None,
     The stop signal is a Bridge fact (currents/FT), never computed here."""
     ctx.envelope.require_stop(stop_on)
     spd = ctx.envelope.clamp_speed(speed)
-    cur = _xyzq(ctx.stack.link_pose(tcp))
+    cur = _live_pose(ctx, tcp)
     h = ctx.trace.begin("descend", tcp=tcp, frm_z=cur[2], to_z=to_z, stop_on=stop_on, speed=spd)
     z = cur[2]
     steps = 0
@@ -168,7 +182,7 @@ def carry(ctx: Ctx, tcp: str, to: Any, *, arc_h: float, speed: Optional[float] =
           via: Sequence[Any] = ()) -> AtomResult:
     """Transport while holding: lift-over arc so the payload clears obstacles between here
     and there. arc peak z = max(start_z, end_z) + arc_h."""
-    p0 = _xyzq(ctx.stack.link_pose(tcp))
+    p0 = _live_pose(ctx, tcp)
     p1 = _xyzq(to)
     peak_z = max(p0[2], p1[2]) + abs(arc_h)
     mid = [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0, peak_z] + p1[3:7]
@@ -198,7 +212,7 @@ def sweep(ctx: Ctx, tcp: str, frm: Any, to: Any, *, press_z: float,
 
 def turn(ctx: Ctx, tcp: str, *, deg: float, axis: str = "z",
          speed: Optional[float] = None) -> AtomResult:
-    cur = _xyzq(ctx.stack.link_pose(tcp))
+    cur = _live_pose(ctx, tcp)
     q = _quat_mul(_axis_quat(axis, deg), cur[3:7])
     tgt = cur[:3] + q
     h = ctx.trace.begin("turn", tcp=tcp, deg=deg, axis=axis)

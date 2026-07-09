@@ -120,6 +120,9 @@ def load_config(project_dir: Path) -> Optional[dict]:
         "port": str(pick("REMOROO_VLA_PORT", "port", VLA_PORT_DEFAULT)),
         "module": pick("REMOROO_VLA_MODULE", "module", VLA_MODULE_DEFAULT),
         "extra_args": [str(a) for a in extra],
+        # env vars the SERVER process needs (QWEN3VL_PATH for the base model, CUDA/cuDNN
+        # workarounds, …) — merged over the inherited environment at spawn.
+        "env": {str(k): str(v) for k, v in (raw.get("env") or {}).items()},
     }
 
 
@@ -269,6 +272,7 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
     cmd = server_cmd(cfg)
     env = dict(os.environ)
     env.update({"PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"})
+    env.update(cfg.get("env") or {})       # the declaration's server env (QWEN3VL_PATH…)
     lp = log_path(project_dir)
     try:
         log_fh = open(lp, "w", encoding="utf-8")   # fresh log per process

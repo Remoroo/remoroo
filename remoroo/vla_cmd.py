@@ -66,6 +66,46 @@ def status(project: Optional[str] = typer.Option(None, "--project", "-p",
         typer.echo(f"  | {ln}")
 
 
+@vla_app.command("init")
+def init(
+    python: str = typer.Option(..., "--python", help="The LingBot venv's interpreter."),
+    workdir: str = typer.Option(..., "--workdir",
+                                help="The lingbot-vla-v2 repo checkout."),
+    checkpoint: Optional[str] = typer.Option(None, "--checkpoint",
+                                             help="Weights dir (default: what "
+                                                  "`remoroo models install` produced)."),
+    qwen: Optional[str] = typer.Option(None, "--qwen",
+                                       help="Qwen3-VL-4B-Instruct dir (sets QWEN3VL_PATH "
+                                            "for the server + qwen_path for configs)."),
+    port: int = typer.Option(8791, "--port"),
+    project: Optional[str] = typer.Option(None, "--project", "-p"),
+):
+    """Write .remoroo/vla.yaml — the once-per-rig declaration everything else reads
+    (`remoroo vla start`, `remoroo task` auto-start, models install, vla_apply_profile).
+    Idempotent: refuses to overwrite an existing declaration."""
+    import yaml
+
+    from . import vla_service
+
+    root = _project(project)
+    p = vla_service.config_path(root)
+    if p.exists():
+        typer.secho(f"{p} already exists — edit it directly (or delete it first).",
+                    fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+    cfg: dict = {"runtime": "lingbot", "python": python, "workdir": workdir,
+                 "port": port, "extra_args": ["--use_compile"]}
+    if checkpoint:
+        cfg["checkpoint"] = checkpoint
+    if qwen:
+        cfg["qwen_path"] = qwen
+        cfg["env"] = {"QWEN3VL_PATH": qwen}
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    typer.secho(f"✓ wrote {p}", fg=typer.colors.GREEN)
+    typer.echo("  next: `remoroo models install` (weights) → `remoroo vla start`.")
+
+
 @vla_app.command("dataset")
 def dataset(
     task_slug: str = typer.Argument(..., help="Task slug whose episodes to ship."),
