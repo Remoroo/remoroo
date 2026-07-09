@@ -39,6 +39,54 @@ def _edge(verb: str, body: dict, port: int, timeout: int = 10) -> dict:
                          "is `remoroo edge` running?"}
 
 
+def _progress_line(log_text: str) -> str:
+    """The most recent line that looks like download/work progress (hf tqdm bars,
+    'Downloading…', fetch lines) — surfaced so a long install is never a silent wall."""
+    for ln in reversed(log_text.splitlines()):
+        s = ln.strip()
+        if s and any(k in s for k in ("%", "Downloading", "Fetching", "download",
+                                      "safetensors", "snapshot")):
+            return s[-110:]
+    return ""
+
+
+def _edge_with_progress(verb: str, body: dict, port: int, timeout: int) -> dict:
+    """A long edge call with a LIVE view: run the request in a thread; while waiting,
+    print elapsed time + the edge log's own progress lines every few seconds. The
+    operator always knows whether it's working or stuck (and where to look:
+    .remoroo/edge.log)."""
+    import threading
+    import time as _time
+
+    result: dict = {}
+    done = threading.Event()
+
+    def call():
+        result.update(_edge(verb, body, port, timeout=timeout))
+        done.set()
+
+    threading.Thread(target=call, daemon=True).start()
+    t0 = _time.time()
+    log = Path(".remoroo/edge.log")
+    last_shown = ""
+    typer.secho(f"  (live progress from .remoroo/edge.log; Ctrl+C leaves the edge "
+                f"working — `remoroo edge restart` aborts it)", fg=typer.colors.BLUE)
+    while not done.wait(timeout=5.0):
+        elapsed = int(_time.time() - t0)
+        line = ""
+        try:
+            line = _progress_line(log.read_text(encoding="utf-8", errors="replace")[-20000:])
+        except Exception:                               # noqa: BLE001
+            pass
+        if line and line != last_shown:
+            typer.echo(f"  [{elapsed:>4d}s] {line}")
+            last_shown = line
+        elif elapsed and elapsed % 30 < 5:
+            typer.echo(f"  [{elapsed:>4d}s] still working… (tail -f .remoroo/edge.log "
+                       "for the full stream)")
+    return result
+
+
 def _headers(client) -> dict:
     return {"Authorization": f"Bearer {client.get_token() or ''}"}
 
@@ -414,7 +462,7 @@ def models_install(port: int = typer.Option(EDGE_PORT_DEFAULT, "--port")):
     typer.secho("Verifying pinned models (downloads ONLY what's missing; a "
                 "checkpoint declared in vla.yaml is never re-downloaded)…",
                 fg=typer.colors.CYAN)
-    out = _edge("models_install", {}, port, timeout=7200)
+    out = _edge_with_progress("models_install", {}, port, timeout=7200)
     typer.echo(json.dumps(out, indent=1))
     models = out.get("models") or {}
     bad = {k: v for k, v in models.items() if not v.get("ok")}

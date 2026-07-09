@@ -142,8 +142,11 @@ def vla_install(weights_dir: str) -> Dict[str, Any]:
                                       "(pip install huggingface_hub)"}
     pin = _vla_pin()
     d = _vla_dir(weights_dir)
+    print(f"[models] pulling {pin['repo_id']} (~12 GB) -> {d} — hf progress follows; "
+          "a checkpoint declared in vla.yaml would have skipped this", flush=True)
     snapshot_download(repo_id=pin["repo_id"], revision=pin["revision"],
                       local_dir=str(d))                   # resumes partial pulls natively
+    print(f"[models] snapshot complete -> {d}", flush=True)
     (d / "REVISION").write_text(pin["revision"], encoding="utf-8")
     return {"ok": True, "path": str(d)}
 
