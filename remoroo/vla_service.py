@@ -249,9 +249,12 @@ def status(project_dir: Path) -> dict:
 # --------------------------------------------------------------------------- #
 def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
     project_dir = Path(project_dir).resolve()
+    if not configured(project_dir):
+        ensure_declared(project_dir, echo)         # zero-flag: discover + write
     cfg = load_config(project_dir)
     if cfg is None:
-        echo("  no VLA declared on this rig (write .remoroo/vla.yaml to enable one).")
+        echo("  no VLA on this rig and none discoverable — `remoroo vla init` "
+             "auto-discovers once the LingBot repo+venv exist near the project.")
         return {"ok": False, "error": "not_configured"}
 
     alive, pid = is_running(project_dir)

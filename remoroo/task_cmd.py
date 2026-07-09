@@ -333,8 +333,13 @@ def task(
     # by the time the agent's vla_load connects; unconfigured rigs skip silently and a
     # failure is stated, never fatal — motion/perception don't depend on it.
     from . import vla_service
-    vla_service.ensure_started(repo_path,
-                               echo=lambda m: typer.secho(m, fg=typer.colors.YELLOW))
+    _vla = vla_service.ensure_started(repo_path,
+                                      echo=lambda m: typer.secho(m, fg=typer.colors.YELLOW))
+    if _vla.get("skipped") == "not_configured":
+        typer.secho("    ⚠⚠ NO VLA ON THIS RIG — scouting and probing run DEGRADED "
+                    "(look tours + mech probes only). Fix in one command once the "
+                    "LingBot repo+venv exist next to this project: `remoroo vla init` "
+                    "(zero flags, auto-discovers).", fg=typer.colors.RED, bold=True)
     typer.secho(f"🤖  remoroo task → @robot_task  (slug: {slug}, run: {run_id})",
                 fg=typer.colors.CYAN)
     typer.secho("    Autonomous: no gates. "

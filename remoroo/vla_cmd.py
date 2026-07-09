@@ -68,9 +68,12 @@ def status(project: Optional[str] = typer.Option(None, "--project", "-p",
 
 @vla_app.command("init")
 def init(
-    python: str = typer.Option(..., "--python", help="The LingBot venv's interpreter."),
-    workdir: str = typer.Option(..., "--workdir",
-                                help="The lingbot-vla-v2 repo checkout."),
+    python: Optional[str] = typer.Option(None, "--python",
+                                         help="Override: the LingBot venv's "
+                                              "interpreter (auto-discovered)."),
+    workdir: Optional[str] = typer.Option(None, "--workdir",
+                                          help="Override: the lingbot-vla-v2 repo "
+                                               "checkout (auto-discovered)."),
     checkpoint: Optional[str] = typer.Option(None, "--checkpoint",
                                              help="Weights dir (default: what "
                                                   "`remoroo models install` produced)."),
@@ -93,13 +96,32 @@ def init(
         typer.secho(f"{p} already exists — edit it directly (or delete it first).",
                     fg=typer.colors.YELLOW)
         raise typer.Exit(code=1)
-    cfg: dict = {"runtime": "lingbot", "python": python, "workdir": workdir,
-                 "port": port, "extra_args": ["--use_compile"]}
+    # ZERO-FLAG PATH: discover the install (repo/venv/weights near the project);
+    # any flag you DO pass overrides what discovery found.
+    cfg: dict = vla_service.discover(root) or {}
+    if not cfg and not (python and workdir):
+        typer.secho("no LingBot install found near this project (searched the parent "
+                    "and grandparent dirs for */deploy/lingbot_vla_v2_policy.py with "
+                    "a venv inside). Clone + create its venv first, or pass --python "
+                    "and --workdir explicitly.", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    cfg.setdefault("runtime", "lingbot")
+    cfg.setdefault("extra_args", ["--use_compile"])
+    if python:
+        cfg["python"] = python
+    if workdir:
+        cfg["workdir"] = workdir
+    cfg["port"] = port
     if checkpoint:
         cfg["checkpoint"] = checkpoint
     if qwen:
         cfg["qwen_path"] = qwen
-        cfg["env"] = {"QWEN3VL_PATH": qwen}
+        cfg.setdefault("env", {})["QWEN3VL_PATH"] = qwen
+    typer.secho(f"  python:     {cfg.get('python')}", fg=typer.colors.CYAN)
+    typer.secho(f"  workdir:    {cfg.get('workdir')}", fg=typer.colors.CYAN)
+    typer.secho(f"  checkpoint: {cfg.get('checkpoint', '(models install)')}",
+                fg=typer.colors.CYAN)
+    typer.secho(f"  qwen:       {cfg.get('qwen_path', '(unset)')}", fg=typer.colors.CYAN)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     typer.secho(f"✓ wrote {p}", fg=typer.colors.GREEN)

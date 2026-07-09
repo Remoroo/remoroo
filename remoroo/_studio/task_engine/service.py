@@ -22,7 +22,8 @@ from .reset.reversibility import ReversibilityTable
 from .run_trial import TrialBudget, run_trial
 from .supervisor import Supervisor, SupervisorConfig
 
-BRIDGE_VERBS = {"trial_run", "vla_rollout", "ritual_trial"}   # edge_real wraps these in its _bridge_lock
+BRIDGE_VERBS = {"trial_run", "vla_rollout", "ritual_trial", "perceive_run",
+                "probe_run", "scout_run"}   # edge_real wraps these in its _bridge_lock
 
 
 class TaskService:
@@ -305,6 +306,72 @@ class TaskService:
             narrow=body.get("narrow"), params=body.get("params"))
         _goto_home(env, led.run_home)              # ... and ends there: cameras clear
         return out
+
+    def _stamped_provenance(self, env, camera: str) -> Dict[str, Any]:
+        """The ENGINE stamps provenance — arm poses and the viewpoint come from the
+        stack, never from agent claims (grading integrity). A static camera is ONE
+        viewpoint forever; a moving mount's viewpoint is its pose bucketed to 5 cm,
+        so re-looking from the same place can never count as a second look."""
+        arm_poses: Dict[str, list] = {}
+        viewpoint = camera
+        stack = getattr(env, "stack", None)
+        if stack is not None:
+            for g in list(getattr(stack, "group_names", []) or [])[:4]:
+                try:
+                    pose = stack.link_pose(g)
+                    xyz = (list(pose[0]) if isinstance(pose, tuple) else
+                           list(pose)[:3])
+                    arm_poses[g] = [float(v) for v in xyz[:3]]
+                except Exception:                  # noqa: BLE001 - stamp what we can
+                    continue
+            try:                                   # a wrist camera moves with its arm
+                cam_pose = stack.link_pose(camera)
+                xyz = (list(cam_pose[0]) if isinstance(cam_pose, tuple)
+                       else list(cam_pose)[:3])
+                bucket = "_".join(str(round(v / 0.05)) for v in xyz[:3])
+                viewpoint = f"{camera}@{bucket}"
+            except Exception:                      # noqa: BLE001 - static camera
+                pass
+        return {"source": camera, "viewpoint": viewpoint, "modality": "rgbd",
+                "arm_poses": arm_poses, "kind": "view"}
+
+    def v_perceive_run(self, body: dict) -> dict:
+        """THE looking-phase loop (closes the live-run gap of 2026-07-11): run the
+        AUTHORED perception against a live capture and submit the result to the
+        record with ENGINE-stamped provenance. Two paths:
+          - default: the task package's env.observe() (perception_task via build_env,
+            hot-reloaded per call — your edit cycle is edit -> perceive_run);
+          - program_src: run an inline make_perceive(shared) candidate BEFORE the
+            package exists (early iteration; same stamping).
+        Returns the grade + what was seen, so the agent iterates until it passes."""
+        slug = body["task_slug"]
+        camera = body.get("camera", "")
+        if body.get("program_src"):
+            ns: Dict[str, Any] = {}
+            exec(compile(body["program_src"], "<perception_candidate>", "exec"), ns)  # noqa: S102
+            if "make_perceive" not in ns:
+                return {"error": "program_src must define make_perceive(shared)"}
+            perceive = ns["make_perceive"](self._shared())
+            stack = self._stack_provider() if self._stack_provider else None
+            env = type("E", (), {"stack": stack, "observe": staticmethod(perceive)})()
+        else:
+            try:
+                env, _actor = self._env_builder(slug)
+            except Exception as e:                 # noqa: BLE001
+                return {"error": (f"no task package for {slug!r} and no program_src "
+                                  f"({type(e).__name__}: {e}) — author "
+                                  "perception_task.py or pass program_src")}
+        scene = env.observe()
+        entities = [{"label": e.label, "pose": list(e.pose[:3]),
+                     "dims": list(e.dims) if e.dims else None}
+                    for e in scene.entities()]
+        prov = self._stamped_provenance(env, camera or "unknown")
+        grade = self._record(slug).submit(entities, prov)
+        return {"seen": len(entities), "viewpoint": prov["viewpoint"],
+                "grade": grade,
+                "note": ("re-run from a DIFFERENT viewpoint (move the wrist camera or "
+                         "use another camera) to corroborate pending objects — the "
+                         "same viewpoint never counts twice")}
 
     def v_scout_run(self, body: dict) -> dict:
         """The VLA scout (COMP-12): a guarded rollout that SWEEPS while saving
