@@ -275,6 +275,13 @@ def task(
                             ["components"]["host"][0]})
     except Exception:                                   # noqa: BLE001 - never blocks a run
         pass
+    # VLA policy server: lives in its OWN venv, declared once in .remoroo/vla.yaml
+    # (`remoroo vla` manages it). Kick it off non-blocking now so the weights are warm
+    # by the time the agent's vla_load connects; unconfigured rigs skip silently and a
+    # failure is stated, never fatal — motion/perception don't depend on it.
+    from . import vla_service
+    vla_service.ensure_started(repo_path,
+                               echo=lambda m: typer.secho(m, fg=typer.colors.YELLOW))
     typer.secho(f"🤖  remoroo task → @robot_task  (slug: {slug}, run: {run_id})",
                 fg=typer.colors.CYAN)
     typer.secho("    Autonomous: no gates. "
@@ -345,9 +352,10 @@ def models_install(port: int = typer.Option(EDGE_PORT_DEFAULT, "--port")):
     """Install the pinned perception checkpoints on this cell (once; GBs, minutes).
     Run it right after setup so task runs find the models warm — the agent never
     spends tokens fetching weights."""
-    typer.secho("Downloading + hash-verifying pinned perception models "
-                "(SAM 2.1, GroundingDINO)…", fg=typer.colors.CYAN)
-    out = _edge("models_install", {}, port, timeout=1800)
+    typer.secho("Downloading + hash-verifying pinned models (SAM 2.1, GroundingDINO; "
+                "plus the LingBot-VLA snapshot on rigs with .remoroo/vla.yaml — that one "
+                "is ~12 GB)…", fg=typer.colors.CYAN)
+    out = _edge("models_install", {}, port, timeout=7200)
     typer.echo(json.dumps(out, indent=1))
     models = out.get("models") or {}
     bad = {k: v for k, v in models.items() if not v.get("ok")}

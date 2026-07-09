@@ -18,6 +18,7 @@ from .studio_cmd import studio
 from .task_cmd import models_install, models_status, task, task_report, task_status
 from .robot_cmd import robot_app
 from .edge_cmd import edge_app
+from .vla_cmd import vla_app
 
 models_app = typer.Typer(no_args_is_help=True,
                          help="Pinned perception models on this cell (install once).")
@@ -39,6 +40,7 @@ app.command(name="task-report")(task_report)
 app.add_typer(robot_app, name="robot")
 app.add_typer(models_app, name="models")
 app.add_typer(edge_app, name="edge")
+app.add_typer(vla_app, name="vla")
 
 @app.command()
 def login():

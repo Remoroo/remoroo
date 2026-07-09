@@ -184,24 +184,86 @@ class TaskService:
 
     # ---- VLA verbs (ENG 8.3): the cold-start policy as smart probe / whole stage -------
     def v_vla_load(self, body: dict) -> dict:
-        """Load a policy runtime on this cell. 'fake' is the CI/dry-run policy; 'openpi'
-        lazy-loads pi0.5 weights (GPU cell only — loading is the stated failure off-GPU)."""
+        """Load a policy runtime on this cell. 'lingbot' (PRIMARY: LingBot-VLA 2.0 via
+        its local policy server) | 'openpi' (pi0.5, evaluation) | 'fake' (CI/dry-run)."""
         kind = body.get("runtime", "fake")
         if kind == "fake":
             from .vla.runtime import FakeVLA
             self._vla = FakeVLA(approach_steps=int(body.get("approach_steps", 3)))
+        elif kind == "lingbot":
+            from .vla.runtime import LingBotRuntime
+            profile = self._vla_profile()
+            self._vla = LingBotRuntime(
+                server_url=body.get("server_url") or self._vla_server_url(),
+                profile=profile, tcps=body.get("tcps"))
+            self._vla_observe = None
+            if profile is not None:                   # profile-driven observation packing
+                from .vla.packer import make_observation_packer
+                stack = self._stack_provider() if self._stack_provider else None
+                self._vla_observe = make_observation_packer(
+                    profile, bridge=self._bridge, stack=stack)
         elif kind == "openpi":
             from .vla.runtime import OpenPiRuntime
             self._vla = OpenPiRuntime(checkpoint=body.get("checkpoint", "pi05_base"),
                                       tcp=body.get("tcp", "arm_a"))
         else:
-            return {"error": f"unknown runtime {kind!r} (fake | openpi)"}
+            return {"error": f"unknown runtime {kind!r} (fake | lingbot | openpi)"}
         self._vla_kind = kind
         return {"ok": True, "runtime": kind}
 
     def v_vla_status(self, body: dict) -> dict:
         kind = getattr(self, "_vla_kind", None)
         return {"loaded": kind is not None, "runtime": kind}
+
+    def _vla_profile(self):
+        """The cell's authored embodiment profile (remoroo_cell/vla_profile.yaml), or
+        None — the agent authors it; both wire sides derive from it."""
+        from .vla.profile import load_profile
+        return load_profile(str(self.data_dir.parent.parent
+                                / "remoroo_cell" / "vla_profile.yaml"))
+
+    def v_vla_apply_profile(self, body: dict) -> dict:
+        """Generate LingBot's OWN config files (robot config + the cli yaml the policy
+        server reads) from the authored profile — the agent never hand-writes LingBot's
+        format. Paths come from .remoroo/vla.yaml; restart the server after (`remoroo
+        vla restart`) so it loads them."""
+        profile = self._vla_profile()
+        if profile is None:
+            return {"error": "no remoroo_cell/vla_profile.yaml on this cell — author it "
+                             "first (the embodiment wiring: cameras/state/actions)"}
+        try:
+            import yaml
+            cfg = yaml.safe_load((self.data_dir.parent / "vla.yaml").read_text()) or {}
+        except Exception as e:                        # noqa: BLE001
+            return {"error": f"no readable .remoroo/vla.yaml ({type(e).__name__}: {e}) — "
+                             "the rig must declare the policy server first"}
+        workdir, checkpoint = cfg.get("workdir"), cfg.get("checkpoint")
+        if not workdir or not checkpoint:
+            return {"error": "vla.yaml needs workdir + checkpoint to place the configs"}
+        from .vla.profile import write_lingbot_configs
+        norm_stats = str(self.data_dir / "vla" / "norm_stats.json")   # finetune job output
+        out = write_lingbot_configs(
+            profile, workdir=workdir, checkpoint=checkpoint,
+            qwen_path=cfg.get("qwen_path") or str(Path(checkpoint).parent
+                                                  / "Qwen3-VL-4B-Instruct"),
+            norm_stats_path=norm_stats)
+        # the config DICTS ride along: task_vla_finetune ships them to the trainer box
+        return {"ok": True, "robo_name": profile.robo_name,
+                "state_dim": profile.state_dim, "action_dim": profile.action_dim,
+                "norm_stats_expected_at": norm_stats, **out}
+
+    def _vla_server_url(self) -> str:
+        """The rig's declared policy server: .remoroo/vla.yaml (the SAME file
+        `remoroo vla` starts the process from), so the service manager and this
+        client can never disagree about the port."""
+        default = "http://127.0.0.1:8791"
+        cfg = self.data_dir.parent / "vla.yaml"           # data_dir = .remoroo/task
+        try:
+            import yaml
+            port = (yaml.safe_load(cfg.read_text()) or {}).get("port")
+            return f"http://127.0.0.1:{int(port)}" if port else default
+        except Exception:                                 # noqa: BLE001 - default is fine
+            return default
 
     def v_vla_rollout(self, body: dict) -> dict:
         """One guarded VLA episode as a FULL trial: reset -> observe -> policy (every
@@ -218,7 +280,9 @@ class TaskService:
             return {"error": (f"cell task package not available for {slug!r}: "
                               f"{type(e).__name__}: {e}")}
         from .vla.skill import make_vla_skill
-        vla = make_vla_skill(runtime)
+        packer = getattr(self, "_vla_observe", None)  # profile packer beats env.observe
+        vla = make_vla_skill(runtime,
+                             observe_of=(lambda env: packer) if packer else None)
         max_steps = int(body.get("max_steps", 30))
 
         def actor(env_, ctx):

@@ -45,6 +45,7 @@ def models_status(weights_dir: str) -> Dict[str, Any]:
         out[role] = {"name": pin["name"], "pinned": bool(pin["url"] and pin["sha256"]),
                      "present": present, "verified": verified,
                      "path": str(path) if path else ""}
+    out["vla"] = vla_status(weights_dir)
     return out
 
 
@@ -62,7 +63,65 @@ def models_install(weights_dir: str) -> Dict[str, Any]:
             out[role] = {"ok": True, "path": str(path)}
         except Exception as e:                            # noqa: BLE001 - stated
             out[role] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        out["vla"] = vla_install(weights_dir)
+    except Exception as e:                                # noqa: BLE001 - stated
+        out["vla"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     return out
+
+
+# --- VLA checkpoint: a multi-file HF SNAPSHOT, pinned by COMMIT --------------------------
+# Unlike the single-file perception pins above, the VLA is 6 safetensors shards + config +
+# bundled teachers (~12 GB); HF content-addresses a repo at a revision, so the pinned commit
+# hash IS the integrity check. The pin itself lives in ONE place — LingBotRuntime.PIN — the
+# same runtime that serves it. Installed only on rigs that DECLARE a policy server
+# (.remoroo/vla.yaml, managed by `remoroo vla`): no silent 12 GB pulls on VLA-less cells.
+
+def _vla_pin() -> Dict[str, str]:
+    from ..vla.runtime import LingBotRuntime              # one pin, one place
+    return dict(LingBotRuntime.PIN)
+
+
+def _vla_dir(weights_dir: str) -> Path:
+    return Path(weights_dir) / _vla_pin()["repo_id"].split("/")[-1]
+
+
+def _vla_declared(weights_dir: str) -> bool:
+    # weights live at <project>/.remoroo/task/weights → the rig declaration sits at
+    # <project>/.remoroo/vla.yaml (vla_service.py owns that file's meaning).
+    return (Path(weights_dir).resolve().parent.parent / "vla.yaml").exists()
+
+
+def vla_status(weights_dir: str) -> Dict[str, Any]:
+    pin = _vla_pin()
+    d = _vla_dir(weights_dir)
+    stamp = d / "REVISION"
+    present = d.is_dir() and any(d.glob("*.safetensors"))
+    verified = bool(present and stamp.exists()
+                    and stamp.read_text().strip() == pin["revision"])
+    return {"name": pin["repo_id"], "pinned": True, "kind": "hf_snapshot",
+            "revision": pin["revision"], "present": present, "verified": verified,
+            "declared": _vla_declared(weights_dir), "path": str(d)}
+
+
+def vla_install(weights_dir: str) -> Dict[str, Any]:
+    st = vla_status(weights_dir)
+    if not st["declared"]:
+        return {"ok": True, "skipped": "no .remoroo/vla.yaml on this rig — declare the "
+                                       "policy server to pull the ~12 GB snapshot"}
+    if st["verified"]:
+        return {"ok": True, "path": st["path"]}           # idempotent
+    try:
+        from huggingface_hub import snapshot_download     # lazy: GPU cell only
+    except ImportError:
+        return {"ok": False, "error": "huggingface_hub not installed in the edge python "
+                                      "(pip install huggingface_hub)"}
+    pin = _vla_pin()
+    d = _vla_dir(weights_dir)
+    snapshot_download(repo_id=pin["repo_id"], revision=pin["revision"],
+                      local_dir=str(d))                   # resumes partial pulls natively
+    (d / "REVISION").write_text(pin["revision"], encoding="utf-8")
+    return {"ok": True, "path": str(d)}
 
 
 def fetch_pinned(url: str, sha256: str, dest_dir: str) -> Path:
