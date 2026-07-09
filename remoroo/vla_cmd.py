@@ -96,14 +96,22 @@ def init(
         typer.secho(f"{p} already exists — edit it directly (or delete it first).",
                     fg=typer.colors.YELLOW)
         raise typer.Exit(code=1)
-    # ZERO-FLAG PATH: discover the install (repo/venv/weights near the project);
-    # any flag you DO pass overrides what discovery found.
-    cfg: dict = vla_service.discover(root) or {}
-    if not cfg and not (python and workdir):
-        typer.secho("no LingBot install found near this project (searched the parent "
-                    "and grandparent dirs for */deploy/lingbot_vla_v2_policy.py with "
-                    "a venv inside). Clone + create its venv first, or pass --python "
-                    "and --workdir explicitly.", fg=typer.colors.RED)
+    # ZERO-FLAG PATH: ground-truth discovery (probe the ACTIVE venv + every python
+    # findable for the runtime's package — same-venv installs are first-class), then
+    # ASK for anything still missing, verifying every answer before accepting it.
+    import sys as _sys
+
+    def _ask(question: str, default: str) -> str:
+        if not _sys.stdin.isatty():
+            return ""                              # non-interactive: derivations only
+        return typer.prompt(question, default=default or None)
+
+    cfg = vla_service.wizard(root, ask=_ask, echo=typer.echo) or {}
+    if not cfg.get("python") and not (python and workdir):
+        typer.secho("could not find OR get a working answer for the VLA python "
+                    "(nothing on this machine imports the runtime's package). Install "
+                    "the VLA (any venv, including the edge/curobo one), then rerun.",
+                    fg=typer.colors.RED)
         raise typer.Exit(code=2)
     cfg.setdefault("runtime", "lingbot")
     cfg.setdefault("extra_args", ["--use_compile"])

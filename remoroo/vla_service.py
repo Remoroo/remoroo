@@ -38,8 +38,42 @@ from typing import Callable, List, Optional
 Echo = Callable[[str], None]
 
 VLA_PORT_DEFAULT = "8791"
-VLA_MODULE_DEFAULT = "deploy.lingbot_vla_v2_policy"   # LingBot's own server entrypoint
 _READY_TIMEOUT_S = 20.0
+
+# Runtime registry — ALL vendor knowledge lives here (and only here). Adding a VLA =
+# one row; a customer's private runtime needs no code change at all: vla.yaml can
+# override any field (probe_import / module / repo_marker / weights_glob).
+RUNTIMES: dict = {
+    "lingbot": {
+        "probe_import": "lingbotvla",              # importable => this python serves it
+        "module": "deploy.lingbot_vla_v2_policy",  # the server entrypoint (cwd=repo)
+        "repo_marker": "deploy/lingbot_vla_v2_policy.py",
+        "weights_glob": "*vla*",
+        "qwen_glob": "Qwen3-VL*",                  # companion weights (QWEN3VL_PATH)
+        "extra_args": ["--use_compile"],
+    },
+    "openpi": {
+        "probe_import": "openpi",
+        "module": "openpi.serving.http_policy_server",
+        "repo_marker": "src/openpi/__init__.py",
+        "weights_glob": "*pi0*",
+        "qwen_glob": "",
+        "extra_args": [],
+    },
+}
+DEFAULT_RUNTIME = "lingbot"
+
+
+def runtime_descriptor(name: str = "", overrides: dict = None) -> dict:
+    """The active runtime's descriptor: registry row + vla.yaml overrides on top."""
+    d = dict(RUNTIMES.get(name or DEFAULT_RUNTIME, RUNTIMES[DEFAULT_RUNTIME]))
+    for k, v in (overrides or {}).items():
+        if k in d and v:
+            d[k] = v
+    return d
+
+
+VLA_MODULE_DEFAULT = RUNTIMES[DEFAULT_RUNTIME]["module"]   # back-compat name
 
 
 # --------------------------------------------------------------------------- #
@@ -118,7 +152,9 @@ def load_config(project_dir: Path) -> Optional[dict]:
         "workdir": pick("REMOROO_VLA_WORKDIR", "workdir"),
         "checkpoint": checkpoint,
         "port": str(pick("REMOROO_VLA_PORT", "port", VLA_PORT_DEFAULT)),
-        "module": pick("REMOROO_VLA_MODULE", "module", VLA_MODULE_DEFAULT),
+        "module": pick("REMOROO_VLA_MODULE", "module",
+                       runtime_descriptor(str(raw.get("runtime", "")),
+                                          raw)["module"]),
         "qwen_path": pick("REMOROO_VLA_QWEN", "qwen_path"),
         "extra_args": [str(a) for a in extra],
         # env vars the SERVER process needs (QWEN3VL_PATH for the base model, CUDA/cuDNN
@@ -374,61 +410,219 @@ def ensure_started(project_dir: Path, echo: Echo = print) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Auto-discovery (v2 startup phase: "the operator never hand-writes a 5-flag   #
-# init"). Bounded scan, never a guess: every found piece is verified on disk.  #
+# Discovery — GROUND TRUTH, not path guesses. Order:                           #
+#   1. interpreters already in play (the ACTIVE venv, the edge's locked        #
+#      python, PATH) asked directly: can you `import lingbotvla`? The          #
+#      same-venv install (VLA in the curobo/edge venv) is a first-class        #
+#      answer, not an accident.                                                #
+#   2. a bounded filesystem search for the INSTALLED PACKAGE                   #
+#      (site-packages/lingbotvla) — wherever it is — walking up to its         #
+#      interpreter; plus the repo (deploy/lingbot_vla_v2_policy.py).           #
+#   3. the repo derived FROM the package (editable installs live in the        #
+#      checkout), so one probe usually answers both questions.                 #
+# The wizard asks a human only for what remains, and VERIFIES every answer     #
+# by probing before writing anything.                                          #
 # --------------------------------------------------------------------------- #
-def discover(project_dir: Path) -> Optional[dict]:
-    """Find the LingBot install near the project: a dir containing
-    deploy/lingbot_vla_v2_policy.py in the project's parent or grandparent, a
-    python under it (venv/.venv) or in a sibling venv dir, weights inside
-    <repo>/weights. Returns a vla.yaml-shaped dict or None (stated by caller)."""
-    project_dir = Path(project_dir).resolve()
-    roots = [project_dir.parent, project_dir.parent.parent]
-    repo = None
-    for root in roots:
-        if not root.is_dir():
-            continue
-        for d in sorted(root.iterdir()):
-            if d.is_dir() and (d / "deploy" / "lingbot_vla_v2_policy.py").exists():
-                repo = d
-                break
-        if repo:
-            break
-    if repo is None:
+SEARCH_ROOTS = ["/home", "/opt", "/srv", "/data", "/usr/local"]
+
+
+def _probe_src(desc: dict) -> str:
+    pkg = desc["probe_import"]
+    marker = desc["repo_marker"]
+    return (f"import {pkg}, pathlib; "
+            f"p = pathlib.Path({pkg}.__file__).resolve(); "
+            "r = next((str(s) for s in p.parents "
+            f"if (s / {marker!r}).exists()), ''); "
+            "print(r)")
+
+
+def probe_python(py: str, desc: dict, timeout_s: float = 30.0) -> Optional[str]:
+    """Ask an interpreter directly: can you import the runtime's package, and where is
+    the repo it came from? Returns the repo path ('' when the package isn't an
+    editable checkout) or None when the import fails. Ground truth, never a guess."""
+    try:
+        r = subprocess.run([py, "-c", _probe_src(desc)], capture_output=True,
+                           text=True, timeout=timeout_s)
+    except Exception:                              # noqa: BLE001
         return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _candidate_pythons(project_dir: Path) -> List[str]:
+    """Interpreters already in play, most-likely first. Includes the ACTIVE venv the
+    operator is standing in and the edge's locked interpreter — the same-venv install
+    is fully supported."""
+    cands: List[str] = []
+    for env_var in ("REMOROO_VLA_PYTHON", "VIRTUAL_ENV", "CONDA_PREFIX"):
+        v = os.environ.get(env_var, "")
+        if v:
+            cands.append(v if v.endswith("python") else str(Path(v) / "bin" / "python"))
+    try:
+        edge_cfg = json.loads((Path(project_dir) / ".remoroo" / "edge.json"
+                               ).read_text(encoding="utf-8"))
+        if edge_cfg.get("interpreter"):
+            cands.append(edge_cfg["interpreter"])
+    except Exception:                              # noqa: BLE001
+        pass
+    for name in ("python3", "python"):
+        w = shutil.which(name)
+        if w:
+            cands.append(w)
+    seen, out = set(), []
+    for c in cands:
+        rc = str(Path(c))
+        if rc not in seen and Path(rc).exists():
+            seen.add(rc)
+            out.append(rc)
+    return out
+
+
+def _system_search(desc: dict, roots: Optional[List[str]] = None,
+                   timeout_s: float = 25.0) -> Dict[str, List[str]]:
+    """Bounded find for the installed package and the repo, wherever they are.
+    Package hits become interpreters (site-packages -> the venv's bin/python)."""
+    roots = [r for r in (roots or SEARCH_ROOTS) if Path(r).is_dir()]
+    if not roots:
+        return {"pythons": [], "repos": []}
+    pkg = desc["probe_import"]
+    marker = desc["repo_marker"]
+    expr = ("find " + " ".join(roots) + " -maxdepth 9 "
+            f"\\( -path '*/site-packages/{pkg}/__init__.py' "
+            f"-o -path '*/{marker}' \\) "
+            "-not -path '*/.git/*' 2>/dev/null | head -40")
+    try:
+        # no `timeout` binary dependency (absent on stock macOS): subprocess enforces it
+        r = subprocess.run(["bash", "-c", expr], capture_output=True, text=True,
+                           timeout=timeout_s)
+        hits = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    except Exception:                              # noqa: BLE001
+        hits = []
+    pythons, repos = [], []
+    for h in hits:
+        hp = Path(h)
+        if hp.name == "__init__.py":               # …/site-packages/<pkg>/__init__.py
+            for up in hp.parents:
+                py = up / "bin" / "python"
+                if py.exists():
+                    pythons.append(str(py))
+                    break
+        else:                                       # …/repo/deploy/lingbot_vla_v2_policy.py
+            repos.append(str(hp.parent.parent))
+    return {"pythons": pythons, "repos": repos}
+
+
+def discover(project_dir: Path, *, runtime: str = "",
+             roots: Optional[List[str]] = None,
+             echo: Echo = lambda m: None) -> Optional[dict]:
+    """Ground-truth discovery. Returns a vla.yaml-shaped dict, a PARTIAL dict with
+    "missing" listed (the wizard fills it), or None when nothing was found at all."""
+    project_dir = Path(project_dir).resolve()
+    desc = runtime_descriptor(runtime)
     python = None
-    for cand in (repo / ".venv" / "bin" / "python", repo / "venv" / "bin" / "python",
-                 *sorted(repo.parent.glob("*lingbot*venv*/bin/python"))):
-        if Path(cand).exists():
-            python = str(cand)
+    repo = None
+    for py in _candidate_pythons(project_dir):
+        got = probe_python(py, desc)
+        if got is not None:
+            python, repo = py, (got or None)
+            echo(f"  vla: {py} imports {desc['probe_import']}"
+                 + (f" (repo {got})" if got else ""))
             break
     if python is None:
-        return None                       # a repo without its venv can't serve
-    cfg: dict = {"runtime": "lingbot", "python": python, "workdir": str(repo),
-                 "port": int(VLA_PORT_DEFAULT), "extra_args": ["--use_compile"]}
-    weights = repo / "weights"
-    if weights.is_dir():
-        ckpts = sorted(weights.glob("*vla*"))
-        if ckpts:
-            cfg["checkpoint"] = str(ckpts[0])
-        qwen = sorted(weights.glob("Qwen3-VL*"))
-        if qwen:
-            cfg["qwen_path"] = str(qwen[0])
-            cfg["env"] = {"QWEN3VL_PATH": str(qwen[0])}
+        found = _system_search(desc, roots)
+        for py in found["pythons"]:
+            got = probe_python(py, desc)
+            if got is not None:
+                python, repo = py, (got or None)
+                echo(f"  vla: found installed package -> {py}")
+                break
+        if repo is None and found["repos"]:
+            repo = found["repos"][0]
+    if repo is None:                                # repo not derivable from the package
+        found = _system_search(desc, roots) if python is not None else {"repos": []}
+        if found.get("repos"):
+            repo = found["repos"][0]
+    if python is None and repo is None:
+        return None
+    cfg: dict = {"runtime": runtime or DEFAULT_RUNTIME,
+                 "port": int(VLA_PORT_DEFAULT),
+                 "extra_args": list(desc["extra_args"])}
+    missing: List[str] = []
+    if python:
+        cfg["python"] = python
+    else:
+        missing.append("python")
+    if repo:
+        cfg["workdir"] = repo
+        weights = Path(repo) / "weights"
+        if weights.is_dir():
+            ckpts = sorted(weights.glob(desc["weights_glob"]))
+            if ckpts:
+                cfg["checkpoint"] = str(ckpts[0])
+            qwen = (sorted(weights.glob(desc["qwen_glob"]))
+                    if desc.get("qwen_glob") else [])
+            if qwen:
+                cfg["qwen_path"] = str(qwen[0])
+                cfg["env"] = {"QWEN3VL_PATH": str(qwen[0])}
+    else:
+        missing.append("workdir")
+    if missing:
+        cfg["missing"] = missing
+    return cfg
+
+
+def wizard(project_dir: Path, *, ask: Callable[[str, str], str],
+           echo: Echo = print, runtime: str = "",
+           roots: Optional[List[str]] = None) -> Optional[dict]:
+    """Derive everything derivable; ask a human ONLY for what remains; VERIFY every
+    answer by probing before it is accepted. Returns the final config (not written)."""
+    desc = runtime_descriptor(runtime)
+    cfg = discover(project_dir, runtime=runtime, roots=roots, echo=echo) or {
+        "runtime": runtime or DEFAULT_RUNTIME, "port": int(VLA_PORT_DEFAULT),
+        "extra_args": list(desc["extra_args"]), "missing": ["python", "workdir"]}
+    missing = cfg.pop("missing", [])
+    while "python" in missing:
+        ans = ask(f"Which python can `import {desc['probe_import']}`? (the venv "
+                  "you installed the VLA into — the curobo/edge venv is fine)", "")
+        if not ans:
+            return None
+        got = probe_python(ans if ans.endswith("python")
+                           else str(Path(ans) / "bin" / "python"), desc)
+        if got is None:
+            echo(f"  ✗ {ans} can NOT import {desc['probe_import']} — not accepting it "
+                 "(install the package there, or point at the right venv)")
+            continue
+        cfg["python"] = (ans if ans.endswith("python")
+                         else str(Path(ans) / "bin" / "python"))
+        if got and "workdir" in missing:
+            cfg["workdir"] = got
+            missing.remove("workdir")
+        missing.remove("python")
+    while "workdir" in missing:
+        ans = ask(f"Where is the runtime checkout (the dir containing "
+                  f"{desc['repo_marker']})?", "")
+        if not ans:
+            return None
+        if (Path(ans) / desc["repo_marker"]).exists():
+            cfg["workdir"] = str(Path(ans).resolve())
+            missing.remove("workdir")
+        else:
+            echo(f"  ✗ {ans} has no {desc['repo_marker']} — not accepting it")
     return cfg
 
 
 def ensure_declared(project_dir: Path, echo: Echo = print) -> bool:
-    """No vla.yaml -> try discovery and WRITE it (stated). True when declared."""
+    """No vla.yaml -> full ground-truth discovery; write only a COMPLETE config
+    (partial ones wait for `remoroo vla init`'s questions). True when declared."""
     if configured(project_dir):
         return True
-    cfg = discover(project_dir)
-    if cfg is None:
+    cfg = discover(project_dir, echo=echo)
+    if cfg is None or cfg.get("missing"):
         return False
     import yaml
 
     p = config_path(project_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-    echo(f"  vla auto-discovered: {cfg['workdir']} (wrote {p})")
+    echo(f"  vla auto-discovered: python={cfg['python']} repo={cfg['workdir']} "
+         f"(wrote {p})")
     return True

@@ -337,9 +337,10 @@ def task(
                                       echo=lambda m: typer.secho(m, fg=typer.colors.YELLOW))
     if _vla.get("skipped") == "not_configured":
         typer.secho("    ⚠⚠ NO VLA ON THIS RIG — scouting and probing run DEGRADED "
-                    "(look tours + mech probes only). Fix in one command once the "
-                    "LingBot repo+venv exist next to this project: `remoroo vla init` "
-                    "(zero flags, auto-discovers).", fg=typer.colors.RED, bold=True)
+                    "(look tours + mech probes only). Fix: `remoroo vla init` — it "
+                    "probes every python on this machine for the VLA package (the "
+                    "edge/curobo venv counts) and asks for anything it can't find.",
+                    fg=typer.colors.RED, bold=True)
     typer.secho(f"🤖  remoroo task → @robot_task  (slug: {slug}, run: {run_id})",
                 fg=typer.colors.CYAN)
     typer.secho("    Autonomous: no gates. "
