@@ -50,7 +50,10 @@ RUNTIMES: dict = {
         "repo_marker": "deploy/lingbot_vla_v2_policy.py",
         "weights_glob": "*vla*",
         "qwen_glob": "Qwen3-VL*",                  # companion weights (QWEN3VL_PATH)
-        "extra_args": ["--use_compile"],
+        # NO default extra args: the vendor's own defaults win (its --use_compile
+        # takes a VALUE — passing it bare crashed argparse on the first live boot).
+        # Rigs override per hardware, e.g. extra_args: ["--use_compile", "False"].
+        "extra_args": [],
     },
     "openpi": {
         "probe_import": "openpi",
@@ -156,11 +159,33 @@ def load_config(project_dir: Path) -> Optional[dict]:
                        runtime_descriptor(str(raw.get("runtime", "")),
                                           raw)["module"]),
         "qwen_path": pick("REMOROO_VLA_QWEN", "qwen_path"),
+        # a shell file SOURCED before spawn (systemd EnvironmentFile= equivalent) —
+        # for env files that COMPUTE their exports (the copy-into-env: trick can't)
+        "env_file": pick("REMOROO_VLA_ENV_FILE", "env_file"),
         "extra_args": [str(a) for a in extra],
         # env vars the SERVER process needs (QWEN3VL_PATH for the base model, CUDA/cuDNN
         # workarounds, …) — merged over the inherited environment at spawn.
         "env": {str(k): str(v) for k, v in (raw.get("env") or {}).items()},
     }
+
+
+def _sourced_env(env_file: str) -> dict:
+    """Source the file in bash and return ONLY what it changed or added (two-run
+    diff), so we apply exactly the file's effect — computed exports included."""
+    import shlex
+
+    def env_of(cmd: str) -> dict:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=30)
+        out = {}
+        for chunk in r.stdout.split(b"\0"):
+            if b"=" in chunk:
+                k, v = chunk.decode(errors="replace").split("=", 1)
+                out[k] = v
+        return out
+
+    base = env_of("env -0")
+    sourced = env_of(f"set -a; source {shlex.quote(env_file)} >/dev/null 2>&1; env -0")
+    return {k: v for k, v in sourced.items() if base.get(k) != v}
 
 
 def server_cmd(cfg: dict) -> List[str]:
@@ -181,6 +206,9 @@ def _validate(cfg: dict) -> Optional[str]:
     if not wd or not Path(wd).is_dir():
         return ("`workdir:` must be the LingBot repo checkout (its deploy/ module runs "
                 f"the server); got {wd!r}")
+    ef = cfg.get("env_file")
+    if ef and not Path(ef).exists():
+        return f"env_file {ef!r} does not exist — fix the path in .remoroo/vla.yaml"
     ck = cfg.get("checkpoint")
     if not ck or not Path(ck).exists():
         return ("no checkpoint found — run `remoroo models install` (pulls the pinned "
@@ -312,7 +340,9 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
     cmd = server_cmd(cfg)
     env = dict(os.environ)
     env.update({"PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"})
-    env.update(cfg.get("env") or {})       # the declaration's server env (QWEN3VL_PATH…)
+    if cfg.get("env_file"):
+        env.update(_sourced_env(cfg["env_file"]))   # sourced first ...
+    env.update(cfg.get("env") or {})       # ... explicit env: still wins (QWEN3VL_PATH…)
     lp = log_path(project_dir)
     try:
         log_fh = open(lp, "w", encoding="utf-8")   # fresh log per process
@@ -354,7 +384,13 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
             echo(f"  ❌ vla server EXITED immediately (code {proc.poll()}).")
             for ln in tail(project_dir, 20):
                 echo(f"     │ {ln}")
-            echo("     Common causes: wrong venv python, checkpoint path, or CUDA OOM.")
+            tail_txt = " ".join(tail(project_dir, 20))
+            if "cannot open shared object file" in tail_txt and not cfg.get("env_file"):
+                echo("     A shared library the venv's torch needs isn't visible. If "
+                     "your working invocation sources an env file (cuda_env.sh etc.), "
+                     "declare it:  env_file: /path/to/that.sh  in .remoroo/vla.yaml")
+            else:
+                echo("     Common causes: wrong venv python, checkpoint path, or CUDA OOM.")
             return {"ok": False, "error": f"exited:{proc.poll()}", "pid": proc.pid}
         if _listening(cfg["port"]):
             echo(f"  ✅ vla server serving on :{cfg['port']}")
@@ -640,6 +676,13 @@ def wizard(project_dir: Path, *, ask: Callable[[str, str], str],
             cfg["workdir"] = repo_from_probe
             missing.remove("workdir")
         missing.remove("python")
+    ef = ask("Does the server need a shell env file sourced first (e.g. a "
+             "cuda_env.sh)? Path, or Enter to skip", "").strip()
+    if ef:
+        if Path(ef).expanduser().exists():
+            cfg["env_file"] = str(Path(ef).expanduser())
+        else:
+            echo(f"  ✗ {ef} does not exist — skipping (add env_file: to vla.yaml later)")
     while "workdir" in missing:
         ans = ask(f"Where is the runtime checkout (the dir containing "
                   f"{desc['repo_marker']})?", "").strip()

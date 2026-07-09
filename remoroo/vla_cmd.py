@@ -114,7 +114,7 @@ def init(
                     fg=typer.colors.RED)
         raise typer.Exit(code=2)
     cfg.setdefault("runtime", "lingbot")
-    cfg.setdefault("extra_args", ["--use_compile"])
+    cfg.setdefault("extra_args", [])
     if python:
         cfg["python"] = python
     if workdir:
