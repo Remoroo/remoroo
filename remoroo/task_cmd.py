@@ -411,9 +411,9 @@ def models_install(port: int = typer.Option(EDGE_PORT_DEFAULT, "--port")):
     """Install the pinned perception checkpoints on this cell (once; GBs, minutes).
     Run it right after setup so task runs find the models warm — the agent never
     spends tokens fetching weights."""
-    typer.secho("Downloading + hash-verifying pinned models (SAM 2.1, GroundingDINO; "
-                "plus the LingBot-VLA snapshot on rigs with .remoroo/vla.yaml — that one "
-                "is ~12 GB)…", fg=typer.colors.CYAN)
+    typer.secho("Verifying pinned models (downloads ONLY what's missing; a "
+                "checkpoint declared in vla.yaml is never re-downloaded)…",
+                fg=typer.colors.CYAN)
     out = _edge("models_install", {}, port, timeout=7200)
     typer.echo(json.dumps(out, indent=1))
     models = out.get("models") or {}

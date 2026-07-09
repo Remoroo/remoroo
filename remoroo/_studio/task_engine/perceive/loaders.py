@@ -92,8 +92,28 @@ def _vla_declared(weights_dir: str) -> bool:
     return (Path(weights_dir).resolve().parent.parent / "vla.yaml").exists()
 
 
+def _declared_checkpoint(weights_dir: str):
+    """A checkpoint the RIG already declared in vla.yaml (downloaded by hand, mounted,
+    wherever) OUTRANKS the pinned snapshot: never download weights the declaration
+    already points at."""
+    cfg = Path(weights_dir).resolve().parent.parent / "vla.yaml"
+    try:
+        import yaml
+        ck = (yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}).get("checkpoint")
+        return str(ck) if ck and Path(ck).exists() else None
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
 def vla_status(weights_dir: str) -> Dict[str, Any]:
     pin = _vla_pin()
+    declared = _declared_checkpoint(weights_dir)
+    if declared:
+        return {"name": pin["repo_id"], "pinned": True, "kind": "declared_checkpoint",
+                "revision": pin["revision"], "present": True, "verified": False,
+                "declared": True, "path": declared,
+                "note": "rig-declared checkpoint (vla.yaml) — pin download skipped; "
+                        "not hash-verified against the pin"}
     d = _vla_dir(weights_dir)
     stamp = d / "REVISION"
     present = d.is_dir() and any(d.glob("*.safetensors"))
@@ -106,6 +126,10 @@ def vla_status(weights_dir: str) -> Dict[str, Any]:
 
 def vla_install(weights_dir: str) -> Dict[str, Any]:
     st = vla_status(weights_dir)
+    if st.get("kind") == "declared_checkpoint":
+        return {"ok": True, "path": st["path"],
+                "skipped": "checkpoint already declared in vla.yaml and present on "
+                           "disk — nothing to download"}
     if not st["declared"]:
         return {"ok": True, "skipped": "no .remoroo/vla.yaml on this rig — declare the "
                                        "policy server to pull the ~12 GB snapshot"}
