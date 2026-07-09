@@ -436,7 +436,35 @@ def _probe_src(desc: dict) -> str:
             "print(r)")
 
 
-def probe_python(py: str, desc: dict, timeout_s: float = 30.0) -> Optional[str]:
+def _python_candidates_from_answer(ans: str) -> List[str]:
+    """A human points anywhere inside a venv (the venv root, lib/python3.10/,
+    site-packages, bin/, or the interpreter itself) — resolve to interpreter
+    candidates instead of demanding the exact binary path."""
+    s = ans.strip().rstrip("/")
+    if not s:
+        return []
+    p = Path(s).expanduser()
+    out: List[str] = []
+    if p.is_file():
+        out.append(str(p))
+    for base in [p, *list(p.parents)[:4]]:
+        for name in ("python", "python3"):
+            cand = base / "bin" / name
+            if cand.exists():
+                out.append(str(cand))
+        if base.name == "bin":
+            for name in ("python", "python3"):
+                if (base / name).exists():
+                    out.append(str(base / name))
+    seen, uniq = set(), []
+    for c in out:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
+def probe_python(py: str, desc: dict, timeout_s: float = 90.0) -> Optional[str]:
     """Ask an interpreter directly: can you import the runtime's package, and where is
     the repo it came from? Returns the repo path ('' when the package isn't an
     editable checkout) or None when the import fails. Ground truth, never a guess."""
@@ -478,7 +506,7 @@ def _candidate_pythons(project_dir: Path) -> List[str]:
 
 
 def _system_search(desc: dict, roots: Optional[List[str]] = None,
-                   timeout_s: float = 25.0) -> Dict[str, List[str]]:
+                   timeout_s: float = 60.0) -> Dict[str, List[str]]:
     """Bounded find for the installed package and the repo, wherever they are.
     Package hits become interpreters (site-packages -> the venv's bin/python)."""
     roots = [r for r in (roots or SEARCH_ROOTS) if Path(r).is_dir()]
@@ -495,6 +523,10 @@ def _system_search(desc: dict, roots: Optional[List[str]] = None,
         r = subprocess.run(["bash", "-c", expr], capture_output=True, text=True,
                            timeout=timeout_s)
         hits = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    except subprocess.TimeoutExpired as e:         # keep what the scan DID find
+        raw = e.stdout or b""
+        raw = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
+        hits = [ln for ln in raw.splitlines() if ln.strip()]
     except Exception:                              # noqa: BLE001
         hits = []
     pythons, repos = [], []
@@ -581,25 +613,36 @@ def wizard(project_dir: Path, *, ask: Callable[[str, str], str],
         "extra_args": list(desc["extra_args"]), "missing": ["python", "workdir"]}
     missing = cfg.pop("missing", [])
     while "python" in missing:
-        ans = ask(f"Which python can `import {desc['probe_import']}`? (the venv "
-                  "you installed the VLA into — the curobo/edge venv is fine)", "")
+        ans = ask(f"Where is the VLA's python? Any of these work: the venv dir, its "
+                  "bin/python, or lib/pythonX.Y — I'll resolve it. (the curobo/edge "
+                  "venv is fine if you installed the VLA there)", "").strip()
         if not ans:
             return None
-        got = probe_python(ans if ans.endswith("python")
-                           else str(Path(ans) / "bin" / "python"), desc)
-        if got is None:
-            echo(f"  ✗ {ans} can NOT import {desc['probe_import']} — not accepting it "
-                 "(install the package there, or point at the right venv)")
+        cands = _python_candidates_from_answer(ans)
+        if not cands:
+            echo(f"  ✗ no python interpreter found under {ans!r} — I looked for "
+                 "bin/python and bin/python3 in it and its parents")
             continue
-        cfg["python"] = (ans if ans.endswith("python")
-                         else str(Path(ans) / "bin" / "python"))
-        if got and "workdir" in missing:
-            cfg["workdir"] = got
+        accepted = None
+        for cand in cands:
+            got = probe_python(cand, desc)
+            if got is not None:
+                accepted, repo_from_probe = cand, got
+                break
+        if accepted is None:
+            echo(f"  ✗ tried {', '.join(cands)} — none can import "
+                 f"{desc['probe_import']}. Check with: "
+                 f"{cands[0]} -c 'import {desc['probe_import']}'")
+            continue
+        echo(f"  ✓ {accepted} imports {desc['probe_import']}")
+        cfg["python"] = accepted
+        if repo_from_probe and "workdir" in missing:
+            cfg["workdir"] = repo_from_probe
             missing.remove("workdir")
         missing.remove("python")
     while "workdir" in missing:
         ans = ask(f"Where is the runtime checkout (the dir containing "
-                  f"{desc['repo_marker']})?", "")
+                  f"{desc['repo_marker']})?", "").strip()
         if not ans:
             return None
         if (Path(ans) / desc["repo_marker"]).exists():
