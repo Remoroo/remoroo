@@ -243,32 +243,55 @@ def _read_pid(project_dir: Path) -> int:
         return 0
 
 
-def _listening(port: str, timeout: float = 1.0) -> bool:
-    """Polite liveness: send a real HTTP request and expect BYTES back (a websockets
-    server answers non-upgrade requests with an HTTP error page — that's a healthy
-    answer). The old bare connect-and-close made the server log a 15-line handshake
-    traceback on EVERY status poll — a probe must never manufacture the noise it
-    then displays."""
+def _listening(port: str, timeout: float = 2.0) -> bool:
+    """A REAL WebSocket visit: proper upgrade handshake, then a clean close frame
+    (masked, code 1000) — the server sees a normal connect/disconnect and logs
+    NOTHING. (v1 bare-connect made it log EOF handshake errors; v2 plain HTTP made
+    it log InvalidUpgrade. A probe must be indistinguishable from a citizen.)
+    A non-websocket server answering the upgrade with any HTTP response also counts
+    as alive."""
+    import base64
+
     try:
         with socket.create_connection(("127.0.0.1", int(port)),
                                       timeout=timeout) as s:
             s.settimeout(timeout)
-            s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                      b"Connection: close\r\n\r\n")
+            key = base64.b64encode(os.urandom(16)).decode()
+            s.sendall((f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                       f"Sec-WebSocket-Key: {key}\r\n"
+                       "Sec-WebSocket-Version: 13\r\n\r\n").encode())
             try:
-                return bool(s.recv(64))          # any answer = alive and speaking
+                resp = s.recv(1024)
             except OSError:
-                return True                      # connected but mute: still alive
+                return True                      # connected but slow: alive
+            if not resp:
+                return False
+            if resp.startswith(b"HTTP/1.1 101"):
+                # handshake accepted: leave like a citizen (masked close, code 1000)
+                mask = os.urandom(4)
+                payload = bytes(b ^ mask[i % 4]
+                                for i, b in enumerate(b"\x03\xe8"))
+                s.sendall(b"\x88\x82" + mask + payload)
+                try:
+                    s.recv(64)                   # the server's close reply
+                except OSError:
+                    pass
+            return True                          # any HTTP answer = something serves
     except OSError:
         return False
 
 
-# Known-noise patterns a healthy websockets server logs when probed/portscanned —
-# filtered from the DISPLAYED tail only (the log file keeps everything).
+# Known-noise a websockets server logs when probed by OLDER remoroo versions or
+# portscanners — filtered from the DISPLAYED tail only (the log keeps everything).
 _NOISE_MARKERS = ("connection closed while reading HTTP request line",
                   "did not receive a valid HTTP request",
                   "opening handshake failed",
                   "websockets.exceptions.InvalidMessage",
+                  "websockets.exceptions.InvalidUpgrade",
+                  "invalid Connection header",
+                  ") = self.process_request(request)",
+                  "raise InvalidUpgrade(",
                   "site-packages/websockets/",
                   "request = yield from Request.parse",
                   "await connection.handshake(",
