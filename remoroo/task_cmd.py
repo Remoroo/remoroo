@@ -283,6 +283,11 @@ def task(
                                     "start clean. Skill identity, ground truth, and "
                                     "probe evidence are KEPT. Use after engine "
                                     "upgrades that change the method."),
+    fresh_all: bool = typer.Option(False, "--fresh-all",
+                                   help="Like --fresh, but archives EVERY task "
+                                        "evolution in this cell (all task_* packages "
+                                        "+ their state) — dead slugs from reworded "
+                                        "sentences stop being scavenged as bait."),
     headless: bool = typer.Option(False, "--headless",
                                   help="No Studio: terminal stream only. Default is "
                                        "the TASK COCKPIT in the browser — the run is "
@@ -330,14 +335,25 @@ def task(
     skill_id = _resolve_skill(client, base, repo_path, sentence=sentence, slug=slug,
                               flag_value=skill)
 
-    if fresh:
-        dest = _archive_evolution(repo_path, slug)
-        if dest:
-            typer.secho(f"    ⟲ previous evolution archived to {dest} "
-                        "(skill identity + probe evidence kept). Starting clean.",
-                        fg=typer.colors.YELLOW)
+    if fresh or fresh_all:
+        slugs = [slug]
+        if fresh_all:
+            cell = repo_path / "remoroo_cell"
+            slugs += [d.name[len("task_"):] for d in sorted(cell.glob("task_*"))
+                      if d.is_dir() and d.name[len("task_"):] != slug]
+        archived = [d for s in slugs if (d := _archive_evolution(repo_path, s))]
+        if archived:
+            typer.secho(f"    ⟲ archived {len(archived)} evolution(s) -> "
+                        f"{archived[0].parent} (skill identity + probe evidence "
+                        "kept). Starting clean.", fg=typer.colors.YELLOW)
         else:
-            typer.secho("    (--fresh: nothing to archive for this task)",
+            typer.secho("    (nothing to archive)", fg=typer.colors.YELLOW)
+        leftovers = [d.name for d in (repo_path / "remoroo_cell").glob("task_*")
+                     if d.is_dir()]
+        if leftovers and not fresh_all:
+            typer.secho(f"    ⚠ other task packages remain in remoroo_cell/ "
+                        f"({', '.join(leftovers)}) — a fresh evolution must not "
+                        "scavenge them (--fresh-all archives everything).",
                         fg=typer.colors.YELLOW)
 
     # RESUME: the evolution lives on the cell (artifacts + trials + bank), so the same
@@ -383,7 +399,22 @@ def task(
     from . import vla_service
     _vla = vla_service.ensure_started(repo_path,
                                       echo=lambda m: typer.secho(m, fg=typer.colors.YELLOW))
-    if _vla.get("skipped") == "not_configured":
+    _vla_none = None
+    try:                                    # a RECORDED skip is a decision, not a defect
+        import yaml as _yaml
+        _cell = _yaml.safe_load((repo_path / "remoroo_cell" / "cell.yaml"
+                                 ).read_text()) or {}
+        _v = _cell.get("vla")
+        if isinstance(_v, dict) and "none" in _v:
+            _vla_none = str(_v["none"])
+        elif _v == "none":
+            _vla_none = "recorded at setup"
+    except Exception:                       # noqa: BLE001 - no cell.yaml yet is fine
+        pass
+    if _vla.get("skipped") == "not_configured" and _vla_none is not None:
+        typer.secho(f"    (no VLA on this rig — recorded at the setup gate: "
+                    f"{_vla_none})", fg=typer.colors.YELLOW)
+    elif _vla.get("skipped") == "not_configured":
         typer.secho("    ⚠⚠ NO VLA ON THIS RIG — scouting and probing run DEGRADED "
                     "(look tours + mech probes only). Fix: `remoroo vla init` — it "
                     "probes every python on this machine for the VLA package (the "

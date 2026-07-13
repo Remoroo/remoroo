@@ -217,8 +217,25 @@ class TaskService:
             return {"error": "no joints readable for RUN HOME — startup can't complete"}
         led.set_run_home(joints)
         led.instruments = body.get("instruments") or led.instruments
+        # the VLA gate's measured facts (latency, wire shape) become ledger
+        # instruments — downstream budgets read MEASUREMENTS, never assumptions
+        commission = (self.data_dir.parent.parent / "remoroo_cell" / "vla"
+                      / "commission.json")
+        if commission.exists():
+            try:
+                import json as _json
+                c = _json.loads(commission.read_text(encoding="utf-8"))
+                led.instruments["vla"] = {
+                    "runtime": c.get("runtime"),
+                    "latency_ms": c.get("latency_ms"),
+                    "wire": c.get("wire"),
+                    "commissioned_at": c.get("commissioned_at")}
+            except Exception as e:             # noqa: BLE001 - stated, not fatal
+                led.instruments["vla"] = {"error": f"unreadable commission.json: "
+                                                   f"{type(e).__name__}"}
         led.save()
-        return {"ok": True, "run_home_joints": len(joints)}
+        return {"ok": True, "run_home_joints": len(joints),
+                "vla_commissioned": "vla" in led.instruments}
 
     def v_phase_advance(self, body: dict) -> dict:
         return self._ledger(body["task_slug"]).advance(body["to"],
@@ -532,8 +549,20 @@ class TaskService:
             return {"error": "vla.yaml needs workdir + checkpoint to place the configs"}
         from .vla.profile import write_lingbot_configs
         norm_stats = str(self.data_dir / "vla" / "norm_stats.json")   # finetune job output
+        # the gate PROBED where this rig's server actually reads its config
+        # (rig-specific, often NOT beside the checkpoint) and recorded it
+        config_path = None
+        commission = (self.data_dir.parent.parent / "remoroo_cell" / "vla"
+                      / "commission.json")
+        if commission.exists():
+            try:
+                import json as _json
+                config_path = _json.loads(commission.read_text()).get("config_path")
+            except Exception:                  # noqa: BLE001
+                pass
         out = write_lingbot_configs(
             profile, workdir=workdir, checkpoint=checkpoint,
+            config_path=config_path,
             qwen_path=cfg.get("qwen_path") or str(Path(checkpoint).parent
                                                   / "Qwen3-VL-4B-Instruct"),
             norm_stats_path=norm_stats)

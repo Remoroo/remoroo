@@ -187,7 +187,8 @@ def to_lingbot_cli_config(profile: VlaProfile, *, checkpoint: str, qwen_path: st
 
 
 def write_lingbot_configs(profile: VlaProfile, *, workdir: str, checkpoint: str,
-                          qwen_path: str, norm_stats_path: str) -> Dict[str, Any]:
+                          qwen_path: str, norm_stats_path: str,
+                          config_path: Optional[str] = None) -> Dict[str, Any]:
     """Materialize both files where LingBot's code looks for them. Returns the written
     paths AND the config dicts themselves — the finetune job ships the dicts to the
     trainer box (which regenerates nothing; the profile decided once, here)."""
@@ -201,7 +202,11 @@ def write_lingbot_configs(profile: VlaProfile, *, workdir: str, checkpoint: str,
 
     cli = to_lingbot_cli_config(profile, checkpoint=checkpoint, qwen_path=qwen_path,
                                 robot_config_root=str(robot_dir))
-    cli_cfg = Path(checkpoint).resolve().parent / "lingbotvla_cli.yaml"
+    # DEFAULT beside the checkpoint is a GUESS; the commissioning gate probes the
+    # rig's REAL path (the Hitbot's server read it three dirs above) and callers
+    # pass it through config_path.
+    cli_cfg = (Path(config_path) if config_path
+               else Path(checkpoint).resolve().parent / "lingbotvla_cli.yaml")
     cli_cfg.write_text(yaml.safe_dump(cli, sort_keys=False), encoding="utf-8")
     return {"robot_config_path": str(robot_cfg), "cli_config_path": str(cli_cfg),
             "robot_config": robot, "cli_config": cli}
