@@ -217,25 +217,36 @@ class TaskService:
             return {"error": "no joints readable for RUN HOME — startup can't complete"}
         led.set_run_home(joints)
         led.instruments = body.get("instruments") or led.instruments
-        # the VLA gate's measured facts (latency, wire shape) become ledger
-        # instruments — downstream budgets read MEASUREMENTS, never assumptions
+        # the VLA truth, declared or not, commissioned or not — the agent must
+        # never have to DISCOVER that a serving policy exists (a live run skipped
+        # the scout because nothing said the server was up)
+        led.instruments["vla"] = self._vla_liveness()
         commission = (self.data_dir.parent.parent / "remoroo_cell" / "vla"
                       / "commission.json")
         if commission.exists():
             try:
                 import json as _json
                 c = _json.loads(commission.read_text(encoding="utf-8"))
-                led.instruments["vla"] = {
+                led.instruments["vla"].update({
                     "runtime": c.get("runtime"),
                     "latency_ms": c.get("latency_ms"),
                     "wire": c.get("wire"),
-                    "commissioned_at": c.get("commissioned_at")}
+                    "commissioned_at": c.get("commissioned_at")})
             except Exception as e:             # noqa: BLE001 - stated, not fatal
-                led.instruments["vla"] = {"error": f"unreadable commission.json: "
-                                                   f"{type(e).__name__}"}
+                led.instruments["vla"]["commission_error"] = (
+                    f"unreadable commission.json: {type(e).__name__}")
         led.save()
+        v = led.instruments.get("vla") or {}
         return {"ok": True, "run_home_joints": len(joints),
-                "vla_commissioned": "vla" in led.instruments}
+                "vla_declared": bool(v.get("declared")),
+                "vla_serving": bool(v.get("serving")),
+                "vla_commissioned": bool(v.get("commissioned_at")),
+                "note": ("VLA is SERVING — vla_load {runtime} NOW (a client handle, "
+                         "costs nothing); scout_run gives your second viewpoints"
+                         if v.get("serving") else
+                         "VLA declared but not serving yet (loading takes minutes); "
+                         "retry vla_load before scouting" if v.get("declared") else
+                         "no VLA on this rig")}
 
     def v_phase_advance(self, body: dict) -> dict:
         return self._ledger(body["task_slug"]).advance(body["to"],
@@ -378,7 +389,11 @@ class TaskService:
                 return {"error": (f"no task package for {slug!r} and no program_src "
                                   f"({type(e).__name__}: {e}) — author "
                                   "perception_task.py or pass program_src")}
+        print(f"[perceive] running {slug} perception (FIRST call loads pinned "
+              "models into this process — minutes on embedded GPUs; this is not a "
+              "hang)", flush=True)
         scene = env.observe()
+        print(f"[perceive] done: {len(scene.entities())} entities", flush=True)
         entities = [{"label": e.label, "pose": list(e.pose[:3]),
                      "dims": list(e.dims) if e.dims else None}
                     for e in scene.entities()]
@@ -570,6 +585,46 @@ class TaskService:
         return {"ok": True, "robo_name": profile.robo_name,
                 "state_dim": profile.state_dim, "action_dim": profile.action_dim,
                 "norm_stats_expected_at": norm_stats, **out}
+
+    def _vla_liveness(self) -> dict:
+        """Declared? serving? — probed like a CITIZEN (full ws handshake + clean
+        masked close; mirrors the CLI's probe: a bare connect makes the server log
+        handshake tracebacks on every startup)."""
+        import base64
+        import socket as _socket
+
+        cfg_path = self.data_dir.parent / "vla.yaml"
+        out: dict = {"declared": cfg_path.exists(), "serving": False}
+        if not out["declared"]:
+            return out
+        try:
+            import yaml
+            port = int((yaml.safe_load(cfg_path.read_text()) or {}).get("port", 8791))
+        except Exception:                          # noqa: BLE001
+            port = 8791
+        out["port"] = port
+        try:
+            with _socket.create_connection(("127.0.0.1", port), timeout=2.0) as s:
+                s.settimeout(2.0)
+                key = base64.b64encode(__import__("os").urandom(16)).decode()
+                s.sendall((f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\n"
+                           "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+                resp = s.recv(1024)
+                out["serving"] = bool(resp)
+                if resp.startswith(b"HTTP/1.1 101"):
+                    mask = __import__("os").urandom(4)
+                    payload = bytes(b ^ mask[i % 4]
+                                    for i, b in enumerate(b"\x03\xe8"))
+                    s.sendall(b"\x88\x82" + mask + payload)
+                    try:
+                        s.recv(64)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return out
 
     def _vla_server_url(self) -> str:
         """The rig's declared policy server: .remoroo/vla.yaml (the SAME file
