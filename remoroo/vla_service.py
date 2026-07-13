@@ -244,13 +244,41 @@ def _read_pid(project_dir: Path) -> int:
 
 
 def _listening(port: str, timeout: float = 1.0) -> bool:
-    """TCP-level health: the policy server has no guaranteed /health route, but a bound
-    port that accepts a connection means the model finished loading and serves."""
+    """Polite liveness: send a real HTTP request and expect BYTES back (a websockets
+    server answers non-upgrade requests with an HTTP error page — that's a healthy
+    answer). The old bare connect-and-close made the server log a 15-line handshake
+    traceback on EVERY status poll — a probe must never manufacture the noise it
+    then displays."""
     try:
-        socket.create_connection(("127.0.0.1", int(port)), timeout=timeout).close()
-        return True
+        with socket.create_connection(("127.0.0.1", int(port)),
+                                      timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      b"Connection: close\r\n\r\n")
+            try:
+                return bool(s.recv(64))          # any answer = alive and speaking
+            except OSError:
+                return True                      # connected but mute: still alive
     except OSError:
         return False
+
+
+# Known-noise patterns a healthy websockets server logs when probed/portscanned —
+# filtered from the DISPLAYED tail only (the log file keeps everything).
+_NOISE_MARKERS = ("connection closed while reading HTTP request line",
+                  "did not receive a valid HTTP request",
+                  "opening handshake failed",
+                  "websockets.exceptions.InvalidMessage",
+                  "site-packages/websockets/",
+                  "request = yield from Request.parse",
+                  "await connection.handshake(",
+                  "raise self.protocol.handshake_exc",
+                  'raise EOFError("connection closed')
+
+
+def _display_tail(lines: list) -> list:
+    """Drop probe-noise blocks from what status SHOWS; keep real content."""
+    return [ln for ln in lines if not any(m in ln for m in _NOISE_MARKERS)]
 
 
 def is_running(project_dir: Path) -> tuple[bool, int]:
@@ -304,7 +332,7 @@ def status(project_dir: Path) -> dict:
         "started_at": st.get("started_at"),
         "config": str(config_path(project_dir)),
         "log": str(log_path(project_dir)),
-        "last_log": tail(project_dir, 12),
+        "last_log": _display_tail(tail(project_dir, 40))[-12:],
     }
 
 
