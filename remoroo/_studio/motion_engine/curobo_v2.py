@@ -419,6 +419,7 @@ class CuroboV2Planner:
             )
         with span("MotionPlanner(cfg) build"):
             self.planner = MotionPlanner(cfg)
+        self._assert_tool_frames_built()
         # COUNT real PRM graph-fallback usage (a plan's attempt ≥1). The roadmap warmup costs
         # ~88 s; whether it earns its keep on this rig has never been measured — this stamp is
         # the measurement. Warmup's own find_path calls are suppressed via _in_prm_warmup.
@@ -848,33 +849,55 @@ class CuroboV2Planner:
             pose_dict[f] = Pose(position=pos, quaternion=quat)
         return GoalToolPose.from_poses(pose_dict, num_goalset=1)
 
+    def _assert_tool_frames_built(self) -> None:
+        """BUILD-TIME invariant (live probe 2026-07-13, $50/run): the planner's actual
+        kinematics must carry EXACTLY the tool frames our cfg declared. A silent drop
+        here surfaced mid-motion as a backwards "not a subset" raise that cost a live
+        run to discover. Mismatch = refuse to build, stating both sides."""
+        from .mtrace import stamp
+        kin = getattr(self.planner, "kinematics", None)
+        actual = list(getattr(kin, "tool_frames", None) or [])
+        if not actual:
+            stamp("tool-frame invariant: kinematics exposes no tool_frames "
+                  "(cannot verify at build)", declared=self._tool_frames)
+            return
+        if set(actual) != set(self._tool_frames):
+            raise RuntimeError(
+                f"planner build dropped tool frames: cfg declared {self._tool_frames} "
+                f"but the built kinematics carries {actual} — every group tip must "
+                "survive the build (partial-goal holds depend on it); fix the robot "
+                "cfg or the cell's groups before any motion")
+        stamp("tool-frame invariant OK", frames=actual)
+
     def plan_pose(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]] = None,
                   *, max_attempts: int = 3) -> PlanResult:
         """Plan ONE synchronous collision-free trajectory driving every frame in `goals` to its
-        pose. `goals` keys are ee_links from this planner's `tool_frames` — a SUBSET is fine (THE
-        robot planner carries every group's tip; a one-arm move goals one tip and the un-goaled
-        limbs ride cuRobo's minimal-motion cost). If cuRobo rejects the partial GoalToolPose, we
-        retry ONCE with FK HOLD-goals filled for the missing tips ("stay where you are" — the
-        semantic of not goaling a limb, made explicit). Safe by construction (collision-free +
-        within the dynamics envelope baked into the robot cfg)."""
+        pose. `goals` keys are ee_links from this planner's `tool_frames` — a SUBSET is fine at
+        THIS boundary, but cuRobo V2 is stricter: `solve_pose` reorders the goal to the
+        kinematics' tool_frames and RAISES on any missing frame ("Ordered link names ... not a
+        subset of ..." — live-diagnosed 2026-07-13: every one-arm move on a bimanual rig burned a
+        full failed attempt on that raise before the old retry path filled holds). So the holds
+        are filled UPFRONT: every un-goaled tip gets an explicit FK "stay where you are" goal —
+        the exact semantic of not goaling a limb — and cuRobo sees a complete goal on the first
+        and only attempt. Safe by construction (collision-free + within the dynamics envelope
+        baked into the robot cfg)."""
         if not goals:
             return PlanResult(False, None, "no goals given")
-        from .mtrace import span as _span, stamp as _stamp
-        res = self._plan_pose_once(goals, start_positions, max_attempts)
+        from .mtrace import stamp as _stamp
         missing = [t for t in self._tool_frames if t not in goals]
-        if not res.success and missing:
+        if missing:
             holds = {}
             for t in missing:
                 fk = self.link_pose(t, start_positions)
                 if fk is None:
-                    return res                      # cannot FK a hold — surface the original failure
+                    return PlanResult(False, None,
+                                      f"cannot FK hold-goal for un-goaled tip {t!r} (cuRobo V2 "
+                                      f"needs every tool frame goaled; this planner carries "
+                                      f"{self._tool_frames})")
                 holds[t] = (list(fk[0]), list(fk[1]))
-            _stamp("plan_pose retry: holding un-goaled tips at their current pose", held=missing)
-            with _span("plan_pose (hold-goal retry)", frames=len(goals) + len(holds)):
-                held_res = self._plan_pose_once({**goals, **holds}, start_positions, max_attempts)
-            if held_res.success:
-                return held_res
-        return res
+            _stamp("plan_pose: holding un-goaled tips at their current pose", held=missing)
+            goals = {**goals, **holds}
+        return self._plan_pose_once(goals, start_positions, max_attempts)
 
     def _plan_pose_once(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]],
                         max_attempts: int) -> PlanResult:

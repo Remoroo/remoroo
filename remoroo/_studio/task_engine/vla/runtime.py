@@ -113,6 +113,35 @@ class LingBotRuntime:
             self._client = PolicyClient(self.server_url)
         return self._client
 
+    def prove(self, obs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Exchange REAL bytes with the server at load time (audit 2026-07-13: "loaded"
+        was a constructor; the wire had never been exercised). With an observation:
+        one full inference round-trip (proven: "inference", + latency and the response
+        row shape). Without: connect + the server's hello frame (proven: "handshake").
+        Failure returns the server's words, stated — never a silent handle."""
+        import time as _time
+
+        t0 = _time.time()
+        try:
+            client = self._client_or_connect()
+            client._ensure()
+            hello = sorted((client.metadata or {}).keys())
+            if obs is None:
+                return {"proven": "handshake", "latency_ms": round((_time.time() - t0) * 1e3),
+                        "hello_keys": hello,
+                        "note": "no observation packer (no vla_profile) — wire connects; "
+                                "inference unproven until a profile exists"}
+            resp = client.infer(obs)
+            rows = self._rows_of(resp)
+            return {"proven": "inference", "latency_ms": round((_time.time() - t0) * 1e3),
+                    "hello_keys": hello, "action_rows": len(rows),
+                    "action_dim": (len(rows[0]) if rows else 0)}
+        except Exception as e:                       # noqa: BLE001 - the server's words
+            return {"proven": False, "error": f"{type(e).__name__}: {e}",
+                    "note": "wire proof FAILED — the server may still be loading "
+                            "(retry vla_load in minutes) or the profile/config "
+                            "disagrees with the server; nothing is loaded"}
+
     # --- decoders ---------------------------------------------------------------------
     def _decode_canonical(self, step: List[float],
                           prev: Optional[List[float]]) -> List[Dict[str, Any]]:

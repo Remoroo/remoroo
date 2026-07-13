@@ -79,6 +79,17 @@ class AtomResult:
     evidence: Dict[str, Any] = field(default_factory=dict)
 
 
+def _planned(res, h, **evidence) -> "AtomResult":
+    """Fold a MoveResult into an AtomResult WITH the planner's message — a failed plan the
+    agent can read in the result, never only in edge.log (live lesson 2026-07-13)."""
+    ok = bool(res.ok)
+    ev = dict(evidence)
+    if not ok:
+        ev["planner"] = str(getattr(res, "message", "") or "plan failed")
+    h.done(ok=ok, stop_cause=None if ok else "plan_failed", **({"planner": ev["planner"]} if not ok else {}))
+    return AtomResult(ok=ok, stop_cause=None if ok else "plan_failed", evidence=ev)
+
+
 @dataclass
 class Ctx:
     """Everything an atom needs. stack/bridge are duck-typed (MotionStack/Bridge or fakes)."""
@@ -103,8 +114,7 @@ def reach(ctx: Ctx, tcp: str, pose: Any, *, speed: Optional[float] = None,
         res = ctx.stack.move_to_pose(tcp, tgt)
     else:
         res = ctx.stack.move_through_poses(tcp, legs)
-    h.done(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
-    return AtomResult(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
+    return _planned(res, h)
 
 
 def descend(ctx: Ctx, tcp: str, to_z: float, *, speed: Optional[float] = None,
@@ -135,8 +145,7 @@ def descend(ctx: Ctx, tcp: str, to_z: float, *, speed: Optional[float] = None,
         ctx.envelope.check_xyz(nxt[:3])
         res = ctx.stack.move_to_pose(tcp, nxt)
         if not res.ok:
-            h.done(ok=False, stop_cause="plan_failed", z_reached=z)
-            return AtomResult(ok=False, stop_cause="plan_failed", evidence={"z": z})
+            return _planned(res, h, z=z)
         steps += 1
     ok = cause in (STOP_Z, STOP_CURRENT, STOP_FT)
     h.done(ok=ok, stop_cause=cause, z_final=z, steps=steps)
@@ -191,9 +200,7 @@ def carry(ctx: Ctx, tcp: str, to: Any, *, arc_h: float, speed: Optional[float] =
     spd = ctx.envelope.clamp_speed(speed)
     h = ctx.trace.begin("carry", tcp=tcp, to=p1, arc_h=arc_h, peak_z=peak_z, speed=spd)
     res = ctx.stack.move_through_poses(tcp, legs)
-    h.done(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
-    return AtomResult(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed",
-                      evidence={"peak_z": peak_z})
+    return _planned(res, h, peak_z=peak_z)
 
 
 def sweep(ctx: Ctx, tcp: str, frm: Any, to: Any, *, press_z: float,
@@ -206,8 +213,7 @@ def sweep(ctx: Ctx, tcp: str, frm: Any, to: Any, *, press_z: float,
     spd = ctx.envelope.clamp_speed(speed)
     h = ctx.trace.begin("sweep", tcp=tcp, frm=a[:3], to=b[:3], press_z=press_z, speed=spd)
     res = ctx.stack.move_through_poses(tcp, [a, b])
-    h.done(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
-    return AtomResult(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
+    return _planned(res, h)
 
 
 def turn(ctx: Ctx, tcp: str, *, deg: float, axis: str = "z",
@@ -217,8 +223,7 @@ def turn(ctx: Ctx, tcp: str, *, deg: float, axis: str = "z",
     tgt = cur[:3] + q
     h = ctx.trace.begin("turn", tcp=tcp, deg=deg, axis=axis)
     res = ctx.stack.move_to_pose(tcp, tgt)
-    h.done(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
-    return AtomResult(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
+    return _planned(res, h)
 
 
 def hold(ctx: Ctx, tcp: str) -> AtomResult:
@@ -258,5 +263,4 @@ def sync(ctx: Ctx, targets: Dict[str, Any], *, speed: Optional[float] = None) ->
     spd = ctx.envelope.clamp_speed(speed)
     h = ctx.trace.begin("sync", tcps=sorted(goals.keys()), speed=spd)
     res = ctx.stack.move_to_poses(goals)
-    h.done(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
-    return AtomResult(ok=bool(res.ok), stop_cause=None if res.ok else "plan_failed")
+    return _planned(res, h)

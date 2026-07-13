@@ -35,7 +35,9 @@ def probe_and_record(kind: str, ctx: Any, tcp: str, *, record: Any,
     out: Dict[str, Any] = {"ok": bool(res.get("ok")), "evidence": dict(res),
                            "probe_id": probe_id}
     if not out["ok"]:
-        out["note"] = "probe failed; nothing recorded (absence of proof is stated)"
+        why = res.get("why")
+        out["note"] = ("probe failed; nothing recorded (absence of proof is stated)"
+                       + (f" — {why}" if why else ""))
         return out
     record.confirm_touch(object_id, kind=PROOF_KIND[kind], source=probe_id)
     for n in narrow or []:

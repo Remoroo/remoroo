@@ -12,6 +12,18 @@ from . import atoms
 from .atoms import Ctx
 
 
+def _why(*results, steps: Sequence[str]) -> Optional[str]:
+    """The FIRST failed atom, stated: which step, its stop cause, and the planner's own
+    message when there is one — so a failed probe reads like a diagnosis, not a boolean
+    (the 2026-07-13 live probe failed silently and the agent had to grep edge.log)."""
+    for name, r in zip(steps, results):
+        if not r.ok:
+            msg = f"{name} failed ({r.stop_cause})"
+            planner = (r.evidence or {}).get("planner")
+            return f"{msg}: {planner}" if planner else msg
+    return None
+
+
 def probe_touch(ctx: Ctx, tcp: str, at_xyz: Sequence[float], *,
                 hover_h: float = 0.05) -> Dict[str, Any]:
     """The gentlest question: go there, come back. Proves reachability + clearance."""
@@ -19,8 +31,12 @@ def probe_touch(ctx: Ctx, tcp: str, at_xyz: Sequence[float], *,
     r1 = atoms.reach(ctx, tcp, [x, y, z + hover_h])
     r2 = atoms.descend(ctx, tcp, z)
     r3 = atoms.reach(ctx, tcp, [x, y, z + hover_h])
-    return {"kind": "touch", "ok": bool(r1.ok and r2.ok and r3.ok),
-            "undo_attempted": True, "undo_ok": bool(r3.ok)}
+    out = {"kind": "touch", "ok": bool(r1.ok and r2.ok and r3.ok),
+           "undo_attempted": True, "undo_ok": bool(r3.ok)}
+    why = _why(r1, r2, r3, steps=("reach hover", "descend", "retreat"))
+    if why:
+        out["why"] = why
+    return out
 
 
 def probe_push(ctx: Ctx, tcp: str, at_xyz: Sequence[float], *, dist_m: float = 0.01,
@@ -32,8 +48,12 @@ def probe_push(ctx: Ctx, tcp: str, at_xyz: Sequence[float], *, dist_m: float = 0
     r1 = atoms.sweep(ctx, tcp, [x, y, z], [x + dist_m, y, z], press_z=z)
     r2 = atoms.sweep(ctx, tcp, [x + dist_m, y, z], [x, y, z], press_z=z)
     after = observe() if observe else None
-    return {"kind": "push", "ok": bool(r1.ok and r2.ok), "undo_attempted": True,
-            "undo_ok": bool(r2.ok), "before": before, "after": after}
+    out = {"kind": "push", "ok": bool(r1.ok and r2.ok), "undo_attempted": True,
+           "undo_ok": bool(r2.ok), "before": before, "after": after}
+    why = _why(r1, r2, steps=("push sweep", "undo sweep"))
+    if why:
+        out["why"] = why
+    return out
 
 
 def probe_lift_place(ctx: Ctx, tcp: str, at_xyz: Sequence[float], *,
