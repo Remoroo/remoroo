@@ -46,6 +46,31 @@ def check_docker_daemon() -> bool:
 # GPU detection  (standalone — no brain imports, no transport)
 # ---------------------------------------------------------------------------
 
+def _run_reap_safe(cmd, *, timeout: float):
+    """subprocess.run whose TIMEOUT CLEANUP cannot hang. The stdlib's run() kills the
+    child on timeout and then wait()s for it — but a child wedged in the GPU driver
+    sits in uninterruptible D-state where SIGKILL never lands, and run()'s own
+    cleanup blocks forever (live 2026-07-14: nvidia-smi in rpm_resume hung
+    `remoroo task` at the GPU doctor, pre-banner). On timeout: kill, hand the corpse
+    to a daemon reaper thread, return None — the caller treats it as "unknown"."""
+    import threading
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        threading.Thread(target=proc.wait, daemon=True).start()
+        return None
+
+    class R:
+        returncode = proc.returncode
+        stdout = out
+        stderr = err
+    return R()
+
+
 def detect_host_gpu() -> Dict[str, Any]:
     """Probe the HOST for NVIDIA GPU hardware.
 
@@ -79,11 +104,8 @@ def detect_host_gpu() -> Dict[str, Any]:
         print(f"  ⚠️  REMOROO_CUDA_VERSION={override} not recognized, auto-detecting...")
 
     try:
-        result = subprocess.run(
-            ["nvidia-smi"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
+        result = _run_reap_safe(["nvidia-smi"], timeout=10)
+        if result is None or result.returncode != 0:
             return {"type": "none"}
 
         cuda_version: Optional[str] = None
@@ -103,12 +125,10 @@ def detect_host_gpu() -> Dict[str, Any]:
 
         devices: List[Dict[str, Any]] = []
         try:
-            dev_result = subprocess.run(
+            dev_result = _run_reap_safe(
                 ["nvidia-smi", "--query-gpu=name,memory.total",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if dev_result.returncode == 0:
+                 "--format=csv,noheader,nounits"], timeout=10)
+            if dev_result is not None and dev_result.returncode == 0:
                 for line in dev_result.stdout.strip().split("\n"):
                     parts = [p.strip() for p in line.split(",")]
                     if len(parts) >= 2:

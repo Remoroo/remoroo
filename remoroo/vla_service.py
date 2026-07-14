@@ -384,7 +384,8 @@ def _preflight_import(cfg: dict, env: dict, timeout_s: float = 60.0) -> str:
     return tail[-1] if tail else f"import {pkg} failed (exit {r.returncode})"
 
 
-def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
+def start(project_dir: Path, echo: Echo = print, *, wait: bool = True,
+          preflight: bool = True) -> dict:
     project_dir = Path(project_dir).resolve()
     if not configured(project_dir):
         ensure_declared(project_dir, echo)         # zero-flag: discover + write
@@ -428,7 +429,9 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
     # surfaces here as the import's own words in seconds, instead of a crash minutes
     # into weight loading (the libcudnn.so.9 class — bit the live run of 2026-07-13
     # after the server had served for days). Declaration verification, not venv repair.
-    problem = _preflight_import(cfg, env)
+    # EXPLICIT starts only: the import costs 30-90s of torch on embedded boards, which
+    # stalled `remoroo task` startup (2026-07-14) — the opportunistic hook skips it.
+    problem = _preflight_import(cfg, env) if preflight else ""
     if problem:
         echo(f"  ❌ vla preflight failed: {problem}")
         echo("     the server would crash the same way — fix `env_file`/`env` in "
@@ -534,7 +537,7 @@ def ensure_started(project_dir: Path, echo: Echo = print) -> dict:
     Failures are stated and never block the run — the geometric path doesn't need this."""
     if not configured(project_dir) and not ensure_declared(project_dir, echo):
         return {"skipped": "not_configured"}
-    return start(project_dir, echo, wait=False)
+    return start(project_dir, echo, wait=False, preflight=False)
 
 
 # --------------------------------------------------------------------------- #
