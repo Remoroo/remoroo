@@ -137,16 +137,31 @@ class LingBotRuntime:
                     "hello_keys": hello, "action_rows": len(rows),
                     "action_dim": (len(rows[0]) if rows else 0)}
         except Exception as e:                       # noqa: BLE001 - the server's words
-            refused = isinstance(e, ConnectionRefusedError) or "refused" in str(e).lower()
-            note = ("the server is DOWN (connection refused — NOT loading; a loading "
-                    "server accepts and stalls): run `remoroo vla status` and "
-                    "`remoroo vla logs` via bash. A crashed server restarts with "
-                    "`remoroo vla restart`; an import/env crash (libcudnn etc.) means "
-                    ".remoroo/vla.yaml env_file/env is wrong — fix the declaration, "
-                    "restart, vla_load again" if refused else
-                    "wire proof FAILED — the server may still be loading (retry "
-                    "vla_load in minutes) or the profile/config disagrees with the "
-                    "server; nothing is loaded")
+            msg = str(e)
+            refused = isinstance(e, ConnectionRefusedError) or "refused" in msg.lower()
+            server_side = "policy server error" in msg    # OUR wire worked; THEIR code crashed
+            if refused:
+                note = ("the server is DOWN (connection refused — NOT loading; a loading "
+                        "server accepts and stalls): run `remoroo vla status` and "
+                        "`remoroo vla logs` via bash. A crashed server restarts with "
+                        "`remoroo vla restart`; an import/env crash (libcudnn etc.) means "
+                        ".remoroo/vla.yaml env_file/env is wrong — fix the declaration, "
+                        "restart, vla_load again")
+            elif server_side:
+                note = ("THE WIRE WORKS — the server received and parsed the observation "
+                        "and crashed inside ITS OWN policy code. That is an INCOMPLETE "
+                        "SERVER INSTALL/CONFIG, and integration configs are YOURS to fix "
+                        "(read_seed robotics/vla_serving — the venv is the customer's, "
+                        "the configs are yours): read the traceback, inspect the server's "
+                        "config files next to the checkpoint (cli yaml / robot config / "
+                        "norm stats — e.g. feature_transform None means the policy "
+                        "loaded weights WITHOUT its feature/robot config), fix, "
+                        "`remoroo vla restart`, vla_load again. Do NOT shrug this off "
+                        "as a rig problem")
+            else:
+                note = ("wire proof FAILED — the server may still be loading (retry "
+                        "vla_load in minutes) or the profile/config disagrees with the "
+                        "server; nothing is loaded")
             return {"proven": False, "error": f"{type(e).__name__}: {e}", "note": note}
 
     # --- decoders ---------------------------------------------------------------------
