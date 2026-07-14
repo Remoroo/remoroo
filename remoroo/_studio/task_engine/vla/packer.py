@@ -82,7 +82,13 @@ def make_observation_packer(profile: VlaProfile, *, bridge: Any,
                 degraded.append(f"state:{s.group}/{s.chain}")
             else:
                 state[s.start:s.end] = np.asarray(vals[:s.dims], dtype=np.float32)
-        obs: Dict[str, Any] = {"image": images, "state": state}
+        # robo_name IS the transform selector on multi-robot checkpoints (rig-decoded
+        # 2026-07-14): the deploy policy builds its FeatureTransform LAZILY from
+        # configs/robot_configs/{robo_name}.yaml + norm stats on the first observation
+        # that names the robot. Without it: feature_transform stays None and the
+        # server crashes at resize_image ('NoneType' has no 'org_features').
+        obs: Dict[str, Any] = {"image": images, "state": state,
+                               "robo_name": profile.robo_name}
         if degraded:
             obs["degraded"] = degraded              # stated, travels in the trace too
         return obs

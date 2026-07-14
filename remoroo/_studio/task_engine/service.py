@@ -422,6 +422,8 @@ class TaskService:
         promoted = ev.get("promoted")
         facts["promoted_fitness"] = (promoted.get("fitness")
                                      if isinstance(promoted, dict) else None)
+        facts["vla_day0"] = bool(led.instruments.get("vla_day0"))
+        facts["vla_waived"] = "vla" in led.waivers
         return facts
 
     def v_phase_status(self, body: dict) -> dict:
@@ -1039,12 +1041,10 @@ class TaskService:
 
     def v_vla_rollout(self, body: dict) -> dict:
         """One guarded VLA episode as a FULL trial: reset -> observe -> policy (every
-        action through GuardedExecutor clamps + envelope) -> judge -> record. The record
-        is judge-labeled probe footage — day-zero demonstrations and finetune data."""
-        if self._motion_lock.locked():
-            running = [j for j, r in self._jobs.items() if r["state"] == "running"]
-            return {"error": (f"job {', '.join(running) or '?'} is still RUNNING on the "
-                              "robot — poll job_status; hardware takes one thing at a time")}
+        action through GuardedExecutor clamps + envelope) -> judge -> record. THE FIRST
+        ACT of looking when a VLA serves: vla_rollout(the task text) IS the jump start —
+        day-zero demonstrations, keyframes, and possibly the task itself. Runs WITHOUT
+        the authored package (day zero precedes authoring)."""
         runtime = getattr(self, "_vla", None)
         if runtime is None:
             return {"error": "no VLA runtime loaded; call vla_load first"}
@@ -1052,9 +1052,35 @@ class TaskService:
         instruction = body.get("instruction") or slug.replace("_", " ")
         try:
             env, _actor = self._env_builder(slug)
-        except Exception as e:                     # noqa: BLE001
-            return {"error": (f"cell task package not available for {slug!r}: "
-                              f"{type(e).__name__}: {e}")}
+        except Exception:                          # noqa: BLE001 - DAY ZERO has no package
+            # THE JUMP START (live lesson 2026-07-14: requiring the authored package
+            # here made the day-zero attempt structurally impossible — every agent
+            # "skipped the VLA" because the machine gated it behind the authoring it
+            # was meant to precede). A minimal env suffices: the guarded executor
+            # clamps every action; judging day zero is the AGENT's job from the
+            # before/after snapshots (view_image), not an authored verifier's.
+            from .env import GenericEnv
+            from .envelope import Envelope
+            shared = self._shared()
+            try:
+                import yaml
+                cell_cfg = yaml.safe_load(Path("remoroo_cell/cell.yaml").read_text()) or {}
+            except Exception:                      # noqa: BLE001 - defaults still clamp
+                cell_cfg = {}
+            from .judge.v0 import Verdict, milestones
+            from .scene.state import SceneState
+            env = GenericEnv(
+                backend="real", stack=shared.get("stack"), bridge=shared.get("bridge"),
+                envelope=Envelope.from_cell(cell_cfg),
+                perceive_fn=lambda: SceneState(perception_program_id="day0-empty"),
+                # day-zero honesty: score = proprioceptive milestones only (grasped,
+                # carried); ok stays False — the AGENT judges outcome from the
+                # before/after snapshots, an authored verifier judges later runs.
+                judge_fn=lambda pre, post, trace: Verdict(
+                    score=milestones(trace), ok=False, confidence=0.0,
+                    judge_version="day0-milestones",
+                    flags=["day0: judge outcome from snapshots via view_image"]),
+                reset_fn=None, perception_version="day0")
         from .vla.skill import make_vla_skill
         packer = getattr(self, "_vla_observe", None)  # profile packer beats env.observe
         vla = make_vla_skill(runtime,
@@ -1064,12 +1090,24 @@ class TaskService:
         def actor(env_, ctx):
             vla(env_, ctx, instruction, max_steps=max_steps)
 
-        rec = run_trial(env, actor, task_slug=slug,
-                        program_ref=f"vla:{getattr(self, '_vla_kind', '?')}",
-                        knobs=Knobs(body.get("knobs") or {}),
-                        seed=int(body.get("seed", 0)),
-                        budget=TrialBudget(**(body.get("budget") or {})),
-                        store=self._store(slug),
-                        skip_reset=bool(body.get("skip_reset", False)))
-        return {"trial_id": rec.trial_id, "outcome": rec.outcome, "verdict": rec.verdict,
-                "instruction": instruction, "runtime": getattr(self, "_vla_kind", "?")}
+        def run() -> dict:
+            rec = run_trial(env, actor, task_slug=slug,
+                            program_ref=f"vla:{getattr(self, '_vla_kind', '?')}",
+                            knobs=Knobs(body.get("knobs") or {}),
+                            seed=int(body.get("seed", 0)),
+                            budget=TrialBudget(**(body.get("budget") or {})),
+                            store=self._store(slug),
+                            skip_reset=bool(body.get("skip_reset", False)))
+            led = self._ledger(slug)
+            led.instruments["vla_day0"] = {"trial_id": rec.trial_id,
+                                           "outcome": rec.outcome,
+                                           "instruction": instruction,
+                                           "t": time.time()}
+            led.save()
+            return {"trial_id": rec.trial_id, "outcome": rec.outcome,
+                    "verdict": rec.verdict, "instruction": instruction,
+                    "runtime": getattr(self, "_vla_kind", "?"),
+                    "note": "day-zero attempt RECORDED (the looking exit needs it); "
+                            "snapshot + view_image now to judge what it did"}
+
+        return self._run_as_job("vla_day0", run, wait_s=5.0)

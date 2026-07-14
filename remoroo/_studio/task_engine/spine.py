@@ -34,6 +34,13 @@ REQUIREMENTS = {
          "phase_start must complete (RUN HOME joints captured)"),
     ],
     "looking": [
+        ("vla_disposition",
+         lambda f: bool(f.get("vla_day0")) or bool(f.get("vla_waived")),
+         "a DAY-ZERO VLA attempt of the task text (vla_rollout — THE FIRST ACT when a "
+         "VLA serves: the pretrained policy tries the task itself, guarded and "
+         "recorded) OR a stated waiver (phase_waive {phase: vla, reason}) when the "
+         "server cannot be made to serve this run — fixing YOUR integration configs "
+         "counts as this run's work (seed vla_serving rung 10) before any waiver"),
         ("actionable", lambda f: int(f.get("actionable", 0)) >= 1,
          "at least 1 ACTIONABLE object (two looks or a touch, graded by the record)"),
         ("gt_cases", lambda f: int(f.get("gt_cases", 0)) >= 1,
@@ -65,7 +72,9 @@ REQUIREMENTS = {
          "(declare predict= in skills; zero declared expectations never certifies)"),
     ],
 }
-WAIVABLE = {"sim", "search"}   # off-cell rehearsal phases; hardware truth never waives
+# sim/search: off-cell rehearsal phases. "vla": not a phase but a CAPABILITY waiver —
+# the day-zero attempt requirement on the looking exit. Hardware truth never waives.
+WAIVABLE = {"sim", "search", "vla"}
 
 
 class PhaseLedger:
