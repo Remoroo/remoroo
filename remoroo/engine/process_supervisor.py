@@ -235,7 +235,11 @@ def check_targets(line_metrics: Dict[str, float], targets: List[TargetMetric]) -
 # ---------------------------------------------------------------------------
 
 ERROR_SIGNATURES: List[Tuple[re.Pattern, str, float]] = [
-    (re.compile(r"(MemoryError|OOM|CUDA out of memory|out of memory)", re.I), "oom", 0.95),
+    # The OOM acronym must be CASE-EXACT and word-bounded: with re.I it matched the
+    # letters "oom" inside base64 stdout (live 2026-07-14: a base64'd PNG tripped
+    # ERROR_SIGNATURE oom). Real phrases stay case-insensitive.
+    (re.compile(r"MemoryError\b|\bOOM\b"), "oom", 0.95),
+    (re.compile(r"CUDA out of memory|\bout of memory\b|oom-kill", re.I), "oom", 0.95),
     (re.compile(r"(ModuleNotFoundError|ImportError)", re.I), "missing_dep", 0.90),
     (re.compile(r"(PermissionError|Permission denied)", re.I), "permission", 0.90),
     (re.compile(r"(Segmentation fault|core dumped|SIGSEGV)", re.I), "segfault", 0.95),

@@ -362,6 +362,28 @@ def status(project_dir: Path) -> dict:
 # --------------------------------------------------------------------------- #
 # Start / stop / restart                                                       #
 # --------------------------------------------------------------------------- #
+def _preflight_import(cfg: dict, env: dict, timeout_s: float = 60.0) -> str:
+    """Import the runtime package in the DECLARED python with the FULLY RESOLVED env
+    (env_file sourced + explicit env). Empty string = healthy; otherwise the import
+    error's last line — which is exactly what the server's crash log would have said."""
+    desc = RUNTIMES.get(cfg.get("runtime", ""), {})
+    pkg = desc.get("probe_import")
+    py = cfg.get("python")
+    if not pkg or not py:
+        return ""                                   # nothing declared to verify
+    try:
+        r = subprocess.run([py, "-c", f"import {pkg}"], env=env,
+                           capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return f"import {pkg} did not finish in {timeout_s:.0f}s"
+    except Exception as e:  # noqa: BLE001
+        return f"{type(e).__name__}: {e}"
+    if r.returncode == 0:
+        return ""
+    tail = [ln for ln in (r.stderr or "").strip().splitlines() if ln.strip()]
+    return tail[-1] if tail else f"import {pkg} failed (exit {r.returncode})"
+
+
 def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
     project_dir = Path(project_dir).resolve()
     if not configured(project_dir):
@@ -394,6 +416,18 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
     if cfg.get("env_file"):
         env.update(_sourced_env(cfg["env_file"]))   # sourced first ...
     env.update(cfg.get("env") or {})       # ... explicit env: still wins (QWEN3VL_PATH…)
+
+    # PREFLIGHT with the EXACT env the server would get: a wrong/missing env_file
+    # surfaces here as the import's own words in seconds, instead of a crash minutes
+    # into weight loading (the libcudnn.so.9 class — bit the live run of 2026-07-13
+    # after the server had served for days). Declaration verification, not venv repair.
+    problem = _preflight_import(cfg, env)
+    if problem:
+        echo(f"  ❌ vla preflight failed: {problem}")
+        echo("     the server would crash the same way — fix `env_file`/`env` in "
+             ".remoroo/vla.yaml (the CUDA env the runtime's own venv needs), then "
+             "`remoroo vla start` again.")
+        return {"ok": False, "error": f"preflight: {problem}"}
     lp = log_path(project_dir)
     try:
         log_fh = open(lp, "w", encoding="utf-8")   # fresh log per process

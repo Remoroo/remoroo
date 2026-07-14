@@ -56,6 +56,10 @@ class PerceptionOps:
 
     # learned proposals ------------------------------------------------------------
     def segment(self, prompt: Any, frame: Dict[str, Any]) -> List[np.ndarray]:
+        """SAM2 masks for a SPATIAL prompt — {'box': [x0,y0,x1,y1]} (use detect's
+        box: the detect->segment composition is THE tight-mask pipeline) or
+        {'points': [[x,y],...], 'labels': [...]}. Text prompts refuse with the
+        recipe (SAM2 has no language grounding)."""
         return list(self.registry.get("segmenter")(frame, prompt))
 
     def detect(self, text: str, frame: Dict[str, Any]) -> List[Dict[str, Any]]:

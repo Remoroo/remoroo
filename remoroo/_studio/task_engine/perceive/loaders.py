@@ -164,6 +164,48 @@ def fetch_pinned(url: str, sha256: str, dest_dir: str) -> Path:
     return path
 
 
+def sam_prompt_kwargs(prompt: Any) -> Dict[str, Any]:
+    """Normalize a segment prompt into SAM2 predictor kwargs (pure numpy — unit-
+    tested off-GPU). Live bug 2026-07-13: the old wrapper passed any non-string
+    prompt as bare point_coords (AssertionError: point_labels must be supplied)
+    and silently turned a STRING prompt into None — text-prompted segmentation
+    never worked on any rig. SAM2 has no text mode: detect(text) first, then
+    segment with the box (or points) it returns.
+    Accepted forms:
+      {"box": [x0,y0,x1,y1]}                       -> box prompt
+      {"points": [[x,y],...], "labels": [1,0,...]} -> labeled points (labels
+                                                      default to all-foreground)
+      [[x,y], ...] / np.ndarray                    -> foreground points
+    """
+    import numpy as np
+
+    if isinstance(prompt, str):
+        raise ValueError(
+            f"SAM2 cannot take a TEXT prompt ({prompt!r}) — it has no language "
+            "grounding. Compose: detect(text) -> take the returned box -> "
+            "segment({'box': box}) for the tight mask")
+    box = pts = labels = None
+    if isinstance(prompt, dict):
+        box = prompt.get("box")
+        pts = prompt.get("points")
+        labels = prompt.get("labels")
+    elif prompt is not None:
+        pts = prompt
+    kwargs: Dict[str, Any] = {}
+    if box is not None:
+        kwargs["box"] = np.asarray(box, dtype=float).reshape(-1)
+    if pts is not None:
+        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
+        kwargs["point_coords"] = pts
+        kwargs["point_labels"] = (np.asarray(labels, dtype=int).reshape(-1)
+                                  if labels is not None
+                                  else np.ones(len(pts), dtype=int))
+    if not kwargs:
+        raise ValueError("segment needs a prompt: {'box': [x0,y0,x1,y1]} or "
+                         "{'points': [[x,y],...]} (from detect's output)")
+    return kwargs
+
+
 def make_segmenter_loader(weights_dir: str) -> Callable[[], Any]:
     def load() -> Any:
         pin = PINS["segmenter"]
@@ -177,8 +219,8 @@ def make_segmenter_loader(weights_dir: str) -> Callable[[], Any]:
 
         def segment(frame: Dict[str, Any], prompt: Any):
             predictor.set_image(frame["rgb"])
-            masks, _scores, _ = predictor.predict(prompt if not isinstance(prompt, str)
-                                                  else None)
+            masks, _scores, _ = predictor.predict(multimask_output=False,
+                                                  **sam_prompt_kwargs(prompt))
             return list(masks)
         return segment
     return load

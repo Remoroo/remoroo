@@ -884,6 +884,7 @@ class CuroboV2Planner:
         if not goals:
             return PlanResult(False, None, "no goals given")
         from .mtrace import stamp as _stamp
+        active = list(goals)
         missing = [t for t in self._tool_frames if t not in goals]
         if missing:
             holds = {}
@@ -895,9 +896,38 @@ class CuroboV2Planner:
                                       f"needs every tool frame goaled; this planner carries "
                                       f"{self._tool_frames})")
                 holds[t] = (list(fk[0]), list(fk[1]))
-            _stamp("plan_pose: holding un-goaled tips at their current pose", held=missing)
             goals = {**goals, **holds}
-        return self._plan_pose_once(goals, start_positions, max_attempts)
+            # The hold is ZERO-COST, not an exact 6-DoF pin: the goal buffer needs every
+            # tool frame (reorder_links), but the pose COST tracks only the goaled tips —
+            # the held limbs ride the null-space at the current seed. Live 2026-07-13:
+            # pinning the idle arm's resting tip made EVERY IK solution read as
+            # in-collision against the inflated ESDF, so a plainly reachable one-arm
+            # target reported "out of reach" ("planning succeeded" was only go-home).
+            _stamp("plan_pose: un-goaled tips held ZERO-COST (null-space), not pinned",
+                   held=missing, tracked=active)
+        try:
+            if missing:
+                self._set_tracking(active)
+            return self._plan_pose_once(goals, start_positions, max_attempts)
+        finally:
+            if missing:
+                self._set_tracking(None)             # planner default: track everything
+
+    def _set_tracking(self, active: Optional[List[str]]) -> None:
+        """Per-tool-frame pose-cost tracking across the IK and trajopt solvers (the IK
+        solver propagates to its seed solver). active=None restores all-tracking —
+        every plan leaves the planner in its default state."""
+        for solver in (getattr(self, "planner", None) and getattr(self.planner, "ik_solver", None),
+                       getattr(self, "planner", None) and getattr(self.planner, "trajopt_solver", None)):
+            if solver is None or not hasattr(solver, "enable_tool_pose_tracking"):
+                continue                             # older cuRobo: exact holds only
+            if active is None:
+                solver.enable_tool_pose_tracking(None)
+            else:
+                solver.enable_tool_pose_tracking(list(active))
+                inactive = [t for t in self._tool_frames if t not in active]
+                if inactive:
+                    solver.disable_tool_pose_tracking(inactive)
 
     def _plan_pose_once(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]],
                         max_attempts: int) -> PlanResult:

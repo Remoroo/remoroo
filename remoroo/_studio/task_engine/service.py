@@ -600,15 +600,68 @@ class TaskService:
 
         return self._run_as_job("probe", run, wait_s=5.0)
 
+    @staticmethod
+    def _fk_ready(stack) -> bool:
+        """True when FK through the stack costs an FK, not a PLANNER BUILD. Live
+        2026-07-14: provenance stamping inside perceive_run triggered the full 124s
+        robot planner build (stack.link_pose -> _planner_for -> build). A real
+        MotionStack exposes _planners; empty means unbuilt — skip FK. Fakes without
+        the attribute stay allowed."""
+        planners = getattr(stack, "_planners", None)
+        return planners is None or bool(planners)
+
+    def _camera_mount(self, camera: str) -> str:
+        """cell.yaml cameras: name/id -> mount ('static' or the carrying arm).
+        Unknown cameras return '' (treated as possibly-moving)."""
+        if not hasattr(self, "_camera_mounts"):
+            mounts: Dict[str, str] = {}
+            try:
+                import yaml
+                cell = yaml.safe_load(Path("remoroo_cell/cell.yaml").read_text()) or {}
+                for c in cell.get("cameras") or []:
+                    name = str(c.get("name") or c.get("id") or "")
+                    if name:
+                        mounts[name] = str(c.get("mount") or c.get("role") or "")
+            except Exception:                      # noqa: BLE001 - no cell, no mounts
+                pass
+            self._camera_mounts = mounts
+        return self._camera_mounts.get(camera, "")
+
     def _stamped_provenance(self, env, camera: str) -> Dict[str, Any]:
-        """The ENGINE stamps provenance — arm poses and the viewpoint come from the
-        stack, never from agent claims (grading integrity). A static camera is ONE
-        viewpoint forever; a moving mount's viewpoint is its pose bucketed to 5 cm,
-        so re-looking from the same place can never count as a second look."""
+        """The ENGINE stamps provenance — never from agent claims (grading
+        integrity). A static camera (cell.yaml mount) is ONE viewpoint forever. A
+        moving mount's viewpoint is the JOINT CONFIGURATION bucketed to 0.05 rad —
+        joints move exactly when the camera moves, cost one bridge read, and need
+        no FK (live 2026-07-14: FK'ing the camera NAME hit cuRobo's parent map
+        with 'overhead' AND triggered the 124s planner build inside perceive_run).
+        Same-place re-looks can still never count as a second look."""
         arm_poses: Dict[str, list] = {}
         viewpoint = camera
         stack = getattr(env, "stack", None)
-        if stack is not None:
+        if self._camera_mount(camera) != "static":
+            bucket = ""
+            bridge = self._bridge or getattr(env, "bridge", None)
+            try:                                   # joints ARE the mount's pose
+                obs = bridge.get_observation()
+                jp = dict(getattr(obs, "joint_positions", None) or {})
+                if jp:
+                    import hashlib
+                    key = ",".join(f"{n}:{round(float(v) / 0.05)}"
+                                   for n, v in sorted(jp.items()))
+                    bucket = hashlib.md5(key.encode()).hexdigest()[:8]
+            except Exception:                      # noqa: BLE001 - fall through to FK
+                pass
+            if not bucket and stack is not None and self._fk_ready(stack):
+                try:
+                    cam_pose = stack.link_pose(camera)
+                    xyz = (list(cam_pose[0]) if isinstance(cam_pose, tuple)
+                           else list(cam_pose)[:3])
+                    bucket = "_".join(str(round(v / 0.05)) for v in xyz[:3])
+                except Exception:                  # noqa: BLE001 - static after all
+                    pass
+            if bucket:
+                viewpoint = f"{camera}@{bucket}"
+        if stack is not None and self._fk_ready(stack):
             for g in list(getattr(stack, "group_names", []) or [])[:4]:
                 try:
                     pose = stack.link_pose(g)
@@ -617,14 +670,6 @@ class TaskService:
                     arm_poses[g] = [float(v) for v in xyz[:3]]
                 except Exception:                  # noqa: BLE001 - stamp what we can
                     continue
-            try:                                   # a wrist camera moves with its arm
-                cam_pose = stack.link_pose(camera)
-                xyz = (list(cam_pose[0]) if isinstance(cam_pose, tuple)
-                       else list(cam_pose)[:3])
-                bucket = "_".join(str(round(v / 0.05)) for v in xyz[:3])
-                viewpoint = f"{camera}@{bucket}"
-            except Exception:                      # noqa: BLE001 - static camera
-                pass
         return {"source": camera, "viewpoint": viewpoint, "modality": "rgbd",
                 "arm_poses": arm_poses, "kind": "view"}
 

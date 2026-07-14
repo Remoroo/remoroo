@@ -137,10 +137,17 @@ class LingBotRuntime:
                     "hello_keys": hello, "action_rows": len(rows),
                     "action_dim": (len(rows[0]) if rows else 0)}
         except Exception as e:                       # noqa: BLE001 - the server's words
-            return {"proven": False, "error": f"{type(e).__name__}: {e}",
-                    "note": "wire proof FAILED — the server may still be loading "
-                            "(retry vla_load in minutes) or the profile/config "
-                            "disagrees with the server; nothing is loaded"}
+            refused = isinstance(e, ConnectionRefusedError) or "refused" in str(e).lower()
+            note = ("the server is DOWN (connection refused — NOT loading; a loading "
+                    "server accepts and stalls): run `remoroo vla status` and "
+                    "`remoroo vla logs` via bash. A crashed server restarts with "
+                    "`remoroo vla restart`; an import/env crash (libcudnn etc.) means "
+                    ".remoroo/vla.yaml env_file/env is wrong — fix the declaration, "
+                    "restart, vla_load again" if refused else
+                    "wire proof FAILED — the server may still be loading (retry "
+                    "vla_load in minutes) or the profile/config disagrees with the "
+                    "server; nothing is loaded")
+            return {"proven": False, "error": f"{type(e).__name__}: {e}", "note": note}
 
     # --- decoders ---------------------------------------------------------------------
     def _decode_canonical(self, step: List[float],
