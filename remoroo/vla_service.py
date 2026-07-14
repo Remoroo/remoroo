@@ -395,6 +395,13 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
         return {"ok": False, "error": "not_configured"}
 
     alive, pid = is_running(project_dir)
+    if not alive and _listening(int(cfg.get("port", 8791))):
+        echo(f"  ❌ something ALREADY serves on :{cfg.get('port', 8791)} but it is not "
+             "THIS project's declared server. You are almost certainly in the wrong "
+             "directory — the real declaration lives in the project where you ran "
+             "`remoroo task`/`remoroo setup` (its .remoroo/vla.yaml). cd there and "
+             "retry; never start a duplicate onto a busy port.")
+        return {"ok": False, "error": "port_busy_foreign_server"}
     if alive:
         if _listening(cfg["port"]):
             echo(f"  vla server already serving (pid {pid}) on :{cfg['port']}.")
@@ -477,7 +484,7 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True) -> dict:
             else:
                 echo("     Common causes: wrong venv python, checkpoint path, or CUDA OOM.")
             return {"ok": False, "error": f"exited:{proc.poll()}", "pid": proc.pid}
-        if _listening(cfg["port"]):
+        if _listening(cfg["port"]) and proc.poll() is None:
             echo(f"  ✅ vla server serving on :{cfg['port']}")
             return {"ok": True, "pid": proc.pid, "port": cfg["port"], "listening": True}
         time.sleep(0.5)
@@ -588,10 +595,15 @@ def _python_candidates_from_answer(ans: str) -> List[str]:
 def probe_python(py: str, desc: dict, timeout_s: float = 90.0) -> Optional[str]:
     """Ask an interpreter directly: can you import the runtime's package, and where is
     the repo it came from? Returns the repo path ('' when the package isn't an
-    editable checkout) or None when the import fails. Ground truth, never a guess."""
+    editable checkout) or None when the import fails. Ground truth, never a guess.
+    ISOLATED (-I) and run from a NEUTRAL cwd: on 2026-07-14 a probe launched from
+    inside the vendor repo imported the SOURCE TREE via cwd and blessed a venv with
+    none of the deps installed (einops/transformers crash loop). An install that only
+    works via PYTHONPATH must be declared explicitly (python: in vla.yaml)."""
+    import tempfile
     try:
-        r = subprocess.run([py, "-c", _probe_src(desc)], capture_output=True,
-                           text=True, timeout=timeout_s)
+        r = subprocess.run([py, "-I", "-c", _probe_src(desc)], capture_output=True,
+                           text=True, timeout=timeout_s, cwd=tempfile.gettempdir())
     except Exception:                              # noqa: BLE001
         return None
     return r.stdout.strip() if r.returncode == 0 else None

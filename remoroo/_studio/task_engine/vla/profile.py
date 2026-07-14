@@ -142,8 +142,12 @@ def load_profile(path: str) -> Optional[VlaProfile]:
 # acceptance is rig-validated, like the wire schema.
 
 def to_lingbot_robot_config(profile: VlaProfile, *, norm_stats_path: str) -> Dict[str, Any]:
-    def slices_of(entries: List[Slice], key: str, *, with_subtract: bool) -> Dict[str, Any]:
-        grouped: Dict[str, Any] = {}
+    """Mirrors the vendor's OWN robotwin.yaml shape (rig-verified 2026-07-14):
+    `states`/`actions` are LISTS of single-key mappings — their loader iterates list
+    items, not dict keys. Our earlier dict emission parsed fine as yaml and then
+    crashed three layers into FeatureTransform."""
+    def slices_of(entries: List[Slice], key: str, *, with_subtract: bool) -> List[Dict[str, Any]]:
+        grouped: List[Dict[str, Any]] = []
         for group in dict.fromkeys(e.group for e in entries):     # keep declaration order
             origin = [{key: {"start": s.start, "end": s.end}}
                       for s in entries if s.group == group]
@@ -151,7 +155,8 @@ def to_lingbot_robot_config(profile: VlaProfile, *, norm_stats_path: str) -> Dic
             if with_subtract:
                 item["subtract_state"] = any(s.subtract_state for s in entries
                                              if s.group == group)
-            grouped[f"{'action' if with_subtract else 'observation.state'}.{group}"] = item
+            grouped.append(
+                {f"{'action' if with_subtract else 'observation.state'}.{group}": item})
         return grouped
 
     return {
@@ -161,6 +166,18 @@ def to_lingbot_robot_config(profile: VlaProfile, *, norm_stats_path: str) -> Dic
                    for slot, cam in profile.cameras.items()},
         "norm_stats": norm_stats_path,
     }
+
+
+def _joints_strings(profile: VlaProfile) -> List[str]:
+    """The cli data section's `joints` entries are QUOTED REPR STRINGS the vendor
+    ast.literal_eval's one by one (rig-verified: FeatureInfo.update_info) — a plain
+    yaml mapping arrives as a dict and crashes literal_eval ("malformed node")."""
+    out: List[str] = []
+    for group in dict.fromkeys(s.group for s in profile.state):
+        dims = sum(s.dims for s in profile.state if s.group == group)
+        if dims:
+            out.append(str({group: dims}))
+    return out
 
 
 def to_lingbot_cli_config(profile: VlaProfile, *, checkpoint: str, qwen_path: str,
@@ -182,6 +199,9 @@ def to_lingbot_cli_config(profile: VlaProfile, *, checkpoint: str, qwen_path: st
             "data_name": profile.robo_name,
             "robot_config_root": robot_config_root,
             "norm": "meanstd",
+            # FeatureInfo.update_info reads BOTH (rig-verified 2026-07-14):
+            "cameras": list(profile.cameras.keys()),
+            "joints": _joints_strings(profile),
         },
     }
 
