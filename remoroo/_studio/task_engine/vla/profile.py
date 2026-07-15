@@ -168,16 +168,13 @@ def to_lingbot_robot_config(profile: VlaProfile, *, norm_stats_path: str) -> Dic
     }
 
 
-def _joints_strings(profile: VlaProfile) -> List[str]:
-    """The cli data section's `joints` entries are QUOTED REPR STRINGS the vendor
-    ast.literal_eval's one by one (rig-verified: FeatureInfo.update_info) — a plain
-    yaml mapping arrives as a dict and crashes literal_eval ("malformed node")."""
-    out: List[str] = []
-    for group in dict.fromkeys(s.group for s in profile.state):
-        dims = sum(s.dims for s in profile.state if s.group == group)
-        if dims:
-            out.append(str({group: dims}))
-    return out
+# NOTE (rig-decoded 2026-07-14, second pass): the data section's `joints` list is
+# the CHECKPOINT'S trained feature-space registry (max padding dims per canonical
+# group: arm.position 14, end.position 14, ...), NOT the robot's dims — it belongs
+# to the vendor base config and must never be overridden per-robot (our dims would
+# under-pad the features the checkpoint expects). The base file ships those entries
+# UNQUOTED (broken for their own ast.literal_eval); the integration fix is quoting
+# them IN THE BASE (seed vla_serving rung 11), not emitting our own.
 
 
 def to_lingbot_cli_config(profile: VlaProfile, *, checkpoint: str, qwen_path: str,
@@ -199,9 +196,9 @@ def to_lingbot_cli_config(profile: VlaProfile, *, checkpoint: str, qwen_path: st
             "data_name": profile.robo_name,
             "robot_config_root": robot_config_root,
             "norm": "meanstd",
-            # FeatureInfo.update_info reads BOTH (rig-verified 2026-07-14):
+            # per-robot camera SLOT selection (update_info reads it); `joints` is
+            # deliberately NOT emitted — see the registry note above.
             "cameras": list(profile.cameras.keys()),
-            "joints": _joints_strings(profile),
         },
     }
 

@@ -362,6 +362,39 @@ def status(project_dir: Path) -> dict:
 # --------------------------------------------------------------------------- #
 # Start / stop / restart                                                       #
 # --------------------------------------------------------------------------- #
+def _mem_available_bytes() -> int:
+    """Linux MemAvailable in bytes; 0 when unknowable (never blocks blind)."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except Exception:                              # noqa: BLE001
+        pass
+    return 0
+
+
+def _preflight_memory(cfg: dict, headroom: float = 1.3) -> str:
+    """LOADING a checkpoint needs its size on disk times headroom of AVAILABLE RAM
+    (torch stages tensors while placing them; unified-memory boards share this with
+    the GPU). Twice on 2026-07-14 a load beside a warm edge died at Action Expert
+    init — once as a logged OOM kill, once as a silent native abort. Empty string =
+    enough room; otherwise the stated shortfall. Never blocks non-Linux or unsized
+    checkpoints."""
+    ckpt = cfg.get("checkpoint") or ""
+    try:
+        total = sum(f.stat().st_size for f in Path(ckpt).rglob("*") if f.is_file())
+        have = _mem_available_bytes()
+        if not total or not have:
+            return ""
+    except Exception:                              # noqa: BLE001 - never block blind
+        return ""
+    need = int(total * headroom)
+    if have < need:
+        return (f"checkpoint is {total / 1e9:.1f} GB; loading needs about "
+                f"{need / 1e9:.1f} GB available, this machine has {have / 1e9:.1f} GB")
+    return ""
+
+
 def _preflight_import(cfg: dict, env: dict, timeout_s: float = 60.0) -> str:
     """Import the runtime package in the DECLARED python with the FULLY RESOLVED env
     (env_file sourced + explicit env). Empty string = healthy; otherwise the import
@@ -396,6 +429,14 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True,
         return {"ok": False, "error": "not_configured"}
 
     alive, pid = is_running(project_dir)
+    strays = [s for s in _server_pids(cfg) if s != pid]
+    if strays:
+        echo(f"  ❌ another {cfg.get('module', 'vla server')} instance is ALREADY "
+             f"running (pid {strays}) outside this declaration — a lost pidfile, a "
+             "second directory's declaration, or an unkillable corpse. ONE instance "
+             "per board: `remoroo vla stop` sweeps it; if it will not die, reboot. "
+             "Never stack a second 12GB load.")
+        return {"ok": False, "error": "instance_already_running", "strays": strays}
     if not alive and _listening(int(cfg.get("port", 8791))):
         echo(f"  ❌ something ALREADY serves on :{cfg.get('port', 8791)} but it is not "
              "THIS project's declared server. You are almost certainly in the wrong "
@@ -431,6 +472,14 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True,
     # after the server had served for days). Declaration verification, not venv repair.
     # EXPLICIT starts only: the import costs 30-90s of torch on embedded boards, which
     # stalled `remoroo task` startup (2026-07-14) — the opportunistic hook skips it.
+    problem = _preflight_memory(cfg)
+    if problem:
+        echo(f"  ❌ not enough memory to LOAD the vla: {problem}")
+        echo("     On a unified-memory board a concurrent load thrashes or aborts "
+             "NATIVELY (silent death at Action Expert init — 2026-07-14 twice). "
+             "Free the RAM first:  remoroo edge stop  →  remoroo vla start  →  "
+             "wait for serving  →  remoroo edge start.")
+        return {"ok": False, "error": f"memory: {problem}"}
     problem = _preflight_import(cfg, env) if preflight else ""
     if problem:
         echo(f"  ❌ vla preflight failed: {problem}")
@@ -496,6 +545,24 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True,
     return {"ok": True, "pid": proc.pid, "port": cfg["port"], "listening": False}
 
 
+def _server_pids(cfg: Optional[dict]) -> List[int]:
+    """EVERY live process running this runtime's server module — found by cmdline,
+    never by pidfile (pidfiles get lost to rm -rf, crashes, and split-brain dirs;
+    2026-07-14: an orphaned loader stacked under a fresh start and OOM'd the board).
+    Includes D-state corpses the kernel can't kill: those hold GPU memory and MUST
+    block a new instance."""
+    module = (cfg or {}).get("module") or "websocket_policy_server"
+    pids: List[int] = []
+    try:
+        r = subprocess.run(["pgrep", "-f", module], capture_output=True, text=True,
+                           timeout=5)
+        pids = [int(x) for x in r.stdout.split() if x.strip().isdigit()
+                and int(x) != os.getpid()]
+    except Exception:                              # noqa: BLE001 - census, not a wall
+        pass
+    return pids
+
+
 def stop(project_dir: Path, echo: Echo = print) -> dict:
     """SIGTERM→SIGKILL the server's process group. No e-stop step: the policy server
     never owns the robot — motion always goes through the edge's GuardedExecutor."""
@@ -521,13 +588,48 @@ def stop(project_dir: Path, echo: Echo = print) -> dict:
                 break
             time.sleep(0.1)
     _pidfile(project_dir).unlink(missing_ok=True)
+    survivors = _sweep_orphans(project_dir, echo)
+    if survivors:
+        return {"ok": False, "was_running": True, "pid": pid, "survivors": survivors,
+                "error": "unkillable server process(es) remain"}
     echo("  vla server stopped.")
     return {"ok": True, "was_running": True, "pid": pid}
 
 
+def _sweep_orphans(project_dir: Path, echo: Echo = print) -> List[int]:
+    """Kill every OTHER process running the server module (lost pidfiles, split-brain
+    declarations) and return the ones that will not die — D-state corpses wedged in
+    the GPU driver. Survivors hold GPU memory: only a reboot frees them."""
+    cfg = load_config(project_dir)
+    strays = _server_pids(cfg)
+    for spid in strays:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if not _pid_alive(spid):
+                break
+            try:
+                os.kill(spid, sig)
+            except Exception:                      # noqa: BLE001
+                pass
+            for _ in range(20):
+                if not _pid_alive(spid):
+                    break
+                time.sleep(0.1)
+    survivors = [spid for spid in strays if _pid_alive(spid)]
+    if survivors:
+        echo(f"  ❌ server process(es) {survivors} will NOT die — uninterruptible in "
+             "the GPU driver, still holding GPU memory. No new instance can start "
+             "over them; REBOOT the board to reclaim.")
+    return survivors
+
+
 def restart(project_dir: Path, echo: Echo = print) -> dict:
     echo("  restarting vla server…")
-    stop(project_dir, echo)
+    out = stop(project_dir, echo)
+    if out.get("survivors"):
+        return {"ok": False, "error": "unkillable_survivors",
+                "survivors": out["survivors"],
+                "note": "restart ABORTED — starting over a corpse stacks GPU memory "
+                        "(the 2026-07-14 OOM); reboot the board first"}
     return start(project_dir, echo)
 
 
