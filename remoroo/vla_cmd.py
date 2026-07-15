@@ -277,3 +277,101 @@ def apply_profile(
     typer.secho(f"✓ robot config: {out['robot_config_path']}", fg=typer.colors.GREEN)
     typer.secho(f"✓ cli config:   {out['cli_config_path']}", fg=typer.colors.GREEN)
     typer.echo("  now: `remoroo vla restart` (the server reads these at reset).")
+
+
+def _studio_path() -> None:
+    import sys
+    studio = Path(__file__).parent / "_studio"
+    if str(studio) not in sys.path:
+        sys.path.insert(0, str(studio))
+
+
+@vla_app.command("prove")
+def prove(
+    project: Optional[str] = typer.Option(None, "--project", "-p",
+                                          help="Project dir (defaults to cwd)."),
+):
+    """END-TO-END wire proof, standalone: pack a synthetic observation in the
+    profile's exact schema, run ONE real inference round-trip against the serving
+    policy server, report latency + action shape. No task run, no edge, no robot —
+    if this passes, the whole config+wire chain is closed."""
+    proj = _project(project)
+    cfg = vla_service.load_config(proj)
+    if not cfg:
+        typer.secho("❌ no .remoroo/vla.yaml — `remoroo vla init` first.",
+                    fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    _studio_path()
+    import numpy as np
+    from task_engine.vla.profile import load_profile
+    from task_engine.vla.runtime import LingBotRuntime
+
+    profile = load_profile(str(proj / "remoroo_cell" / "vla_profile.yaml"))
+    rt = LingBotRuntime(server_url=f"http://127.0.0.1:{cfg.get('port', 8791)}",
+                        profile=profile)
+    obs = None
+    if profile is not None:                      # full inference: their exact obs schema
+        obs = {"observation.state": np.zeros(profile.state_dim, dtype=np.float32),
+               "robo_name": profile.robo_name,
+               "prompt": ["remoroo wire proof"]}
+        for slot in profile.cameras:
+            obs[f"observation.images.{slot}"] = np.zeros((256, 256, 3), dtype=np.uint8)
+    proof = rt.prove(obs)
+    typer.echo(f"  proof: {proof}")
+    if proof.get("proven") == "inference":
+        typer.secho(f"✓ WIRE PROVEN — {proof.get('latency_ms')}ms, "
+                    f"{proof.get('action_rows')} action rows × "
+                    f"{proof.get('action_dim')} dims.", fg=typer.colors.GREEN)
+        raise typer.Exit(code=0)
+    if proof.get("proven") == "handshake":
+        typer.secho("◐ handshake only (no vla_profile.yaml — author it for full "
+                    "inference proof).", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=0)
+    typer.secho("❌ proof failed — the note above says what to fix.",
+                fg=typer.colors.RED)
+    raise typer.Exit(code=1)
+
+
+def _edge_post(verb: str, body: dict, port: int = 7779, timeout: float = 30.0) -> dict:
+    import json as _json
+    import urllib.request
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/edge/task/{verb}",
+                                 data=_json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return _json.loads(r.read().decode())
+
+
+@vla_app.command("rollout")
+def rollout(
+    instruction: str = typer.Argument(..., help="The task text the policy attempts."),
+    steps: int = typer.Option(30, "--steps", help="Max policy steps (guarded)."),
+    slug: str = typer.Option("vla_smoke", "--slug", help="Trial store slug."),
+    port: int = typer.Option(7779, "--port", help="Edge port."),
+):
+    """One guarded VLA episode ON THE ROBOT, standalone: needs only a running edge
+    (`remoroo edge start`) and a serving policy server. Every action goes through the
+    GuardedExecutor clamps + safety envelope; the trial is recorded like any day-zero
+    attempt. No `remoroo task`, no agent."""
+    import time as _time
+
+    out = _edge_post("vla_load", {"runtime": "lingbot"})
+    if "error" in out:
+        typer.secho(f"❌ vla_load: {out['error']}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    typer.secho(f"✓ wire proven: {out.get('proof', {}).get('latency_ms')}ms",
+                fg=typer.colors.GREEN)
+    out = _edge_post("vla_rollout", {"task_slug": slug, "instruction": instruction,
+                                     "max_steps": steps, "skip_reset": True})
+    while out.get("state") == "running":         # motion runs as a job: poll, never re-issue
+        typer.echo(f"  … rolling out (job {out['job']})")
+        _time.sleep(10)
+        out = _edge_post("job_status", {"job": out["job"]})
+        out = out.get("result") or out
+    if "error" in out:
+        typer.secho(f"❌ rollout: {out['error']}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    typer.secho(f"✓ rollout done — trial {out.get('trial_id')} "
+                f"outcome={out.get('outcome')}", fg=typer.colors.GREEN)
+    typer.echo("  judge it with your eyes: the before/after frames are in "
+               ".remoroo/task/frames/ (scene_snapshot), verdict flags say day0.")
