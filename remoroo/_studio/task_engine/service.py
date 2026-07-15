@@ -1209,13 +1209,18 @@ class TaskService:
             # MOTION ACCOUNTING (live 2026-07-15: "completed, zero movement" — turn
             # that into numbers): every commanded target is in the trace.
             import math
-            moves = [s for s in rec.trace
-                     if s.get("name") in ("vla_direct", "reach") and
-                     (s.get("tgt") or s.get("pose"))]
+            moves = []
+            for s in rec.trace:                 # targets nest under args (TraceStep)
+                if s.get("name") not in ("vla_direct", "reach"):
+                    continue
+                a = s.get("args") or {}
+                if a.get("tgt") or a.get("pose"):
+                    moves.append(s)
             deltas = []
             prev = None
             for s in moves:
-                xyz = list(s.get("tgt") or s.get("pose"))[:3]
+                a = s.get("args") or {}
+                xyz = list(a.get("tgt") or a.get("pose"))[:3]
                 if prev is not None:
                     deltas.append(math.dist(prev, xyz))
                 prev = xyz
