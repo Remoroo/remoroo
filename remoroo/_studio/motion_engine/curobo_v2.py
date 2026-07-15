@@ -220,6 +220,16 @@ class CuroboMapper:
             self._mapper.reset()
         self._voxelgrid = None
 
+    def clear_region(self, bounds_min: Sequence[float], bounds_max: Sequence[float]) -> int:
+        """Clear the block-sparse TSDF inside a world-space AABB and return the voxels cleared. The
+        targeted alternative to `reset()` under INCREMENTAL mapping: when the map persists across
+        cycles (no per-frame reset), a moved/removed obstacle that the cameras can't yet see through
+        (so free-space carving hasn't caught it) leaves a phantom. Clear just its old AABB instead of
+        wiping the whole map. Blocks stay allocated; the next `compute_esdf` reflects the hole."""
+        if self._mapper is None or not hasattr(self._mapper, "clear_region"):
+            return 0
+        return int(self._mapper.clear_region(list(bounds_min), list(bounds_max)) or 0)
+
     def _observation(self, depth: np.ndarray, intrinsics: np.ndarray,
                      cam_pose_in_base: Tuple[Sequence[float], Sequence[float]]):
         """Build a batched (1,H,W) cuRobo CameraObservation in the robot base frame. We map for

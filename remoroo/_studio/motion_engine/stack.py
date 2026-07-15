@@ -232,6 +232,8 @@ class MotionStack:
         self._mapper = None
         self._grid_meta: dict = {}                     # last ESDF grid extent/center (for legibility)
         self._live_voxels: np.ndarray = np.zeros((0, 4), dtype=float)
+        self._live_voxels_dirty = False                # a fast (diagnostics=False) refresh left the
+        #                                                render voxels stale; esdf_voxels() reads back lazily
         # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace; the
         # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
         self._actuated = actuated_joints(urdf_path)
@@ -412,11 +414,29 @@ class MotionStack:
         ctr = tuple(float((hi[i] + lo[i]) / 2) for i in range(3))
         return ext, ctr
 
-    def update_world_live(self, frames, tcp: Optional[str] = None) -> dict:
-        with span("update_world_live", frames=len(frames) if frames is not None else 0):
-            return self._update_world_live_impl(frames, tcp)
+    def update_world_live(self, frames, tcp: Optional[str] = None, *,
+                          reset: bool = False, diagnostics: bool = True) -> dict:
+        """Refresh the live collision world. Two cost knobs (both default to the SAFE, legible values):
 
-    def _update_world_live_impl(self, frames, tcp: Optional[str] = None) -> dict:
+        - `reset=False` (default) = INCREMENTAL: fuse this cycle's frames into the PERSISTENT
+          block-sparse TSDF instead of wiping it first. cuRobo's mapper is nvblox-style — an
+          incremental integrate touches only observed blocks (~1.5 ms/frame) and the ESDF recompute
+          only dirty blocks, vs a full rebuild (~1–2 s) when the map is reset every cycle. Persistence
+          is also SAFER: a wipe-and-rebuild drops any real obstacle a camera doesn't happen to see
+          THIS frame (under-conservative → collision); persistence can only leave a stale phantom
+          (over-conservative → a plan fails, visibly). Stale dynamics self-heal via TSDF free-space
+          carving; use `clear_dynamic_region()` for an obstacle that vanished before it was seen
+          through. Pass `reset=True` for a hard fresh start (e.g. the scene changed wholesale).
+        - `diagnostics=True` (default) computes the render readback + the ground-truth mask
+          cross-check (per-frame back-projection) — ~100s of ms of CPU work the COMMISSION gate and
+          the debug/render streams want. The hot reactive/planning refresh passes `diagnostics=False`:
+          integrate→ESDF→apply only, and the render voxels refresh LAZILY on the next `esdf_voxels()`."""
+        with span("update_world_live", frames=len(frames) if frames is not None else 0,
+                  reset=reset, diagnostics=diagnostics):
+            return self._update_world_live_impl(frames, tcp, reset=reset, diagnostics=diagnostics)
+
+    def _update_world_live_impl(self, frames, tcp: Optional[str] = None, *,
+                                reset: bool = False, diagnostics: bool = True) -> dict:
         """Refresh the LIVE collision world from N camera depth frames (ANY rig — the agent's
         commission pipeline calls this each cycle). cuRobo does the heavy lifting: each frame is
         cleaned (`FilterDepth`) and robot-MASKED at the live config (`RobotSegmenter`, so the robot is
@@ -452,7 +472,14 @@ class MotionStack:
                     ext, ctr, robot_cfg, esdf_vs, voxel_sz)
             self._grid_meta = {"extent": [round(v, 3) for v in ext], "center": [round(v, 3) for v in ctr],
                                "esdf_voxel_size": round(float(esdf_vs), 4), "from_scene": scene is not None}
-        self._mapper.reset()
+        # INCREMENTAL by default (reset=False): fuse into the persistent TSDF. Only wipe on an
+        # explicit `reset=True` — a freshly BUILT mapper (the branch above) is already empty, so a
+        # reset there would be a no-op anyway. This is the single biggest refresh-latency lever:
+        # a full wipe forces cuRobo to re-integrate every frame + recompute the whole ESDF (~1–2 s);
+        # incremental touches only the blocks this cycle's depth changed (~tens of ms).
+        if reset:
+            with span("mapper.reset (hard fresh start — reset=True)"):
+                self._mapper.reset()
         q = self._seed_positions()                 # FALLBACK mask config (live "now") — used only for a
                                                    # frame that carries no capture-time config (commission).
         total_px, n_masked = 0, 0
@@ -472,7 +499,20 @@ class MotionStack:
         with span("compute ESDF + apply to planner"):
             voxelgrid = self._mapper.compute_esdf()
             planner.update_voxel_world(voxelgrid)
+
+        # FAST PATH (diagnostics=False): the planner's collision world is now fresh — that's all a
+        # reactive/planning refresh needs. Skip the render readback (occupied_voxels → GPU→CPU) AND
+        # the per-frame ground-truth mask cross-check below (~100s of ms of CPU). The render voxels
+        # go stale, so mark them dirty; `esdf_voxels()` reads them back LAZILY when something renders.
+        frac = round(n_masked / total_px, 3) if total_px else 0.0
+        if not diagnostics:
+            self._live_voxels_dirty = True
+            return {"ok": True, "n_frames": len(frames), "n_robot_pixels_masked": n_masked,
+                    "total_pixels": total_px, "mask_fraction": frac, "grid": dict(self._grid_meta),
+                    "incremental": not reset, "diagnostics": False}
+
         self._live_voxels = np.asarray(self._mapper.occupied_voxels(), dtype=float).reshape(-1, 3)
+        self._live_voxels_dirty = False
 
         # GROUND TRUTH side-by-side: OUR masking (the one that keeps the object GREEN in the debug view)
         # vs cuRobo's RobotSegmenter (`n_masked` above). If `our_mask_fraction` ≪ `mask_fraction`, the
@@ -504,7 +544,6 @@ class MotionStack:
         # (a 96%-masked image or 0/N matched joints is the smoking gun), not a silent mystery.
         seg_names = list(getattr(self._mapper, "segmenter_joint_names", []) or [])
         n_matched = sum(1 for n in seg_names if n in q)
-        frac = round(n_masked / total_px, 3) if total_px else 0.0
         warnings: List[str] = []
         if seg_names and n_matched < len(seg_names):
             warnings.append(f"seed↔segmenter joint mismatch: only {n_matched}/{len(seg_names)} of the "
@@ -539,8 +578,27 @@ class MotionStack:
 
     def esdf_voxels(self) -> np.ndarray:
         """The current live world's occupied voxel centres `[N, 3]` (x, y, z) in the base frame — the
-        Studio renders these as the live collision world."""
+        Studio renders these as the live collision world. A fast (`diagnostics=False`) refresh skips
+        the GPU→CPU readback and marks the render voxels dirty; we do it HERE, lazily, so the render
+        pays for it (on its own slow cadence) instead of the hot planning path."""
+        if self._live_voxels_dirty and self._mapper is not None:
+            with span("esdf_voxels lazy readback (after a fast refresh)"):
+                self._live_voxels = np.asarray(self._mapper.occupied_voxels(), dtype=float).reshape(-1, 3)
+            self._live_voxels_dirty = False
         return self._live_voxels
+
+    def clear_dynamic_region(self, bounds_min: Sequence[float], bounds_max: Sequence[float]) -> int:
+        """Clear the persistent live TSDF inside a world-space AABB (min/max xyz, base frame) and
+        return the voxels cleared. Under INCREMENTAL mapping (`update_world_live(reset=False)`) the map
+        keeps geometry across cycles; call this to forget a dynamic obstacle that MOVED before the
+        cameras could see through its old location (so free-space carving hasn't cleared it yet). The
+        next `update_world_live` re-applies the ESDF with the hole. No-op without a live mapper."""
+        if self._mapper is None or not hasattr(self._mapper, "clear_region"):
+            return 0
+        n = self._mapper.clear_region(bounds_min, bounds_max)
+        if n:
+            self._live_voxels_dirty = True
+        return int(n)
 
     def esdf_voxel_size(self) -> float:
         """The live ESDF voxel edge length (m), so the Studio sizes the debug cubes at the planner's
@@ -1845,7 +1903,9 @@ class MotionStack:
             if frames is not None:
                 fr = list(frames() or [])
                 if fr:
-                    wr = self.update_world_live(fr, tcp=tcp)
+                    # Hot reactive path: incremental + no diagnostics readback (the plan only needs the
+                    # planner's collision world fresh; the render polls esdf_voxels() on its own cadence).
+                    wr = self.update_world_live(fr, tcp=tcp, diagnostics=False)
                     emit(step="world", leg=i, ok=wr.get("ok", False), n_voxels=wr.get("n_voxels"))
             targets = self.find_free_targets(tcp, n=1)        # a reachable, collision-free point
             if not targets:
