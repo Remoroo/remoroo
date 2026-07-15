@@ -205,9 +205,11 @@ class LingBotRuntime:
     def _rows_of(self, resp: Dict[str, Any]) -> List[List[float]]:
         import numpy as np
 
-        if "actions" in resp:                        # single-array form
-            arr = np.asarray(resp["actions"], dtype=float)
-            return [list(r) for r in (arr if arr.ndim > 1 else arr.reshape(1, -1))]
+        for flat_key in ("action", "actions"):       # the REAL server returns "action":
+            if flat_key in resp:                     # unapply's org key = the flat vector
+                arr = np.asarray(resp[flat_key], dtype=float)   # [chunk, action_dim],
+                return [list(r) for r in               # already in the PROFILE's layout
+                        (arr if arr.ndim > 1 else arr.reshape(1, -1))]
         if self.profile is not None:                 # per-group keys ("action.<group>")
             chunks = {}
             for s in self.profile.actions:

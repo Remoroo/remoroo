@@ -159,12 +159,14 @@ def to_lingbot_robot_config(profile: VlaProfile, *, norm_stats_path: str) -> Dic
                 {f"{'action' if with_subtract else 'observation.state'}.{group}": item})
         return grouped
 
-    # NO images key: check_robot_config asserts every top-level section is a LIST
-    # (rig 2026-07-15) and the vendor's own robotwin.yaml carries only states/actions/
-    # norm_stats — camera slot selection lives in the cli data section (cameras:).
+    # images: STRING entries (their check accepts str|dict; robotwin.yaml uses the
+    # dict form to RENAME robot streams to canonical slots — our packer already emits
+    # canonical slot names, so target == org and the plain string is the whole truth).
+    # Read from the vendor source 2026-07-15, not inferred.
     return {
         "states": slices_of(profile.state, "observation.state", with_subtract=False),
         "actions": slices_of(profile.actions, "action", with_subtract=True),
+        "images": [f"observation.images.{slot}" for slot in profile.cameras],
         "norm_stats": norm_stats_path,
     }
 
@@ -196,10 +198,13 @@ def to_lingbot_cli_config(profile: VlaProfile, *, checkpoint: str, qwen_path: st
             "datasets_type": "vla",
             "data_name": profile.robo_name,
             "robot_config_root": robot_config_root,
-            "norm": "meanstd",
             # per-robot camera SLOT selection (update_info reads it); `joints` is
-            # deliberately NOT emitted — see the registry note above.
+            # deliberately NOT emitted — see the registry note above. norm_type
+            # entries are literal_eval'd strings like joints (get_normalizer);
+            # every group this profile uses must carry one.
             "cameras": list(profile.cameras.keys()),
+            "norm_type": [str({g: "meanstd"}) for g in dict.fromkeys(
+                [s.group for s in profile.state] + [s.group for s in profile.actions])],
         },
     }
 

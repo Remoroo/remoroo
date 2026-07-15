@@ -82,13 +82,19 @@ def make_observation_packer(profile: VlaProfile, *, bridge: Any,
                 degraded.append(f"state:{s.group}/{s.chain}")
             else:
                 state[s.start:s.end] = np.asarray(vals[:s.dims], dtype=np.float32)
-        # robo_name IS the transform selector on multi-robot checkpoints (rig-decoded
-        # 2026-07-14): the deploy policy builds its FeatureTransform LAZILY from
-        # configs/robot_configs/{robo_name}.yaml + norm stats on the first observation
-        # that names the robot. Without it: feature_transform stays None and the
-        # server crashes at resize_image ('NoneType' has no 'org_features').
-        obs: Dict[str, Any] = {"image": images, "state": state,
+        # WIRE SCHEMA READ FROM THE VENDOR SOURCE (2026-07-15, deploy/
+        # lingbot_vla_v2_policy.py resize_image + FeatureTransform.apply): the obs is
+        # a FLAT dict — each image under its full feature name
+        # ("observation.images.<slot>", HxWx3), the state vector under
+        # "observation.state" (their origin_keys slice exactly that key), "prompt"
+        # injected by the runtime at act time, and "robo_name" (the lazy-reset
+        # transform selector on multi-robot checkpoints). The old nested
+        # {"image": {...}, "state": ...} would have failed resize_image's
+        # `assert image_feature in observation`.
+        obs: Dict[str, Any] = {"observation.state": state,
                                "robo_name": profile.robo_name}
+        for slot, rgb in images.items():
+            obs[f"observation.images.{slot}"] = rgb
         if degraded:
             obs["degraded"] = degraded              # stated, travels in the trace too
         return obs
