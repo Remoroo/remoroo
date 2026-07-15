@@ -241,6 +241,18 @@ class LingBotRuntime:
             if pending:
                 return pending.pop(0)
             payload = dict(obs) if isinstance(obs, dict) else {"observation": obs}
+            if self.profile is not None and isinstance(obs, dict):
+                # the server ASSERTS every profile camera (resize_image) — a missing
+                # frame must fail HERE with the camera named, not as a bare server
+                # AssertionError (live 2026-07-15: one dead grab killed the rollout)
+                missing = [f"{slot}({cam})" for slot, cam in self.profile.cameras.items()
+                           if f"observation.images.{slot}" not in payload]
+                if missing:
+                    raise RuntimeError(
+                        f"observation is missing camera frames: {missing} — the "
+                        "server requires every profile camera. Check each with "
+                        "scene_snapshot; if a camera is truly unavailable, re-author "
+                        "vla_profile.yaml without it and vla_apply_profile + restart")
             payload["prompt"] = [instruction]
             payload["task"] = instruction        # pad_and_concat reads item["task"]
             resp = self._client_or_connect().infer(payload)

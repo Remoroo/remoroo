@@ -950,12 +950,26 @@ class TaskService:
                     profile, bridge=self._bridge, stack=stack,
                     groups=self._groups_for_packer(stack))
             obs = None
+            packer_err = None
             if self._vla_observe is not None and self._bridge is not None:
                 try:
                     obs = self._vla_observe()
-                except Exception:                     # noqa: BLE001 - handshake proof then
+                    bad = [d for d in (obs.get("degraded") or [])
+                           if d.startswith("image:")]
+                    if bad:                           # the server asserts these frames
+                        packer_err = f"camera frames missing: {bad}"
+                        obs = None
+                except Exception as e:                # noqa: BLE001 - stated, not masked
+                    packer_err = f"{type(e).__name__}: {e}"
                     obs = None
             proof = runtime.prove(obs)
+            if packer_err and proof.get("proven") == "handshake":
+                # a handshake-only proof because the PACKER failed is not a pass —
+                # the silent downgrade masked a dead camera as "wire proven: 42ms"
+                return {"error": f"cannot prove inference — the observation packer "
+                                 f"failed ({packer_err}); scene_snapshot each profile "
+                                 "camera to find the dead one",
+                        "proof": proof}
             if proof.get("proven") is False:
                 return {"error": f"vla wire proof failed: {proof.get('error')}",
                         "proof": proof}               # NOT loaded — stated, never silent
