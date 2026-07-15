@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remoroo"
-version = "0.17.24"
+version = "0.17.25"
 description = "Remoroo Offline Engine CLI"
 requires-python = ">=3.10"
 dependencies = [
@@ -21,6 +21,11 @@ dependencies = [
     "pexpect>=4.9.0",
     "playwright>=1.40.0",
     "pyyaml>=6.0",
+    # `remoroo vla prove`/`rollout` run the bundled wire client IN the CLI venv
+    # (2026-07-15: uv tool env had no numpy -> ModuleNotFoundError on the rig)
+    "numpy>=1.24",
+    "msgpack>=1.0",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]

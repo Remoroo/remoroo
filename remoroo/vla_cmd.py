@@ -355,19 +355,37 @@ def rollout(
     attempt. No `remoroo task`, no agent."""
     import time as _time
 
-    out = _edge_post("vla_load", {"runtime": "lingbot"})
+    try:
+        # the proof round-trip inside vla_load can take ~60s cold, and a freshly
+        # restarted edge spends its first minutes deep-warming cuRobo before it
+        # answers task verbs — 30s here guaranteed a raw TimeoutError (2026-07-15)
+        out = _edge_post("vla_load", {"runtime": "lingbot"}, port=port, timeout=180.0)
+    except Exception as e:                     # noqa: BLE001 - stated, never a traceback
+        typer.secho(f"❌ edge did not answer vla_load ({type(e).__name__}): a freshly "
+                    "(re)started edge warms cuRobo for ~2-3 min first — wait and "
+                    "retry; `tail -f .remoroo/edge.log` shows the warmup.",
+                    fg=typer.colors.RED)
+        raise typer.Exit(code=1)
     if "error" in out:
         typer.secho(f"❌ vla_load: {out['error']}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
     typer.secho(f"✓ wire proven: {out.get('proof', {}).get('latency_ms')}ms",
                 fg=typer.colors.GREEN)
-    out = _edge_post("vla_rollout", {"task_slug": slug, "instruction": instruction,
-                                     "max_steps": steps, "skip_reset": True})
-    while out.get("state") == "running":         # motion runs as a job: poll, never re-issue
-        typer.echo(f"  … rolling out (job {out['job']})")
-        _time.sleep(10)
-        out = _edge_post("job_status", {"job": out["job"]})
-        out = out.get("result") or out
+    try:
+        out = _edge_post("vla_rollout", {"task_slug": slug, "instruction": instruction,
+                                         "max_steps": steps, "skip_reset": True},
+                         port=port, timeout=60.0)
+        job = out.get("job")
+        while out.get("state") == "running":     # motion runs as a job: poll, never re-issue
+            typer.echo(f"  … rolling out (job {job})")
+            _time.sleep(10)
+            out = _edge_post("job_status", {"job": job}, port=port)
+            out = out.get("result") or out
+    except Exception as e:                     # noqa: BLE001
+        typer.secho(f"❌ edge stopped answering mid-rollout ({type(e).__name__}) — "
+                    "the job keeps running on the edge; check `job_status` via the "
+                    "edge log rather than re-issuing.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
     if "error" in out:
         typer.secho(f"❌ rollout: {out['error']}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
