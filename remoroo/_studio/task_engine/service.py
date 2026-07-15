@@ -623,6 +623,17 @@ class TaskService:
         planners = getattr(stack, "_planners", None)
         return planners is None or bool(planners)
 
+    def _cell_groups(self) -> Dict[str, Any]:
+        """cell.yaml groups (joint_names per chain) — the packer selects each chain's
+        joints from get_observation() with these (live 2026-07-15: without them the
+        state vector was all zeros and the stats tour averaged blindness)."""
+        try:
+            import yaml
+            cell = yaml.safe_load(Path("remoroo_cell/cell.yaml").read_text()) or {}
+            return dict(cell.get("groups") or {})
+        except Exception:                          # noqa: BLE001
+            return {}
+
     def _camera_mount(self, camera: str) -> str:
         """cell.yaml cameras: name/id -> mount ('static' or the carrying arm).
         Unknown cameras return '' (treated as possibly-moving)."""
@@ -917,7 +928,8 @@ class TaskService:
                 from .vla.packer import make_observation_packer
                 stack = self._stack_provider() if self._stack_provider else None
                 self._vla_observe = make_observation_packer(
-                    profile, bridge=self._bridge, stack=stack)
+                    profile, bridge=self._bridge, stack=stack,
+                    groups=self._cell_groups())
             obs = None
             if self._vla_observe is not None and self._bridge is not None:
                 try:
@@ -971,7 +983,8 @@ class TaskService:
             from .vla.packer import make_observation_packer
             from .vla.stats import bootstrap_tour, stats_from_states
             stack = self._stack_provider() if self._stack_provider else None
-            packer = make_observation_packer(profile, bridge=self._bridge, stack=stack)
+            packer = make_observation_packer(profile, bridge=self._bridge, stack=stack,
+                                             groups=self._cell_groups())
             states = bootstrap_tour(profile, stack=stack, bridge=self._bridge,
                                     packer=packer,
                                     n_poses=int(body.get("n_poses", 10)),

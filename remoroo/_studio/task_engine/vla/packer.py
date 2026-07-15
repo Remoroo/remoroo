@@ -25,7 +25,8 @@ def _rgb_of(bridge: Any, camera: str) -> Optional[np.ndarray]:
     return None                                     # depth-only camera_frame can't feed a VLA
 
 
-def _joints_of(bridge: Any, chain: str, dims: int) -> Optional[List[float]]:
+def _joints_of(bridge: Any, chain: str, dims: int,
+               groups: Optional[Dict[str, Any]] = None) -> Optional[List[float]]:
     for name in ("joint_state", "joint_positions", "get_joints"):   # authored dialects
         fn = getattr(bridge, name, None)
         if callable(fn):
@@ -34,6 +35,20 @@ def _joints_of(bridge: Any, chain: str, dims: int) -> Optional[List[float]]:
                 return ([float(v) for v in vals] + [0.0] * dims)[:dims]
             except Exception:                       # noqa: BLE001 - keep trying dialects
                 continue
+    # THE dialect this rig actually speaks (and the stack already uses):
+    # get_observation().joint_positions is a dict of ALL joints; the cell's groups
+    # say which names belong to this chain. Live 2026-07-15: without this path the
+    # packer zeroed every state and the policy was BLIND to its own configuration.
+    try:
+        obs = bridge.get_observation()
+        jp = dict(getattr(obs, "joint_positions", None) or {})
+        names = list(((groups or {}).get(chain) or {}).get("joint_names") or [])
+        if jp and names:
+            vals = [float(jp[n]) for n in names if n in jp]
+            if len(vals) >= min(dims, len(names)):
+                return (vals + [0.0] * dims)[:dims]
+    except Exception:                               # noqa: BLE001
+        pass
     return None
 
 
@@ -41,8 +56,14 @@ def _ee_of(stack: Any, chain: str, dims: int) -> Optional[List[float]]:
     if stack is None:
         return None
     try:
-        pose = list(stack.link_pose(chain))
-        return ([float(v) for v in pose] + [0.0] * dims)[:dims]
+        pose = stack.link_pose(chain)
+        if pose is None:
+            return None
+        if isinstance(pose, tuple) and len(pose) == 2:   # (xyz, wxyz) stack convention
+            flat = list(pose[0])[:3] + list(pose[1])[:4]  # the tuple bug's THIRD site:
+        else:                                             # float(list) raised -> silent
+            flat = list(pose)                             # None -> zero states (2026-07-15)
+        return ([float(v) for v in flat] + [0.0] * dims)[:dims]
     except Exception:                               # noqa: BLE001
         return None
 
@@ -58,7 +79,9 @@ def _gripper_of(bridge: Any, chain: str) -> Optional[float]:
 
 
 def make_observation_packer(profile: VlaProfile, *, bridge: Any,
-                            stack: Any = None) -> Callable[[], Dict[str, Any]]:
+                            stack: Any = None,
+                            groups: Optional[Dict[str, Any]] = None
+                            ) -> Callable[[], Dict[str, Any]]:
     def observe() -> Dict[str, Any]:
         degraded: List[str] = []
         images: Dict[str, np.ndarray] = {}
@@ -72,7 +95,7 @@ def make_observation_packer(profile: VlaProfile, *, bridge: Any,
         for s in profile.state:
             vals: Optional[List[float]] = None
             if s.source == "joints":
-                vals = _joints_of(bridge, s.chain, s.dims)
+                vals = _joints_of(bridge, s.chain, s.dims, groups=groups)
             elif s.source == "ee_pose":
                 vals = _ee_of(stack, s.chain, s.dims)
             elif s.source == "gripper":
