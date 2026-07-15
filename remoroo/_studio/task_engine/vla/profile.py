@@ -159,11 +159,12 @@ def to_lingbot_robot_config(profile: VlaProfile, *, norm_stats_path: str) -> Dic
                 {f"{'action' if with_subtract else 'observation.state'}.{group}": item})
         return grouped
 
+    # NO images key: check_robot_config asserts every top-level section is a LIST
+    # (rig 2026-07-15) and the vendor's own robotwin.yaml carries only states/actions/
+    # norm_stats — camera slot selection lives in the cli data section (cameras:).
     return {
         "states": slices_of(profile.state, "observation.state", with_subtract=False),
         "actions": slices_of(profile.actions, "action", with_subtract=True),
-        "images": {f"observation.images.{slot}": f"observation.images.{cam}"
-                   for slot, cam in profile.cameras.items()},
         "norm_stats": norm_stats_path,
     }
 
