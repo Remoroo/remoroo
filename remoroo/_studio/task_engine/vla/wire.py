@@ -55,7 +55,12 @@ def unpackb(data: bytes) -> Any:
 def _default_connect(uri: str) -> Any:
     import websockets.sync.client
 
-    return websockets.sync.client.connect(uri, compression=None, max_size=None)
+    # open_timeout 60s: the vendor server BLOCKS its event loop for the whole ~21s
+    # GPU inference (sync infer inside the async handler, rig-measured 2026-07-15),
+    # so a legitimate handshake can wait behind an in-flight inference. The default
+    # 10s open_timeout made healthy connects "fail" whenever the server was thinking.
+    return websockets.sync.client.connect(uri, compression=None, max_size=None,
+                                          open_timeout=60)
 
 
 class PolicyClient:

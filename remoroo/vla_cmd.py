@@ -355,17 +355,30 @@ def rollout(
     attempt. No `remoroo task`, no agent."""
     import time as _time
 
-    out = None
-    for attempt in range(16):                  # ~4 min of VISIBLE waiting, never silent
+    # STEP 1: wait for the edge with a CHEAP verb — never by re-firing vla_load
+    # (each vla_load runs a ~21s inference; 20s retries STACKED inferences behind the
+    # vendor's event-loop-blocking handler until handshakes failed — rig 2026-07-15).
+    ready = False
+    for attempt in range(24):                  # ~4 min of VISIBLE waiting, never silent
         try:
-            out = _edge_post("vla_load", {"runtime": "lingbot"}, port=port, timeout=20.0)
+            _edge_post("status", {}, port=port, timeout=10.0)
+            ready = True
             break
         except Exception:                      # noqa: BLE001 - edge still warming
             typer.echo("  … waiting for the edge (cuRobo warmup on a fresh start "
-                       f"takes ~2-3 min) [{(attempt + 1) * 20}s]")
-    if out is None:
-        typer.secho("❌ the edge never answered vla_load — `tail -f "
-                    ".remoroo/edge.log` to see where it is.", fg=typer.colors.RED)
+                       f"takes ~2-3 min) [{(attempt + 1) * 10}s]")
+    if not ready:
+        typer.secho("❌ the edge never answered — `tail -f .remoroo/edge.log` to "
+                    "see where it is.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    # STEP 2: ONE proof, generous timeout (a full inference on this board is ~21s)
+    typer.echo("  proving the wire (one full inference, ~20-30s on this board)…")
+    try:
+        out = _edge_post("vla_load", {"runtime": "lingbot"}, port=port, timeout=150.0)
+    except Exception as e:                     # noqa: BLE001
+        typer.secho(f"❌ wire proof did not return ({type(e).__name__}) — check "
+                    "`remoroo vla logs`; do NOT re-run in a loop (each attempt costs "
+                    "a full inference).", fg=typer.colors.RED)
         raise typer.Exit(code=1)
     if "error" in out:
         typer.secho(f"❌ vla_load: {out['error']}", fg=typer.colors.RED)
