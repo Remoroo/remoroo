@@ -634,6 +634,25 @@ class TaskService:
         except Exception:                          # noqa: BLE001
             return {}
 
+    def _groups_for_packer(self, stack: Any) -> Dict[str, Any]:
+        """Chain -> joint_names for the packer. Raw cell.yaml groups often carry only
+        tip_links (rig 2026-07-15: bootstrap refused with arm.position degraded while
+        goto_joints worked fine — the joint names live in the STACK's enriched
+        groups, not the yaml). Yaml first (either key spelling), stack overlay wins."""
+        groups = self._cell_groups()
+        for spec in groups.values():
+            if isinstance(spec, dict) and "joint_names" not in spec and "joints" in spec:
+                spec["joint_names"] = list(spec["joints"])
+        if stack is not None:
+            for g in list(getattr(stack, "group_names", []) or []):
+                try:
+                    jn = stack._group(g).get("joint_names")
+                    if jn:
+                        groups.setdefault(g, {})["joint_names"] = list(jn)
+                except Exception:                  # noqa: BLE001 - yaml names remain
+                    continue
+        return groups
+
     def _camera_mount(self, camera: str) -> str:
         """cell.yaml cameras: name/id -> mount ('static' or the carrying arm).
         Unknown cameras return '' (treated as possibly-moving)."""
@@ -929,7 +948,7 @@ class TaskService:
                 stack = self._stack_provider() if self._stack_provider else None
                 self._vla_observe = make_observation_packer(
                     profile, bridge=self._bridge, stack=stack,
-                    groups=self._cell_groups())
+                    groups=self._groups_for_packer(stack))
             obs = None
             if self._vla_observe is not None and self._bridge is not None:
                 try:
@@ -984,7 +1003,7 @@ class TaskService:
             from .vla.stats import bootstrap_tour, stats_from_states
             stack = self._stack_provider() if self._stack_provider else None
             packer = make_observation_packer(profile, bridge=self._bridge, stack=stack,
-                                             groups=self._cell_groups())
+                                             groups=self._groups_for_packer(stack))
             states = bootstrap_tour(profile, stack=stack, bridge=self._bridge,
                                     packer=packer,
                                     n_poses=int(body.get("n_poses", 10)),
