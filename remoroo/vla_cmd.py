@@ -421,13 +421,23 @@ def rollout(
                 fg=typer.colors.GREEN if ok_outcome else typer.colors.RED)
     for flag in out.get("anomalies") or []:    # the actor's own traceback tail
         typer.echo(f"    {flag}")
+    motion = out.get("motion") or {}
+    if motion:
+        typer.echo(f"  motion: {motion.get('commands', 0)} commands, "
+                   f"{motion.get('total_path_m', 0)}m total path, "
+                   f"max step {motion.get('max_step_m', 0)}m")
+        if motion.get("note"):
+            typer.secho(f"  ⚠ {motion['note']}", fg=typer.colors.YELLOW)
     typer.echo("  judge it with your eyes: the before/after frames are in "
                ".remoroo/task/frames/ (scene_snapshot), verdict flags say day0.")
 
 
 @vla_app.command("bootstrap-stats")
 def bootstrap_stats(
-    poses: int = typer.Option(10, "--poses", help="Tour stops around home."),
+    poses: int = typer.Option(16, "--poses", help="Tour stops around home."),
+    span: float = typer.Option(0.35, "--span",
+                               help="Joint offset span (rad) — the stats ARE the "
+                                    "policy's reachable envelope: sweep wide."),
     port: int = typer.Option(7779, "--port", help="Edge port."),
 ):
     """REAL norm stats from a short guarded tour (the robot MOVES: small joint
@@ -436,7 +446,8 @@ def bootstrap_stats(
     import time as _time
     try:
         out = _edge_post("vla_bootstrap_stats", {"task_slug": "vla_smoke",
-                                                 "n_poses": poses},
+                                                 "n_poses": poses,
+                                                 "joint_span": span},
                          port=port, timeout=30.0)
         job = out.get("job")
         while out.get("state") == "running":

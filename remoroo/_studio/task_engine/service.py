@@ -1206,6 +1206,39 @@ class TaskService:
             flags = list(getattr(rec, "anomaly_flags", None) or [])
             if flags:                          # a failed actor names its own cause HERE
                 out["anomalies"] = flags
+            # MOTION ACCOUNTING (live 2026-07-15: "completed, zero movement" — turn
+            # that into numbers): every commanded target is in the trace.
+            import math
+            moves = [s for s in rec.trace
+                     if s.get("name") in ("vla_direct", "reach") and
+                     (s.get("tgt") or s.get("pose"))]
+            deltas = []
+            prev = None
+            for s in moves:
+                xyz = list(s.get("tgt") or s.get("pose"))[:3]
+                if prev is not None:
+                    deltas.append(math.dist(prev, xyz))
+                prev = xyz
+            out["motion"] = {"commands": len(moves),
+                             "total_path_m": round(sum(deltas), 4),
+                             "max_step_m": round(max(deltas), 4) if deltas else 0.0,
+                             "decode": dict(getattr(runtime, "decode_stats", {}) or {})}
+            dec = out["motion"]["decode"]
+            if dec.get("rows") and not dec.get("emitted"):
+                out["motion"]["note"] = (
+                    f"the model produced {dec['rows']} action rows and the decoder "
+                    "emitted ZERO commands — (near-)CONSTANT outputs, the collapsed-"
+                    "policy signature of out-of-distribution inputs: NARROW norm "
+                    "stats blow up state z-scores ((x-mean)/std) AND shrink the "
+                    "output envelope. Re-run vla_bootstrap_stats with a WIDE tour, "
+                    "restart, retry")
+            elif moves and sum(deltas) < 0.01:
+                out["motion"]["note"] = (
+                    "the policy commanded near-ZERO displacement — its reachable "
+                    "envelope is the norm-stats distribution (z*std+mean): a narrow "
+                    "bootstrap tour = a policy trapped in a centimeter bubble. "
+                    "Re-run vla_bootstrap_stats with a WIDER tour (joint_span 0.35+, "
+                    "n_poses 16+) so the stats span the workspace, then restart+prove")
             return out
 
         return self._run_as_job("vla_day0", run, wait_s=5.0)

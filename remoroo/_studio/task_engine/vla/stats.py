@@ -5,9 +5,12 @@ observation at every stop, then per-dimension stats over the visited states.
 Identity stats proved the wire but de-normalize the model's outputs into
 semantically-aimless motion (the first day-zero rollout: slow, small, approached
 nothing). Bootstrap stats are honest about what they are: the distribution of THIS
-cell's reachable states around home — enough to put decoded actions in real metric
-range, NOT a substitute for episode statistics (the finetune pipeline overwrites
-this same file from recorded episodes).
+cell's reachable states around home — and CRITICALLY, they are the policy's
+reachable envelope: denormalization is z*std+mean, so the model can only command
+poses within a few sigma of what the tour visited (live 2026-07-15: a 0.12-rad
+tour trapped the policy in a centimeter bubble — "completed, zero movement").
+Default span/poses raised so the tour SWEEPS the workspace; still NOT a substitute
+for episode statistics (the finetune pipeline overwrites this same file).
 
 Action features use the state's own distribution for absolute-target groups
 (subtract_state False: an absolute EE-pose action lives in the same space as the
@@ -65,7 +68,7 @@ def stats_from_states(profile: Any, states: List[np.ndarray]) -> Dict[str, Any]:
 
 
 def bootstrap_tour(profile: Any, *, stack: Any, bridge: Any, packer: Any,
-                   n_poses: int = 10, joint_span: float = 0.12,
+                   n_poses: int = 16, joint_span: float = 0.35,
                    seed: int = 0) -> List[np.ndarray]:
     """Visit n_poses small joint-space offsets around the CURRENT config — every move
     collision-checked through goto_joints (the planner IS the right tool here: this

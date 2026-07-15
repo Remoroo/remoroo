@@ -105,6 +105,7 @@ class LingBotRuntime:
         self.decode_fn = decode_fn or (self._decode_profile if profile is not None
                                        else self._decode_canonical)
         self._client = client                        # injectable (tests); lazy otherwise
+        self.decode_stats = {"rows": 0, "emitted": 0}   # rollout accounting (2026-07-15)
 
     def _client_or_connect(self) -> Any:
         if self._client is None:
@@ -258,7 +259,10 @@ class LingBotRuntime:
             resp = self._client_or_connect().infer(payload)
             for raw in self._rows_of(resp)[: self.max_chunk]:
                 step = [float(v) for v in raw]
-                pending.extend(self.decode_fn(step, prev_step[0]))
+                acts = self.decode_fn(step, prev_step[0])
+                self.decode_stats["rows"] += 1
+                self.decode_stats["emitted"] += len(acts)
+                pending.extend(acts)
                 prev_step[0] = step
             return pending.pop(0) if pending else None
         return act
