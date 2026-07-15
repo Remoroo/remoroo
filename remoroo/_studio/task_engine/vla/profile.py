@@ -181,7 +181,8 @@ def to_lingbot_robot_config(profile: VlaProfile, *, norm_stats_path: str) -> Dic
 
 
 def to_lingbot_cli_config(profile: VlaProfile, *, checkpoint: str, qwen_path: str,
-                          robot_config_root: str) -> Dict[str, Any]:
+                          robot_config_root: str,
+                          norm_stats_path: Optional[str] = None) -> Dict[str, Any]:
     """The training/CLI yaml the policy server reads from the checkpoint's parent
     (lingbotvla_cli.yaml). Minimal: dims + paths; training hyperparams belong to the
     finetune job, not here."""
@@ -205,6 +206,13 @@ def to_lingbot_cli_config(profile: VlaProfile, *, checkpoint: str, qwen_path: st
             "cameras": list(profile.cameras.keys()),
             "norm_type": [str({g: "meanstd"}) for g in dict.fromkeys(
                 [s.group for s in profile.state] + [s.group for s in profile.actions])],
+            # PRECEDENCE (rig-decoded 2026-07-15): the deploy policy takes
+            # data_config.norm_stats_file (THIS section, parsed at startup) OVER the
+            # robot config's norm_stats — a stale robotwin path here silently
+            # normalized a 6-dim arm against 12-dim stats. Point it at the per-rig
+            # stats (identity for the wire proof; real stats come from recorded
+            # episodes via the finetune pipeline, written to the same path).
+            **({"norm_stats_file": norm_stats_path} if norm_stats_path else {}),
         },
     }
 
@@ -224,7 +232,8 @@ def write_lingbot_configs(profile: VlaProfile, *, workdir: str, checkpoint: str,
     robot_cfg.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
 
     cli = to_lingbot_cli_config(profile, checkpoint=checkpoint, qwen_path=qwen_path,
-                                robot_config_root=str(robot_dir))
+                                robot_config_root=str(robot_dir),
+                                norm_stats_path=norm_stats_path)
     # DEFAULT beside the checkpoint is a GUESS; the commissioning gate probes the
     # rig's REAL path (the Hitbot's server read it three dirs above) and callers
     # pass it through config_path.

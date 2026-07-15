@@ -355,16 +355,17 @@ def rollout(
     attempt. No `remoroo task`, no agent."""
     import time as _time
 
-    try:
-        # the proof round-trip inside vla_load can take ~60s cold, and a freshly
-        # restarted edge spends its first minutes deep-warming cuRobo before it
-        # answers task verbs — 30s here guaranteed a raw TimeoutError (2026-07-15)
-        out = _edge_post("vla_load", {"runtime": "lingbot"}, port=port, timeout=180.0)
-    except Exception as e:                     # noqa: BLE001 - stated, never a traceback
-        typer.secho(f"❌ edge did not answer vla_load ({type(e).__name__}): a freshly "
-                    "(re)started edge warms cuRobo for ~2-3 min first — wait and "
-                    "retry; `tail -f .remoroo/edge.log` shows the warmup.",
-                    fg=typer.colors.RED)
+    out = None
+    for attempt in range(16):                  # ~4 min of VISIBLE waiting, never silent
+        try:
+            out = _edge_post("vla_load", {"runtime": "lingbot"}, port=port, timeout=20.0)
+            break
+        except Exception:                      # noqa: BLE001 - edge still warming
+            typer.echo("  … waiting for the edge (cuRobo warmup on a fresh start "
+                       f"takes ~2-3 min) [{(attempt + 1) * 20}s]")
+    if out is None:
+        typer.secho("❌ the edge never answered vla_load — `tail -f "
+                    ".remoroo/edge.log` to see where it is.", fg=typer.colors.RED)
         raise typer.Exit(code=1)
     if "error" in out:
         typer.secho(f"❌ vla_load: {out['error']}", fg=typer.colors.RED)

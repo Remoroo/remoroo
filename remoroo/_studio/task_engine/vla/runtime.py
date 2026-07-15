@@ -131,6 +131,9 @@ class LingBotRuntime:
                         "hello_keys": hello,
                         "note": "no observation packer (no vla_profile) — wire connects; "
                                 "inference unproven until a profile exists"}
+            obs = dict(obs)
+            obs.setdefault("task", "remoroo wire proof")      # pad_and_concat needs it
+            obs.setdefault("prompt", [obs["task"]])
             resp = client.infer(obs)
             rows = self._rows_of(resp)
             return {"proven": "inference", "latency_ms": round((_time.time() - t0) * 1e3),
@@ -239,6 +242,7 @@ class LingBotRuntime:
                 return pending.pop(0)
             payload = dict(obs) if isinstance(obs, dict) else {"observation": obs}
             payload["prompt"] = [instruction]
+            payload["task"] = instruction        # pad_and_concat reads item["task"]
             resp = self._client_or_connect().infer(payload)
             for raw in self._rows_of(resp)[: self.max_chunk]:
                 step = [float(v) for v in raw]

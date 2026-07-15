@@ -437,7 +437,17 @@ def start(project_dir: Path, echo: Echo = print, *, wait: bool = True,
              "per board: `remoroo vla stop` sweeps it; if it will not die, reboot. "
              "Never stack a second 12GB load.")
         return {"ok": False, "error": "instance_already_running", "strays": strays}
-    if not alive and _listening(int(cfg.get("port", 8791))):
+    port_busy = False
+    if not alive:
+        # a just-killed server's socket can LINGER a few seconds — the instant check
+        # misread it as a foreign server (rig 2026-07-15, twice; the "phantom" on
+        # :8791 was always our own dying socket). Grace, then decide.
+        for _ in range(6):
+            port_busy = _listening(int(cfg.get("port", 8791)))
+            if not port_busy:
+                break
+            time.sleep(1.0)
+    if not alive and port_busy:
         echo(f"  ❌ something ALREADY serves on :{cfg.get('port', 8791)} but it is not "
              "THIS project's declared server. You are almost certainly in the wrong "
              "directory — the real declaration lives in the project where you ran "
