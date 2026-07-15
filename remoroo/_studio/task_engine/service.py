@@ -1104,10 +1104,14 @@ class TaskService:
                                            "instruction": instruction,
                                            "t": time.time()}
             led.save()
-            return {"trial_id": rec.trial_id, "outcome": rec.outcome,
-                    "verdict": rec.verdict, "instruction": instruction,
-                    "runtime": getattr(self, "_vla_kind", "?"),
-                    "note": "day-zero attempt RECORDED (the looking exit needs it); "
-                            "snapshot + view_image now to judge what it did"}
+            out = {"trial_id": rec.trial_id, "outcome": rec.outcome,
+                   "verdict": rec.verdict, "instruction": instruction,
+                   "runtime": getattr(self, "_vla_kind", "?"),
+                   "note": "day-zero attempt RECORDED (the looking exit needs it); "
+                           "snapshot + view_image now to judge what it did"}
+            flags = list(getattr(rec, "anomaly_flags", None) or [])
+            if flags:                          # a failed actor names its own cause HERE
+                out["anomalies"] = flags
+            return out
 
         return self._run_as_job("vla_day0", run, wait_s=5.0)

@@ -30,7 +30,11 @@ class ActionAdapter:
                 return atoms.grasp(ctx, tcp, width=float(action["gripper"])).ok
             return atoms.release(ctx, tcp, open_width=float(action["gripper"])).ok
         if "delta_xyz" in action:
-            cur = ctx.stack.link_pose(tcp)
+            # atoms._live_pose normalizes the stack's (xyz, wxyz) tuple to a FLAT
+            # 7-vector — hand-indexing link_pose here got the tuple and crashed the
+            # first live day-zero rollout (2026-07-15: list + float TypeError; the
+            # same tuple-vs-flat FK class as the 2026-07-10 trial-ritual bug).
+            cur = atoms._live_pose(ctx, tcp)
             d = self.clamp_delta(action["delta_xyz"])
             tgt = [cur[0] + d[0], cur[1] + d[1], cur[2] + d[2]] + list(cur[3:7])
             return atoms.reach(ctx, tcp, tgt).ok

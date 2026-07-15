@@ -403,7 +403,11 @@ def rollout(
     if "error" in out:
         typer.secho(f"❌ rollout: {out['error']}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
-    typer.secho(f"✓ rollout done — trial {out.get('trial_id')} "
-                f"outcome={out.get('outcome')}", fg=typer.colors.GREEN)
+    ok_outcome = out.get("outcome") not in ("actor_exception", "envelope_violation")
+    typer.secho(f"{'✓' if ok_outcome else '✗'} rollout done — trial "
+                f"{out.get('trial_id')} outcome={out.get('outcome')}",
+                fg=typer.colors.GREEN if ok_outcome else typer.colors.RED)
+    for flag in out.get("anomalies") or []:    # the actor's own traceback tail
+        typer.echo(f"    {flag}")
     typer.echo("  judge it with your eyes: the before/after frames are in "
                ".remoroo/task/frames/ (scene_snapshot), verdict flags say day0.")
