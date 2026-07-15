@@ -1,0 +1,79 @@
+"""Norm-stats bootstrap (2026-07-15) — REAL statistics for the vendor normalizer
+without teleop: a short guarded joint-space tour around home, packing the profile's
+observation at every stop, then per-dimension stats over the visited states.
+
+Identity stats proved the wire but de-normalize the model's outputs into
+semantically-aimless motion (the first day-zero rollout: slow, small, approached
+nothing). Bootstrap stats are honest about what they are: the distribution of THIS
+cell's reachable states around home — enough to put decoded actions in real metric
+range, NOT a substitute for episode statistics (the finetune pipeline overwrites
+this same file from recorded episodes).
+
+Action features use the state's own distribution for absolute-target groups
+(subtract_state False: an absolute EE-pose action lives in the same space as the
+EE-pose state)."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+
+
+def _block(arr: np.ndarray) -> Dict[str, list]:
+    """The vendor's norm-stats entry shape for one feature: per-dim moments over
+    samples. std floors at 1e-3 so a barely-moving dim can't explode the divide."""
+    return {"mean": arr.mean(axis=0).tolist(),
+            "std": np.maximum(arr.std(axis=0), 1e-3).tolist(),
+            "q01": np.quantile(arr, 0.01, axis=0).tolist(),
+            "q99": np.quantile(arr, 0.99, axis=0).tolist(),
+            "min": arr.min(axis=0).tolist(),
+            "max": arr.max(axis=0).tolist()}
+
+
+def stats_from_states(profile: Any, states: List[np.ndarray]) -> Dict[str, Any]:
+    """states: packed flat state vectors (profile.state_dim) from the tour."""
+    S = np.stack([np.asarray(s, dtype=float) for s in states])
+    out: Dict[str, Dict[str, list]] = {}
+    for group in dict.fromkeys(s.group for s in profile.state):
+        cols = np.concatenate([S[:, s.start:s.end]
+                               for s in profile.state if s.group == group], axis=1)
+        out[f"observation.state.{group}"] = _block(cols)
+    for group in dict.fromkeys(s.group for s in profile.actions):
+        src = [s for s in profile.state if s.group == group]
+        if not src:                              # action group with no state twin:
+            continue                             # stays identity via the file's absence
+        cols = np.concatenate([S[:, s.start:s.end] for s in src], axis=1)
+        out[f"action.{group}"] = _block(cols)
+    return {"norm_stats": out}
+
+
+def bootstrap_tour(profile: Any, *, stack: Any, bridge: Any, packer: Any,
+                   n_poses: int = 10, joint_span: float = 0.12,
+                   seed: int = 0) -> List[np.ndarray]:
+    """Visit n_poses small joint-space offsets around the CURRENT config — every move
+    collision-checked through goto_joints (the planner IS the right tool here: this
+    is transport, not policy execution) — packing the observation at each stop, and
+    return home. Refuses without a stack (no blind motion)."""
+    if stack is None:
+        raise RuntimeError("norm-stats bootstrap needs the motion stack (guarded "
+                           "joint moves) — run it on the cell via the edge")
+    rng = np.random.default_rng(seed)
+    obs0 = bridge.get_observation()
+    home = {str(n): float(v) for n, v in dict(obs0.joint_positions).items()}
+    arm_joints = [n for n in home if "finger" not in n and "knuckle" not in n]
+    states: List[np.ndarray] = [np.asarray(packer()["observation.state"], dtype=float)]
+    try:
+        for _ in range(int(n_poses)):
+            goal = dict(home)
+            for j in rng.choice(arm_joints, size=min(3, len(arm_joints)),
+                                replace=False):
+                goal[j] = home[j] + float(rng.uniform(-joint_span, joint_span))
+            res = stack.goto_joints(goal)
+            if not getattr(res, "ok", False):
+                continue                         # an unreachable sample is skipped, stated by count
+            states.append(np.asarray(packer()["observation.state"], dtype=float))
+    finally:
+        stack.goto_joints(home)                  # ALWAYS end at home: cameras clear
+    return states

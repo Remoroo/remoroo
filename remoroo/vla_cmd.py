@@ -359,9 +359,11 @@ def rollout(
     # (each vla_load runs a ~21s inference; 20s retries STACKED inferences behind the
     # vendor's event-loop-blocking handler until handshakes failed — rig 2026-07-15).
     ready = False
+    edge_stamp = None
     for attempt in range(24):                  # ~4 min of VISIBLE waiting, never silent
         try:
-            _edge_post("status", {}, port=port, timeout=10.0)
+            st = _edge_post("status", {}, port=port, timeout=10.0)
+            edge_stamp = st.get("build_stamp")
             ready = True
             break
         except Exception:                      # noqa: BLE001 - edge still warming
@@ -370,6 +372,16 @@ def rollout(
     if not ready:
         typer.secho("❌ the edge never answered — `tail -f .remoroo/edge.log` to "
                     "see where it is.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    try:
+        mine = (Path(__file__).parent / "_studio" / "BUILD_STAMP").read_text().strip()
+    except Exception:                          # noqa: BLE001
+        mine = None
+    if mine and edge_stamp and edge_stamp != mine:
+        typer.secho(f"❌ the edge PROCESS is running an older engine build "
+                    f"({edge_stamp} vs installed {mine}) — your last fix is on disk "
+                    "but not in memory. `remoroo edge restart`, then retry. (This "
+                    "exact staleness burned two live cycles.)", fg=typer.colors.RED)
         raise typer.Exit(code=1)
     # STEP 2: ONE proof, generous timeout (a full inference on this board is ~21s)
     typer.echo("  proving the wire (one full inference, ~20-30s on this board)…")
@@ -411,3 +423,71 @@ def rollout(
         typer.echo(f"    {flag}")
     typer.echo("  judge it with your eyes: the before/after frames are in "
                ".remoroo/task/frames/ (scene_snapshot), verdict flags say day0.")
+
+
+@vla_app.command("bootstrap-stats")
+def bootstrap_stats(
+    poses: int = typer.Option(10, "--poses", help="Tour stops around home."),
+    port: int = typer.Option(7779, "--port", help="Edge port."),
+):
+    """REAL norm stats from a short guarded tour (the robot MOVES: small joint
+    offsets around home, collision-checked). Replaces the identity stats that make
+    day-zero motion aimless. Needs a running edge."""
+    import time as _time
+    try:
+        out = _edge_post("vla_bootstrap_stats", {"task_slug": "vla_smoke",
+                                                 "n_poses": poses},
+                         port=port, timeout=30.0)
+        job = out.get("job")
+        while out.get("state") == "running":
+            typer.echo(f"  … touring (job {job})")
+            _time.sleep(10)
+            out = _edge_post("job_status", {"job": job}, port=port)
+            out = out.get("result") or out
+    except Exception as e:                     # noqa: BLE001
+        typer.secho(f"❌ edge did not answer ({type(e).__name__}).", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    if "error" in out:
+        typer.secho(f"❌ {out['error']}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    typer.secho(f"✓ stats from {out['poses']} poses → {out['path']}",
+                fg=typer.colors.GREEN)
+    typer.echo("  now: `remoroo vla restart` then `remoroo vla prove`.")
+
+
+@vla_app.command("wrapper")
+def wrapper(
+    project: Optional[str] = typer.Option(None, "--project", "-p",
+                                          help="Project dir (defaults to cwd)."),
+):
+    """Install the remoroo WRAPPER policy server into the vendor workdir and point
+    .remoroo/vla.yaml at it: the vendor's own policy class, constructed the way
+    their own tests construct it (reset at startup, executor-pooled inference,
+    stated obs errors). Kills the vendor-checkout patches for good."""
+    import yaml
+
+    proj = _project(project)
+    cfg = vla_service.load_config(proj)
+    if not cfg or not cfg.get("workdir"):
+        typer.secho("❌ .remoroo/vla.yaml needs workdir (`remoroo vla init`).",
+                    fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    profile_path = proj / "remoroo_cell" / "vla_profile.yaml"
+    if not profile_path.exists():
+        typer.secho("❌ no vla_profile.yaml — the wrapper needs robo_name.",
+                    fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    _studio_path()
+    from task_engine.vla.profile import load_profile
+    from task_engine.vla.wrapper import WRAPPER_MODULE, write_wrapper
+
+    robo = load_profile(str(profile_path)).robo_name
+    path = write_wrapper(cfg["workdir"], robo)
+    cfg_path = vla_service.config_path(proj)
+    raw = yaml.safe_load(cfg_path.read_text()) or {}
+    raw["module"] = WRAPPER_MODULE
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    typer.secho(f"✓ wrapper written: {path}", fg=typer.colors.GREEN)
+    typer.secho(f"✓ vla.yaml module → {WRAPPER_MODULE}", fg=typer.colors.GREEN)
+    typer.echo("  now: `remoroo vla restart` — reset runs at startup; no lazy-reset "
+               "patch, no event-loop blocking, stated obs errors.")

@@ -273,9 +273,20 @@ class TaskService:
         return self._run_as_job("snapshot", run, wait_s=30.0)
 
     # ---- verbs -----------------------------------------------------------------------
+    @staticmethod
+    def _build_stamp() -> str:
+        """The bundle's build stamp (written by bundle_studio.py) — lets the CLI catch
+        a stale edge PROCESS executing old bytecode (cost two live cycles)."""
+        try:
+            return (Path(__file__).resolve().parents[1]
+                    / "BUILD_STAMP").read_text().strip()
+        except Exception:                          # noqa: BLE001 - dev tree has no stamp
+            return ""
+
     def v_status(self, body: dict) -> dict:
         return {
             "service": "task", "data_dir": str(self.data_dir),
+            "build_stamp": self._build_stamp(),
             "supervisor": self.supervisor.status() if self.supervisor else {"state": "off"},
             "bank_cases": len(self.bank.cases),
             "reversibility": self.reversibility.to_dict(),
@@ -943,6 +954,43 @@ class TaskService:
         from .vla.profile import load_profile
         return load_profile(str(self.data_dir.parent.parent
                                 / "remoroo_cell" / "vla_profile.yaml"))
+
+    def v_vla_bootstrap_stats(self, body: dict) -> dict:
+        """REAL norm stats from a short guarded tour (motion job): N small joint-space
+        offsets around home, observation packed at each stop, per-dim stats written to
+        the file the server's config points at. Replaces identity stats (which
+        de-normalize the policy's outputs into aimless motion); replaced in turn by
+        episode statistics once the finetune pipeline runs."""
+        profile = self._vla_profile()
+        if profile is None:
+            return {"error": "no vla_profile.yaml — author the embodiment first"}
+        if self._bridge is None:
+            return {"error": "no bridge wired; the bootstrap tour moves the robot"}
+
+        def run() -> dict:
+            from .vla.packer import make_observation_packer
+            from .vla.stats import bootstrap_tour, stats_from_states
+            stack = self._stack_provider() if self._stack_provider else None
+            packer = make_observation_packer(profile, bridge=self._bridge, stack=stack)
+            states = bootstrap_tour(profile, stack=stack, bridge=self._bridge,
+                                    packer=packer,
+                                    n_poses=int(body.get("n_poses", 10)),
+                                    joint_span=float(body.get("joint_span", 0.12)),
+                                    seed=int(body.get("seed", 0)))
+            if len(states) < 4:
+                return {"error": f"only {len(states)} poses reached — too few for "
+                                 "stats; widen joint_span or check the planner"}
+            import json as _json
+            out_path = self.data_dir / "vla" / "norm_stats.json"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            stats = stats_from_states(profile, states)
+            out_path.write_text(_json.dumps(stats, indent=1))
+            return {"ok": True, "poses": len(states), "path": str(out_path),
+                    "features": sorted(stats["norm_stats"]),
+                    "note": "restart the vla server (norm stats load at reset; the "
+                            "cli yaml's norm_stats_file must point at this path)"}
+
+        return self._run_as_job("vla_stats", run, wait_s=5.0)
 
     def v_vla_apply_profile(self, body: dict) -> dict:
         """Generate LingBot's OWN config files (robot config + the cli yaml the policy
