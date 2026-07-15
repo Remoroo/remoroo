@@ -226,3 +226,54 @@ def logs(
         return
     txt = vla_service.read_log(_project(project))
     typer.echo(txt if txt else "(vla log is empty or not present yet)")
+
+
+@vla_app.command("apply-profile")
+def apply_profile(
+    project: Optional[str] = typer.Option(None, "--project", "-p",
+                                          help="Project dir (defaults to cwd)."),
+):
+    """Generate the vendor's OWN config files (robot config + cli yaml) from the
+    authored remoroo_cell/vla_profile.yaml — standalone, no task run and no edge
+    needed. Restart the server after (`remoroo vla restart`) so it loads them."""
+    import json
+
+    import yaml
+
+    proj = _project(project)
+    profile_path = proj / "remoroo_cell" / "vla_profile.yaml"
+    if not profile_path.exists():
+        typer.secho("❌ no remoroo_cell/vla_profile.yaml — author the embodiment "
+                    "wiring first (cameras/state/actions).", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    cfg = vla_service.load_config(proj)
+    if not cfg or not cfg.get("workdir") or not cfg.get("checkpoint"):
+        typer.secho("❌ .remoroo/vla.yaml needs workdir + checkpoint (declare the "
+                    "server first: `remoroo vla init`).", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    # the generator ships inside the bundled engine — one implementation, no drift
+    import sys
+    studio = Path(__file__).parent / "_studio"
+    if str(studio) not in sys.path:
+        sys.path.insert(0, str(studio))
+    from task_engine.vla.profile import load_profile, write_lingbot_configs
+
+    profile = load_profile(str(profile_path))
+    config_path = None
+    commission = proj / "remoroo_cell" / "vla" / "commission.json"
+    if commission.exists():
+        try:
+            config_path = json.loads(commission.read_text()).get("config_path")
+        except Exception:                      # noqa: BLE001
+            pass
+    checkpoint = cfg["checkpoint"]
+    out = write_lingbot_configs(
+        profile, workdir=cfg["workdir"], checkpoint=checkpoint,
+        config_path=config_path,
+        qwen_path=cfg.get("qwen_path") or str(Path(checkpoint).parent
+                                              / "Qwen3-VL-4B-Instruct"),
+        norm_stats_path=str(proj / ".remoroo" / "task" / "vla" / "norm_stats.json"))
+    typer.secho(f"✓ robot config: {out['robot_config_path']}", fg=typer.colors.GREEN)
+    typer.secho(f"✓ cli config:   {out['cli_config_path']}", fg=typer.colors.GREEN)
+    typer.echo("  now: `remoroo vla restart` (the server reads these at reset).")

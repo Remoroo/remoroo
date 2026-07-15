@@ -106,3 +106,6 @@ credentials
 !remoroo/_studio/
 !remoroo/_studio/**/
 !remoroo/_studio/**
+# ...but never vendor Python bytecode caches into the bundle (last match wins).
+remoroo/_studio/**/__pycache__/
+remoroo/_studio/**/*.py[cod]
