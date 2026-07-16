@@ -37,15 +37,27 @@ except Exception:  # noqa: BLE001
 Pose = Tuple[List[float], List[float]]   # (xyz, wxyz)
 
 
-def _ensure_safety_shim(cell: str) -> None:
-    """Register the `safety_shim` spine the cell Bridge imports (the edge does this at startup)."""
+def _ensure_safety_shim(cell: str) -> bool:
+    """Register the `safety_shim` spine the cell Bridge imports (the edge does this at startup). Prefer
+    the shipped `remoroo.edge`; else fall back to the edge's own resolver, which builds an inline
+    spine — the path that actually works in the repo-checkout venv (the bench uses this)."""
     try:
         from remoroo import edge as spine
     except Exception:  # noqa: BLE001
-        return
+        try:
+            server_dir = str(Path(__file__).resolve().parents[1])
+            if server_dir not in sys.path:
+                sys.path.insert(0, server_dir)
+            from edge_real import _ensure_safety_shim_resolves  # type: ignore
+            _ensure_safety_shim_resolves()
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"  could not register safety_shim spine ({type(e).__name__}: {e})")
+            return False
     name = Path(cell).name
     sys.modules.setdefault("safety_shim", spine)
     sys.modules.setdefault(f"{name}.safety_shim", spine)
+    return True
 
 
 def connect_bridge(cell: str):
