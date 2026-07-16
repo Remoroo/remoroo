@@ -187,18 +187,32 @@ def planning_benchmark(stack: MotionStack, arms: List[str], home: Dict[str, Pose
                   "model, not the target)")
 
 
-def sanity_nudge(stack: MotionStack, home: Dict[str, Pose], arms: List[str],
-                 execute: bool, log: List[dict]) -> bool:
-    """A 3 cm single-arm lift — the smallest real move. If THIS can't plan, the failure is NOT the
-    demo's targets: the start config is born-in-collision (modeled world, or the two-arm self-collision
-    spheres / ignore matrix). Say so loudly, with where to look."""
-    a = _sorted_by_y(home, arms)[0]
-    ok = step(stack, "sanity-nudge", home, [a], {a: [0.0, 0.0, 0.03]}, execute, log, scales=(1.0, 0.5))
-    if not ok:
-        print("  ⚠ EVEN A 3 cm NUDGE FAILED — this is NOT the demo targets. The current config is")
-        print("    likely BORN-IN-COLLISION. Check `stack.debug_world()` (modeled obstacles sitting on")
-        print("    the arm) and the two-arm self-collision spheres / ignore matrix. Fix that first.")
-    return ok
+def retract_gate(stack: MotionStack, execute: bool) -> tuple:
+    """Establish a clean start (and prove the current config is escapable): plan a retract to HOME. In
+    execute mode PERFORM it, so the dance begins from a known spread pose — this is what the working
+    plan→execute demo did. In dry-run it plans only (no motion). Returns (planned_ok, moved).
+
+    Why this instead of a 3 cm nudge: a nudge keeps the arms as crowded as they are now (so it collides
+    if they're close), which says nothing useful. A retract SEPARATES them — if even THAT can't plan,
+    the current config is genuinely stuck (born-in-collision / over-conservative two-arm self-collision),
+    which is a real world/model bug, not a demo-target problem."""
+    print("\n── gate: plan a retract to home (clean start) ──")
+    t0 = time.perf_counter()
+    try:
+        r = stack.retract(execute=execute)
+    except Exception as e:  # noqa: BLE001
+        print(f"  ✗ retract raised {type(e).__name__}: {e}")
+        return False, False
+    ms = float(getattr(r, "total_time", 0.0)) * 1e3
+    ok = bool(getattr(r, "ok", False)) and getattr(r, "trajectory", None) is not None
+    moved = bool(getattr(r, "executed", False))
+    wall = (time.perf_counter() - t0) * 1e3
+    if ok:
+        tail = "and EXECUTED → arm now at home" if moved else "PLAN ONLY — the arm did NOT move"
+        print(f"  ✓ retract plans OK ({ms:.0f} ms plan | wall {wall:.0f} ms) — {tail}")
+    else:
+        print(f"  ✗ retract could NOT plan ({(getattr(r, 'message', '') or '')[:56]})")
+    return ok, moved
 
 
 def scenes(home: Dict[str, Pose], arms: List[str], approach: float) -> List[tuple]:
@@ -229,13 +243,23 @@ def run(stack: MotionStack, args) -> int:
     print("=" * 74)
     print(f"cuRobo showcase — arms={arms}  mode={'EXECUTE (real motion)' if execute else 'DRY-RUN (plan only)'}")
 
-    if execute:
-        print("\nretracting to home...")
-        r = stack.retract(execute=True)
-        print(f"  retract: ok={r.ok} executed={r.executed} {r.message[:50]}")
-        if not r.ok:
-            print("  cannot reach home — aborting for safety.")
-            return 2
+    # GATE: plan (and in execute, perform) a retract to home. This both establishes a clean spread
+    # start — the crux the working plan→execute demo relied on — and, if it fails, distinguishes a
+    # genuinely-stuck config from a mere demo-target problem.
+    ok, moved = retract_gate(stack, execute)
+    if not ok:
+        print("-" * 74)
+        print("ABORTED: cuRobo can't plan a path to HOME from the current config. This is NOT the demo")
+        print("targets — the current pose is genuinely stuck: born-in-collision, or the two-arm")
+        print("self-collision spheres / ignore matrix are over-conservative. Physically jog the arms")
+        print("apart, or check `stack.debug_world()` + the self-collision model, then retry.")
+        print("-" * 74)
+        return 3
+    if not moved:
+        print("  NOTE: dry-run did NOT move the arms — the scenes below are planned from the CURRENT")
+        print("  (possibly crowded) config, NOT from home. If the arms are close, in-place scenes will")
+        print("  still fail. For a from-home preview run with --execute (retracts first), or jog the")
+        print("  arms to a spread pose. (This is why dry-run 'doesn't work' but plan→execute does.)")
 
     home = {a: stack.current_tool_pose(a) for a in arms}
     if any(v is None for v in home.values()):
@@ -243,16 +267,6 @@ def run(stack: MotionStack, args) -> int:
         return 2
 
     log: List[dict] = []
-    # SANITY FIRST: if a 3 cm nudge can't plan, the problem is the collision world, not the targets —
-    # bail early with the diagnosis rather than grinding through the whole (doomed) sequence.
-    print("\n── sanity: smallest real move ──")
-    if not sanity_nudge(stack, home, arms, execute, log):
-        print("-" * 74)
-        print("ABORTED: born-in-collision at the current config. Fix the collision world first "
-              "(see the ⚠ above); the coordinated scenes can't succeed until then.")
-        print("-" * 74)
-        return 3
-
     planning_benchmark(stack, arms, home, reps=args.reps)
 
     # Coordinated dual-arm scenes — per-arm offsets from own pose, adaptive (shrink-on-failure).
