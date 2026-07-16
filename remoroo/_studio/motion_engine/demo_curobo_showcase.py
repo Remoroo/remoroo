@@ -19,6 +19,7 @@ supervisor, the robot retracts home at start and end, and Ctrl-C E-stops then re
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import signal
 import statistics
@@ -274,6 +275,32 @@ def scenes(home: Dict[str, Pose], arms: List[str], approach: float, close: float
     return seq
 
 
+def generate_poses(home: Dict[str, Pose], arms: List[str], n: int,
+                   close: float, stagger: float, depth: float) -> List[tuple]:
+    """Procedurally generate N flowing coordinated poses (deterministic — parametric, no RNG). Each arm
+    traces a smooth OWN-SIDE path; every ~5th pose is a CLOSE ENCOUNTER (grippers converge, staggered in
+    height + depth so the bodies clear). `--poses N` = an arbitrarily long dance."""
+    ys = _sorted_by_y(home, arms)
+    tw = _toward(home, arms)
+    OUT, UP, FWD = 0.10, 0.09, 0.08
+    seq: List[tuple] = []
+    for k in range(max(1, int(n))):
+        t = 2.0 * math.pi * k / max(6, int(n))
+        if len(arms) >= 2 and k % 5 == 4:                              # periodic close encounter
+            hi = (k % 10) < 5                                          # alternate which arm is high
+            off = {a: [FWD * 0.5 + ((depth if (i % 2 == 0) == hi else -depth)),
+                       tw[a] * close,
+                       (stagger if (i % 2 == 0) == hi else -stagger)] for i, a in enumerate(ys)}
+            name = f"close-{k:02d}"
+        else:                                                         # own-side flow (dy always outward)
+            off = {a: [FWD * 0.7 * math.sin(t + i * 0.7),
+                       -tw[a] * OUT * (0.4 + 0.6 * abs(math.sin(t))),
+                       UP * math.sin(1.5 * t + i * math.pi)] for i, a in enumerate(ys)}
+            name = f"flow-{k:02d}"
+        seq.append((name, {a: [float(v) for v in off[a]] for a in arms}))
+    return seq
+
+
 # --- orchestration -----------------------------------------------------------------------------
 
 def run(stack: MotionStack, args) -> int:
@@ -305,32 +332,60 @@ def run(stack: MotionStack, args) -> int:
         print("  could not FK current tool poses — is the bridge connected?")
         return 2
 
-    log: List[dict] = []
-    planning_benchmark(stack, arms, home, reps=args.reps)
+    # Build the routine: the curated ~21-move dance, or `--poses N` procedurally-generated poses.
+    if args.poses and int(args.poses) > 0:
+        seq = generate_poses(home, arms, int(args.poses), close=args.close,
+                             stagger=args.stagger, depth=args.depth)
+    else:
+        seq = scenes(home, arms, approach=args.sep, close=args.close,
+                     stagger=args.stagger, depth=args.depth)
 
-    # Coordinated dual-arm scenes — per-arm offsets from own pose, adaptive (shrink-on-failure).
-    seq = scenes(home, arms, approach=args.sep, close=args.close, stagger=args.stagger, depth=args.depth)
-    print("\n── coordinated multi-TCP moves (plan → execute) ──")
+    # ── PHASE 1 · PLAN (no motion) — plan every pose from home; report feasibility + timing.
+    print(f"\n── PHASE 1 · PLAN {len(seq)} poses (no motion) ──")
+    plan_log: List[dict] = []
+    for name, offsets in seq:
+        step(stack, name, home, arms, offsets, execute=False, log=plan_log)
+    n_ok = sum(1 for r in plan_log if r.get("ok"))
+    pms = [r["plan_ms"] for r in plan_log if r.get("plan_ms")]
+    seps = [r["sep"] for r in plan_log if r.get("ok") and r.get("sep") is not None]
+    print(f"\n  PLAN complete: {n_ok}/{len(seq)} poses OK"
+          + (f" · median {statistics.median(pms):.0f} ms" if pms else "")
+          + (f" · closest TCP approach {min(seps) * 100:.0f} cm" if seps else ""))
+
+    if not execute:
+        print("-" * 74)
+        print(f"DRY-RUN done ({n_ok}/{len(seq)} plan OK). Re-run with --execute to move.")
+        print("-" * 74)
+        return 0
+
+    # ── GATE · wait for the operator before ANY motion.
+    try:
+        input(f"\n>>> Press ENTER to EXECUTE these {len(seq)} poses on hardware (Ctrl-C to abort): ")
+    except (EOFError, KeyboardInterrupt):
+        print("\naborted before execution — no motion.")
+        return 0
+
+    # ── PHASE 2 · EXECUTE — run on hardware (re-plans against live state; motion chains the poses).
+    print(f"\n── PHASE 2 · EXECUTE {len(seq)} poses × {args.loops} loop(s) ──")
+    exec_log: List[dict] = []
     for loop in range(args.loops):
         if args.loops > 1:
             print(f"  · loop {loop + 1}/{args.loops}")
         for name, offsets in seq:
-            step(stack, name, home, arms, offsets, execute, log)
+            step(stack, name, home, arms, offsets, execute=True, log=exec_log)
+    print("\nretracting home...")
+    stack.retract(execute=True)
 
-    if execute:
-        print("\nretracting home...")
-        stack.retract(execute=True)
-
-    ok = [r for r in log if r.get("ok")]
-    pms = [r["plan_ms"] for r in log if r.get("plan_ms")]
-    seps = [r["sep"] for r in log if r.get("ok") and r.get("sep") is not None]
+    ok = [r for r in exec_log if r.get("ok")]
+    pms = [r["plan_ms"] for r in exec_log if r.get("plan_ms")]
+    seps = [r["sep"] for r in exec_log if r.get("ok") and r.get("sep") is not None]
     print("\n" + "-" * 74)
     if pms:
-        line = (f"SUMMARY: {len(ok)}/{len(log)} moves ok · plan median {statistics.median(pms):.0f} ms "
-                f"(min {min(pms):.0f})")
+        line = (f"SUMMARY: {len(ok)}/{len(exec_log)} moves executed · plan median "
+                f"{statistics.median(pms):.0f} ms (min {min(pms):.0f})")
         if seps:
             line += f" · closest TCP approach {min(seps) * 100:.0f} cm"
-        line += f" · {'EXECUTED on hardware' if execute else 'DRY-RUN, no motion'}"
+        line += " · EXECUTED on hardware"
         print(line)
     print("-" * 74)
     return 0
@@ -341,7 +396,10 @@ def main() -> int:
     ap.add_argument("--cell", default=os.environ.get("REMOROO_CELL", "remoroo_cell"))
     ap.add_argument("--execute", action="store_true", help="ACTUALLY MOVE the robot (default: dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="plan + time only, never move (overrides --execute)")
-    ap.add_argument("--loops", type=int, default=1, help="how many times through the scene set")
+    ap.add_argument("--loops", type=int, default=1, help="how many times through the routine (execute phase)")
+    ap.add_argument("--poses", type=int, default=0,
+                    help="generate N procedural flowing poses instead of the curated ~21-move routine "
+                         "(own-side flow + a close encounter every ~5th pose). 0 = use the curated dance")
     ap.add_argument("--sep", type=float, default=0.06,
                     help="gentle inward reach (m) for the own-side scenes — closes only part of the gap "
                          "so the bodies stay clear (default 6 cm)")
