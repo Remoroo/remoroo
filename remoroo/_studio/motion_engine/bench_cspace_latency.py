@@ -182,9 +182,10 @@ class Planner:
 
     def __init__(self, stack: MotionStack, delta: float, mode: str = "cspace",
                  finetune: int = -1, iters: int = 0, n_goals: int = 1, seed: int = 0,
-                 preset_goals=None) -> None:
+                 preset_goals=None, escalate: bool = False) -> None:
         self.stack = stack
         self.mode = mode
+        self.escalate = bool(escalate)               # on direct-solve failure, fall to the full retry path
         groups = list(getattr(stack, "_groups", {}).keys())
         self.cvp = stack._planner_for(groups)          # CuroboV2Planner
         self.mp = self.cvp.planner                       # raw cuRobo MotionPlanner
@@ -289,29 +290,45 @@ class Planner:
         except Exception:  # noqa: BLE001
             return None
 
+    @staticmethod
+    def _ok(res) -> bool:
+        if res is None:
+            return False
+        try:
+            return bool(res.success.any())
+        except Exception:  # noqa: BLE001
+            return bool(getattr(res, "success", False))
+
+    def _real_path(self, goal, max_attempts):
+        if self.mode == "cspace":
+            return self.mp.plan_cspace(goal, self._start, max_attempts=max_attempts)
+        return self.mp.plan_pose(goal, self._start, use_implicit_goal=True, max_attempts=max_attempts)
+
     def plan(self, max_attempts: int, gi: int = 0) -> dict:
         goal = self._goals[gi % len(self._goals)]
         t0 = time.perf_counter()
         rec = {"wall_ms": None, "solve_ms": None, "total_ms": None, "ik_ms": None,
-               "motion_ms": None, "success": False, "poison": False, "msg": ""}
+               "motion_ms": None, "success": False, "poison": False, "escalated": False, "msg": ""}
         try:
-            if self.mode == "cspace":
-                res = (self._solve_direct_cspace(goal) if self.finetune >= 0
-                       else self.mp.plan_cspace(goal, self._start, max_attempts=max_attempts))
+            direct = self.finetune >= 0
+            if direct:
+                res = (self._solve_direct_cspace(goal) if self.mode == "cspace"
+                       else self._solve_direct_pose(goal, rec))
             else:
-                res = (self._solve_direct_pose(goal, rec) if self.finetune >= 0
-                       else self.mp.plan_pose(goal, self._start,
-                                              use_implicit_goal=True, max_attempts=max_attempts))
+                res = self._real_path(goal, max_attempts)
+            # ESCALATE: the fast attempt-0 (direct ft/it) missed -> fall through to the FULL retry
+            # path (the fork's plan_* with its finetune + PRM graph fallback), exactly what production
+            # would do. Measures: how often attempt-0 is enough (fast) vs needs the slow escalation.
+            if self.escalate and direct and not self._ok(res):
+                rec["escalated"] = True
+                res = self._real_path(goal, max_attempts)
             rec["wall_ms"] = (time.perf_counter() - t0) * 1e3
             if res is not None:
                 st = getattr(res, "solve_time", None)
                 tt = getattr(res, "total_time", None)
                 rec["solve_ms"] = float(st) * 1e3 if st is not None else None
                 rec["total_ms"] = float(tt) * 1e3 if tt is not None else None
-                try:
-                    rec["success"] = bool(res.success.any())
-                except Exception:  # noqa: BLE001
-                    rec["success"] = bool(getattr(res, "success", False))
+                rec["success"] = self._ok(res)
                 if rec["success"]:
                     rec["motion_ms"] = self._motion_ms(res)
         except Exception as e:  # noqa: BLE001
@@ -496,9 +513,12 @@ def _run_config(planner: Planner, plans: int, warmup: int, max_attempts: int) ->
     for i in range(warmup):
         planner.plan(max_attempts, i % ng)
     recs = [planner.plan(max_attempts, i % ng) for i in range(plans)]
+    fast = [r for r in recs if not r.get("escalated")]
     return {"solve": _agg(recs, "solve_ms").get("median"), "wall": _agg(recs, "wall_ms").get("median"),
+            "wall_fast": _agg(fast, "wall_ms").get("median"),   # typical latency (attempt-0 hits)
             "ik": _agg(recs, "ik_ms").get("median"), "motion": _agg(recs, "motion_ms").get("median"),
             "ok": sum(1 for r in recs if r["success"]), "n": len(recs),
+            "escalated": sum(1 for r in recs if r.get("escalated")),
             "poison": sum(1 for r in recs if r["poison"]),
             "msg": next((r["msg"] for r in recs if r["msg"]), "")}
 
@@ -583,7 +603,7 @@ def run_ablation(args) -> int:
 
         def _mk(ft, it, _stack=stack, _goals=goals):
             return Planner(_stack, args.delta, args.mode, finetune=ft, iters=it,
-                           n_goals=ng, seed=1234, preset_goals=_goals)
+                           n_goals=ng, seed=1234, preset_goals=_goals, escalate=args.escalate)
 
         # baseline = the REAL plan path (finetune=3 cspace / 1 pose + retry) at default iters
         base = _run_config(_mk(-1, 0), this_pcfg, 2, args.max_attempts)
@@ -597,8 +617,9 @@ def run_ablation(args) -> int:
                 r["seeds"], r["ft"], r["it"] = sk, ft, it
                 r["speedup"] = (base["solve"] / r["solve"]) if (base.get("solve") and r.get("solve")) else None
                 rows.append(r)
+                esc = f" escalated={r.get('escalated', 0)}/{r['n']} (fast_wall={_fmt(r.get('wall_fast'))}ms)" if args.escalate else ""
                 print(f"  [{sk}] ft={ft} it={it}: solve={_fmt(r['solve'])}ms "
-                      f"motion={_fmt(r['motion'])}ms ok={r['ok']}/{r['n']} poison={r['poison']}")
+                      f"motion={_fmt(r['motion'])}ms ok={r['ok']}/{r['n']} poison={r['poison']}{esc}")
 
     # --- table ---
     print("\n" + "=" * 78)
@@ -688,6 +709,10 @@ def main() -> int:
     ap.add_argument("--bridge", action="store_true",
                     help="connect the cell Bridge so the REAL robot config seeds the start "
                          "(needed with --world modeled so the start isn't born-in-collision)")
+    ap.add_argument("--escalate", action="store_true",
+                    help="production behavior: run the fast direct ft/it attempt-0, and on failure "
+                         "fall through to the FULL retry path (fork plan_* finetune + PRM). Reports "
+                         "escalated N/n + the typical (attempt-0) wall time.")
     args = ap.parse_args()
 
     if args.ablate:
