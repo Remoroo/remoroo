@@ -180,7 +180,8 @@ class Planner:
     execution time (finetune's quality payoff — fewer passes -> slower/rougher execution)."""
 
     def __init__(self, stack: MotionStack, delta: float, mode: str = "cspace",
-                 finetune: int = -1, iters: int = 0, n_goals: int = 1, seed: int = 0) -> None:
+                 finetune: int = -1, iters: int = 0, n_goals: int = 1, seed: int = 0,
+                 preset_goals=None) -> None:
         self.stack = stack
         self.mode = mode
         groups = list(getattr(stack, "_groups", {}).keys())
@@ -192,6 +193,7 @@ class Planner:
         self.iters = int(iters)
         self.n_goals = max(1, int(n_goals))
         self._rng = random.Random(seed)
+        self._preset_goals = preset_goals              # a pre-validated (feasible) goal list to reuse
         try:
             self._interp_dt = float(self.mp.trajopt_solver.config.interpolation_dt)
         except Exception:  # noqa: BLE001
@@ -203,9 +205,16 @@ class Planner:
         q0 = self._start.position.detach().clone()
         lims = self.cvp.joint_limits() if hasattr(self.cvp, "joint_limits") else {}
         q1 = q0.clone()
+        # Randomized goals: perturb a RANDOM SUBSET of joints by a random magnitude (a per-goal scale)
+        # — fewer joints moving = far fewer dual-arm self-collisions, so most goals are FEASIBLE, and
+        # the random scale gives an easy->hard spread. (Infeasible ones are still filtered by the
+        # feasibility validator upstream.)
+        scale = self._rng.uniform(0.3, 1.0) if randomize else 1.0
         for i, n in enumerate(self.names):
-            step = (self._rng.uniform(-self.delta, self.delta) if randomize
-                    else (self.delta if i % 3 == 1 else (-self.delta if i % 3 == 2 else 0.0)))
+            if randomize:
+                step = self._rng.uniform(-self.delta, self.delta) * scale if self._rng.random() < 0.5 else 0.0
+            else:
+                step = self.delta if i % 3 == 1 else (-self.delta if i % 3 == 2 else 0.0)
             lo, hi = lims.get(n, (-3.1, 3.1))
             q1[0, i] = min(max(float(q0[0, i]) + step, lo + 1e-3), hi - 1e-3)
         return JointState.from_position(q1, joint_names=self.names)
@@ -232,6 +241,10 @@ class Planner:
     def _build_goals(self) -> None:
         seed = self.stack._seed_positions() or {}
         self._start = self.cvp._start_js(seed)           # (1, n) JointState
+        if self._preset_goals is not None:               # reuse a validated feasible set (all configs share it)
+            self._goals = list(self._preset_goals)
+            self.n_goals = max(1, len(self._goals))
+            return
         rnd = self.n_goals > 1
         if self.mode == "cspace":
             self._goals = [self._cspace_goal(rnd) for _ in range(self.n_goals)]
@@ -435,6 +448,33 @@ def _run_config(planner: Planner, plans: int, warmup: int, max_attempts: int) ->
             "msg": next((r["msg"] for r in recs if r["msg"]), "")}
 
 
+def _start_ok(stack: MotionStack, mode: str, max_attempts: int):
+    """Is the START collision-free in the CURRENT world? Plan a tiny (0.05) move — if that fast-fails
+    on 'collision', the start config itself sits in the world (modeled obstacles wrong / robot near
+    them), so nothing downstream is measurable. Returns (ok, msg)."""
+    r = Planner(stack, 0.05, mode, finetune=-1, n_goals=1).plan(max_attempts, 0)
+    return bool(r["success"]), (r.get("msg") or "")
+
+
+def _make_validated_goals(stack: MotionStack, mode: str, delta: float, n: int, seed: int,
+                          max_attempts: int):
+    """Generate diverse goals and keep only those the FULL (real-path) planner SOLVES — so the goal
+    set is genuinely feasible and success RATE measures the reduced config, not infeasible targets.
+    Returns (goals, n_collision_rejected, n_tried)."""
+    gen = Planner(stack, delta, mode, finetune=-1, n_goals=max(4 * n, 12), seed=seed)
+    keep, coll, tried = [], 0, 0
+    for gi in range(len(gen._goals)):
+        tried += 1
+        r = gen.plan(max_attempts, gi)
+        if r["success"]:
+            keep.append(gen._goals[gi])
+        elif "collision" in (r.get("msg") or "").lower():
+            coll += 1
+        if len(keep) >= n:
+            break
+    return keep, coll, tried
+
+
 def _fmt(v) -> str:
     return f"{v:.0f}" if isinstance(v, (int, float)) else "-"
 
@@ -452,24 +492,48 @@ def run_ablation(args) -> int:
           f"goals={ng}  plans/config={pcfg}  bridge={'yes' if args.bridge else 'no'}")
     print(f"  finetune={fts}  iters={its}  seeds={seeds_list if seeds_list != [0] else 'default(4)'}")
 
-    def _mk(stack, ft, it):
-        return Planner(stack, args.delta, args.mode, finetune=ft, iters=it, n_goals=ng, seed=1234)
-
     rows: List[dict] = []
     for seeds in seeds_list:
         stack = _build_stack(cell, args.graph == "on", seeds, args.mode, args.delta,
                              warm=(args.warm_cspace == "on"), warmup_plans=2,
                              max_attempts=args.max_attempts, use_bridge=args.bridge, world=args.world)
         sk = "def" if not seeds else str(seeds)
+
+        # Guard: is the START valid in this world? (modeled world / a bad robot config makes EVERY
+        # plan fast-fail on 'start in collision' — measuring nothing.)
+        ok, smsg = _start_ok(stack, args.mode, args.max_attempts)
+        if not ok:
+            print(f"  ⚠ [{sk}] START is NOT collision-free in world={args.world}: {smsg[:90]}")
+            print("     -> the start config sits in the world. Use --world empty (default), or fix the "
+                  "modeled obstacles / robot config. Skipping this build.")
+            continue
+
+        # Build ONE validated (feasible) goal set that every config is scored against.
+        goals = None
+        this_pcfg = pcfg
+        if ng > 1:
+            goals, coll, tried = _make_validated_goals(stack, args.mode, args.delta, ng, 1234,
+                                                       args.max_attempts)
+            print(f"  [{sk}] validated {len(goals)} feasible goals (tried {tried}, "
+                  f"rejected {coll} in-collision)")
+            if not goals:
+                print("     -> no feasible goals at this --delta; lower it. Skipping this build.")
+                continue
+            this_pcfg = len(goals)
+
+        def _mk(ft, it, _stack=stack, _goals=goals):
+            return Planner(_stack, args.delta, args.mode, finetune=ft, iters=it,
+                           n_goals=ng, seed=1234, preset_goals=_goals)
+
         # baseline = the REAL plan path (finetune=3 cspace / 1 pose + retry) at default iters
-        base = _run_config(_mk(stack, -1, 0), pcfg, 2, args.max_attempts)
+        base = _run_config(_mk(-1, 0), this_pcfg, 2, args.max_attempts)
         base["seeds"], base["ft"], base["it"], base["speedup"] = sk, "real", "def", 1.0
         rows.append(base)
         print(f"  [{sk}] real path (baseline): solve={_fmt(base['solve'])}ms "
               f"motion={_fmt(base['motion'])}ms ok={base['ok']}/{base['n']}")
         for ft in fts:
             for it in its:
-                r = _run_config(_mk(stack, ft, it), pcfg, 2, args.max_attempts)
+                r = _run_config(_mk(ft, it), this_pcfg, 2, args.max_attempts)
                 r["seeds"], r["ft"], r["it"] = sk, ft, it
                 r["speedup"] = (base["solve"] / r["solve"]) if (base.get("solve") and r.get("solve")) else None
                 rows.append(r)
