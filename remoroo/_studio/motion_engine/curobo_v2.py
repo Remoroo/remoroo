@@ -880,7 +880,9 @@ class CuroboV2Planner:
         stamp("tool-frame invariant OK", frames=actual)
 
     def plan_pose(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]] = None,
-                  *, max_attempts: int = 3) -> PlanResult:
+                  *, max_attempts: int = 3,
+                  position_only: Optional[Sequence[str]] = None,
+                  axes_weight: Optional[Dict[str, Sequence[float]]] = None) -> PlanResult:
         """Plan ONE synchronous collision-free trajectory driving every frame in `goals` to its
         pose. `goals` keys are ee_links from this planner's `tool_frames` — a SUBSET is fine at
         THIS boundary, but cuRobo V2 is stricter: `solve_pose` reorders the goal to the
@@ -894,7 +896,7 @@ class CuroboV2Planner:
         if not goals:
             return PlanResult(False, None, "no goals given")
         from .mtrace import stamp as _stamp
-        active = list(goals)
+        pos_only = set(position_only or [])
         missing = [t for t in self._tool_frames if t not in goals]
         if missing:
             holds = {}
@@ -909,35 +911,62 @@ class CuroboV2Planner:
             goals = {**goals, **holds}
             # The hold is ZERO-COST, not an exact 6-DoF pin: the goal buffer needs every
             # tool frame (reorder_links), but the pose COST tracks only the goaled tips —
-            # the held limbs ride the null-space at the current seed. Live 2026-07-13:
-            # pinning the idle arm's resting tip made EVERY IK solution read as
-            # in-collision against the inflated ESDF, so a plainly reachable one-arm
-            # target reported "out of reach" ("planning succeeded" was only go-home).
+            # the held limbs ride the null-space at the current seed (live 2026-07-13).
             _stamp("plan_pose: un-goaled tips held ZERO-COST (null-space), not pinned",
-                   held=missing, tracked=active)
+                   held=missing, tracked=[t for t in goals if t not in missing])
+        axes = dict(axes_weight or {})
+        if pos_only:
+            # POSITION-ONLY goals: the caller stated a position and NO orientation, so
+            # the planner SOLVES the orientation (ToolPoseCriteria.track_position —
+            # cuRobo's designed mode). Never a fill-in: identity was infeasible at
+            # tabletop points (live 2026-07-15) and "current orientation" is
+            # arbitrary mid-task state — both hacks, operator-rejected.
+            _stamp("plan_pose: position-only goals (orientation solved by the planner)",
+                   frames=sorted(pos_only))
+        if axes:
+            # AGENT-DECLARED per-axis constraints (operator doctrine 2026-07-15: the
+            # engine holds NO orientation opinions — the agent, who knows the task,
+            # weights (x,y,z,roll,pitch,yaw) per goal; e.g. [1,1,1,1,1,0] = tool
+            # vertical, yaw free). Passed straight to cuRobo's criteria kernel.
+            _stamp("plan_pose: agent-declared axes constraints",
+                   frames={k: list(v) for k, v in axes.items()})
         try:
-            if missing:
-                self._set_tracking(active)
+            if missing or pos_only or axes:
+                self._apply_criteria(held=missing, position_only=pos_only, axes=axes)
             return self._plan_pose_once(goals, start_positions, max_attempts)
         finally:
-            if missing:
-                self._set_tracking(None)             # planner default: track everything
+            if missing or pos_only or axes:
+                self._apply_criteria(reset=True)     # every plan restores the default
 
-    def _set_tracking(self, active: Optional[List[str]]) -> None:
-        """Per-tool-frame pose-cost tracking across the IK and trajopt solvers (the IK
-        solver propagates to its seed solver). active=None restores all-tracking —
-        every plan leaves the planner in its default state."""
-        for solver in (getattr(self, "planner", None) and getattr(self.planner, "ik_solver", None),
-                       getattr(self, "planner", None) and getattr(self.planner, "trajopt_solver", None)):
-            if solver is None or not hasattr(solver, "enable_tool_pose_tracking"):
-                continue                             # older cuRobo: exact holds only
-            if active is None:
-                solver.enable_tool_pose_tracking(None)
-            else:
-                solver.enable_tool_pose_tracking(list(active))
-                inactive = [t for t in self._tool_frames if t not in active]
-                if inactive:
-                    solver.disable_tool_pose_tracking(inactive)
+    def _apply_criteria(self, *, held: Optional[List[str]] = None,
+                        position_only: Optional[set] = None,
+                        axes: Optional[Dict[str, Sequence[float]]] = None,
+                        reset: bool = False) -> None:
+        """Per-tool-frame pose criteria across IK and trajopt (IK propagates to its
+        seed solver): held frames get zero cost, position-only frames track position
+        with orientation free, reset restores the config default for every frame."""
+        solvers = [getattr(self, "planner", None) and getattr(self.planner, "ik_solver", None),
+                   getattr(self, "planner", None) and getattr(self.planner, "trajopt_solver", None)]
+        solvers = [s for s in solvers if s is not None]
+        if not solvers:
+            return
+        if reset:
+            for s in solvers:
+                if hasattr(s, "enable_tool_pose_tracking"):
+                    s.enable_tool_pose_tracking(None)   # config-default weights, all frames
+            return
+        from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+        crit = {}
+        for f in held or []:
+            crit[f] = ToolPoseCriteria.disabled()
+        for f in position_only or []:
+            crit[f] = ToolPoseCriteria.track_position()
+        for f, w in (axes or {}).items():
+            crit[f] = ToolPoseCriteria(
+                terminal_pose_axes_weight_factor=[float(v) for v in list(w)[:6]])
+        for s in solvers:
+            if crit and hasattr(s, "update_tool_pose_criteria"):
+                s.update_tool_pose_criteria(crit)
 
     def _plan_pose_once(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]],
                         max_attempts: int) -> PlanResult:
@@ -956,15 +985,20 @@ class CuroboV2Planner:
 
     def plan_through(self, tool_frame: str, poses: Sequence[Goal],
                      start_positions: Optional[Dict[str, float]] = None,
-                     *, max_attempts: int = 3) -> PlanResult:
+                     *, max_attempts: int = 3,
+                     legs_position_only: Optional[Sequence[bool]] = None) -> PlanResult:
         """Drive ONE tool frame through a sequence of poses — plan each leg from the previous leg's
-        end, concatenate into one path. Each leg is independently collision-free."""
+        end, concatenate into one path. Each leg is independently collision-free.
+        legs_position_only marks legs whose orientation the planner solves."""
         if not poses:
             return PlanResult(False, None, "no poses given")
         segments: List[Trajectory] = []
         cur = dict(start_positions or {})
         for k, pose in enumerate(poses):
-            leg = self.plan_pose({tool_frame: pose}, cur, max_attempts=max_attempts)
+            po = ([tool_frame] if legs_position_only and k < len(legs_position_only)
+                  and legs_position_only[k] else None)
+            leg = self.plan_pose({tool_frame: pose}, cur, max_attempts=max_attempts,
+                                 position_only=po)
             if not leg.success or leg.trajectory is None:
                 return PlanResult(False, None, f"leg {k+1}/{len(poses)} failed: {leg.message}")
             segments.append(leg.trajectory)

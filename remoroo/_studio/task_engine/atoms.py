@@ -18,7 +18,12 @@ from .trace import Trace
 
 # --- pose helpers (mirror motion_engine._norm_pose accepted shapes) -----------------------
 def _xyzq(pose: Any) -> List[float]:
-    """Accept [x,y,z] | [x,y,z,qw,qx,qy,qz] | {'position','quaternion'} -> 7-list."""
+    """Accept [x,y,z] | [x,y,z,qw,qx,qy,qz] | {'position','quaternion'} -> 7-list.
+    NOTE: a bare position gets the IDENTITY quat here — callers with a ctx must use
+    _xyzq_live instead, which fills the CURRENT tool orientation (operator-diagnosed
+    2026-07-15: identity = "tool aligned with the base", near-infeasible at tabletop
+    reach points — both arms "failed IK" at positions the arm demonstrably reaches;
+    probes were the only bare-position caller, so it looked like a probe curse)."""
     if isinstance(pose, dict):
         p = list(pose["position"])[:3]
         q = list(pose.get("quaternion") or [1.0, 0.0, 0.0, 0.0])[:4]
@@ -29,6 +34,18 @@ def _xyzq(pose: Any) -> List[float]:
     if len(p) == 3:
         return [float(v) for v in p] + [1.0, 0.0, 0.0, 0.0]
     raise ValueError(f"unrecognised pose shape: {pose!r}")
+
+
+def _xyzq_live(ctx: "Ctx", tcp: str, pose: Any) -> List[float]:
+    """_xyzq, but a bare position keeps the tool's CURRENT orientation. ONLY for the
+    verbs whose PHYSICS constrain orientation: carry (a held payload must not be
+    reoriented) and sweep (contact continuation at the approach orientation). Free-
+    space reach/sync pass bare positions through as POSITION-ONLY planner goals."""
+    if not isinstance(pose, dict):
+        p = list(pose)
+        if len(p) == 3:
+            return [float(v) for v in p] + _live_pose(ctx, tcp)[3:7]
+    return _xyzq(pose)
 
 
 def _live_pose(ctx: "Ctx", tcp: str) -> List[float]:
@@ -105,8 +122,14 @@ class Ctx:
 # --- atoms ---------------------------------------------------------------------------------
 def reach(ctx: Ctx, tcp: str, pose: Any, *, speed: Optional[float] = None,
           via: Sequence[Any] = ()) -> AtomResult:
-    tgt = _xyzq(pose)
-    legs = [_xyzq(p) for p in via] + [tgt]
+    # A bare [x,y,z] is a POSITION-ONLY goal: the stack marks it and the planner
+    # SOLVES the orientation (ToolPoseCriteria.track_position — cuRobo's designed
+    # mode). Neither identity (infeasible, the 2026-07-15 probe bug) nor "current
+    # orientation" (arbitrary mid-task state) is ever substituted. Envelope checks
+    # need only xyz; the raw pose passes through to the stack untouched.
+    tgt = _xyzq(pose) if len(list(pose)) != 3 or isinstance(pose, dict) else list(pose)
+    legs = [(p if not isinstance(p, dict) and len(list(p)) == 3 else _xyzq(p))
+            for p in via] + [tgt]
     ctx.envelope.check_points(legs)
     spd = ctx.envelope.clamp_speed(speed)
     h = ctx.trace.begin("reach", tcp=tcp, pose=tgt, via=len(via), speed=spd)
@@ -192,10 +215,10 @@ def carry(ctx: Ctx, tcp: str, to: Any, *, arc_h: float, speed: Optional[float] =
     """Transport while holding: lift-over arc so the payload clears obstacles between here
     and there. arc peak z = max(start_z, end_z) + arc_h."""
     p0 = _live_pose(ctx, tcp)
-    p1 = _xyzq(to)
+    p1 = _xyzq_live(ctx, tcp, to)
     peak_z = max(p0[2], p1[2]) + abs(arc_h)
     mid = [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0, peak_z] + p1[3:7]
-    legs = [mid] + [_xyzq(p) for p in via] + [p1]
+    legs = [mid] + [_xyzq_live(ctx, tcp, p) for p in via] + [p1]
     ctx.envelope.check_points(legs)
     spd = ctx.envelope.clamp_speed(speed)
     h = ctx.trace.begin("carry", tcp=tcp, to=p1, arc_h=arc_h, peak_z=peak_z, speed=spd)
@@ -206,8 +229,8 @@ def carry(ctx: Ctx, tcp: str, to: Any, *, arc_h: float, speed: Optional[float] =
 def sweep(ctx: Ctx, tcp: str, frm: Any, to: Any, *, press_z: float,
           speed: Optional[float] = None) -> AtomResult:
     """Planar move in contact with a surface at constant z (press_z)."""
-    a = _xyzq(frm)
-    b = _xyzq(to)
+    a = _xyzq_live(ctx, tcp, frm)
+    b = _xyzq_live(ctx, tcp, to)
     a[2] = b[2] = float(press_z)
     ctx.envelope.check_points([a, b])
     spd = ctx.envelope.clamp_speed(speed)
@@ -258,7 +281,8 @@ def sync(ctx: Ctx, targets: Dict[str, Any], *, speed: Optional[float] = None) ->
     MotionStack goal set is already N-arm, lift the cap when a third arm exists)."""
     if len(targets) != 2:
         raise ValueError("sync v1 supports exactly two tcps")
-    goals = {t: _xyzq(p) for t, p in targets.items()}
+    goals = {t: (list(p) if not isinstance(p, dict) and len(list(p)) == 3 else _xyzq(p))
+             for t, p in targets.items()}          # bare = position-only (stack marks it)
     ctx.envelope.check_points(list(goals.values()))
     spd = ctx.envelope.clamp_speed(speed)
     h = ctx.trace.begin("sync", tcps=sorted(goals.keys()), speed=spd)

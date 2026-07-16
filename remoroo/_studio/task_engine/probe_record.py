@@ -31,9 +31,23 @@ def probe_and_record(kind: str, ctx: Any, tcp: str, *, record: Any,
         return {"error": f"no recorded object {object_id!r} — probe what the record "
                          "knows, not coordinates from thin air"}
     probe_id = f"probe_{kind}_{int(time.time())}"
-    res = PROBE_FNS[kind](ctx, tcp, obj.pose[:3], **(params or {}))
+    # TOUCH THE TOP, never the centroid (live 2026-07-15: a screwdriver's centroid
+    # sat at z=-0.018 — at/below the table plane — so every descend target was in
+    # collision and BOTH arms "failed IK" on a plainly reachable object; the run
+    # wedged at the looking exit). Top = pose.z + dims_z/2 + a contact margin;
+    # params.touch_z overrides when the agent knows the support plane better.
+    kwargs = dict(params or {})
+    at = [float(v) for v in obj.pose[:3]]
+    if "touch_z" in kwargs:
+        at[2] = float(kwargs.pop("touch_z"))
+    else:
+        dims = list(getattr(obj, "dims", None) or [])
+        half_h = float(dims[2]) / 2.0 if len(dims) >= 3 and dims[2] else 0.02
+        at[2] = at[2] + half_h + 0.005
+    res = PROBE_FNS[kind](ctx, tcp, at, **kwargs)
     out: Dict[str, Any] = {"ok": bool(res.get("ok")), "evidence": dict(res),
-                           "probe_id": probe_id}
+                           "probe_id": probe_id,
+                           "touch_point": [round(v, 4) for v in at]}
     if not out["ok"]:
         why = res.get("why")
         out["note"] = ("probe failed; nothing recorded (absence of proof is stated)"

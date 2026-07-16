@@ -60,6 +60,30 @@ def _norm_pose(pose) -> Pose:
     raise ValueError(f"unrecognised pose shape: {pose!r}")
 
 
+def _axes_of(pose) -> "Optional[list]":
+    """Agent-declared per-axis constraint weights (x,y,z,roll,pitch,yaw) — the dict
+    pose form's 'axes' key. The engine never invents these; the agent, who knows the
+    task, does (operator doctrine 2026-07-15)."""
+    if isinstance(pose, dict) and pose.get("axes") is not None:
+        return [float(v) for v in list(pose["axes"])[:6]]
+    return None
+
+
+def _is_bare_position(pose) -> bool:
+    """A 3-vector (or position-only dict) states a position and NO orientation — the
+    planner solves the orientation (ToolPoseCriteria.track_position). The [1,0,0,0]
+    in _norm_pose is a tensor FILLER for such goals, carrying zero cost weight —
+    never a constraint (identity-as-constraint was the 2026-07-15 probe bug)."""
+    if isinstance(pose, dict):
+        return not pose.get("quaternion")
+    if isinstance(pose, (list, tuple)) and len(pose) == 2 and np.ndim(pose[0]) == 1:
+        return False
+    try:
+        return len(list(pose)) == 3
+    except Exception:                              # noqa: BLE001
+        return False
+
+
 @dataclass
 class MoveResult:
     """The outcome of a motion verb — planned + (optionally) executed."""
@@ -846,7 +870,12 @@ class MotionStack:
         arms = list(targets.keys())
         planner = self._planner_for(arms)
         goals = {self._tip(a): _norm_pose(p) for a, p in targets.items()}
-        res = planner.plan_pose(goals, self._seed_positions(), max_attempts=max_attempts)
+        pos_only = [self._tip(a) for a, p in targets.items() if _is_bare_position(p)]
+        axes = {self._tip(a): w for a, p in targets.items()
+                if (w := _axes_of(p)) is not None}
+        res = planner.plan_pose(goals, self._seed_positions(), max_attempts=max_attempts,
+                                position_only=pos_only or None,
+                                axes_weight=axes or None)
         return self._finish(res, execute)
 
     def goto_joints(self, goal: Dict[str, float], *, groups: Optional[Sequence[str]] = None,
@@ -948,8 +977,10 @@ class MotionStack:
         """Drive one TCP through a sequence of poses (one concatenated collision-free path)."""
         planner = self._planner_for([tcp])
         legs = [_norm_pose(p) for p in poses]
+        legs_pos_only = [_is_bare_position(p) for p in poses]
         res = planner.plan_through(self._tip(tcp), legs, self._seed_positions(),
-                                   max_attempts=max_attempts)
+                                   max_attempts=max_attempts,
+                                   legs_position_only=legs_pos_only)
         return self._finish(res, execute)
 
     def current_tool_pose(self, tcp: str) -> object:

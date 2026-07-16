@@ -24,13 +24,25 @@ def _why(*results, steps: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _goal(xyz: Sequence[float], approach: Optional[dict]) -> Any:
+    """A probe target: bare position (planner solves orientation) unless the AGENT
+    declared an approach — {'quaternion': [...], 'axes': [x,y,z,r,p,yaw weights]} —
+    e.g. vertical-tool-free-yaw. The engine never invents orientation semantics
+    (operator doctrine 2026-07-15); the agent passes `approach` via probe params."""
+    if not approach:
+        return [float(v) for v in xyz[:3]]
+    g = dict(approach)
+    g["position"] = [float(v) for v in xyz[:3]]
+    return g
+
+
 def probe_touch(ctx: Ctx, tcp: str, at_xyz: Sequence[float], *,
-                hover_h: float = 0.05) -> Dict[str, Any]:
+                hover_h: float = 0.05, approach: Optional[dict] = None) -> Dict[str, Any]:
     """The gentlest question: go there, come back. Proves reachability + clearance."""
     x, y, z = [float(v) for v in at_xyz[:3]]
-    r1 = atoms.reach(ctx, tcp, [x, y, z + hover_h])
+    r1 = atoms.reach(ctx, tcp, _goal([x, y, z + hover_h], approach))
     r2 = atoms.descend(ctx, tcp, z)
-    r3 = atoms.reach(ctx, tcp, [x, y, z + hover_h])
+    r3 = atoms.reach(ctx, tcp, _goal([x, y, z + hover_h], approach))
     out = {"kind": "touch", "ok": bool(r1.ok and r2.ok and r3.ok),
            "undo_attempted": True, "undo_ok": bool(r3.ok)}
     why = _why(r1, r2, r3, steps=("reach hover", "descend", "retreat"))

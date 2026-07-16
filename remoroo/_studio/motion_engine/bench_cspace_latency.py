@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Rig micro-benchmark: WHY is a warm cspace plan 10.5 s, and is it the CUDA-graph poison?
+
+Runs the SAME plan cuRobo runs for `goto_joints` (`MotionPlanner.plan_cspace`) in a tight,
+instrumented loop and prints `solve_time` (cuRobo's own metric — the one the edge log shows at
+`solve_time=10.5`), wall time, success, and whether the CUDA-graph state got POISONED. It isolates
+the mechanism with four independent knobs, so ONE table answers "do we need to touch cuRobo?":
+
+  --graph {on,off}        cuRobo CUDA graphs on (default) or force eager (curobo.runtime.cuda_graphs)
+  --warm-cspace {on,off}  capture the cspace graph in a QUIET window BEFORE timing (default on).
+                          cuRobo's warmup() only warms plan_POSE, so normally the cspace graph is
+                          captured lazily on the first goto_joints — under concurrent load. This
+                          flag captures it clean first.
+  --load {none,perception}  run cuRobo's perception graphs (segmenter + ESDF integrator) CONCURRENTLY
+                          in a background thread — the SAME concurrent cuRobo-graph work the boot-time
+                          "deep-warm perception" does while the first goto_joints plans. This is the
+                          suspected poison trigger, reproduced with SYNTHETIC depth (no camera needed).
+  --plans N / --max-attempts M / --delta R
+
+The decisive matrix (run each; stop the edge first so the GPU is yours):
+  A  --graph on  --warm-cspace on  --load none          clean warm replay  -> expect a few hundred ms
+  B  --graph on  --warm-cspace off --load perception     reproduce the rig  -> expect seconds + POISON
+  C  --graph on  --warm-cspace on  --load perception     does load poison a CLEAN-warmed graph? (key)
+  D  --graph off --load none                              the pure-eager floor
+
+Reading it:  A fast + D slow  => graphs are the whole story (not ESDF, not "cuRobo is slow").
+             C fast           => a clean serial warm is enough; the fix is our warmup ordering, NO fork.
+             C slow/poisoned  => steady-state replay is poisoned too; need serialize or camera-process.
+
+Self-contained: builds its OWN MotionStack.from_cell — no edge, no cameras, no robot required (falls
+back to the planner's default config as the start). Run WITHOUT the edge running (it owns the GPU).
+
+    python3 bench_cspace_latency.py --cell /path/to/remoroo_cell --graph on --warm-cspace on --load none
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import statistics
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+# --- import motion_engine whether run from the repo or the bundled _studio tree ------------------
+try:
+    from motion_engine import MotionStack, DepthFrame  # type: ignore
+except Exception:  # noqa: BLE001
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # the server/ dir
+    from motion_engine import MotionStack, DepthFrame  # type: ignore
+
+
+POISON_MARKERS = ("offset increment", "stream is capturing", "capture", "cuda graph", "cudagraph")
+
+
+def _is_poison(msg: str) -> bool:
+    m = (msg or "").lower()
+    return any(k in m for k in POISON_MARKERS)
+
+
+def _set_cuda_graphs(enabled: bool) -> str:
+    """Flip cuRobo's global CUDA-graph switch BEFORE the planner is built (GraphExecutor reads it at
+    construction). Returns a human string of what was set."""
+    out = []
+    for modname in ("curobo.runtime", "curobo._src.runtime"):
+        try:
+            mod = __import__(modname, fromlist=["cuda_graphs"])
+            setattr(mod, "cuda_graphs", bool(enabled))
+            out.append(f"{modname}.cuda_graphs={enabled}")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"{modname}: {type(e).__name__}")
+    return "; ".join(out)
+
+
+class PerceptionLoad:
+    """Background thread that runs cuRobo's perception pipeline (segmenter + ESDF integrator, both
+    CUDA-graphed) on SYNTHETIC frames, continuously — the concurrent cuRobo-graph GPU work that the
+    boot deep-warm does while the first cspace plan captures. Reproduces the poison without a camera."""
+
+    def __init__(self, stack: MotionStack, hz: float = 8.0) -> None:
+        self.stack = stack
+        self.period = 1.0 / max(0.5, hz)
+        self._stop = threading.Event()
+        self._t: Optional[threading.Thread] = None
+        self.iters = 0
+        self.errors = 0
+        self.last_error = ""
+
+    def _frames(self) -> List[DepthFrame]:
+        import numpy as np
+        H, W = 180, 320
+        depth = np.full((H, W), 0.8, dtype=np.float32)
+        K = np.array([[200.0, 0, W / 2.0], [0, 200.0, H / 2.0], [0, 0, 1]], dtype=np.float32)
+        pose = ([0.5, 0.0, 0.6], [0.5, -0.5, 0.5, -0.5])   # a plausible cam-in-base pose (wxyz, unit)
+        q = self.stack._seed_positions() or {}
+        return [DepthFrame(depth=depth, intrinsics=K, cam_pose_in_base=pose, q=q, name="synth")]
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.perf_counter()
+            try:
+                # diagnostics=False = the fast integrate->ESDF path (still runs the perception CUDA
+                # graphs, which is the point). Fall back for an older motion_engine without the kwarg.
+                try:
+                    self.stack.update_world_live(self._frames(), diagnostics=False)
+                except TypeError:
+                    self.stack.update_world_live(self._frames())
+                self.iters += 1
+            except Exception as e:  # noqa: BLE001 — count, keep hammering (errors are informative)
+                self.errors += 1
+                self.last_error = f"{type(e).__name__}: {e}"
+            dt = time.perf_counter() - t0
+            if dt < self.period:
+                self._stop.wait(self.period - dt)
+
+    def start(self) -> None:
+        self._t = threading.Thread(target=self._run, name="perception-load", daemon=True)
+        self._t.start()
+        time.sleep(0.5)   # let one integrate land so the mapper is built before timing starts
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._t is not None:
+            self._t.join(timeout=5.0)
+
+
+class Planner:
+    """Thin wrapper over the stack's cuRobo MotionPlanner to issue a real `plan_cspace` and read its
+    `solve_time` / `total_time` — the exact call `goto_joints` makes."""
+
+    def __init__(self, stack: MotionStack, delta: float) -> None:
+        self.stack = stack
+        groups = list(getattr(stack, "_groups", {}).keys())
+        self.cvp = stack._planner_for(groups)          # CuroboV2Planner
+        self.mp = self.cvp.planner                       # raw cuRobo MotionPlanner
+        self.names = list(self.mp.joint_names)
+        self.delta = float(delta)
+        self._js = None
+        self._build_goal()
+
+    def _build_goal(self) -> None:
+        import torch  # noqa: F401
+        from curobo.types import JointState
+        seed = self.stack._seed_positions() or {}
+        start = self.cvp._start_js(seed)                 # (1, n) JointState
+        q0 = start.position.detach().clone()
+        lims = self.cvp.joint_limits() if hasattr(self.cvp, "joint_limits") else {}
+        q1 = q0.clone()
+        # Perturb a couple of mid-chain joints by +/-delta, clamped inside limits — a real but modest,
+        # almost-always-feasible move. Alternating sign keeps it small and collision-unlikely.
+        for i, n in enumerate(self.names):
+            step = self.delta if (i % 3 == 1) else (-self.delta if (i % 3 == 2) else 0.0)
+            lo, hi = lims.get(n, (-3.1, 3.1))
+            q1[0, i] = min(max(float(q0[0, i]) + step, lo + 1e-3), hi - 1e-3)
+        self._start = start
+        self._goal = JointState.from_position(q1, joint_names=self.names)
+
+    def plan(self, max_attempts: int) -> dict:
+        t0 = time.perf_counter()
+        rec = {"wall_ms": None, "solve_ms": None, "total_ms": None,
+               "success": False, "poison": False, "msg": ""}
+        try:
+            res = self.mp.plan_cspace(self._goal, self._start, max_attempts=max_attempts)
+            rec["wall_ms"] = (time.perf_counter() - t0) * 1e3
+            if res is not None:
+                st = getattr(res, "solve_time", None)
+                tt = getattr(res, "total_time", None)
+                rec["solve_ms"] = float(st) * 1e3 if st is not None else None
+                rec["total_ms"] = float(tt) * 1e3 if tt is not None else None
+                try:
+                    rec["success"] = bool(res.success.any())
+                except Exception:  # noqa: BLE001
+                    rec["success"] = bool(getattr(res, "success", False))
+        except Exception as e:  # noqa: BLE001
+            rec["wall_ms"] = (time.perf_counter() - t0) * 1e3
+            rec["msg"] = f"{type(e).__name__}: {e}"
+            rec["poison"] = _is_poison(rec["msg"])
+        return rec
+
+
+def _agg(recs: List[dict], key: str) -> dict:
+    xs = [r[key] for r in recs if r.get(key) is not None]
+    if not xs:
+        return {"n": 0}
+    xs_sorted = sorted(xs)
+    p95 = xs_sorted[min(len(xs_sorted) - 1, int(round(0.95 * (len(xs_sorted) - 1))))]
+    return {"n": len(xs), "median": statistics.median(xs), "p95": p95,
+            "min": xs_sorted[0], "max": xs_sorted[-1], "mean": statistics.fmean(xs)}
+
+
+def _print_phase(title: str, recs: List[dict]) -> None:
+    print(f"\n  [{title}]  ({len(recs)} plans)")
+    print(f"    {'#':>3} {'wall_ms':>9} {'solve_ms':>9} {'total_ms':>9} {'ok':>3} {'poison':>7}  msg")
+    for i, r in enumerate(recs):
+        w = f"{r['wall_ms']:.0f}" if r['wall_ms'] is not None else "-"
+        s = f"{r['solve_ms']:.0f}" if r['solve_ms'] is not None else "-"
+        t = f"{r['total_ms']:.0f}" if r['total_ms'] is not None else "-"
+        print(f"    {i:>3} {w:>9} {s:>9} {t:>9} {str(r['success']):>3} "
+              f"{str(r['poison']):>7}  {r['msg'][:70]}")
+    a = _agg(recs, "solve_ms")
+    aw = _agg(recs, "wall_ms")
+    npois = sum(1 for r in recs if r["poison"])
+    nok = sum(1 for r in recs if r["success"])
+    if a.get("n"):
+        print(f"    solve_ms  median={a['median']:.0f}  p95={a['p95']:.0f}  "
+              f"min={a['min']:.0f}  max={a['max']:.0f}")
+    if aw.get("n"):
+        print(f"    wall_ms   median={aw['median']:.0f}  p95={aw['p95']:.0f}")
+    print(f"    success={nok}/{len(recs)}   poisoned={npois}/{len(recs)}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="cuRobo cspace plan latency / CUDA-graph-poison probe")
+    ap.add_argument("--cell", default=os.environ.get("REMOROO_CELL", "remoroo_cell"))
+    ap.add_argument("--graph", choices=["on", "off"], default="on")
+    ap.add_argument("--warm-cspace", choices=["on", "off"], default="on")
+    ap.add_argument("--load", choices=["none", "perception"], default="none")
+    ap.add_argument("--plans", type=int, default=20)
+    ap.add_argument("--warmup-plans", type=int, default=3)
+    ap.add_argument("--max-attempts", type=int, default=5)
+    ap.add_argument("--delta", type=float, default=0.15)
+    ap.add_argument("--load-hz", type=float, default=8.0)
+    ap.add_argument("--json", default="")
+    args = ap.parse_args()
+
+    cell = str(Path(args.cell).resolve())
+    print("=" * 78)
+    print("cuRobo cspace latency / graph-poison probe")
+    print(f"  cell={cell}")
+    print(f"  graph={args.graph}  warm_cspace={args.warm_cspace}  load={args.load}  "
+          f"plans={args.plans}  max_attempts={args.max_attempts}  delta={args.delta}")
+
+    # 1) flip the CUDA-graph switch BEFORE the planner is built
+    print("  " + _set_cuda_graphs(args.graph == "on"))
+
+    # 2) build + warm the stack (planner build + pose warmup). No bridge: default config start.
+    t0 = time.perf_counter()
+    stack = MotionStack.from_cell(cell)
+    print(f"  MotionStack.from_cell: {time.perf_counter() - t0:.1f}s")
+    t0 = time.perf_counter()
+    try:
+        stack.prewarm()                 # planner build + IK/trajopt (pose) warmup
+    except Exception as e:  # noqa: BLE001
+        print(f"  prewarm FAILED: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return 2
+    print(f"  prewarm (build + pose warmup): {time.perf_counter() - t0:.1f}s")
+
+    planner = Planner(stack, delta=args.delta)
+    print(f"  planner ready: dof={len(planner.names)} groups={list(stack._groups.keys())}")
+
+    # 3) optional CLEAN cspace warmup — capture the cspace graph while the GPU is QUIET (no load yet)
+    warm_recs: List[dict] = []
+    if args.warm_cspace == "on":
+        print("\n  warming the cspace graph in a quiet window (this is the proposed fix — cuRobo only "
+              "warms plan_pose)...")
+        for _ in range(max(2, args.warmup_plans)):
+            warm_recs.append(planner.plan(args.max_attempts))
+        _print_phase("cspace WARM (quiet)", warm_recs)
+
+    # 4) start the concurrent perception load (if requested)
+    load: Optional[PerceptionLoad] = None
+    if args.load == "perception":
+        print("\n  starting concurrent perception load (segmenter+ESDF graphs on synthetic frames)...")
+        load = PerceptionLoad(stack, hz=args.load_hz)
+        load.start()
+
+    # 5) untimed warmups (under the current load), then the timed run
+    for _ in range(args.warmup_plans):
+        planner.plan(args.max_attempts)
+
+    timed: List[dict] = []
+    poisoned_latched = False
+    for _ in range(args.plans):
+        r = planner.plan(args.max_attempts)
+        if r["poison"]:
+            poisoned_latched = True
+        # once the process RNG is poisoned, later eager ops throw too — mark the run
+        r["poison"] = r["poison"] or poisoned_latched
+        timed.append(r)
+
+    if load is not None:
+        load.stop()
+        print(f"\n  perception load: {load.iters} integrates, {load.errors} errors"
+              + (f" (last: {load.last_error[:80]})" if load.last_error else ""))
+
+    _print_phase(f"TIMED  (graph={args.graph} warm_cspace={args.warm_cspace} load={args.load})", timed)
+
+    # 6) verdict
+    a = _agg(timed, "solve_ms")
+    med = a.get("median")
+    npois = sum(1 for r in timed if r["poison"])
+    print("\n" + "-" * 78)
+    print("VERDICT")
+    if med is None:
+        print("  no solve_time captured — every plan raised. Check the msg column (likely poison).")
+    else:
+        print(f"  median warm solve_time = {med:.0f} ms   (edge log showed ~10500 ms; "
+              f"cuRobo Orin baseline ~100-480 ms)")
+        if args.graph == "off":
+            print("  -> this is the PURE-EAGER floor. Compare against graph=on runs.")
+        elif npois > 0:
+            print(f"  -> {npois}/{len(timed)} plans POISONED. Concurrent load bricked the graph -> eager. "
+                  "This reproduces the rig.")
+        elif med < 1000:
+            print("  -> graph replay WORKS here. The 10.5 s is NOT intrinsic to cuRobo/ESDF.")
+            if args.load == "perception" and args.warm_cspace == "on":
+                print("     AND a clean-warmed graph SURVIVED the concurrent load => a serial warm is "
+                      "sufficient; the fix is our warmup ordering, NO cuRobo fork needed.")
+        else:
+            print("  -> slow but no explicit poison caught — inspect solve_ms spread + the msg column.")
+    print("  Suggested matrix: A(on/on/none) B(on/off/perception) C(on/on/perception) D(off/*/none)")
+    print("-" * 78)
+
+    if args.json:
+        import json
+        Path(args.json).write_text(json.dumps(
+            {"args": vars(args), "warm": warm_recs, "timed": timed,
+             "load_iters": (load.iters if load else 0)}, indent=2))
+        print(f"  raw records -> {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
