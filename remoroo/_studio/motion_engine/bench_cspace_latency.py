@@ -35,6 +35,7 @@ back to the planner's default config as the start). Run WITHOUT the edge running
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import random
 import statistics
@@ -463,7 +464,31 @@ def _build_stack(cell: str, graph_on: bool, seeds: int, mode: str, delta: float,
     if warm:
         for i in range(max(2, warmup_plans)):
             p0.plan(max_attempts, i)
+    try:
+        stack._bench_bridge = bridge           # stashed so a multi-seed loop can release cameras
+    except Exception:  # noqa: BLE001
+        pass
     return stack
+
+
+def _release_stack(stack) -> None:
+    """Release the bridge/cameras (the 3 ZEDs are single-open, so the NEXT seed build can't reopen
+    them unless we close first) and free GPU memory between rebuilds."""
+    b = getattr(stack, "_bench_bridge", None)
+    for m in ("disconnect", "close", "shutdown", "stop", "release"):
+        fn = getattr(b, m, None)
+        if callable(fn):
+            try:
+                fn()
+                break
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _run_config(planner: Planner, plans: int, warmup: int, max_attempts: int) -> dict:
@@ -523,10 +548,15 @@ def run_ablation(args) -> int:
     print(f"  finetune={fts}  iters={its}  seeds={seeds_list if seeds_list != [0] else 'default(4)'}")
 
     rows: List[dict] = []
+    prev_stack = None
     for seeds in seeds_list:
+        if prev_stack is not None:                 # free the ZEDs/GPU before the next build reopens them
+            _release_stack(prev_stack)
+            prev_stack = None
         stack = _build_stack(cell, args.graph == "on", seeds, args.mode, args.delta,
                              warm=(args.warm_cspace == "on"), warmup_plans=2,
                              max_attempts=args.max_attempts, use_bridge=args.bridge, world=args.world)
+        prev_stack = stack
         sk = "def" if not seeds else str(seeds)
 
         # Guard: is the START valid in this world? (modeled world / a bad robot config makes EVERY
