@@ -69,17 +69,28 @@ def connect_bridge(cell: str):
 
 
 # --- geometry (pure) ---------------------------------------------------------------------------
-# Targets are BARE [x,y,z] positions (orientation-free): cuRobo picks a reachable wrist orientation,
-# so the arms can meet near the shared centre without us guessing feasible orientations. That's also
-# where the coordination is visible — the two TCPs approach a common region and cuRobo keeps the arm
-# BODIES collision-free.
+# Targets are BARE [x,y,z] positions (orientation-free): cuRobo picks a reachable wrist orientation.
+# CRITICAL DESIGN RULE (the fix for the all-failing v1): every target is each arm's OWN current TCP
+# pose + a SMALL bounded offset — NOT a shared centre both arms crowd into. Driving two TCPs to one
+# midpoint forces the arm BODIES to interpenetrate (self-collision), which cuRobo correctly refuses;
+# and large offsets leave the workspace (v1 saw 796 mm IK error). Offset-from-own-pose is reachable
+# by construction, and a mutual approach only closes PART of the current gap, so the bodies stay clear.
 
 XYZ = List[float]
 
 
-def _center(home: Dict[str, Pose], arms: List[str]) -> XYZ:
-    """Midpoint of the arms' current TCPs — the shared workspace centre the scenes aim at."""
-    return [sum(home[a][0][i] for a in arms) / len(arms) for i in range(3)]
+def _toward(home: Dict[str, Pose], arms: List[str]) -> Dict[str, float]:
+    """Per-arm sign for 'move toward the other arm(s)' in y: +1 for an arm left of the group centre,
+    -1 for one on the right. So a mutual-approach offset closes the gap symmetrically."""
+    cy = sum(home[a][0][1] for a in arms) / len(arms)
+    return {a: (1.0 if home[a][0][1] <= cy else -1.0) for a in arms}
+
+
+def _apply(home: Dict[str, Pose], arms: List[str],
+           offsets: Dict[str, XYZ], scale: float) -> Dict[str, XYZ]:
+    """Target = each arm's current TCP xyz + scale*offset. scale<1 shrinks toward the current pose
+    (guaranteed reachable + collision-free), which is how a scene degrades gracefully on failure."""
+    return {a: [home[a][0][i] + scale * offsets[a][i] for i in range(3)] for a in arms}
 
 
 def _sorted_by_y(home: Dict[str, Pose], arms: List[str]) -> List[str]:
@@ -107,51 +118,59 @@ def _max_dq(traj) -> float:
 
 # --- one plan→execute step ---------------------------------------------------------------------
 
-def step(stack: MotionStack, name: str, targets: Dict[str, XYZ], execute: bool, log: List[dict]) -> bool:
-    """ONE move: plan + (optionally) execute in a single call. `MoveResult.total_time` is cuRobo's
-    plan solve time (the headline), and we also print the TCP separation the arms reach and the joint
-    travel — so 'the arms met 16 cm apart, planned in 340 ms' is legible. Never raises."""
-    sep = _sep(targets)
-    t0 = time.perf_counter()
-    try:
-        mv = stack.move_to_poses(targets, execute=execute)
-    except Exception as e:  # noqa: BLE001
-        print(f"  ✗ {name:16s} raised {type(e).__name__}: {e}")
-        log.append({"scene": name, "ok": False})
-        return False
-    wall = (time.perf_counter() - t0) * 1e3
-    if not getattr(mv, "ok", False) or getattr(mv, "trajectory", None) is None:
-        print(f"  ✗ {name:16s} no plan ({(getattr(mv, 'message', '') or '')[:46]})")
-        log.append({"scene": name, "ok": False})
-        return False
-    plan_ms = float(getattr(mv, "total_time", 0.0)) * 1e3
-    dq = _max_dq(mv.trajectory)
-    dur = getattr(mv.trajectory, "duration", 0.0)
-    sep_s = f"TCPs {sep * 100:4.0f}cm" if sep is not None else f"{len(targets)} TCP"
-    if execute:
-        st = "executed" if mv.executed else ("ABORTED" if getattr(mv, "aborted", False) else "not exec")
-    else:
-        st = "plan-only"
-    flag = "✓" if mv.ok and (mv.executed or not execute) else ("⚠" if getattr(mv, "aborted", False) else "✗")
-    print(f"  {flag} {name:16s} plan {plan_ms:5.0f} ms | {sep_s} | Δq {dq:4.2f} rad | "
-          f"motion {dur:.1f}s | wall {wall:5.0f} ms | {st}")
-    log.append({"scene": name, "ok": bool(mv.ok), "plan_ms": plan_ms, "sep": sep,
-                "dq": dq, "executed": bool(mv.executed)})
-    return bool(mv.ok)
+_SCALES = (1.0, 0.6, 0.35, 0.15)   # shrink the offset toward the current pose until a plan is found
+
+
+def step(stack: MotionStack, name: str, home: Dict[str, Pose], arms: List[str],
+         offsets: Dict[str, XYZ], execute: bool, log: List[dict],
+         scales: tuple = _SCALES) -> bool:
+    """ONE coordinated move, ADAPTIVE: try the full offset, and on a planning failure shrink it toward
+    the current pose and retry (`scales`). Since scale→0 is the current (trivially feasible) pose, a
+    scene never spams failures — it lands the largest feasible version, or reports that even the
+    smallest offset failed (which means born-in-collision, not the target). Never raises."""
+    mv = None
+    err = ""
+    for scale in scales:
+        targets = _apply(home, arms, offsets, scale)
+        sep = _sep(targets)
+        t0 = time.perf_counter()
+        try:
+            mv = stack.move_to_poses(targets, execute=execute)
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+            continue
+        wall = (time.perf_counter() - t0) * 1e3
+        if not getattr(mv, "ok", False) or getattr(mv, "trajectory", None) is None:
+            err = (getattr(mv, "message", "") or "")
+            continue                                    # shrink and retry
+        plan_ms = float(getattr(mv, "total_time", 0.0)) * 1e3
+        dq = _max_dq(mv.trajectory)
+        dur = getattr(mv.trajectory, "duration", 0.0)
+        tag = "" if scale == 1.0 else f" @{int(scale * 100)}%"
+        sep_s = f"TCPs {sep * 100:4.0f}cm" if sep is not None else f"{len(targets)} TCP"
+        st = ("executed" if mv.executed else ("ABORTED" if getattr(mv, "aborted", False) else "not exec")) \
+            if execute else "plan-only"
+        flag = "✓" if (mv.executed or not execute) else ("⚠" if getattr(mv, "aborted", False) else "✗")
+        print(f"  {flag} {name:16s}{tag:5s} plan {plan_ms:5.0f} ms | {sep_s} | Δq {dq:4.2f} rad | "
+              f"motion {dur:.1f}s | wall {wall:5.0f} ms | {st}")
+        log.append({"scene": name, "ok": True, "plan_ms": plan_ms, "sep": sep,
+                    "dq": dq, "scale": scale, "executed": bool(mv.executed)})
+        return True
+    print(f"  ✗ {name:16s} no plan even at {int(scales[-1] * 100)}% offset ({(err or '')[:44]})")
+    log.append({"scene": name, "ok": False})
+    return False
 
 
 # --- scenes (coordinated dual-arm, TCPs meeting near the shared centre) -------------------------
 
-def planning_benchmark(stack: MotionStack, arms: List[str], home: Dict[str, Pose],
-                       center: XYZ, reps: int) -> None:
-    """(a) MULTI-TCP benchmark: one arm vs ALL arms coordinated to the centre, plan-only, no motion.
-    Shows the FAST_PLAN sub-second headline + what the extra arms cost."""
+def planning_benchmark(stack: MotionStack, arms: List[str], home: Dict[str, Pose], reps: int) -> None:
+    """MULTI-TCP benchmark: one arm vs ALL arms, a small synchronized +8 cm lift (feasible by
+    construction), plan-only. Shows the plan-time headline + what the extra arm costs."""
     print("\n── planning-speed benchmark (plan only, no motion) ──")
     ys = _sorted_by_y(home, arms)
-    one = {ys[0]: [center[0], home[ys[0]][0][1], center[2] + 0.12]}
-    allt = {a: [center[0], center[1] + (0.09 if i % 2 == 0 else -0.09), center[2] + 0.12]
-            for i, a in enumerate(ys)}
-    for label, tgt in ((f"1 TCP ({ys[0]})", one), (f"{len(arms)} TCP → centre", allt)):
+    one = _apply(home, [ys[0]], {ys[0]: [0.0, 0.0, 0.08]}, 1.0)
+    allt = _apply(home, arms, {a: [0.0, 0.0, 0.08] for a in arms}, 1.0)
+    for label, tgt in ((f"1 TCP ({ys[0]})", one), (f"{len(arms)} TCP lift", allt)):
         ms = []
         for _ in range(reps):
             try:
@@ -161,42 +180,45 @@ def planning_benchmark(stack: MotionStack, arms: List[str], home: Dict[str, Pose
             except Exception:  # noqa: BLE001
                 pass
         if ms:
-            print(f"  {label:18s} plan median {statistics.median(ms):6.0f} ms  (min {min(ms):.0f}, {len(ms)}/{reps} ok)")
+            print(f"  {label:18s} plan median {statistics.median(ms):6.0f} ms  "
+                  f"(min {min(ms):.0f}, {len(ms)}/{reps} ok)")
         else:
-            print(f"  {label:18s} — no successful plan")
+            print(f"  {label:18s} — no successful plan (even a +8 cm lift → suspect the collision "
+                  "model, not the target)")
 
 
-def scene_spread(home: Dict[str, Pose], arms: List[str], center: XYZ) -> Dict[str, XYZ]:
-    """Arms out to their OWN sides + up — the wide 'reset' pose between close encounters."""
+def sanity_nudge(stack: MotionStack, home: Dict[str, Pose], arms: List[str],
+                 execute: bool, log: List[dict]) -> bool:
+    """A 3 cm single-arm lift — the smallest real move. If THIS can't plan, the failure is NOT the
+    demo's targets: the start config is born-in-collision (modeled world, or the two-arm self-collision
+    spheres / ignore matrix). Say so loudly, with where to look."""
+    a = _sorted_by_y(home, arms)[0]
+    ok = step(stack, "sanity-nudge", home, [a], {a: [0.0, 0.0, 0.03]}, execute, log, scales=(1.0, 0.5))
+    if not ok:
+        print("  ⚠ EVEN A 3 cm NUDGE FAILED — this is NOT the demo targets. The current config is")
+        print("    likely BORN-IN-COLLISION. Check `stack.debug_world()` (modeled obstacles sitting on")
+        print("    the arm) and the two-arm self-collision spheres / ignore matrix. Fix that first.")
+    return ok
+
+
+def scenes(home: Dict[str, Pose], arms: List[str], approach: float) -> List[tuple]:
+    """Coordinated dual-arm scenes as per-arm OFFSETS (dx,dy,dz) from each arm's own pose — small,
+    on-own-side, feasible. Mutual moves close only `approach` of the gap so the bodies stay clear."""
     ys = _sorted_by_y(home, arms)
-    return {a: [home[a][0][0], home[a][0][1] + (-0.10 if i == 0 else 0.10), center[2] + 0.15]
-            for i, a in enumerate(ys)}
-
-
-def scene_converge(home: Dict[str, Pose], arms: List[str], center: XYZ, sep: float) -> Dict[str, XYZ]:
-    """Both TCPs meet NEAR the centre, `sep` apart (each stays on its own side) — the arm bodies come
-    close and cuRobo keeps them collision-free. The signature coordinated move."""
-    ys = _sorted_by_y(home, arms)
-    return {a: [center[0], center[1] + (-sep / 2 if i == 0 else sep / 2), center[2] + 0.12]
-            for i, a in enumerate(ys)}
-
-
-def scene_cross(home: Dict[str, Pose], arms: List[str], center: XYZ, sep: float) -> Dict[str, XYZ]:
-    """TCPs SWAP sides across the centre — the two arms' paths cross; cuRobo staggers them in time/space
-    so the bodies never touch. The most striking collision-avoidance demo. (Kept at different heights
-    for clearance.)"""
-    ys = _sorted_by_y(home, arms)
-    return {a: [center[0], center[1] + (sep / 2 if i == 0 else -sep / 2),
-                center[2] + (0.08 if i == 0 else 0.20)]
-            for i, a in enumerate(ys)}
-
-
-def scene_weave(home: Dict[str, Pose], arms: List[str], center: XYZ) -> Dict[str, XYZ]:
-    """Both near the centre at ALTERNATING heights — the arms interleave vertically."""
-    ys = _sorted_by_y(home, arms)
-    return {a: [center[0], center[1] + (-0.07 if i == 0 else 0.07),
-                center[2] + (0.06 if i % 2 == 0 else 0.22)]
-            for i, a in enumerate(ys)}
+    tw = _toward(home, arms)
+    out = [("lift", {a: [0.0, 0.0, 0.08] for a in arms})]        # synchronized rise (also a sanity move)
+    if len(arms) >= 2:
+        out += [
+            ("reach-in",  {a: [0.06, tw[a] * approach, 0.04] for a in arms}),   # forward + gently toward
+            ("spread",    {a: [0.0, -tw[a] * 0.10, 0.06] for a in arms}),       # apart to own sides + up
+            ("weave",     {a: [0.0, tw[a] * (approach * 0.6),
+                               (0.08 if i % 2 == 0 else -0.05)] for i, a in enumerate(ys)}),  # interleave z
+            ("bow",       {a: [0.05, 0.0, -0.06] for a in arms}),               # both reach down-forward
+        ]
+    else:
+        out += [("reach", {a: [0.08, 0.0, 0.04] for a in arms}),
+                ("bow",   {a: [0.05, 0.0, -0.06] for a in arms})]
+    return out
 
 
 # --- orchestration -----------------------------------------------------------------------------
@@ -219,26 +241,28 @@ def run(stack: MotionStack, args) -> int:
     if any(v is None for v in home.values()):
         print("  could not FK current tool poses — is the bridge connected?")
         return 2
-    center = _center(home, arms)
 
-    planning_benchmark(stack, arms, home, center, reps=args.reps)
-
-    # The showcase sequence: each entry is ONE coordinated plan→execute. The centre scenes bring the
-    # two TCPs close / cross them, so the collision-free coordination is visible.
-    seq = [("spread", scene_spread(home, arms, center))]
-    if len(arms) >= 2:
-        seq += [("converge", scene_converge(home, arms, center, args.sep)),
-                ("cross", scene_cross(home, arms, center, args.sep)),
-                ("weave", scene_weave(home, arms, center)),
-                ("converge-tight", scene_converge(home, arms, center, max(0.12, args.sep * 0.7)))]
-
-    print("\n── coordinated multi-TCP moves (plan → execute) ──")
     log: List[dict] = []
+    # SANITY FIRST: if a 3 cm nudge can't plan, the problem is the collision world, not the targets —
+    # bail early with the diagnosis rather than grinding through the whole (doomed) sequence.
+    print("\n── sanity: smallest real move ──")
+    if not sanity_nudge(stack, home, arms, execute, log):
+        print("-" * 74)
+        print("ABORTED: born-in-collision at the current config. Fix the collision world first "
+              "(see the ⚠ above); the coordinated scenes can't succeed until then.")
+        print("-" * 74)
+        return 3
+
+    planning_benchmark(stack, arms, home, reps=args.reps)
+
+    # Coordinated dual-arm scenes — per-arm offsets from own pose, adaptive (shrink-on-failure).
+    seq = scenes(home, arms, approach=args.sep)
+    print("\n── coordinated multi-TCP moves (plan → execute) ──")
     for loop in range(args.loops):
         if args.loops > 1:
             print(f"  · loop {loop + 1}/{args.loops}")
-        for name, targets in seq:
-            step(stack, name, targets, execute, log)
+        for name, offsets in seq:
+            step(stack, name, home, arms, offsets, execute, log)
 
     if execute:
         print("\nretracting home...")
@@ -265,9 +289,10 @@ def main() -> int:
     ap.add_argument("--execute", action="store_true", help="ACTUALLY MOVE the robot (default: dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="plan + time only, never move (overrides --execute)")
     ap.add_argument("--loops", type=int, default=1, help="how many times through the scene set")
-    ap.add_argument("--sep", type=float, default=0.20,
-                    help="TCP separation (m) at the centre for the converge/cross scenes — smaller = "
-                         "the arms get closer (more dramatic coordination); the plan fails safely if too tight")
+    ap.add_argument("--sep", type=float, default=0.06,
+                    help="how far each arm reaches TOWARD the other (m) in the coordinated scenes — the "
+                         "mutual approach closes only part of the gap so the arm bodies stay clear "
+                         "(default 6 cm; raise for a wider dance, lower for a closer one)")
     ap.add_argument("--reps", type=int, default=6, help="plan repetitions for the speed benchmark")
     args = ap.parse_args()
     cell = str(Path(args.cell).resolve())
