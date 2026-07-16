@@ -396,6 +396,32 @@ def _patch_seeds(n: int):
     return lambda: setattr(MotionPlannerCfg, "create", desc)
 
 
+def _ensure_safety_shim(cell: str) -> bool:
+    """The cell's primitives.py Bridge imports a `safety_shim` spine that the EDGE pre-registers in
+    sys.modules at startup — a standalone script must do the same or the Bridge import fails
+    ('No module named safety_shim') and the harness silently falls back to the planner default
+    (home) config, which then reads as in-collision against the real cell.yaml obstacles. Mirror the
+    edge's registration (remoroo.edge is the shipped spine)."""
+    try:
+        from remoroo import edge as spine  # the shipped safety/transport spine
+    except Exception:  # noqa: BLE001
+        try:                               # fall back to the edge's own resolver (also registers it)
+            import sys as _sys
+            sys_path0 = str(Path(__file__).resolve().parents[1])
+            if sys_path0 not in _sys.path:
+                _sys.path.insert(0, sys_path0)
+            from edge_real import _ensure_safety_shim_resolves  # type: ignore
+            _ensure_safety_shim_resolves()
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"  could not register safety_shim spine ({type(e).__name__}: {e})")
+            return False
+    name = Path(cell).name
+    sys.modules.setdefault("safety_shim", spine)
+    sys.modules.setdefault(f"{name}.safety_shim", spine)
+    return True
+
+
 def _build_stack(cell: str, graph_on: bool, seeds: int, mode: str, delta: float,
                  warm: bool, warmup_plans: int, max_attempts: int,
                  use_bridge: bool = False, world: str = "empty") -> MotionStack:
@@ -407,13 +433,17 @@ def _build_stack(cell: str, graph_on: bool, seeds: int, mode: str, delta: float,
     restore = _patch_seeds(seeds) if seeds and seeds > 0 else None
     bridge = None
     if use_bridge:
+        _ensure_safety_shim(cell)          # register the spine the cell Bridge imports (like the edge)
         try:
             from remoroo_cell.primitives import Bridge  # type: ignore
             bridge = Bridge.from_cell_yaml(str(Path(cell) / "cell.yaml"))
             bridge.connect()
             print("  bridge CONNECTED — real robot config seeds the start")
         except Exception as e:  # noqa: BLE001
-            print(f"  bridge connect FAILED ({type(e).__name__}: {e}); using planner default start")
+            print(f"  bridge connect FAILED ({type(e).__name__}: {e})")
+            if world != "empty":
+                print("  !!! --world modeled WITHOUT a real start = the DEFAULT (home) config, which "
+                      "collides with the cell.yaml obstacles. Fix the bridge or use --world empty.")
             bridge = None
     print(f"  building stack (seeds={'default' if not seeds else seeds}, "
           f"graph={'on' if graph_on else 'off'}, world={world}, bridge={'yes' if bridge else 'no'})...")
