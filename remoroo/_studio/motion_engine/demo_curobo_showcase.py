@@ -219,7 +219,8 @@ def retract_gate(stack: MotionStack, execute: bool) -> tuple:
     return ok, moved
 
 
-def scenes(home: Dict[str, Pose], arms: List[str], approach: float, close: float) -> List[tuple]:
+def scenes(home: Dict[str, Pose], arms: List[str], approach: float, close: float,
+           stagger: float, depth: float) -> List[tuple]:
     """A flowing ~20-move coordinated routine with a CLOSE-ENCOUNTER climax. Most moves keep each arm
     on its own side; the close scenes bring the two grippers NEAR each other but STAGGERED IN HEIGHT
     (one high, one low) so the arm bodies pass at different levels and stay collision-free — the real
@@ -228,7 +229,11 @@ def scenes(home: Dict[str, Pose], arms: List[str], approach: float, close: float
     ys = _sorted_by_y(home, arms)
     tw = _toward(home, arms)                          # +1 = toward centre (inward), -1 = outward, per arm
     IN = float(approach)                              # small inward reach — stays own-side (default 6 cm)
-    CLOSE = float(close)                              # bigger inward for the close encounter (default 16 cm)
+    CLOSE = float(close)                              # bigger inward for the close encounter (default 20 cm)
+    STAG = float(stagger)                             # vertical (z) stagger for the close encounter
+    DEEP = float(depth)                               # depth (x) stagger — one arm reaches deep, the other
+    #                                                   shallow. TWO clearance axes (height + depth) let the
+    #                                                   grippers converge closer in y before a body touches.
     OUT, UP, DN, FWD, BAK = 0.10, 0.09, -0.07, 0.08, -0.06
 
     def per(fn) -> Dict[str, XYZ]:                    # build {arm: [dx,dy,dz]} from a per-(index,arm) fn
@@ -243,13 +248,17 @@ def scenes(home: Dict[str, Pose], arms: List[str], approach: float, close: float
         ("gather",    per(lambda i, a: (FWD * 0.3,  tw[a] * IN,        UP * 0.4))),    # gentle inward (own-side)
     ]
     if len(arms) >= 2:
-        # CLOSE ENCOUNTER — grippers come near, staggered in HEIGHT so the bodies clear. The step's
-        # adaptive shrink backs `close` off until it's collision-free, and prints the separation reached.
+        # CLOSE ENCOUNTER — grippers come near, staggered in HEIGHT (`stagger`) so the bodies clear.
+        # A BIGGER stagger is what lets them approach closer; the adaptive shrink backs `close` off only
+        # if it's STILL too tight, and prints the separation reached. `clasp` is the closest: most inward
+        # AND most stagger.
         seq += [
-            ("approach",  per(lambda i, a: (FWD * 0.4,  tw[a] * CLOSE,       UP * 1.3 if i % 2 == 0 else DN * 1.3))),
-            ("near-pass", per(lambda i, a: (FWD * 0.4,  tw[a] * CLOSE,       DN * 1.3 if i % 2 == 0 else UP * 1.3))),
-            ("clasp",     per(lambda i, a: (FWD * 0.6,  tw[a] * CLOSE * 1.1, UP * 0.9 if i % 2 == 0 else DN * 0.9))),
-            ("part",      per(lambda i, a: (FWD * 0.2, -tw[a] * OUT,         UP * 0.4))),  # ease back apart
+            # A reaches DEEP+HIGH, B reaches SHALLOW+LOW (then swap) — bodies pass at different depth AND
+            # height, so the grippers can converge closer in y. `clasp` is the tightest: most inward.
+            ("approach",  per(lambda i, a: (FWD * 0.4 + (DEEP if i % 2 == 0 else -DEEP),  tw[a] * CLOSE,        STAG if i % 2 == 0 else -STAG))),
+            ("near-pass", per(lambda i, a: (FWD * 0.4 + (-DEEP if i % 2 == 0 else DEEP),  tw[a] * CLOSE,       -STAG if i % 2 == 0 else STAG))),
+            ("clasp",     per(lambda i, a: (FWD * 0.6 + (DEEP if i % 2 == 0 else -DEEP),  tw[a] * CLOSE * 1.2,  STAG * 1.25 if i % 2 == 0 else -STAG * 1.25))),
+            ("part",      per(lambda i, a: (FWD * 0.2, -tw[a] * OUT,          UP * 0.4))),  # ease back apart
         ]
     seq += [
         ("bow",       per(lambda i, a: (FWD,        0,                 DN))),          # both dip forward-down
@@ -300,7 +309,7 @@ def run(stack: MotionStack, args) -> int:
     planning_benchmark(stack, arms, home, reps=args.reps)
 
     # Coordinated dual-arm scenes — per-arm offsets from own pose, adaptive (shrink-on-failure).
-    seq = scenes(home, arms, approach=args.sep, close=args.close)
+    seq = scenes(home, arms, approach=args.sep, close=args.close, stagger=args.stagger, depth=args.depth)
     print("\n── coordinated multi-TCP moves (plan → execute) ──")
     for loop in range(args.loops):
         if args.loops > 1:
@@ -336,11 +345,19 @@ def main() -> int:
     ap.add_argument("--sep", type=float, default=0.06,
                     help="gentle inward reach (m) for the own-side scenes — closes only part of the gap "
                          "so the bodies stay clear (default 6 cm)")
-    ap.add_argument("--close", type=float, default=0.16,
+    ap.add_argument("--close", type=float, default=0.20,
                     help="how far each arm reaches toward the other (m) in the CLOSE-ENCOUNTER scenes — "
                          "the grippers come near, staggered in height so the bodies clear; the adaptive "
                          "shrink backs off if it's too tight, so raising this only ever gets them as "
-                         "close as is collision-free (default 16 cm)")
+                         "close as is collision-free (default 20 cm)")
+    ap.add_argument("--stagger", type=float, default=0.18,
+                    help="vertical (height) offset (m) between the two grippers during the close encounter "
+                         "— a lever for getting closer: the bodies pass at different levels (default 18 cm)")
+    ap.add_argument("--depth", type=float, default=0.08,
+                    help="depth (x) offset (m) between the two arms during the close encounter — one reaches "
+                         "deep, the other shallow, so the bodies also pass at different distances; combined "
+                         "with --stagger this opens both clearance axes so the grippers converge closer in y "
+                         "(default 8 cm; raise it with --close to push nearer, the shrink stays safe)")
     ap.add_argument("--reps", type=int, default=6, help="plan repetitions for the speed benchmark")
     args = ap.parse_args()
     cell = str(Path(args.cell).resolve())
