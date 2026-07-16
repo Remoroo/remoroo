@@ -356,8 +356,10 @@ def make_mapper(extent_m, center=(0.0, 0.0, 0.0), *, robot_cfg=None, **kw) -> "C
 # The fast path is attempt-0 only; ANY miss escalates to the untouched plan_cspace/plan_pose (full
 # finetune + PRM retry). Revert instantly by setting FAST_PLAN_FINETUNE = -1 (disables the fast path).
 FAST_PLAN_SEEDS = 2          # num_trajopt_seeds baked into the build (cspace tolerates 2; pose leans on the retry)
-FAST_PLAN_ITERS = 25         # LBFGS iters for the lean attempt-0
-FAST_PLAN_FINETUNE = 0       # finetune passes on attempt-0 (0 = none). -1 = disable fast path, use the old plan_* directly.
+FAST_PLAN_ITERS = 25         # LBFGS iters for the lean attempt-0 (~350 ms). Bigger moves may need more →
+FAST_PLAN_ESCALATE_ITERS = 100  # a MEDIUM tier (more iters, still finetune=0, no PRM ~1 s) tried BEFORE the
+#                               full PRM retry — so a missed attempt-0 lands in ~1 s, not ~4 s. 0 = skip it.
+FAST_PLAN_FINETUNE = 0       # finetune passes on attempt-0/medium (0 = none). -1 = disable fast path, use the old plan_* directly.
 
 
 class CuroboV2Planner:
@@ -994,19 +996,26 @@ class CuroboV2Planner:
         except Exception:  # noqa: BLE001
             return bool(getattr(result, "success", False))
 
-    def _fast_iter_kw(self) -> dict:
-        """The lean attempt-0 knobs (finetune=0, iters=25). Empty when the fast path is disabled."""
+    def _fast_iter_kw(self, iters: int) -> dict:
+        """Lean solve knobs (finetune=0, the given iters). Empty when the fast path is disabled."""
         if FAST_PLAN_FINETUNE < 0:
             return {}
-        return {"finetune_attempts": int(FAST_PLAN_FINETUNE), "initial_iters": int(FAST_PLAN_ITERS),
-                "time_optimal_iters": int(FAST_PLAN_ITERS), "finetune_iters": int(FAST_PLAN_ITERS)}
+        return {"finetune_attempts": int(FAST_PLAN_FINETUNE), "initial_iters": int(iters),
+                "time_optimal_iters": int(iters), "finetune_iters": int(iters)}
 
-    def _fast_cspace(self, goal, start):
-        """Lean attempt-0 trajopt straight on the solver (finetune=0, iters=25) — the ~347 ms path.
-        Returns a TrajOptSolverResult or None (None → caller escalates to the full plan_cspace). ANY
-        error returns None so the fast path can never fail a plan the full retry would have solved."""
+    def _fast_tiers(self) -> List[int]:
+        """The lean iteration ladder tried before the full PRM retry: attempt-0 (25), then a medium
+        tier (100) so a missed attempt-0 lands in ~1 s instead of the ~4 s full retry."""
+        tiers = [FAST_PLAN_ITERS]
+        if FAST_PLAN_ESCALATE_ITERS and int(FAST_PLAN_ESCALATE_ITERS) > FAST_PLAN_ITERS:
+            tiers.append(int(FAST_PLAN_ESCALATE_ITERS))
+        return tiers
+
+    def _fast_cspace(self, goal, start, iters: int):
+        """Lean trajopt straight on the solver (finetune=0, `iters`). Returns a TrajOptSolverResult or
+        None. ANY error returns None so the fast path can never fail a plan the full retry would solve."""
         ts = getattr(self.planner, "trajopt_solver", None)
-        kw = self._fast_iter_kw()
+        kw = self._fast_iter_kw(iters)
         if not kw or ts is None or not hasattr(ts, "solve_cspace"):
             return None
         try:
@@ -1014,12 +1023,12 @@ class CuroboV2Planner:
         except Exception:  # noqa: BLE001 — fast-path failure just escalates (poison recovers on the retry)
             return None
 
-    def _fast_pose(self, goal, start):
-        """Lean attempt-0 for pose: IK (num_seeds) → lean trajopt.solve_pose. Mirrors the fork's
-        _plan_pose_single attempt-0 (seed repair) but with finetune=0/iters=25. None → escalate."""
+    def _fast_pose(self, goal, start, iters: int):
+        """Lean pose: IK (num_seeds) → lean trajopt.solve_pose (finetune=0, `iters`). Mirrors the fork's
+        _plan_pose_single attempt-0 (seed repair). None → escalate."""
         ts = getattr(self.planner, "trajopt_solver", None)
         ik = getattr(self.planner, "ik_solver", None)
-        kw = self._fast_iter_kw()
+        kw = self._fast_iter_kw(iters)
         if not kw or ts is None or ik is None or not hasattr(ts, "solve_pose"):
             return None
         try:
@@ -1043,8 +1052,12 @@ class CuroboV2Planner:
             goal = self._goal(goals)
             start = self._start_js(start_positions)
             with _span("plan_pose", frames=len(goals), attempts=max_attempts):
-                result = self._fast_pose(goal, start)          # lean attempt-0 (~347 ms)
-                if not self._solve_ok(result):                 # miss → escalate to the full retry
+                result = None
+                for _it in self._fast_tiers():                 # lean ladder: 25 (~350ms) → 100 (~1s)
+                    result = self._fast_pose(goal, start, _it)
+                    if self._solve_ok(result):
+                        break
+                if not self._solve_ok(result):                 # still a miss → full PRM retry
                     result = self.planner.plan_pose(goal, start, use_implicit_goal=True,
                                                     max_attempts=max_attempts)
         except Exception as e:  # a planner exception is a failure to surface, not a crash
@@ -1126,8 +1139,12 @@ class CuroboV2Planner:
                     q[0, i] = v
             goal = JointState.from_position(q, joint_names=names)
             with span("plan_cspace", attempts=max_attempts, named=len(goal_positions)):
-                result = self._fast_cspace(goal, start)        # lean attempt-0 (~347 ms)
-                if not self._solve_ok(result):                 # miss → escalate to the full retry
+                result = None
+                for _it in self._fast_tiers():                 # lean ladder: 25 (~350ms) → 100 (~1s)
+                    result = self._fast_cspace(goal, start, _it)
+                    if self._solve_ok(result):
+                        break
+                if not self._solve_ok(result):                 # still a miss → full PRM retry
                     result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
         except Exception as e:
             return PlanResult(False, None, f"plan_cspace raised: {e}{self._recover_if_capture_poisoned(e)}")
