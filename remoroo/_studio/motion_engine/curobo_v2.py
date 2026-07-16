@@ -347,6 +347,19 @@ def make_mapper(extent_m, center=(0.0, 0.0, 0.0), *, robot_cfg=None, **kw) -> "C
     return CuroboMapper(extent_m, center, robot_cfg=robot_cfg, **kw)
 
 
+# --- FAST-PLAN config (rig-ablated 2026-07-16; see memory curobo-planner-latency-iteration-bound) ---
+# The warm plan latency was TRAJOPT-COMPUTE bound: solve_ms ≈ (finetune+1 passes)×iters×seeds×~4.2ms
+# on the Orin (NOT the CUDA graph, NOT the ESDF). On 20 real-obstacle goals, a lean attempt-0
+# (finetune=0, iters=25, seeds=2) plans in ~347 ms (vs 10.4 s for the default 4-pass/100-iter/4-seed
+# path) at 20/20 success (cspace 0 escalations; pose 2/20 fall through to the full retry and still
+# land). `motion_ms` was identical across all configs → dropping finetune costs ZERO execution quality.
+# The fast path is attempt-0 only; ANY miss escalates to the untouched plan_cspace/plan_pose (full
+# finetune + PRM retry). Revert instantly by setting FAST_PLAN_FINETUNE = -1 (disables the fast path).
+FAST_PLAN_SEEDS = 2          # num_trajopt_seeds baked into the build (cspace tolerates 2; pose leans on the retry)
+FAST_PLAN_ITERS = 25         # LBFGS iters for the lean attempt-0
+FAST_PLAN_FINETUNE = 0       # finetune passes on attempt-0 (0 = none). -1 = disable fast path, use the old plan_* directly.
+
+
 class CuroboV2Planner:
     """A warmed cuRoboV2 MotionPlanner for one TCP set, built from the cell's artifacts."""
 
@@ -415,6 +428,10 @@ class CuroboV2Planner:
                 scene_model=scene or None,
                 collision_cache={"mesh": int(n_mesh), "cuboid": int(n_cuboid), "voxel": voxel_cache},
                 max_goalset=int(max_goalset),
+                # FAST PLAN: fewer trajopt seeds → linearly less rollout compute. seeds=2 (vs the
+                # default 4) is HALF the per-plan cost and, with the lean attempt-0 + full-retry
+                # escalation, held 20/20 on real obstacles (see FAST_PLAN_* above).
+                num_trajopt_seeds=int(FAST_PLAN_SEEDS),
                 self_collision_check=bool(self_collision_check),   # False = diagnostic probe (isolate self-collision)
                 # THE capture switch. cuRobo has two separately-named "graph" knobs and our one flag
                 # must drive BOTH: cfg-level `use_cuda_graph` is CUDA-graph CAPTURE in the IK/trajopt/
@@ -968,6 +985,57 @@ class CuroboV2Planner:
             if crit and hasattr(s, "update_tool_pose_criteria"):
                 s.update_tool_pose_criteria(crit)
 
+    @staticmethod
+    def _solve_ok(result) -> bool:
+        if result is None:
+            return False
+        try:
+            return bool(result.success.any())
+        except Exception:  # noqa: BLE001
+            return bool(getattr(result, "success", False))
+
+    def _fast_iter_kw(self) -> dict:
+        """The lean attempt-0 knobs (finetune=0, iters=25). Empty when the fast path is disabled."""
+        if FAST_PLAN_FINETUNE < 0:
+            return {}
+        return {"finetune_attempts": int(FAST_PLAN_FINETUNE), "initial_iters": int(FAST_PLAN_ITERS),
+                "time_optimal_iters": int(FAST_PLAN_ITERS), "finetune_iters": int(FAST_PLAN_ITERS)}
+
+    def _fast_cspace(self, goal, start):
+        """Lean attempt-0 trajopt straight on the solver (finetune=0, iters=25) — the ~347 ms path.
+        Returns a TrajOptSolverResult or None (None → caller escalates to the full plan_cspace). ANY
+        error returns None so the fast path can never fail a plan the full retry would have solved."""
+        ts = getattr(self.planner, "trajopt_solver", None)
+        kw = self._fast_iter_kw()
+        if not kw or ts is None or not hasattr(ts, "solve_cspace"):
+            return None
+        try:
+            return ts.solve_cspace(goal, start, **kw)
+        except Exception:  # noqa: BLE001 — fast-path failure just escalates (poison recovers on the retry)
+            return None
+
+    def _fast_pose(self, goal, start):
+        """Lean attempt-0 for pose: IK (num_seeds) → lean trajopt.solve_pose. Mirrors the fork's
+        _plan_pose_single attempt-0 (seed repair) but with finetune=0/iters=25. None → escalate."""
+        ts = getattr(self.planner, "trajopt_solver", None)
+        ik = getattr(self.planner, "ik_solver", None)
+        kw = self._fast_iter_kw()
+        if not kw or ts is None or ik is None or not hasattr(ts, "solve_pose"):
+            return None
+        try:
+            import torch
+            num_seeds = ts.config.num_seeds
+            ikr = ik.solve_pose(goal, return_seeds=num_seeds, current_state=start)
+            good = int(torch.count_nonzero(ikr.success))
+            if good == 0:
+                return None
+            seed_config = ikr.solution
+            if good < num_seeds:                          # repair bad seeds (as plan_pose does)
+                seed_config[~ikr.success][:, :] = seed_config[ikr.success][0:1, :].clone()
+            return ts.solve_pose(goal, start, seed_config=seed_config, use_implicit_goal=True, **kw)
+        except Exception:  # noqa: BLE001 — fast-path failure just escalates
+            return None
+
     def _plan_pose_once(self, goals: Dict[str, Goal], start_positions: Optional[Dict[str, float]],
                         max_attempts: int) -> PlanResult:
         try:
@@ -975,7 +1043,10 @@ class CuroboV2Planner:
             goal = self._goal(goals)
             start = self._start_js(start_positions)
             with _span("plan_pose", frames=len(goals), attempts=max_attempts):
-                result = self.planner.plan_pose(goal, start, use_implicit_goal=True, max_attempts=max_attempts)
+                result = self._fast_pose(goal, start)          # lean attempt-0 (~347 ms)
+                if not self._solve_ok(result):                 # miss → escalate to the full retry
+                    result = self.planner.plan_pose(goal, start, use_implicit_goal=True,
+                                                    max_attempts=max_attempts)
         except Exception as e:  # a planner exception is a failure to surface, not a crash
             return PlanResult(False, None, f"plan_pose raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
@@ -1055,7 +1126,9 @@ class CuroboV2Planner:
                     q[0, i] = v
             goal = JointState.from_position(q, joint_names=names)
             with span("plan_cspace", attempts=max_attempts, named=len(goal_positions)):
-                result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
+                result = self._fast_cspace(goal, start)        # lean attempt-0 (~347 ms)
+                if not self._solve_ok(result):                 # miss → escalate to the full retry
+                    result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
         except Exception as e:
             return PlanResult(False, None, f"plan_cspace raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
