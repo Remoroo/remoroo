@@ -321,6 +321,146 @@ def _print_phase(title: str, recs: List[dict]) -> None:
     print(f"    success={nok}/{len(recs)}   poisoned={npois}/{len(recs)}")
 
 
+# ============================== ABLATION STUDY ==================================================
+
+def _force_debug_off() -> None:
+    for modname in ("curobo.runtime", "curobo._src.runtime"):
+        try:
+            setattr(__import__(modname, fromlist=["debug"]), "debug", False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _patch_seeds(n: int):
+    """Best-effort: force num_trajopt_seeds=n in MotionPlannerCfg.create (a BUILD-time param, so it
+    must be patched around the planner build). Returns a restore() callable, or None if unpatchable."""
+    try:
+        from curobo.motion_planner import MotionPlannerCfg
+    except Exception:  # noqa: BLE001
+        return None
+    desc = MotionPlannerCfg.__dict__.get("create")
+    func = getattr(desc, "__func__", None)
+    if func is None:
+        return None
+    is_static = isinstance(desc, staticmethod)
+
+    def wrapped(*a, **kw):
+        kw.setdefault("num_trajopt_seeds", int(n))
+        return func(*a, **kw)
+
+    MotionPlannerCfg.create = staticmethod(wrapped) if is_static else classmethod(wrapped)
+    return lambda: setattr(MotionPlannerCfg, "create", desc)
+
+
+def _build_stack(cell: str, graph_on: bool, seeds: int, mode: str, delta: float,
+                 warm: bool, warmup_plans: int, max_attempts: int) -> MotionStack:
+    """Fresh stack: set graph/debug flags, (optionally) patch trajopt seeds, build+prewarm, clear the
+    world, and warm the graph in a quiet window. One build serves a whole finetune x iters grid."""
+    _set_cuda_graphs(graph_on)
+    _force_debug_off()
+    restore = _patch_seeds(seeds) if seeds and seeds > 0 else None
+    print(f"  building stack (seeds={'default' if not seeds else seeds}, graph={'on' if graph_on else 'off'})...")
+    stack = MotionStack.from_cell(cell)
+    stack.prewarm()
+    if restore is not None:
+        restore()                              # only needed during the build
+    p0 = Planner(stack, delta, mode)
+    try:
+        p0.cvp.clear_world()                   # empty world -> latency solves always run
+    except Exception as e:  # noqa: BLE001
+        print(f"  clear_world failed: {type(e).__name__}: {e}")
+    if warm:
+        for _ in range(max(2, warmup_plans)):
+            p0.plan(max_attempts)
+    return stack
+
+
+def _run_config(planner: Planner, plans: int, warmup: int, max_attempts: int) -> dict:
+    for _ in range(warmup):
+        planner.plan(max_attempts)
+    recs = [planner.plan(max_attempts) for _ in range(plans)]
+    a = _agg(recs, "solve_ms")
+    return {"solve": a.get("median"), "wall": _agg(recs, "wall_ms").get("median"),
+            "ik": _agg(recs, "ik_ms").get("median"), "ok": sum(1 for r in recs if r["success"]),
+            "n": len(recs), "poison": sum(1 for r in recs if r["poison"]),
+            "msg": next((r["msg"] for r in recs if r["msg"]), "")}
+
+
+def _fmt(v) -> str:
+    return f"{v:.0f}" if isinstance(v, (int, float)) else "-"
+
+
+def run_ablation(args) -> int:
+    cell = str(Path(args.cell).resolve())
+    fts = [int(x) for x in str(args.ablate_finetune).split(",") if x.strip()]
+    its = [int(x) for x in str(args.ablate_iters).split(",") if x.strip()]
+    seeds_list = [int(x) for x in str(args.ablate_seeds).split(",") if x.strip()] or [0]
+    show_ik = args.mode == "pose"
+    print("=" * 78)
+    print(f"ABLATION STUDY  mode={args.mode}  graph={args.graph}  world=empty  "
+          f"plans/config={args.ablate_plans}")
+    print(f"  finetune={fts}  iters={its}  seeds={seeds_list if seeds_list != [0] else 'default(4)'}")
+
+    rows: List[dict] = []
+    for seeds in seeds_list:
+        stack = _build_stack(cell, args.graph == "on", seeds, args.mode, args.delta,
+                             warm=(args.warm_cspace == "on"), warmup_plans=2,
+                             max_attempts=args.max_attempts)
+        sk = "def" if not seeds else str(seeds)
+        # baseline = the REAL plan path (finetune=3 cspace / 1 pose + retry) at default iters
+        base = _run_config(Planner(stack, args.delta, args.mode, finetune=-1),
+                           args.ablate_plans, 2, args.max_attempts)
+        base["seeds"], base["ft"], base["it"], base["speedup"] = sk, "real", "def", 1.0
+        rows.append(base)
+        print(f"  [{sk}] real path (baseline): solve={_fmt(base['solve'])}ms ok={base['ok']}/{base['n']}")
+        for ft in fts:
+            for it in its:
+                r = _run_config(Planner(stack, args.delta, args.mode, finetune=ft, iters=it),
+                                args.ablate_plans, 2, args.max_attempts)
+                r["seeds"], r["ft"], r["it"] = sk, ft, it
+                r["speedup"] = (base["solve"] / r["solve"]) if (base.get("solve") and r.get("solve")) else None
+                rows.append(r)
+                print(f"  [{sk}] ft={ft} it={it}: solve={_fmt(r['solve'])}ms "
+                      f"ok={r['ok']}/{r['n']} poison={r['poison']}")
+
+    # --- table ---
+    print("\n" + "=" * 78)
+    print(f"ABLATION RESULTS  (mode={args.mode})")
+    hdr = f"  {'seeds':>5} {'ft':>4} {'iters':>5} {'solve_ms':>9} {'wall_ms':>8}"
+    if show_ik:
+        hdr += f" {'ik_ms':>6}"
+    print(hdr + f" {'ok':>6} {'pois':>4} {'speedup':>8}")
+    for r in rows:
+        line = (f"  {r['seeds']:>5} {str(r['ft']):>4} {str(r['it']):>5} "
+                f"{_fmt(r['solve']):>9} {_fmt(r['wall']):>8}")
+        if show_ik:
+            line += f" {_fmt(r['ik']):>6}"
+        sp = f"{r['speedup']:.1f}x" if r.get("speedup") else "-"
+        print(line + f" {r['ok']}/{r['n']:<3} {r['poison']:>4} {sp:>8}")
+
+    # --- recommendation: fastest config with 100% success and no poison ---
+    ok_rows = [r for r in rows if r["ok"] == r["n"] and r["poison"] == 0 and r.get("solve")
+               and r["ft"] != "real"]
+    print("\n" + "-" * 78)
+    if ok_rows:
+        best = min(ok_rows, key=lambda r: r["solve"])
+        base_solve = next((r["solve"] for r in rows if r["ft"] == "real" and r["seeds"] == best["seeds"]), None)
+        sp = f"{base_solve / best['solve']:.1f}x" if base_solve else "?"
+        print(f"RECOMMENDATION (mode={args.mode}): finetune={best['ft']} iters={best['it']} "
+              f"seeds={best['seeds']} -> {_fmt(best['solve'])} ms  ({sp} vs real path, {best['ok']}/{best['n']} ok)")
+        print("  NOTE: empty-world floor. Re-validate the chosen config on REAL cluttered goals "
+              "(--world modeled + bridge) for success rate AND trajectory quality before integrating.")
+    else:
+        print("No config hit 100% success — widen iters/finetune or check the msg column.")
+    print("-" * 78)
+
+    if args.json:
+        import json
+        Path(args.json).write_text(json.dumps({"args": vars(args), "rows": rows}, indent=2))
+        print(f"  raw rows -> {args.json}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="cuRobo cspace plan latency / CUDA-graph-poison probe")
     ap.add_argument("--cell", default=os.environ.get("REMOROO_CELL", "remoroo_cell"))
@@ -346,7 +486,19 @@ def main() -> int:
                          "(needs --finetune >=0). Tests whether solve time scales with iterations.")
     ap.add_argument("--load-hz", type=float, default=8.0)
     ap.add_argument("--json", default="")
+    # --- ablation study (one build, sweep finetune x iters [x rebuilt seeds]) ---
+    ap.add_argument("--ablate", action="store_true",
+                    help="run the finetune x iters (x seeds) ablation and print a ranked table")
+    ap.add_argument("--ablate-finetune", default="0,1,2,3", help="comma list of finetune passes")
+    ap.add_argument("--ablate-iters", default="25,50,75,100",
+                    help="comma list of LBFGS iters/pass (multiples of inner_iters=25)")
+    ap.add_argument("--ablate-seeds", default="",
+                    help="comma list of num_trajopt_seeds to REBUILD+test (empty = default 4 only)")
+    ap.add_argument("--ablate-plans", type=int, default=5, help="timed plans per config")
     args = ap.parse_args()
+
+    if args.ablate:
+        return run_ablation(args)
 
     cell = str(Path(args.cell).resolve())
     print("=" * 78)
