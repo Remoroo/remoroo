@@ -75,13 +75,10 @@ def _set_cuda_graphs(enabled: bool) -> str:
     return "; ".join(out)
 
 
-class PerceptionLoad:
-    """Background thread that runs cuRobo's perception pipeline (segmenter + ESDF integrator, both
-    CUDA-graphed) on SYNTHETIC frames, continuously — the concurrent cuRobo-graph GPU work that the
-    boot deep-warm does while the first cspace plan captures. Reproduces the poison without a camera."""
+class _BgLoad:
+    """Base: a background thread doing GPU work concurrent with the solver, with error counting."""
 
-    def __init__(self, stack: MotionStack, hz: float = 8.0) -> None:
-        self.stack = stack
+    def __init__(self, hz: float) -> None:
         self.period = 1.0 / max(0.5, hz)
         self._stop = threading.Event()
         self._t: Optional[threading.Thread] = None
@@ -89,25 +86,14 @@ class PerceptionLoad:
         self.errors = 0
         self.last_error = ""
 
-    def _frames(self) -> List[DepthFrame]:
-        import numpy as np
-        H, W = 180, 320
-        depth = np.full((H, W), 0.8, dtype=np.float32)
-        K = np.array([[200.0, 0, W / 2.0], [0, 200.0, H / 2.0], [0, 0, 1]], dtype=np.float32)
-        pose = ([0.5, 0.0, 0.6], [0.5, -0.5, 0.5, -0.5])   # a plausible cam-in-base pose (wxyz, unit)
-        q = self.stack._seed_positions() or {}
-        return [DepthFrame(depth=depth, intrinsics=K, cam_pose_in_base=pose, q=q, name="synth")]
+    def _once(self) -> None:  # override
+        raise NotImplementedError
 
     def _run(self) -> None:
         while not self._stop.is_set():
             t0 = time.perf_counter()
             try:
-                # diagnostics=False = the fast integrate->ESDF path (still runs the perception CUDA
-                # graphs, which is the point). Fall back for an older motion_engine without the kwarg.
-                try:
-                    self.stack.update_world_live(self._frames(), diagnostics=False)
-                except TypeError:
-                    self.stack.update_world_live(self._frames())
+                self._once()
                 self.iters += 1
             except Exception as e:  # noqa: BLE001 — count, keep hammering (errors are informative)
                 self.errors += 1
@@ -117,14 +103,72 @@ class PerceptionLoad:
                 self._stop.wait(self.period - dt)
 
     def start(self) -> None:
-        self._t = threading.Thread(target=self._run, name="perception-load", daemon=True)
+        self._t = threading.Thread(target=self._run, name="bg-load", daemon=True)
         self._t.start()
-        time.sleep(0.5)   # let one integrate land so the mapper is built before timing starts
+        time.sleep(0.5)
 
     def stop(self) -> None:
         self._stop.set()
         if self._t is not None:
             self._t.join(timeout=5.0)
+
+
+class GraphLoad(_BgLoad):
+    """Concurrent CUDA-GRAPH contention from another thread — the poison mechanism, distilled: it
+    captures+replays a small torch CUDA graph and runs `torch.randn` (which touches the DEVICE-GLOBAL
+    PyTorch RNG generator whose `capturing_` flag the poison corrupts) on its own stream, continuously.
+    Reproduces "another thread does graph/RNG work while the solver captures/replays" WITHOUT touching
+    the planner's collision world — so solves stay collision-free and the timing stays clean."""
+
+    def __init__(self, hz: float = 30.0) -> None:
+        super().__init__(hz)
+        import torch  # noqa: F401 — fail fast if no CUDA torch
+        self._dev = "cuda"
+
+    def _once(self) -> None:
+        import torch
+        a = torch.randn(384, 384, device=self._dev)     # eager RNG (the poisoned resource) + matmul
+        _ = a @ a
+        g = torch.cuda.CUDAGraph()
+        s = torch.cuda.Stream(device=self._dev)
+        s.wait_stream(torch.cuda.current_stream(device=self._dev))
+        with torch.cuda.stream(s):
+            x = torch.randn(384, 384, device=self._dev)
+        # torch.cuda.graph is patched to capture_error_mode=thread_local by capture_mode.install()
+        # (same as the rig). A concurrent capture here still races the device-global generator flag.
+        with torch.cuda.graph(g):
+            _ = torch.randn(384, 384, device=self._dev) @ x
+        g.replay()
+        torch.cuda.synchronize(self._dev)
+
+
+class PerceptionLoad(_BgLoad):
+    """MOST FAITHFUL load: run cuRobo's real perception pipeline (segmenter + ESDF integrator, both
+    CUDA-graphed) on SYNTHETIC frames — the exact concurrent cuRobo-graph work the boot deep-warm does.
+    CAVEAT: update_world_live APPLIES an ESDF to the planner, so solves may then fast-fail on collision
+    — under this load, read the POISON column (a RuntimeError), not solve_ms. Pair with --world modeled."""
+
+    def __init__(self, stack: MotionStack, hz: float = 8.0) -> None:
+        super().__init__(hz)
+        self.stack = stack
+
+    def _frames(self) -> List[DepthFrame]:
+        import numpy as np
+        H, W = 180, 320
+        # Obstacles FAR from the robot (depth 2.5 m, camera 3 m out) so the ESDF this load applies
+        # doesn't make the home config born-in-collision — we want the GPU/graph contention, not a
+        # collision problem. The segmenter + ESDF graphs still run (the point), so plans keep timing.
+        depth = np.full((H, W), 2.5, dtype=np.float32)
+        K = np.array([[200.0, 0, W / 2.0], [0, 200.0, H / 2.0], [0, 0, 1]], dtype=np.float32)
+        pose = ([3.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0])     # far out, looking away from base (wxyz)
+        q = self.stack._seed_positions() or {}
+        return [DepthFrame(depth=depth, intrinsics=K, cam_pose_in_base=pose, q=q, name="synth")]
+
+    def _once(self) -> None:
+        try:
+            self.stack.update_world_live(self._frames(), diagnostics=False)
+        except TypeError:
+            self.stack.update_world_live(self._frames())
 
 
 class Planner:
@@ -217,7 +261,10 @@ def main() -> int:
     ap.add_argument("--cell", default=os.environ.get("REMOROO_CELL", "remoroo_cell"))
     ap.add_argument("--graph", choices=["on", "off"], default="on")
     ap.add_argument("--warm-cspace", choices=["on", "off"], default="on")
-    ap.add_argument("--load", choices=["none", "perception"], default="none")
+    ap.add_argument("--load", choices=["none", "graph", "perception"], default="none")
+    ap.add_argument("--world", choices=["empty", "modeled"], default="empty",
+                    help="empty (default) clears obstacles so latency solves always run "
+                         "(self-collision only); modeled keeps the cell obstacles")
     ap.add_argument("--plans", type=int, default=20)
     ap.add_argument("--warmup-plans", type=int, default=3)
     ap.add_argument("--max-attempts", type=int, default=5)
@@ -252,6 +299,16 @@ def main() -> int:
     planner = Planner(stack, delta=args.delta)
     print(f"  planner ready: dof={len(planner.names)} groups={list(stack._groups.keys())}")
 
+    # Clear the collision world so a latency solve isn't fast-failed on "start/end in collision"
+    # (self-collision stays ON). The graph-vs-eager mechanism is independent of the world, so this is
+    # a clean lower bound on solver latency; use --world modeled to keep the cell's obstacles.
+    if args.world == "empty":
+        try:
+            planner.cvp.clear_world()
+            print("  world CLEARED (empty; self-collision only) — latency solves will run")
+        except Exception as e:  # noqa: BLE001
+            print(f"  clear_world failed ({type(e).__name__}: {e}); solves may fast-fail on collision")
+
     # 3) optional CLEAN cspace warmup — capture the cspace graph while the GPU is QUIET (no load yet)
     warm_recs: List[dict] = []
     if args.warm_cspace == "on":
@@ -261,10 +318,15 @@ def main() -> int:
             warm_recs.append(planner.plan(args.max_attempts))
         _print_phase("cspace WARM (quiet)", warm_recs)
 
-    # 4) start the concurrent perception load (if requested)
-    load: Optional[PerceptionLoad] = None
-    if args.load == "perception":
-        print("\n  starting concurrent perception load (segmenter+ESDF graphs on synthetic frames)...")
+    # 4) start the concurrent GPU load (if requested)
+    load: Optional[_BgLoad] = None
+    if args.load == "graph":
+        print("\n  starting CUDA-graph contention load (torch capture+randn on another thread)...")
+        load = GraphLoad(hz=max(args.load_hz, 20.0))
+        load.start()
+    elif args.load == "perception":
+        print("\n  starting perception load (segmenter+ESDF graphs, synthetic frames — sets the "
+              "world; read the POISON column, not solve_ms)...")
         load = PerceptionLoad(stack, hz=args.load_hz)
         load.start()
 
@@ -307,12 +369,15 @@ def main() -> int:
                   "This reproduces the rig.")
         elif med < 1000:
             print("  -> graph replay WORKS here. The 10.5 s is NOT intrinsic to cuRobo/ESDF.")
-            if args.load == "perception" and args.warm_cspace == "on":
+            if args.load != "none" and args.warm_cspace == "on":
                 print("     AND a clean-warmed graph SURVIVED the concurrent load => a serial warm is "
                       "sufficient; the fix is our warmup ordering, NO cuRobo fork needed.")
         else:
             print("  -> slow but no explicit poison caught — inspect solve_ms spread + the msg column.")
-    print("  Suggested matrix: A(on/on/none) B(on/off/perception) C(on/on/perception) D(off/*/none)")
+    print("  Matrix:  A --graph on  --warm-cspace on  --load none   (clean warm -> expect hundreds of ms)")
+    print("           B --graph on  --warm-cspace off --load graph  (reproduce the poison)")
+    print("           C --graph on  --warm-cspace on  --load graph  (does load poison a clean graph?)")
+    print("           D --graph off --warm-cspace off --load none   (pure-eager floor)")
     print("-" * 78)
 
     if args.json:
