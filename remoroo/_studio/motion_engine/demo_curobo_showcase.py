@@ -168,9 +168,13 @@ def planning_benchmark(stack: MotionStack, arms: List[str], home: Dict[str, Pose
     construction), plan-only. Shows the plan-time headline + what the extra arm costs."""
     print("\n── planning-speed benchmark (plan only, no motion) ──")
     ys = _sorted_by_y(home, arms)
-    one = _apply(home, [ys[0]], {ys[0]: [0.0, 0.0, 0.08]}, 1.0)
+    # "1 arm moves": lift ys[0] +8 cm while the OTHER arm(s) hold their CURRENT pose — goaled
+    # EXPLICITLY (both tracked). We do NOT use the single-tip path (which leaves the idle arm on a
+    # zero-cost null-space hold): on this bimanual rig that path drifts the idle arm into collision and
+    # fails even a trivial lift. Goaling both is the honest "one arm moves, one holds" measurement.
+    one = {a: [home[a][0][0], home[a][0][1], home[a][0][2] + (0.08 if a == ys[0] else 0.0)] for a in arms}
     allt = _apply(home, arms, {a: [0.0, 0.0, 0.08] for a in arms}, 1.0)
-    for label, tgt in ((f"1 TCP ({ys[0]})", one), (f"{len(arms)} TCP lift", allt)):
+    for label, tgt in ((f"1 arm moves ({ys[0]})", one), (f"{len(arms)} arms lift", allt)):
         ms = []
         for _ in range(reps):
             try:
@@ -215,24 +219,50 @@ def retract_gate(stack: MotionStack, execute: bool) -> tuple:
     return ok, moved
 
 
-def scenes(home: Dict[str, Pose], arms: List[str], approach: float) -> List[tuple]:
-    """Coordinated dual-arm scenes as per-arm OFFSETS (dx,dy,dz) from each arm's own pose — small,
-    on-own-side, feasible. Mutual moves close only `approach` of the gap so the bodies stay clear."""
+def scenes(home: Dict[str, Pose], arms: List[str], approach: float, close: float) -> List[tuple]:
+    """A flowing ~20-move coordinated routine with a CLOSE-ENCOUNTER climax. Most moves keep each arm
+    on its own side; the close scenes bring the two grippers NEAR each other but STAGGERED IN HEIGHT
+    (one high, one low) so the arm bodies pass at different levels and stay collision-free — the real
+    collision-avoidance showcase. Every move is a per-arm OFFSET from home; the adaptive shrink finds
+    the closest feasible approach, so a too-tight `close` backs off gracefully and never breaks."""
     ys = _sorted_by_y(home, arms)
-    tw = _toward(home, arms)
-    out = [("lift", {a: [0.0, 0.0, 0.08] for a in arms})]        # synchronized rise (also a sanity move)
+    tw = _toward(home, arms)                          # +1 = toward centre (inward), -1 = outward, per arm
+    IN = float(approach)                              # small inward reach — stays own-side (default 6 cm)
+    CLOSE = float(close)                              # bigger inward for the close encounter (default 16 cm)
+    OUT, UP, DN, FWD, BAK = 0.10, 0.09, -0.07, 0.08, -0.06
+
+    def per(fn) -> Dict[str, XYZ]:                    # build {arm: [dx,dy,dz]} from a per-(index,arm) fn
+        return {a: [float(v) for v in fn(i, a)] for i, a in enumerate(ys)}
+
+    seq = [
+        ("wake",      per(lambda i, a: (0,          0,                 UP))),          # both rise
+        ("reach",     per(lambda i, a: (FWD,        0,                 UP * 0.5))),    # both forward
+        ("open",      per(lambda i, a: (FWD * 0.5, -tw[a] * OUT,       UP * 0.3))),    # spread to own sides
+        ("sway-L",    per(lambda i, a: (FWD * 0.5, -tw[a] * OUT,       UP if i % 2 == 0 else DN))),  # A up/B down
+        ("sway-R",    per(lambda i, a: (FWD * 0.5, -tw[a] * OUT,       DN if i % 2 == 0 else UP))),  # swap
+        ("gather",    per(lambda i, a: (FWD * 0.3,  tw[a] * IN,        UP * 0.4))),    # gentle inward (own-side)
+    ]
     if len(arms) >= 2:
-        out += [
-            ("reach-in",  {a: [0.06, tw[a] * approach, 0.04] for a in arms}),   # forward + gently toward
-            ("spread",    {a: [0.0, -tw[a] * 0.10, 0.06] for a in arms}),       # apart to own sides + up
-            ("weave",     {a: [0.0, tw[a] * (approach * 0.6),
-                               (0.08 if i % 2 == 0 else -0.05)] for i, a in enumerate(ys)}),  # interleave z
-            ("bow",       {a: [0.05, 0.0, -0.06] for a in arms}),               # both reach down-forward
+        # CLOSE ENCOUNTER — grippers come near, staggered in HEIGHT so the bodies clear. The step's
+        # adaptive shrink backs `close` off until it's collision-free, and prints the separation reached.
+        seq += [
+            ("approach",  per(lambda i, a: (FWD * 0.4,  tw[a] * CLOSE,       UP * 1.3 if i % 2 == 0 else DN * 1.3))),
+            ("near-pass", per(lambda i, a: (FWD * 0.4,  tw[a] * CLOSE,       DN * 1.3 if i % 2 == 0 else UP * 1.3))),
+            ("clasp",     per(lambda i, a: (FWD * 0.6,  tw[a] * CLOSE * 1.1, UP * 0.9 if i % 2 == 0 else DN * 0.9))),
+            ("part",      per(lambda i, a: (FWD * 0.2, -tw[a] * OUT,         UP * 0.4))),  # ease back apart
         ]
-    else:
-        out += [("reach", {a: [0.08, 0.0, 0.04] for a in arms}),
-                ("bow",   {a: [0.05, 0.0, -0.06] for a in arms})]
-    return out
+    seq += [
+        ("bow",       per(lambda i, a: (FWD,        0,                 DN))),          # both dip forward-down
+        ("rise",      per(lambda i, a: (BAK,        0,                 UP))),          # both up and back
+        ("ripple-1",  per(lambda i, a: (0,         -tw[a] * IN,        UP if i % 2 == 0 else DN * 0.3))),
+        ("ripple-2",  per(lambda i, a: (0,         -tw[a] * IN,        DN * 0.3 if i % 2 == 0 else UP))),
+        ("present",   per(lambda i, a: (FWD,       -tw[a] * IN,        UP * 0.6))),    # offer pose
+        ("tip-L",     per(lambda i, a: (FWD * 0.6, -tw[a] * OUT,       UP if i % 2 == 0 else DN * 0.5))),
+        ("tip-R",     per(lambda i, a: (FWD * 0.6, -tw[a] * OUT,       DN * 0.5 if i % 2 == 0 else UP))),
+        ("float",     per(lambda i, a: (0,          0,                 UP))),          # both hover high
+        ("settle",    per(lambda i, a: (0,          0,                 DN * 0.3))),    # ease back toward home
+    ]
+    return seq
 
 
 # --- orchestration -----------------------------------------------------------------------------
@@ -270,7 +300,7 @@ def run(stack: MotionStack, args) -> int:
     planning_benchmark(stack, arms, home, reps=args.reps)
 
     # Coordinated dual-arm scenes — per-arm offsets from own pose, adaptive (shrink-on-failure).
-    seq = scenes(home, arms, approach=args.sep)
+    seq = scenes(home, arms, approach=args.sep, close=args.close)
     print("\n── coordinated multi-TCP moves (plan → execute) ──")
     for loop in range(args.loops):
         if args.loops > 1:
@@ -304,9 +334,13 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="plan + time only, never move (overrides --execute)")
     ap.add_argument("--loops", type=int, default=1, help="how many times through the scene set")
     ap.add_argument("--sep", type=float, default=0.06,
-                    help="how far each arm reaches TOWARD the other (m) in the coordinated scenes — the "
-                         "mutual approach closes only part of the gap so the arm bodies stay clear "
-                         "(default 6 cm; raise for a wider dance, lower for a closer one)")
+                    help="gentle inward reach (m) for the own-side scenes — closes only part of the gap "
+                         "so the bodies stay clear (default 6 cm)")
+    ap.add_argument("--close", type=float, default=0.16,
+                    help="how far each arm reaches toward the other (m) in the CLOSE-ENCOUNTER scenes — "
+                         "the grippers come near, staggered in height so the bodies clear; the adaptive "
+                         "shrink backs off if it's too tight, so raising this only ever gets them as "
+                         "close as is collision-free (default 16 cm)")
     ap.add_argument("--reps", type=int, default=6, help="plan repetitions for the speed benchmark")
     args = ap.parse_args()
     cell = str(Path(args.cell).resolve())
