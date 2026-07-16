@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import statistics
 import sys
 import threading
@@ -172,12 +173,14 @@ class PerceptionLoad(_BgLoad):
 
 
 class Planner:
-    """Issue a real cuRobo plan and read its `solve_time` — the exact call the atoms make. mode='cspace'
-    = `plan_cspace` (joint goal; what `goto_joints` does — the 6.5 s we measured). mode='pose' =
-    `plan_pose` (Cartesian goal; what `move_to_pose`/reach/descend do — adds IK on top of trajopt)."""
+    """Issue real cuRobo plans and read `solve_time` + trajectory quality. mode='cspace' = `plan_cspace`
+    (joint goal; what `goto_joints` does). mode='pose' = `plan_pose` (Cartesian goal + IK; what
+    `move_to_pose`/reach/descend do). n_goals>1 builds DIVERSE random goals so success is a real RATE
+    over varied targets, not one trivial move repeated; motion_ms = the interpolated trajectory's
+    execution time (finetune's quality payoff — fewer passes -> slower/rougher execution)."""
 
     def __init__(self, stack: MotionStack, delta: float, mode: str = "cspace",
-                 finetune: int = -1, iters: int = 0) -> None:
+                 finetune: int = -1, iters: int = 0, n_goals: int = 1, seed: int = 0) -> None:
         self.stack = stack
         self.mode = mode
         groups = list(getattr(stack, "_groups", {}).keys())
@@ -185,42 +188,55 @@ class Planner:
         self.mp = self.cvp.planner                       # raw cuRobo MotionPlanner
         self.names = list(self.mp.joint_names)
         self.delta = float(delta)
-        # finetune >= 0 routes through the trajopt solver directly (bypassing the plan wrapper's
-        # hardcoded finetune + retry loop) so we can attribute solve time to passes vs iters. iters>0
-        # overrides the per-pass LBFGS iteration count (default 100). finetune=-1 = the real plan path.
         self.finetune = int(finetune)
         self.iters = int(iters)
-        self._build_goal()
+        self.n_goals = max(1, int(n_goals))
+        self._rng = random.Random(seed)
+        try:
+            self._interp_dt = float(self.mp.trajopt_solver.config.interpolation_dt)
+        except Exception:  # noqa: BLE001
+            self._interp_dt = 0.025
+        self._build_goals()
 
-    def _build_goal(self) -> None:
+    def _cspace_goal(self, randomize: bool):
         from curobo.types import JointState
+        q0 = self._start.position.detach().clone()
+        lims = self.cvp.joint_limits() if hasattr(self.cvp, "joint_limits") else {}
+        q1 = q0.clone()
+        for i, n in enumerate(self.names):
+            step = (self._rng.uniform(-self.delta, self.delta) if randomize
+                    else (self.delta if i % 3 == 1 else (-self.delta if i % 3 == 2 else 0.0)))
+            lo, hi = lims.get(n, (-3.1, 3.1))
+            q1[0, i] = min(max(float(q0[0, i]) + step, lo + 1e-3), hi - 1e-3)
+        return JointState.from_position(q1, joint_names=self.names)
+
+    def _pose_goal(self, randomize: bool, seed: dict):
+        # FK every tool frame at home, then offset. randomize = a small random xyz box (diverse
+        # reachable targets); else a fixed z-lift (deterministic single goal).
+        goals = {}
+        for tf in self.cvp._tool_frames:
+            fk = self.cvp.link_pose(tf, seed)
+            if fk is None:
+                continue
+            xyz, wxyz = [float(v) for v in fk[0]], [float(v) for v in fk[1]]
+            if randomize:
+                for k in range(3):
+                    xyz[k] += self._rng.uniform(-self.delta, self.delta)
+            else:
+                xyz[2] += self.delta
+            goals[tf] = (xyz, wxyz)
+        if not goals:
+            raise RuntimeError("no tool-frame FK available to build a pose goal")
+        return self.cvp._goal(goals)
+
+    def _build_goals(self) -> None:
         seed = self.stack._seed_positions() or {}
         self._start = self.cvp._start_js(seed)           # (1, n) JointState
+        rnd = self.n_goals > 1
         if self.mode == "cspace":
-            q0 = self._start.position.detach().clone()
-            lims = self.cvp.joint_limits() if hasattr(self.cvp, "joint_limits") else {}
-            q1 = q0.clone()
-            # Perturb a couple of mid-chain joints by +/-delta (rad), clamped — a modest, feasible move.
-            for i, n in enumerate(self.names):
-                step = self.delta if (i % 3 == 1) else (-self.delta if (i % 3 == 2) else 0.0)
-                lo, hi = lims.get(n, (-3.1, 3.1))
-                q1[0, i] = min(max(float(q0[0, i]) + step, lo + 1e-3), hi - 1e-3)
-            self._goal = JointState.from_position(q1, joint_names=self.names)
+            self._goals = [self._cspace_goal(rnd) for _ in range(self.n_goals)]
         else:
-            # Cartesian goal = FK every tool frame at home, then LIFT z by delta (m) — a modest,
-            # almost-always-reachable move. All tool frames goaled (cuRobo V2 needs each one).
-            goals = {}
-            for tf in self.cvp._tool_frames:
-                fk = self.cvp.link_pose(tf, seed)
-                if fk is None:
-                    continue
-                xyz, wxyz = [float(v) for v in fk[0]], [float(v) for v in fk[1]]
-                xyz[2] += self.delta
-                goals[tf] = (xyz, wxyz)
-            if not goals:
-                raise RuntimeError("no tool-frame FK available to build a pose goal")
-            self._goal = self.cvp._goal(goals)           # GoalToolPose
-            self._tool_goals = goals
+            self._goals = [self._pose_goal(rnd, seed) for _ in range(self.n_goals)]
 
     def _iter_kw(self) -> dict:
         kw = {"finetune_attempts": max(0, self.finetune)}
@@ -228,16 +244,15 @@ class Planner:
             kw.update(initial_iters=self.iters, time_optimal_iters=self.iters, finetune_iters=self.iters)
         return kw
 
-    def _solve_direct_cspace(self):
-        return self.mp.trajopt_solver.solve_cspace(self._goal, self._start, **self._iter_kw())
+    def _solve_direct_cspace(self, goal):
+        return self.mp.trajopt_solver.solve_cspace(goal, self._start, **self._iter_kw())
 
-    def _solve_direct_pose(self, rec: dict):
-        """IK (num_seeds) -> trajopt.solve_pose, timing IK and trajopt SEPARATELY so 'reach' latency
-        splits into its IK vs trajopt halves."""
+    def _solve_direct_pose(self, goal, rec: dict):
+        """IK (num_seeds) -> trajopt.solve_pose, timing IK and trajopt SEPARATELY."""
         import torch
         num_seeds = self.mp.trajopt_solver.config.num_seeds
         t_ik = time.perf_counter()
-        ik = self.mp.ik_solver.solve_pose(self._goal, return_seeds=num_seeds, current_state=self._start)
+        ik = self.mp.ik_solver.solve_pose(goal, return_seeds=num_seeds, current_state=self._start)
         torch.cuda.synchronize()
         rec["ik_ms"] = (time.perf_counter() - t_ik) * 1e3
         seed_config = ik.solution
@@ -248,19 +263,30 @@ class Planner:
         if good < num_seeds:                              # repair bad seeds (as plan_pose does)
             seed_config[~ik.success][:, :] = seed_config[ik.success][0:1, :].clone()
         return self.mp.trajopt_solver.solve_pose(
-            self._goal, self._start, seed_config=seed_config, use_implicit_goal=True, **self._iter_kw())
+            goal, self._start, seed_config=seed_config, use_implicit_goal=True, **self._iter_kw())
 
-    def plan(self, max_attempts: int) -> dict:
+    def _motion_ms(self, res):
+        """Execution duration of the interpolated trajectory (n_points x interpolation_dt) — the
+        quality signal for finetune (time-optimal retiming makes this SHORTER)."""
+        try:
+            ip = res.get_interpolated_plan()
+            npts = int(ip.position.shape[-2])
+            return npts * self._interp_dt * 1e3
+        except Exception:  # noqa: BLE001
+            return None
+
+    def plan(self, max_attempts: int, gi: int = 0) -> dict:
+        goal = self._goals[gi % len(self._goals)]
         t0 = time.perf_counter()
         rec = {"wall_ms": None, "solve_ms": None, "total_ms": None, "ik_ms": None,
-               "success": False, "poison": False, "msg": ""}
+               "motion_ms": None, "success": False, "poison": False, "msg": ""}
         try:
             if self.mode == "cspace":
-                res = (self._solve_direct_cspace() if self.finetune >= 0
-                       else self.mp.plan_cspace(self._goal, self._start, max_attempts=max_attempts))
+                res = (self._solve_direct_cspace(goal) if self.finetune >= 0
+                       else self.mp.plan_cspace(goal, self._start, max_attempts=max_attempts))
             else:
-                res = (self._solve_direct_pose(rec) if self.finetune >= 0
-                       else self.mp.plan_pose(self._goal, self._start,
+                res = (self._solve_direct_pose(goal, rec) if self.finetune >= 0
+                       else self.mp.plan_pose(goal, self._start,
                                               use_implicit_goal=True, max_attempts=max_attempts))
             rec["wall_ms"] = (time.perf_counter() - t0) * 1e3
             if res is not None:
@@ -272,6 +298,8 @@ class Planner:
                     rec["success"] = bool(res.success.any())
                 except Exception:  # noqa: BLE001
                     rec["success"] = bool(getattr(res, "success", False))
+                if rec["success"]:
+                    rec["motion_ms"] = self._motion_ms(res)
         except Exception as e:  # noqa: BLE001
             rec["wall_ms"] = (time.perf_counter() - t0) * 1e3
             rec["msg"] = f"{type(e).__name__}: {e}"
@@ -311,6 +339,9 @@ def _print_phase(title: str, recs: List[dict]) -> None:
         aik = _agg(recs, "ik_ms")
         if aik.get("n"):
             print(f"    ik_ms     median={aik['median']:.0f}  p95={aik['p95']:.0f}")
+    amo = _agg(recs, "motion_ms")
+    if amo.get("n"):
+        print(f"    motion_ms median={amo['median']:.0f}  (trajectory execution time)")
     npois = sum(1 for r in recs if r["poison"])
     nok = sum(1 for r in recs if r["success"])
     if a.get("n"):
@@ -353,36 +384,54 @@ def _patch_seeds(n: int):
 
 
 def _build_stack(cell: str, graph_on: bool, seeds: int, mode: str, delta: float,
-                 warm: bool, warmup_plans: int, max_attempts: int) -> MotionStack:
-    """Fresh stack: set graph/debug flags, (optionally) patch trajopt seeds, build+prewarm, clear the
-    world, and warm the graph in a quiet window. One build serves a whole finetune x iters grid."""
+                 warm: bool, warmup_plans: int, max_attempts: int,
+                 use_bridge: bool = False, world: str = "empty") -> MotionStack:
+    """Fresh stack: set graph/debug flags, (optionally) patch trajopt seeds + connect the bridge,
+    build+prewarm, set the world (empty=clear for a latency floor / modeled=keep the cell obstacles
+    for a REAL success test), and warm. One build serves a whole finetune x iters grid."""
     _set_cuda_graphs(graph_on)
     _force_debug_off()
     restore = _patch_seeds(seeds) if seeds and seeds > 0 else None
-    print(f"  building stack (seeds={'default' if not seeds else seeds}, graph={'on' if graph_on else 'off'})...")
-    stack = MotionStack.from_cell(cell)
+    bridge = None
+    if use_bridge:
+        try:
+            from remoroo_cell.primitives import Bridge  # type: ignore
+            bridge = Bridge.from_cell_yaml(str(Path(cell) / "cell.yaml"))
+            bridge.connect()
+            print("  bridge CONNECTED — real robot config seeds the start")
+        except Exception as e:  # noqa: BLE001
+            print(f"  bridge connect FAILED ({type(e).__name__}: {e}); using planner default start")
+            bridge = None
+    print(f"  building stack (seeds={'default' if not seeds else seeds}, "
+          f"graph={'on' if graph_on else 'off'}, world={world}, bridge={'yes' if bridge else 'no'})...")
+    stack = MotionStack.from_cell(cell, bridge=bridge) if bridge is not None else MotionStack.from_cell(cell)
     stack.prewarm()
     if restore is not None:
         restore()                              # only needed during the build
     p0 = Planner(stack, delta, mode)
-    try:
-        p0.cvp.clear_world()                   # empty world -> latency solves always run
-    except Exception as e:  # noqa: BLE001
-        print(f"  clear_world failed: {type(e).__name__}: {e}")
+    if world == "empty":
+        try:
+            p0.cvp.clear_world()               # empty world -> latency solves always run
+            print("  world CLEARED (empty; self-collision only)")
+        except Exception as e:  # noqa: BLE001
+            print(f"  clear_world failed: {type(e).__name__}: {e}")
+    else:
+        print("  world = MODELED (cell obstacles kept — this is a real success/quality test)")
     if warm:
-        for _ in range(max(2, warmup_plans)):
-            p0.plan(max_attempts)
+        for i in range(max(2, warmup_plans)):
+            p0.plan(max_attempts, i)
     return stack
 
 
 def _run_config(planner: Planner, plans: int, warmup: int, max_attempts: int) -> dict:
-    for _ in range(warmup):
-        planner.plan(max_attempts)
-    recs = [planner.plan(max_attempts) for _ in range(plans)]
-    a = _agg(recs, "solve_ms")
-    return {"solve": a.get("median"), "wall": _agg(recs, "wall_ms").get("median"),
-            "ik": _agg(recs, "ik_ms").get("median"), "ok": sum(1 for r in recs if r["success"]),
-            "n": len(recs), "poison": sum(1 for r in recs if r["poison"]),
+    ng = planner.n_goals
+    for i in range(warmup):
+        planner.plan(max_attempts, i % ng)
+    recs = [planner.plan(max_attempts, i % ng) for i in range(plans)]
+    return {"solve": _agg(recs, "solve_ms").get("median"), "wall": _agg(recs, "wall_ms").get("median"),
+            "ik": _agg(recs, "ik_ms").get("median"), "motion": _agg(recs, "motion_ms").get("median"),
+            "ok": sum(1 for r in recs if r["success"]), "n": len(recs),
+            "poison": sum(1 for r in recs if r["poison"]),
             "msg": next((r["msg"] for r in recs if r["msg"]), "")}
 
 
@@ -396,62 +445,76 @@ def run_ablation(args) -> int:
     its = [int(x) for x in str(args.ablate_iters).split(",") if x.strip()]
     seeds_list = [int(x) for x in str(args.ablate_seeds).split(",") if x.strip()] or [0]
     show_ik = args.mode == "pose"
+    ng = max(1, int(args.goals))
+    pcfg = ng if ng > 1 else args.ablate_plans          # 1 plan per distinct goal, else repeat one goal
     print("=" * 78)
-    print(f"ABLATION STUDY  mode={args.mode}  graph={args.graph}  world=empty  "
-          f"plans/config={args.ablate_plans}")
+    print(f"ABLATION STUDY  mode={args.mode}  graph={args.graph}  world={args.world}  "
+          f"goals={ng}  plans/config={pcfg}  bridge={'yes' if args.bridge else 'no'}")
     print(f"  finetune={fts}  iters={its}  seeds={seeds_list if seeds_list != [0] else 'default(4)'}")
+
+    def _mk(stack, ft, it):
+        return Planner(stack, args.delta, args.mode, finetune=ft, iters=it, n_goals=ng, seed=1234)
 
     rows: List[dict] = []
     for seeds in seeds_list:
         stack = _build_stack(cell, args.graph == "on", seeds, args.mode, args.delta,
                              warm=(args.warm_cspace == "on"), warmup_plans=2,
-                             max_attempts=args.max_attempts)
+                             max_attempts=args.max_attempts, use_bridge=args.bridge, world=args.world)
         sk = "def" if not seeds else str(seeds)
         # baseline = the REAL plan path (finetune=3 cspace / 1 pose + retry) at default iters
-        base = _run_config(Planner(stack, args.delta, args.mode, finetune=-1),
-                           args.ablate_plans, 2, args.max_attempts)
+        base = _run_config(_mk(stack, -1, 0), pcfg, 2, args.max_attempts)
         base["seeds"], base["ft"], base["it"], base["speedup"] = sk, "real", "def", 1.0
         rows.append(base)
-        print(f"  [{sk}] real path (baseline): solve={_fmt(base['solve'])}ms ok={base['ok']}/{base['n']}")
+        print(f"  [{sk}] real path (baseline): solve={_fmt(base['solve'])}ms "
+              f"motion={_fmt(base['motion'])}ms ok={base['ok']}/{base['n']}")
         for ft in fts:
             for it in its:
-                r = _run_config(Planner(stack, args.delta, args.mode, finetune=ft, iters=it),
-                                args.ablate_plans, 2, args.max_attempts)
+                r = _run_config(_mk(stack, ft, it), pcfg, 2, args.max_attempts)
                 r["seeds"], r["ft"], r["it"] = sk, ft, it
                 r["speedup"] = (base["solve"] / r["solve"]) if (base.get("solve") and r.get("solve")) else None
                 rows.append(r)
                 print(f"  [{sk}] ft={ft} it={it}: solve={_fmt(r['solve'])}ms "
-                      f"ok={r['ok']}/{r['n']} poison={r['poison']}")
+                      f"motion={_fmt(r['motion'])}ms ok={r['ok']}/{r['n']} poison={r['poison']}")
 
     # --- table ---
     print("\n" + "=" * 78)
-    print(f"ABLATION RESULTS  (mode={args.mode})")
-    hdr = f"  {'seeds':>5} {'ft':>4} {'iters':>5} {'solve_ms':>9} {'wall_ms':>8}"
+    print(f"ABLATION RESULTS  (mode={args.mode}, world={args.world}, goals={ng})")
+    hdr = f"  {'seeds':>5} {'ft':>4} {'iters':>5} {'solve_ms':>9} {'motion_ms':>9} {'wall_ms':>8}"
     if show_ik:
         hdr += f" {'ik_ms':>6}"
     print(hdr + f" {'ok':>6} {'pois':>4} {'speedup':>8}")
     for r in rows:
         line = (f"  {r['seeds']:>5} {str(r['ft']):>4} {str(r['it']):>5} "
-                f"{_fmt(r['solve']):>9} {_fmt(r['wall']):>8}")
+                f"{_fmt(r['solve']):>9} {_fmt(r.get('motion')):>9} {_fmt(r['wall']):>8}")
         if show_ik:
             line += f" {_fmt(r['ik']):>6}"
         sp = f"{r['speedup']:.1f}x" if r.get("speedup") else "-"
         print(line + f" {r['ok']}/{r['n']:<3} {r['poison']:>4} {sp:>8}")
 
-    # --- recommendation: fastest config with 100% success and no poison ---
-    ok_rows = [r for r in rows if r["ok"] == r["n"] and r["poison"] == 0 and r.get("solve")
-               and r["ft"] != "real"]
+    # --- recommendation: fastest config that keeps 100% success, no poison, and ~baseline motion time
+    #     (motion within 1.5x of the real path's — so we don't trade a 15x planning win for a robot
+    #     that then crawls through the move because finetune's time-optimal retiming was dropped). ---
     print("\n" + "-" * 78)
-    if ok_rows:
-        best = min(ok_rows, key=lambda r: r["solve"])
-        base_solve = next((r["solve"] for r in rows if r["ft"] == "real" and r["seeds"] == best["seeds"]), None)
-        sp = f"{base_solve / best['solve']:.1f}x" if base_solve else "?"
-        print(f"RECOMMENDATION (mode={args.mode}): finetune={best['ft']} iters={best['it']} "
-              f"seeds={best['seeds']} -> {_fmt(best['solve'])} ms  ({sp} vs real path, {best['ok']}/{best['n']} ok)")
-        print("  NOTE: empty-world floor. Re-validate the chosen config on REAL cluttered goals "
-              "(--world modeled + bridge) for success rate AND trajectory quality before integrating.")
-    else:
-        print("No config hit 100% success — widen iters/finetune or check the msg column.")
+    for seeds in seeds_list:
+        sk = "def" if not seeds else str(seeds)
+        base = next((r for r in rows if r["ft"] == "real" and r["seeds"] == sk), None)
+        cand = [r for r in rows if r["seeds"] == sk and r["ft"] != "real"
+                and r["ok"] == r["n"] and r["poison"] == 0 and r.get("solve")]
+        if not base or not cand:
+            print(f"[seeds={sk}] no fully-succeeding config — widen the grid or check the msg column.")
+            continue
+        bm = base.get("motion")
+        quality = [r for r in cand if not (bm and r.get("motion")) or r["motion"] <= 1.5 * bm]
+        best = min(quality or cand, key=lambda r: r["solve"])
+        sp = f"{base['solve'] / best['solve']:.1f}x" if base.get("solve") and best.get("solve") else "?"
+        mnote = ""
+        if bm and best.get("motion"):
+            mnote = f", motion {_fmt(best['motion'])}ms vs {_fmt(bm)}ms baseline ({best['motion']/bm:.2f}x)"
+        print(f"RECOMMENDATION [seeds={sk}, mode={args.mode}]: finetune={best['ft']} iters={best['it']} "
+              f"-> {_fmt(best['solve'])} ms ({sp} vs real{mnote}), {best['ok']}/{best['n']} ok")
+    if args.world == "empty":
+        print("  NOTE: empty world + benchmark goals. Re-run with --world modeled --bridge --goals 30 "
+              "for the REAL success rate + trajectory quality that picks the final config.")
     print("-" * 78)
 
     if args.json:
@@ -495,6 +558,12 @@ def main() -> int:
     ap.add_argument("--ablate-seeds", default="",
                     help="comma list of num_trajopt_seeds to REBUILD+test (empty = default 4 only)")
     ap.add_argument("--ablate-plans", type=int, default=5, help="timed plans per config")
+    ap.add_argument("--goals", type=int, default=1,
+                    help=">1 tests that many DIVERSE random goals (real success RATE + motion time), "
+                         "1 = one fixed goal repeated (pure latency)")
+    ap.add_argument("--bridge", action="store_true",
+                    help="connect the cell Bridge so the REAL robot config seeds the start "
+                         "(needed with --world modeled so the start isn't born-in-collision)")
     args = ap.parse_args()
 
     if args.ablate:
