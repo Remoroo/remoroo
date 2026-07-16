@@ -172,42 +172,96 @@ class PerceptionLoad(_BgLoad):
 
 
 class Planner:
-    """Thin wrapper over the stack's cuRobo MotionPlanner to issue a real `plan_cspace` and read its
-    `solve_time` / `total_time` — the exact call `goto_joints` makes."""
+    """Issue a real cuRobo plan and read its `solve_time` — the exact call the atoms make. mode='cspace'
+    = `plan_cspace` (joint goal; what `goto_joints` does — the 6.5 s we measured). mode='pose' =
+    `plan_pose` (Cartesian goal; what `move_to_pose`/reach/descend do — adds IK on top of trajopt)."""
 
-    def __init__(self, stack: MotionStack, delta: float) -> None:
+    def __init__(self, stack: MotionStack, delta: float, mode: str = "cspace",
+                 finetune: int = -1, iters: int = 0) -> None:
         self.stack = stack
+        self.mode = mode
         groups = list(getattr(stack, "_groups", {}).keys())
         self.cvp = stack._planner_for(groups)          # CuroboV2Planner
         self.mp = self.cvp.planner                       # raw cuRobo MotionPlanner
         self.names = list(self.mp.joint_names)
         self.delta = float(delta)
-        self._js = None
+        # finetune >= 0 routes through the trajopt solver directly (bypassing the plan wrapper's
+        # hardcoded finetune + retry loop) so we can attribute solve time to passes vs iters. iters>0
+        # overrides the per-pass LBFGS iteration count (default 100). finetune=-1 = the real plan path.
+        self.finetune = int(finetune)
+        self.iters = int(iters)
         self._build_goal()
 
     def _build_goal(self) -> None:
-        import torch  # noqa: F401
         from curobo.types import JointState
         seed = self.stack._seed_positions() or {}
-        start = self.cvp._start_js(seed)                 # (1, n) JointState
-        q0 = start.position.detach().clone()
-        lims = self.cvp.joint_limits() if hasattr(self.cvp, "joint_limits") else {}
-        q1 = q0.clone()
-        # Perturb a couple of mid-chain joints by +/-delta, clamped inside limits — a real but modest,
-        # almost-always-feasible move. Alternating sign keeps it small and collision-unlikely.
-        for i, n in enumerate(self.names):
-            step = self.delta if (i % 3 == 1) else (-self.delta if (i % 3 == 2) else 0.0)
-            lo, hi = lims.get(n, (-3.1, 3.1))
-            q1[0, i] = min(max(float(q0[0, i]) + step, lo + 1e-3), hi - 1e-3)
-        self._start = start
-        self._goal = JointState.from_position(q1, joint_names=self.names)
+        self._start = self.cvp._start_js(seed)           # (1, n) JointState
+        if self.mode == "cspace":
+            q0 = self._start.position.detach().clone()
+            lims = self.cvp.joint_limits() if hasattr(self.cvp, "joint_limits") else {}
+            q1 = q0.clone()
+            # Perturb a couple of mid-chain joints by +/-delta (rad), clamped — a modest, feasible move.
+            for i, n in enumerate(self.names):
+                step = self.delta if (i % 3 == 1) else (-self.delta if (i % 3 == 2) else 0.0)
+                lo, hi = lims.get(n, (-3.1, 3.1))
+                q1[0, i] = min(max(float(q0[0, i]) + step, lo + 1e-3), hi - 1e-3)
+            self._goal = JointState.from_position(q1, joint_names=self.names)
+        else:
+            # Cartesian goal = FK every tool frame at home, then LIFT z by delta (m) — a modest,
+            # almost-always-reachable move. All tool frames goaled (cuRobo V2 needs each one).
+            goals = {}
+            for tf in self.cvp._tool_frames:
+                fk = self.cvp.link_pose(tf, seed)
+                if fk is None:
+                    continue
+                xyz, wxyz = [float(v) for v in fk[0]], [float(v) for v in fk[1]]
+                xyz[2] += self.delta
+                goals[tf] = (xyz, wxyz)
+            if not goals:
+                raise RuntimeError("no tool-frame FK available to build a pose goal")
+            self._goal = self.cvp._goal(goals)           # GoalToolPose
+            self._tool_goals = goals
+
+    def _iter_kw(self) -> dict:
+        kw = {"finetune_attempts": max(0, self.finetune)}
+        if self.iters > 0:
+            kw.update(initial_iters=self.iters, time_optimal_iters=self.iters, finetune_iters=self.iters)
+        return kw
+
+    def _solve_direct_cspace(self):
+        return self.mp.trajopt_solver.solve_cspace(self._goal, self._start, **self._iter_kw())
+
+    def _solve_direct_pose(self, rec: dict):
+        """IK (num_seeds) -> trajopt.solve_pose, timing IK and trajopt SEPARATELY so 'reach' latency
+        splits into its IK vs trajopt halves."""
+        import torch
+        num_seeds = self.mp.trajopt_solver.config.num_seeds
+        t_ik = time.perf_counter()
+        ik = self.mp.ik_solver.solve_pose(self._goal, return_seeds=num_seeds, current_state=self._start)
+        torch.cuda.synchronize()
+        rec["ik_ms"] = (time.perf_counter() - t_ik) * 1e3
+        seed_config = ik.solution
+        good = int(torch.count_nonzero(ik.success))
+        if good == 0:
+            rec["msg"] = "IK found no solution"
+            return None
+        if good < num_seeds:                              # repair bad seeds (as plan_pose does)
+            seed_config[~ik.success][:, :] = seed_config[ik.success][0:1, :].clone()
+        return self.mp.trajopt_solver.solve_pose(
+            self._goal, self._start, seed_config=seed_config, use_implicit_goal=True, **self._iter_kw())
 
     def plan(self, max_attempts: int) -> dict:
         t0 = time.perf_counter()
-        rec = {"wall_ms": None, "solve_ms": None, "total_ms": None,
+        rec = {"wall_ms": None, "solve_ms": None, "total_ms": None, "ik_ms": None,
                "success": False, "poison": False, "msg": ""}
         try:
-            res = self.mp.plan_cspace(self._goal, self._start, max_attempts=max_attempts)
+            if self.mode == "cspace":
+                res = (self._solve_direct_cspace() if self.finetune >= 0
+                       else self.mp.plan_cspace(self._goal, self._start, max_attempts=max_attempts))
+            else:
+                res = (self._solve_direct_pose(rec) if self.finetune >= 0
+                       else self.mp.plan_pose(self._goal, self._start,
+                                              use_implicit_goal=True, max_attempts=max_attempts))
             rec["wall_ms"] = (time.perf_counter() - t0) * 1e3
             if res is not None:
                 st = getattr(res, "solve_time", None)
@@ -236,16 +290,27 @@ def _agg(recs: List[dict], key: str) -> dict:
 
 
 def _print_phase(title: str, recs: List[dict]) -> None:
+    show_ik = any(r.get("ik_ms") is not None for r in recs)
     print(f"\n  [{title}]  ({len(recs)} plans)")
-    print(f"    {'#':>3} {'wall_ms':>9} {'solve_ms':>9} {'total_ms':>9} {'ok':>3} {'poison':>7}  msg")
+    hdr = f"    {'#':>3} {'wall_ms':>9} {'solve_ms':>9} {'total_ms':>9}"
+    if show_ik:
+        hdr += f" {'ik_ms':>8}"
+    print(hdr + f" {'ok':>3} {'poison':>7}  msg")
     for i, r in enumerate(recs):
         w = f"{r['wall_ms']:.0f}" if r['wall_ms'] is not None else "-"
         s = f"{r['solve_ms']:.0f}" if r['solve_ms'] is not None else "-"
         t = f"{r['total_ms']:.0f}" if r['total_ms'] is not None else "-"
-        print(f"    {i:>3} {w:>9} {s:>9} {t:>9} {str(r['success']):>3} "
-              f"{str(r['poison']):>7}  {r['msg'][:70]}")
+        line = f"    {i:>3} {w:>9} {s:>9} {t:>9}"
+        if show_ik:
+            ik = f"{r['ik_ms']:.0f}" if r.get("ik_ms") is not None else "-"
+            line += f" {ik:>8}"
+        print(line + f" {str(r['success']):>3} {str(r['poison']):>7}  {r['msg'][:70]}")
     a = _agg(recs, "solve_ms")
     aw = _agg(recs, "wall_ms")
+    if show_ik:
+        aik = _agg(recs, "ik_ms")
+        if aik.get("n"):
+            print(f"    ik_ms     median={aik['median']:.0f}  p95={aik['p95']:.0f}")
     npois = sum(1 for r in recs if r["poison"])
     nok = sum(1 for r in recs if r["success"])
     if a.get("n"):
@@ -259,6 +324,9 @@ def _print_phase(title: str, recs: List[dict]) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="cuRobo cspace plan latency / CUDA-graph-poison probe")
     ap.add_argument("--cell", default=os.environ.get("REMOROO_CELL", "remoroo_cell"))
+    ap.add_argument("--mode", choices=["cspace", "pose"], default="cspace",
+                    help="cspace = plan_cspace (joint goal, what goto_joints does); "
+                         "pose = plan_pose (Cartesian goal + IK, what move_to_pose/reach/descend do)")
     ap.add_argument("--graph", choices=["on", "off"], default="on")
     ap.add_argument("--warm-cspace", choices=["on", "off"], default="on")
     ap.add_argument("--load", choices=["none", "graph", "perception"], default="none")
@@ -269,6 +337,13 @@ def main() -> int:
     ap.add_argument("--warmup-plans", type=int, default=3)
     ap.add_argument("--max-attempts", type=int, default=5)
     ap.add_argument("--delta", type=float, default=0.15)
+    ap.add_argument("--finetune", type=int, default=-1,
+                    help="-1 (default) = real plan_cspace path (finetune=3 + retry). >=0 calls "
+                         "trajopt_solver.solve_cspace directly with this many finetune passes "
+                         "(0 = a single optimize pass) — attributes the 6.5 s to passes.")
+    ap.add_argument("--iters", type=int, default=0,
+                    help="0 = default LBFGS iters (100). >0 overrides per-pass iteration count "
+                         "(needs --finetune >=0). Tests whether solve time scales with iterations.")
     ap.add_argument("--load-hz", type=float, default=8.0)
     ap.add_argument("--json", default="")
     args = ap.parse_args()
@@ -280,8 +355,20 @@ def main() -> int:
     print(f"  graph={args.graph}  warm_cspace={args.warm_cspace}  load={args.load}  "
           f"plans={args.plans}  max_attempts={args.max_attempts}  delta={args.delta}")
 
-    # 1) flip the CUDA-graph switch BEFORE the planner is built
+    # 1) flip the CUDA-graph switch BEFORE the planner is built; force debug OFF (debug adds
+    #    per-op TORCH_CHECK + cuda syncs that could dominate — rule it out).
     print("  " + _set_cuda_graphs(args.graph == "on"))
+    for modname in ("curobo.runtime", "curobo._src.runtime"):
+        try:
+            m = __import__(modname, fromlist=["debug"])
+            if getattr(m, "debug", False):
+                print(f"  WARNING: {modname}.debug was True — forcing False")
+            setattr(m, "debug", False)
+        except Exception:  # noqa: BLE001
+            pass
+    if args.finetune >= 0:
+        print(f"  DIRECT solve_cspace: finetune_attempts={args.finetune} "
+              f"iters={'default' if args.iters <= 0 else args.iters}")
 
     # 2) build + warm the stack (planner build + pose warmup). No bridge: default config start.
     t0 = time.perf_counter()
@@ -296,8 +383,10 @@ def main() -> int:
         return 2
     print(f"  prewarm (build + pose warmup): {time.perf_counter() - t0:.1f}s")
 
-    planner = Planner(stack, delta=args.delta)
-    print(f"  planner ready: dof={len(planner.names)} groups={list(stack._groups.keys())}")
+    planner = Planner(stack, delta=args.delta, mode=args.mode,
+                      finetune=args.finetune, iters=args.iters)
+    print(f"  planner ready: mode={args.mode} dof={len(planner.names)} "
+          f"groups={list(stack._groups.keys())}")
 
     # Clear the collision world so a latency solve isn't fast-failed on "start/end in collision"
     # (self-collision stays ON). The graph-vs-eager mechanism is independent of the world, so this is
