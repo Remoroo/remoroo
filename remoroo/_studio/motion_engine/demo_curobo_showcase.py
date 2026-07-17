@@ -119,16 +119,18 @@ def _max_dq(traj) -> float:
 
 # --- one plan→execute step ---------------------------------------------------------------------
 
-_SCALES = (1.0, 0.6, 0.35, 0.15)   # shrink the offset toward the current pose until a plan is found
+_SCALES = (1.0, 0.6, 0.3)          # shrink the offset toward the current pose until a plan is found
+_MAX_ATTEMPTS = 1                  # attempt-0 + the lean escalate ladder only — NO slow PRM retry (~1s
+#                                    cap per pose vs ~16s); a pose that would need PRM is just skipped
 
 
 def step(stack: MotionStack, name: str, home: Dict[str, Pose], arms: List[str],
          offsets: Dict[str, XYZ], execute: bool, log: List[dict],
-         scales: tuple = _SCALES):
+         scales: tuple = _SCALES, start: Optional[Dict[str, float]] = None):
     """ONE coordinated move, ADAPTIVE: try the full offset, and on a planning failure shrink it toward
-    the current pose and retry (`scales`). Since scale→0 is the current (trivially feasible) pose, a
-    scene never spams failures — it lands the largest feasible version, or reports that even the
-    smallest offset failed (which means born-in-collision, not the target). Never raises."""
+    the current pose and retry (`scales`). `start` plans from a given config (for chaining a sequence
+    off-line) instead of the live joints. Returns the MoveResult (with the trajectory) or None. Never
+    raises."""
     mv = None
     err = ""
     for scale in scales:
@@ -136,7 +138,7 @@ def step(stack: MotionStack, name: str, home: Dict[str, Pose], arms: List[str],
         sep = _sep(targets)
         t0 = time.perf_counter()
         try:
-            mv = stack.move_to_poses(targets, execute=execute)
+            mv = stack.move_to_poses(targets, execute=execute, start=start, max_attempts=_MAX_ATTEMPTS)
         except Exception as e:  # noqa: BLE001
             err = f"{type(e).__name__}: {e}"
             continue
@@ -514,76 +516,73 @@ def run(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None) -> i
         seq = scenes(home, arms, approach=args.sep, close=args.close,
                      stagger=args.stagger, depth=args.depth)
 
-    # ── PHASE 1 · PLAN (no motion) — plan every pose from home; report feasibility + timing.
-    print(f"\n── PHASE 1 · PLAN {len(seq)} poses (no motion) ──")
+    # ── PHASE 1 · PLAN THE WHOLE CHAIN (no motion). Each pose plans from the PREVIOUS pose's END
+    # (chained), and we SAVE the trajectory. Only ONE live-state read (the first seed); after that the
+    # chain rides trajectory ends — so planning never re-reads the camera or drifts. A pose that can't
+    # plan is SKIPPED (the chain continues from the last good config), so Phase 2 only replays validated
+    # moves — no stuck re-planning, no drift into the wall, no out-of-range.
+    print(f"\n── PHASE 1 · PLAN {len(seq)} poses (chained, no motion) ──")
     plan_log: List[dict] = []
+    planned: List[tuple] = []                              # [(name, trajectory)] — the saved chain
+    seed = stack._seed_positions()                        # the ONLY live read; then we chain off trajectories
     for name, offsets in seq:
-        step(stack, name, home, arms, offsets, execute=False, log=plan_log)
-    n_ok = sum(1 for r in plan_log if r.get("ok"))
+        mv = step(stack, name, home, arms, offsets, execute=False, log=plan_log, start=seed)
+        traj = getattr(mv, "trajectory", None) if mv is not None else None
+        if traj is not None:
+            planned.append((name, traj))
+            seed = {n: float(v) for n, v in zip(traj.joint_names, traj.final)}   # chain from this pose's END
     pms = [r["plan_ms"] for r in plan_log if r.get("plan_ms")]
     seps = [r["sep"] for r in plan_log if r.get("ok") and r.get("sep") is not None]
-    print(f"\n  PLAN complete: {n_ok}/{len(seq)} poses OK"
+    print(f"\n  PLAN complete: {len(planned)}/{len(seq)} poses planned + SAVED"
           + (f" · median {statistics.median(pms):.0f} ms" if pms else "")
           + (f" · closest TCP approach {min(seps) * 100:.0f} cm" if seps else ""))
 
     if not execute:
         print("-" * 74)
-        print(f"DRY-RUN done ({n_ok}/{len(seq)} plan OK). Re-run with --execute to move.")
+        print(f"DRY-RUN done ({len(planned)}/{len(seq)} planned + saved). Re-run with --execute to replay.")
         print("-" * 74)
+        return 0
+    if not planned:
+        print("nothing planned — nothing to execute.")
         return 0
 
     # ── GATE · wait for the operator before ANY motion.
     try:
-        input(f"\n>>> Press ENTER to EXECUTE these {len(seq)} poses on hardware (Ctrl-C to abort): ")
+        input(f"\n>>> Press ENTER to EXECUTE (replay) these {len(planned)} saved trajectories "
+              "(Ctrl-C aborts): ")
     except (EOFError, KeyboardInterrupt):
         print("\naborted before execution — no motion.")
         return 0
 
-    # ── PHASE 2 · EXECUTE — run on hardware (re-plans against live state; motion chains the poses).
-    print(f"\n── PHASE 2 · EXECUTE {len(seq)} poses × {args.loops} loop(s) ──")
-    exec_log: List[dict] = []
-    aborted = False
-    for loop in range(args.loops):
-        if aborted:
+    # ── PHASE 2 · REPLAY the saved trajectories — NO re-planning, NO camera reads. The chain is only
+    # valid while each move COMPLETES (the next traj starts where this one ends), so STOP on any abort.
+    print(f"\n── PHASE 2 · EXECUTE {len(planned)} saved trajectories ──")
+    done = 0
+    for name, traj in planned:
+        res = stack.play_trajectory(traj)
+        if getattr(res, "ok", False) and getattr(res, "executed", False):
+            print(f"  ✓ {name:16s} motion {float(getattr(traj, 'duration', 0.0)):.1f}s | executed")
+            done += 1
+        else:
+            aborted = getattr(res, "aborted", False)
+            print(f"  {'⚠' if aborted else '✗'} {name:16s} "
+                  f"{'ABORTED' if aborted else 'FAILED'}: {(getattr(res, 'message', '') or '')[:70]}")
+            print("  stopping — the arm didn't finish this move, so the saved chain no longer lines up.")
             break
-        if args.loops > 1:
-            print(f"  · loop {loop + 1}/{args.loops}")
-        for name, offsets in seq:
-            # SAFETY: the seed must reflect where the arm ACTUALLY is, or the plan starts from HOME →
-            # a violent fly-home jump. With the tracker, a camera-read drop falls back to the last-known
-            # config (kept fresh by advance()), so we CONTINUE safely. We only stop if there's no seed
-            # AND no cached fallback (camera dead before any good read) — then a plan would fly home.
-            if not _joints_readable(stack):
-                print("\n" + "!" * 74)
-                print("SAFETY ABORT — no joint reading AND no cached seed (camera failed before any good")
-                print("read). A plan now would seed from HOME → fly-home jump. Refusing further motion.")
-                print("Fix the camera cable / bridge, then re-run. (E-stop now if the arm is moving.)")
-                print("!" * 74)
-                aborted = True
-                break
-            mv = step(stack, name, home, arms, offsets, execute=True, log=exec_log)
-            if tracker is not None:
-                tracker.advance(getattr(mv, "trajectory", None))   # keep the tracked seed accurate
 
-    if aborted:
-        print("\nNOT auto-retracting — no safe seed; a retract could fly-home. Recover manually.")
-    elif tracker is not None and tracker.using_fallback:
-        print("\nskipping auto-retract — camera read is down; leaving the arms where they are (safe).")
-    else:
-        print("\nretracting home...")
-        stack.retract(execute=True)
+    try:                                                  # best-effort retract (non-fatal)
+        print("\nretracting home (best-effort)...")
+        r = stack.retract(execute=True)
+        if not getattr(r, "ok", False):
+            print("  retract couldn't plan from here — leaving the arms put.")
+    except Exception as e:  # noqa: BLE001
+        print(f"  retract skipped: {type(e).__name__}: {e}")
 
-    ok = [r for r in exec_log if r.get("ok")]
-    pms = [r["plan_ms"] for r in exec_log if r.get("plan_ms")]
-    seps = [r["sep"] for r in exec_log if r.get("ok") and r.get("sep") is not None]
     print("\n" + "-" * 74)
-    if pms:
-        line = (f"SUMMARY: {len(ok)}/{len(exec_log)} moves executed · plan median "
-                f"{statistics.median(pms):.0f} ms (min {min(pms):.0f})")
-        if seps:
-            line += f" · closest TCP approach {min(seps) * 100:.0f} cm"
-        line += " · EXECUTED on hardware"
-        print(line)
+    print(f"SUMMARY: {done}/{len(planned)} saved trajectories replayed on hardware"
+          + (f" · closest TCP approach {min(seps) * 100:.0f} cm" if seps else ""))
+    if args.loops > 1:
+        print("(--loops is ignored in replay mode: the saved chain only lines up from its own start.)")
     print("-" * 74)
     return 0
 

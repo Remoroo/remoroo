@@ -877,9 +877,12 @@ class MotionStack:
         return self.move_to_poses({tcp: pose}, execute=execute, max_attempts=max_attempts)
 
     def move_to_poses(self, targets: Dict[str, object], *, execute: bool = True,
-                      max_attempts: int = 3) -> MoveResult:
+                      max_attempts: int = 3, start: Optional[Dict[str, float]] = None) -> MoveResult:
         """Drive every TCP in `targets` to its pose, SYNCHRONOUSLY, as ONE collision-free
-        trajectory (cuRobo plans them jointly over the combined cspace). 1, 2, or many TCPs."""
+        trajectory (cuRobo plans them jointly over the combined cspace). 1, 2, or many TCPs.
+        `start` overrides the plan-start config (default = the live joints) — pass a previous plan's
+        END config to chain a whole sequence off-line, then replay the trajectories (see
+        `play_trajectory`), without re-planning or reading the live state each step."""
         if not targets:
             return MoveResult(False, "no targets given")
         arms = list(targets.keys())
@@ -888,10 +891,20 @@ class MotionStack:
         pos_only = [self._tip(a) for a, p in targets.items() if _is_bare_position(p)]
         axes = {self._tip(a): w for a, p in targets.items()
                 if (w := _axes_of(p)) is not None}
-        res = planner.plan_pose(goals, self._seed_positions(), max_attempts=max_attempts,
+        seed = start if start is not None else self._seed_positions()
+        res = planner.plan_pose(goals, seed, max_attempts=max_attempts,
                                 position_only=pos_only or None,
                                 axes_weight=axes or None)
         return self._finish(res, execute)
+
+    def play_trajectory(self, traj, *, execute: bool = True) -> MoveResult:
+        """Execute a PRE-PLANNED trajectory (defensive audit + the whole-robot executor) WITHOUT
+        re-planning. Lets a caller plan a whole chain up front (see `move_to_poses(start=…)`) and replay
+        it — no live-state reads, no re-plan drift. `execute=False` just re-audits it."""
+        from .curobo_v2 import PlanResult
+        if traj is None:
+            return MoveResult(False, "no trajectory to play")
+        return self._finish(PlanResult(True, traj, "ok", float(getattr(traj, "duration", 0.0))), execute)
 
     def goto_joints(self, goal: Dict[str, float], *, groups: Optional[Sequence[str]] = None,
                     execute: bool = True, max_attempts: int = 5) -> MoveResult:
