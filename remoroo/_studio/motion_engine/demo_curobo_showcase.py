@@ -313,30 +313,51 @@ class _FakeObs:
 
 
 class _SeedTracker:
-    """Keep the plan seed ALIVE across camera-coupled `get_observation()` failures — a stop-gap for a
-    flaky camera cable so the demo CONTINUES instead of aborting. Every good read is cached; on a failed
-    read it returns the last-known joints (advanced by each executed trajectory), so the planner always
-    seeds from where the arm ACTUALLY is — never HOME → no fly-home. Wraps `bridge.get_observation`
-    in place. (Real fix is the camera cable + a joint read decoupled from the cameras.)"""
+    """Keep the plan seed ALIVE and STOP a dying camera from freezing the run — a stop-gap for a flaky
+    cable so the demo CONTINUES. Wraps `bridge.get_observation`: every good read caches the joints; but
+    the moment a read FAILS or goes SLOW (the ZED grab hanging ~10 s and leaking Argus threads until the
+    box freezes), it LATCHES to tracked-only — it NEVER grabs the camera again, and thereafter returns
+    the last-known joints (advanced by each executed trajectory). So the planner always seeds from where
+    the arm ACTUALLY is (never HOME → no fly-home) AND the camera errors can't infect the control loop.
+    (Real fix is the cable + a joint read decoupled from the cameras.)"""
+
+    SLOW_S = 2.0        # a read slower than this = the camera is struggling → latch (good reads are ~0.07 s)
 
     def __init__(self, bridge) -> None:
         self._real = bridge.get_observation
         self.tracked: Optional[Dict[str, float]] = None
         self.using_fallback = False
+        self.camera_dead = False
         self.fallbacks = 0
         bridge.get_observation = self._get_observation      # monkeypatch in place
 
+    def _latch(self, why: str) -> None:
+        if not self.camera_dead:
+            self.camera_dead = True
+            print(f"      ⚠ {why} — SWITCHING to tracked-seed-only for the rest of the run: NO more camera "
+                  "grabs (stops the Argus hang/freeze). Seed = last read, advanced by each executed move.")
+
     def _get_observation(self, *a, **k):
+        # Once latched, never touch the (dying) camera again — return the tracked config immediately.
+        if self.camera_dead and self.tracked is not None:
+            self.using_fallback = True
+            self.fallbacks += 1
+            return _FakeObs(self.tracked)
+        t0 = time.perf_counter()
         try:
             obs = self._real(*a, **k)
+            dt = time.perf_counter() - t0
             jp = getattr(obs, "joint_positions", None)
             if jp:
                 self.tracked = {str(n): float(v) for n, v in dict(jp).items()}
                 self.using_fallback = False
+                if dt > self.SLOW_S:                        # slow read = camera struggling → stop grabbing it
+                    self._latch(f"camera read took {dt:.1f}s")
                 return obs
         except Exception:  # noqa: BLE001 — camera/bridge read failed
             pass
-        if self.tracked is not None:                        # fall back to the tracked config
+        if self.tracked is not None:                        # failed read → latch + fall back
+            self._latch("camera read failed")
             self.using_fallback = True
             self.fallbacks += 1
             return _FakeObs(self.tracked)
@@ -543,8 +564,6 @@ def run(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None) -> i
             mv = step(stack, name, home, arms, offsets, execute=True, log=exec_log)
             if tracker is not None:
                 tracker.advance(getattr(mv, "trajectory", None))   # keep the tracked seed accurate
-                if tracker.using_fallback:
-                    print("      ⚠ camera read down — continuing on the tracked seed (arm's real pose)")
 
     if aborted:
         print("\nNOT auto-retracting — no safe seed; a retract could fly-home. Recover manually.")
