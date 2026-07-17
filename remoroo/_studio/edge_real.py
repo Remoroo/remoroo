@@ -2553,10 +2553,35 @@ def _task_handle(verb: str, body: dict) -> dict:
     return _task_service.handle(verb, body)
 
 
+_SNAP_CACHE: dict = {}   # viewfinder coalescing: verb -> {"t": stamp, "data": last-good payload}
+
+
 def _calib_handle(verb: str, body: dict) -> dict:
     # The pure-URDF reads (`pipeline`/`plan`) touch no bridge, so they don't need the lock;
     # everything else may move/capture/read the shared device, so it serialises with the live
     # SSE poll (G14). RLock so a handler that internally reads joints doesn't self-deadlock.
+    if verb in ("snapshot", "b2b_snapshot"):
+        # VIEWFINDER FAST PATH — never queue a snapshot behind real work. The panel polls at
+        # 1 Hz; each snapshot costs >1 s on the Orin (grabs + detection + JPEG), so blocking
+        # on _bridge_lock made arrivals outpace service and the lock queue grew WITHOUT BOUND
+        # — every button (Save included) then waited minutes behind stacked snapshots. A
+        # fresh-enough cache answers instantly; when the bridge is busy (a solve, a capture)
+        # the STALE frame is returned marked, and the feed catches up when the bridge frees.
+        c = _SNAP_CACHE.get(verb)
+        now = time.time()
+        if c is not None and now - c["t"] < 0.7:
+            return c["data"]
+        if not _bridge_lock.acquire(blocking=False):
+            if c is not None:
+                return {**c["data"], "stale": True}
+            return {"error": "camera busy — the feed resumes when the current operation finishes"}
+        try:
+            out = _calib_handle_locked(verb, body)
+        finally:
+            _bridge_lock.release()
+        if isinstance(out, dict) and "error" not in out:
+            _SNAP_CACHE[verb] = {"t": time.time(), "data": out}
+        return out
     if verb not in ("plan", "pipeline"):
         with _bridge_lock:
             return _calib_handle_locked(verb, body)

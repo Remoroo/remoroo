@@ -442,18 +442,34 @@ def solve_static_camera(
     stashed on the result so the covariance/observability meter works (the depth caveat)."""
     pts = np.concatenate([np.asarray(board_points)[v.corner_ids] for v in views])
     uv = np.concatenate([np.asarray(v.corners, float) for v in views])
-    T0 = _estimate_target_pose(views[0], board_points, K)     # PnP init from the first view
+    # BOTH planar-ambiguity branches, refined on the POOLED corners: the camera-anchoring
+    # board is often near-fronto-parallel to the fixed camera — exactly the regime where a
+    # single-branch PnP commit is wrong ~50% of the time (a flipped STATIC camera pose is a
+    # silent world-frame disaster the depth-σ gate cannot catch). Pooling only averages
+    # detection noise, it never undoes a flip — so the branch choice happens HERE, on cost.
+    cands = _planar_pose_candidates(np.asarray(board_points)[views[0].corner_ids],
+                                    np.asarray(views[0].corners, float), K)
     prob = _StaticProblem(pts, uv, K)
-    x0 = prob.x0_from(T0)
-    res = least_squares(prob.residual, x0, loss="huber" if robust else "linear", f_scale=f_scale,
-                        method="trf", max_nfev=400)
+    best_res, ambiguous = None, False
+    costs = []
+    for T0, _ in cands:
+        r_ = least_squares(prob.residual, prob.x0_from(T0),
+                           loss="huber" if robust else "linear", f_scale=f_scale,
+                           method="trf", max_nfev=400)
+        costs.append(float(r_.cost))
+        if best_res is None or r_.cost < best_res.cost:
+            best_res = r_
+    if len(costs) == 2:
+        ambiguous = bool(min(costs) > 0 and max(costs) < 3.0 * min(costs))
+    res = best_res
     T = make_T(rodrigues(res.x[:3]), res.x[3:])
     rms = float(np.sqrt(np.mean(res.fun ** 2))) if res.fun.size else 0.0
     result = CalibResult(
         T_optical=T, T_board=np.eye(4), fk_offsets=np.zeros(0), board_scale=1.0,
         residual_px=rms, samples_used=len(views), kind="static",
         converged=bool(res.success), message=str(res.message),
-        K=np.asarray(K, float), metrics={"train_rms_px": rms},
+        K=np.asarray(K, float),
+        metrics={"train_rms_px": rms, "pose_ambiguous": ambiguous},
     )
     # Stash the problem + solution for the covariance metrics (per-DOF camera-pose σ).
     result._problem = prob   # type: ignore[attr-defined]

@@ -846,16 +846,67 @@ class CalibSession:
     def _gated_solve(self, **kw):
         """THE eye-in-hand estimator policy — the over-parametrisation guard in ONE place:
         FK correction + board scale only with enough poses (thin sets overfit — absorbing
-        noise into FK shrinks the covariance and lies to the convergence check), K refined
-        only for a multi-point board over enough views. solve(), observe() AND every mid-loop
-        meter (replay/active) go through here, so the refine loop can never converge on a σ
-        the final displayed solve won't reproduce (the live 0.148-meter-vs-0.17-panel bug)."""
+        noise into FK shrinks the covariance and lies to the convergence check), and K
+        refinement made CONDITIONAL: co-estimating intrinsics can win the reprojection
+        metric while WORSENING 3D accuracy (Koide & Menegatti Table II — rp2 overfits; Tabb
+        & Yousef recommend it only when the prior K is poor), so with held-out poses in hand
+        the refinement must EARN its keep out-of-sample — same philosophy as the b2b offsets
+        guard. Without held-out poses the old behaviour stands (refining is what fixed the
+        bad-factory-K 9%-scale failure — the guard keeps that rescue, gated honestly).
+        solve(), observe() AND every mid-loop meter go through here."""
         n = len(self.samples)
         many_points = int(getattr(self.board, "n", 0)) >= 8
-        return solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain,
+        want_intr = many_points and n >= 12
+        base = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain,
                                  mode=self.kind, estimate_fk=(n >= 10),
                                  estimate_scale=(n >= 10),
-                                 estimate_intrinsics=(many_points and n >= 12), **kw)
+                                 estimate_intrinsics=False, **kw)
+        if not want_intr:
+            return base
+        refined = solve_eye_in_hand(self.samples, self.board.points, self.K, self.chain,
+                                    mode=self.kind, estimate_fk=(n >= 10),
+                                    estimate_scale=(n >= 10),
+                                    estimate_intrinsics=True, **kw)
+        # Deciding whether the refinement is a RESCUE (factory K genuinely wrong) or the rp2
+        # OVERFIT (K twiddled to win reprojection while 3D degrades). Measured on synth: a 5%
+        # focal error hides as 24mm of X-translation error while board_scale reads 1.006 and
+        # train residual 1.0px — neither scale nor held-out px can see it. What DOES separate
+        # the cases is the refinement's own behaviour: a genuine K error makes refinement move
+        # the focal a lot AND collapse the residual (5% shift, 2× residual drop measured); an
+        # overfit twiddle shifts focal <1% for marginal gain (the rp2 signature).
+        scale_base = float(getattr(base, "board_scale", 1.0))
+        scale_ref = float(getattr(refined, "board_scale", 1.0))
+        K_ref = refined.K if getattr(refined, "K", None) is not None else self.K
+        focal_shift = max(abs(K_ref[0, 0] / self.K[0, 0] - 1.0),
+                          abs(K_ref[1, 1] / self.K[1, 1] - 1.0))
+        resid_gain = float(base.residual_px) / max(float(refined.residual_px), 1e-6)
+        if abs(scale_base - 1.0) > 0.02 and abs(scale_ref - 1.0) < abs(scale_base - 1.0):
+            refined.metrics["intrinsics_guard"] = (
+                f"refinement KEPT — factory K disagrees with the printed board "
+                f"(scale {scale_base:.4f}→{scale_ref:.4f})")            # the P9c rescue
+            return refined
+        # measured separation (synth, fk-correction ON): genuine 5%-K error → shift 4.8%,
+        # gain 1.26×; good-K overfit twiddles → shift ≤1.5%, gain ≤0.81× — (2%, 1.1×) splits
+        if focal_shift > 0.02 and resid_gain > 1.1:
+            refined.metrics["intrinsics_guard"] = (
+                f"refinement KEPT — large correction that pays "
+                f"(focal {focal_shift * 100:.1f}%, residual {resid_gain:.2f}×)")  # hidden-focal rescue
+            return refined
+        if self.heldout:
+            from .metrics import held_out_reprojection
+            try:
+                h_base = held_out_reprojection(base, self.heldout, self.board.points, self.K, self.chain)
+                h_ref = held_out_reprojection(refined, self.heldout, self.board.points, K_ref, self.chain)
+                if h_ref < 0.9 * h_base:
+                    refined.metrics["intrinsics_guard"] = (
+                        f"refinement KEPT (held-out {h_base:.3f}→{h_ref:.3f} px)")
+                    return refined
+            except Exception:  # noqa: BLE001 — a guard failure must not sink the solve
+                pass
+        base.metrics["intrinsics_guard"] = (
+            f"refinement REJECTED — overfit signature (focal shift {focal_shift * 100:.2f}%, "
+            f"residual gain {resid_gain:.2f}×, scale {scale_base:.4f})")
+        return base
 
     # ── observe: live observability DURING collection (6.2) — a cheap solve, no motion ──
     def observe(self) -> dict:

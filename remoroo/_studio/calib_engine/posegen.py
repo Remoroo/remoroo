@@ -286,10 +286,13 @@ def suggest_next_pose(
                                  corner_ids=board.point_ids,
                                  corners=_predict_corners(chain, X_est, T_board_est, board, K, q))
             sigma = predicted_sigma_after(result, cand, board.points, K, chain)
-            # tiny tiebreaks so near-equal candidates prefer a safe framing AND a LARGE board
-            # (bigger board in frame = better corner signal-to-noise)
+            # tiny tiebreaks so near-equal candidates prefer a safe framing, a LARGE board
+            # (better corner signal-to-noise) AND rotation DIVERSITY vs the collected set —
+            # published NBV pairs uncertainty with pose diversity (Zhang et al., Vis. Comput.
+            # 2023) as a guard against degenerate motion sets pure information gain can favor
             score = (sigma - 0.01 * _centering(T_bc, T_board_est, board, K, wh)
-                     - 0.01 * min(_fill_frac(T_bc, T_board_est, board, K, wh) / 0.6, 1.0))
+                     - 0.01 * min(_fill_frac(T_bc, T_board_est, board, K, wh) / 0.6, 1.0)
+                     - 0.005 * min(div / np.pi, 1.0))
             if score < best_sigma:
                 best_sigma, best = score, (q, div)
         return best[0], float(best[1]), diag
