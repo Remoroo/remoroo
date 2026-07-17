@@ -28,11 +28,15 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 try:
     from motion_engine import MotionStack
+    from motion_engine.trajectory import Trajectory
 except Exception:  # noqa: BLE001
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from motion_engine import MotionStack
+    from motion_engine.trajectory import Trajectory
 
 
 Pose = Tuple[List[float], List[float]]   # (xyz, wxyz)
@@ -305,6 +309,182 @@ def generate_poses(home: Dict[str, Pose], arms: List[str], n: int,
     return seq
 
 
+# --- FLOW: ONE multi-waypoint cuRobo trajectory (the "right way") ------------------------------
+# Instead of N per-pose plans stitched together (each cuRobo traj decelerates to a full STOP at its
+# last waypoint → a pause at every join, and the chained per-pose seeds can drift into an obstacle and
+# waste failing retries), we hand cuRobo's MotionRetargeter the WHOLE dance as one dense sequence of
+# TCP targets and get back ONE continuous, velocity-linked, collision-free joint trajectory. The
+# retargeter tracks a target-per-frame: global IK on frame 0, then each frame warm-starts (and is
+# velocity-limited by `optimization_dt`) off the previous → smooth motion THROUGH the keyposes, not TO
+# each one. No per-pose stops, no chaining, no drift, no retries — the pauses and the wasted plan time
+# both dissolve because there is exactly one solve.
+
+
+def _catmull_rom(pts: np.ndarray, per: int) -> np.ndarray:
+    """Dense C1-smooth path PASSING THROUGH every keypose in `pts` (K,3), `per` samples per segment.
+    Endpoints are clamped (duplicated) so the path starts/ends at REST (zero tangent) but keeps a
+    continuous, non-zero velocity THROUGH the interior keyposes — that continuity is what removes the
+    per-pose pause. Pure numpy (no scipy), one spline per axis."""
+    pts = np.asarray(pts, float)
+    if len(pts) < 2:
+        return pts.copy()
+    P = np.vstack([pts[0], pts, pts[-1]])          # clamp: tangent≈0 at the very start and end
+    out: List[np.ndarray] = []
+    for s in range(len(pts) - 1):
+        p0, p1, p2, p3 = P[s], P[s + 1], P[s + 2], P[s + 3]
+        last = s == len(pts) - 2
+        for t in np.linspace(0.0, 1.0, per, endpoint=last):
+            t2, t3 = t * t, t * t * t
+            out.append(0.5 * ((2 * p1) + (-p0 + p2) * t
+                              + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                              + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
+    return np.asarray(out)
+
+
+def run_flow(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None) -> int:
+    """Plan + (optionally) execute the dance as ONE continuous cuRobo trajectory via MotionRetargeter.
+    Two-part like the rest of the demo: build the flow (no motion), GATE on ENTER, then move to the
+    flow's start config and REPLAY the single trajectory. Camera-independent after one seed read."""
+    import torch
+    from curobo.motion_retargeter import (
+        MotionRetargeter, MotionRetargeterCfg, SequenceGoalToolPose,
+    )
+    from curobo.types import ToolPoseCriteria
+
+    arms = list(stack._groups.keys())
+    execute = bool(args.execute) and not args.dry_run
+    dt = float(args.flow_dt)
+    print("=" * 74)
+    print(f"cuRobo showcase · FLOW (one multi-waypoint trajectory) — arms={arms}  "
+          f"mode={'EXECUTE (real motion)' if execute else 'DRY-RUN (plan only)'}  "
+          f"dt={dt * 1e3:.0f}ms  solver={'MPC' if args.flow_mpc else 'IK'}")
+
+    home = {a: stack.current_tool_pose(a) for a in arms}
+    if any(v is None for v in home.values()):
+        print("  could not FK current tool poses — is the bridge connected?")
+        return 2
+
+    # 1) the SAME choreography, as discrete keyposes (curated dance or --poses generator) --------
+    if args.poses and int(args.poses) > 0:
+        seq = generate_poses(home, arms, int(args.poses), close=args.close,
+                             stagger=args.stagger, depth=args.depth)
+    else:
+        seq = scenes(home, arms, approach=args.sep, close=args.close,
+                     stagger=args.stagger, depth=args.depth)
+    keys: Dict[str, List[XYZ]] = {a: [list(home[a][0])] for a in arms}          # start AT the current pose
+    for _name, offsets in seq:
+        tgt = _apply(home, arms, offsets, 1.0)
+        for a in arms:
+            keys[a].append([float(v) for v in tgt[a]])
+    for a in arms:
+        keys[a].append(list(home[a][0]))                                        # …and return home
+
+    # 2) densify into a shared, synchronized frame count (both arms hit keypose k at the same frame) -
+    max_seg = max(float(np.linalg.norm(np.diff(np.asarray(keys[a]), axis=0), axis=1).max()) for a in arms)
+    per = int(np.clip(round(max_seg / max(float(args.flow_step), 1e-3)), 2, 60))
+    dense = {a: _catmull_rom(np.asarray(keys[a], float), per) for a in arms}
+    N = len(next(iter(dense.values())))
+    print(f"  path: {len(seq) + 2} keyposes → {N} frames "
+          f"(~{max_seg * 1e3:.0f} mm max segment · {per}/seg · {(N - 1) * dt:.1f}s at dt)")
+
+    tool_frames = [stack._tip(a) for a in arms]
+    pos = np.stack([dense[a] for a in arms], axis=1)                            # (N, L, 3)
+    pos_t = torch.tensor(pos, dtype=torch.float32).view(N, 1, len(arms), 1, 3)
+    quat_t = torch.zeros(N, 1, len(arms), 1, 4, dtype=torch.float32)
+    quat_t[..., 0] = 1.0                                                        # identity wxyz (ignored: position-only)
+
+    # 3) build the retargeter solver from OUR robot cfg + modeled world (self + world collision) ----
+    print(f"  building retargeter solver ({'IK+MPC' if args.flow_mpc else 'warm-started IK'} · "
+          "self+world collision)... (one-time)")
+    try:
+        cfg = MotionRetargeterCfg.create(
+            robot=stack._robot_cfg_for(arms),
+            tool_pose_criteria={tf: ToolPoseCriteria.track_position() for tf in tool_frames},
+            use_mpc=bool(args.flow_mpc),
+            self_collision_check=True,
+            scene_model=stack.world.scene,
+            optimization_dt=dt,                                                 # velocity limit rides THIS dt
+            position_tolerance=0.005,
+        )
+        retargeter = MotionRetargeter(cfg)
+        dev = cfg.device_cfg.device
+        seq_goal = SequenceGoalToolPose(tool_frames=list(tool_frames),
+                                        position=pos_t.to(dev), quaternion=quat_t.to(dev))
+        t0 = time.perf_counter()
+        result = retargeter.solve_sequence(seq_goal)
+        solve_ms = (time.perf_counter() - t0) * 1e3
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        print(f"  ✗ retargeter FAILED to build/solve: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return 1
+
+    # IK: one velocity-limited solve per frame → `joint_state` IS the path (frames are `dt` apart).
+    # MPC: `joint_state` holds only the per-frame ENDPOINTS (steps_per_target apart); the fine path at
+    # `optimization_dt` is in `result.trajectory` — use it so the replay cadence stays correct.
+    src = result.trajectory if (args.flow_mpc and result.trajectory is not None) else result.joint_state
+    names = list(src.joint_names)
+    positions = src.position[0].detach().cpu().numpy()                         # (T, dof)
+    T = len(positions)
+    vel = np.zeros_like(positions)
+    vel[1:] = (positions[1:] - positions[:-1]) / dt                            # feed-forward consistent with dt
+    flow = Trajectory(names, positions, dt, velocities=vel,
+                      meta={"flow": True, "frames": int(T), "solver": "mpc" if args.flow_mpc else "ik"})
+    vmax = float(np.max(np.abs(vel))) if len(flow) else 0.0
+    print(f"  ✓ solved {N} targets → {flow.summary()} in {solve_ms:.0f} ms  · "
+          f"Δq {_max_dq(flow):.2f} rad · peak |q̇| {vmax:.2f} rad/s")
+
+    if not execute:
+        print("-" * 74)
+        print(f"DRY-RUN done (one {flow.duration:.1f}s flow, {len(flow)} waypoints planned + saved). "
+              "Re-run with --flow --execute to run it.")
+        print("-" * 74)
+        return 0
+
+    # 4) GATE, then approach the flow's start config and REPLAY the single trajectory ---------------
+    q0 = {n: float(v) for n, v in zip(names, positions[0])}
+    try:
+        input(f"\n>>> Press ENTER to (1) move to the flow start, then (2) run the {flow.duration:.1f}s "
+              "CONTINUOUS dance (Ctrl-C aborts): ")
+    except (EOFError, KeyboardInterrupt):
+        print("\naborted before motion — nothing moved.")
+        return 0
+
+    print("\n── approach · move to the flow start config (collision-checked) ──")
+    ap = stack.goto_joints(q0, execute=True)
+    if not (getattr(ap, "ok", False) and getattr(ap, "executed", False)):
+        print(f"  ✗ could not reach the flow start ({(getattr(ap, 'message', '') or '')[:90]}) — NOT running the flow.")
+        return 1
+    if tracker is not None and getattr(ap, "trajectory", None) is not None:
+        tracker.advance(ap.trajectory)
+
+    print(f"\n── FLOW · replaying ONE {flow.duration:.1f}s trajectory ({len(flow)} waypoints, no stops) ──")
+    res = stack.play_trajectory(flow)
+    ok = bool(getattr(res, "ok", False) and getattr(res, "executed", False))
+    if ok:
+        if tracker is not None:
+            tracker.advance(flow)
+        print(f"  ✓ flow executed — one continuous dual-arm trajectory, no per-pose pauses")
+    else:
+        aborted = getattr(res, "aborted", False)
+        print(f"  {'⚠' if aborted else '✗'} flow {'ABORTED' if aborted else 'FAILED'}: "
+              f"{(getattr(res, 'message', '') or '')[:90]}")
+
+    try:                                                                       # best-effort retract (non-fatal)
+        print("\nretracting home (best-effort)...")
+        r = stack.retract(execute=True)
+        if not getattr(r, "ok", False):
+            print("  retract couldn't plan from here — leaving the arms put.")
+    except Exception as e:  # noqa: BLE001
+        print(f"  retract skipped: {type(e).__name__}: {e}")
+
+    print("\n" + "-" * 74)
+    print("FLOW SUMMARY: one multi-waypoint cuRobo trajectory replayed on hardware."
+          if ok else "FLOW did not complete on hardware.")
+    print("-" * 74)
+    return 0 if ok else 1
+
+
 # --- orchestration -----------------------------------------------------------------------------
 
 class _FakeObs:
@@ -485,6 +665,9 @@ def diagnose_start(stack: MotionStack) -> int:
 
 
 def run(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None) -> int:
+    if getattr(args, "flow", False):
+        return run_flow(stack, args, tracker)
+
     arms = list(stack._groups.keys())
     execute = bool(args.execute) and not args.dry_run
     print("=" * 74)
@@ -616,6 +799,21 @@ def main() -> int:
                          "with --stagger this opens both clearance axes so the grippers converge closer in y "
                          "(default 8 cm; raise it with --close to push nearer, the shrink stays safe)")
     ap.add_argument("--reps", type=int, default=6, help="plan repetitions for the speed benchmark")
+    # ── FLOW: one continuous multi-waypoint cuRobo trajectory (the "right way") ──
+    ap.add_argument("--flow", action="store_true",
+                    help="plan the WHOLE dance as ONE continuous cuRobo trajectory (MotionRetargeter): "
+                         "no per-pose stops, no chaining, no failing retries. Two-part like the rest: "
+                         "builds the flow (no motion), waits for ENTER, then moves to the flow start and "
+                         "replays the single trajectory. Combine with --execute / --poses N")
+    ap.add_argument("--flow-dt", type=float, default=0.025,
+                    help="seconds per frame for the flow (the replay cadence AND the retargeter's "
+                         "velocity limit); matches the stack's ~25 ms interpolation dt (default 0.025)")
+    ap.add_argument("--flow-step", type=float, default=0.006,
+                    help="target TCP spacing (m) between consecutive flow frames — the density knob: "
+                         "smaller = smoother + slower, larger = faster + coarser (default 6 mm)")
+    ap.add_argument("--flow-mpc", action="store_true",
+                    help="use the retargeter's MPC solver (Level 3: smoothest, acceleration/jerk-aware) "
+                         "instead of warm-started IK — slower to solve, nicer motion")
     args = ap.parse_args()
     cell = str(Path(args.cell).resolve())
 
