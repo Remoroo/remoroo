@@ -315,6 +315,32 @@ def _joints_readable(stack: MotionStack) -> bool:
         return False
 
 
+def _world_culprits(stack: MotionStack, cvp, seed) -> list:
+    """Which modeled cuboid(s) the robot's collision spheres penetrate at `seed` → (name, n_spheres,
+    center, dims), worst first. AABB test (rotation ignored), inflated by each sphere's radius — names
+    the exact obstacle the arm is sitting inside."""
+    try:
+        spheres = cvp.robot_spheres(seed)
+    except Exception:  # noqa: BLE001
+        return []
+    cuboids = (stack.world.scene or {}).get("cuboid") or {}
+    hits = []
+    for name, b in cuboids.items():
+        pose = list(b.get("pose") or [0, 0, 0])
+        c = [float(x) for x in (list(pose[:3]) + [0, 0, 0])[:3]]
+        d = [float(x) for x in (list(b.get("dims") or [0.1, 0.1, 0.1]) + [0.1, 0.1, 0.1])[:3]]
+        n = 0
+        for s in spheres:
+            sx, sy, sz, r = float(s[0]), float(s[1]), float(s[2]), float(s[3])
+            if (abs(sx - c[0]) <= d[0] / 2 + r and abs(sy - c[1]) <= d[1] / 2 + r
+                    and abs(sz - c[2]) <= d[2] / 2 + r):
+                n += 1
+        if n:
+            hits.append((name, n, c, d))
+    hits.sort(key=lambda h: -h[1])
+    return hits
+
+
 def diagnose_start(stack: MotionStack) -> int:
     """Interrogate the CURRENT config to explain 'Start in collision' — NO motion. Shows each joint vs
     its planner limit (out-of-bounds is the usual cause after a wrist wraps past a URDF limit), plus
@@ -369,9 +395,16 @@ def diagnose_start(stack: MotionStack) -> int:
         print("  >>> the start plans fine now — the config is OK; earlier failures were from a different")
         print("      (worse) pose. Re-run the demo.")
     elif no_world:
-        print("  >>> WORLD collision — clearing the modeled obstacles fixed it. A cell cuboid (table/wall/")
-        print("      cage) is placed where the arm sits. The fix is the MODELED WORLD (cell.yaml obstacles),")
-        print("      not the arm. The demo could also just clear the world (it doesn't need obstacles).")
+        print("  >>> WORLD collision — clearing the modeled obstacles fixed it.")
+        culprits = _world_culprits(stack, cvp, seed)
+        if culprits:
+            print("      The arm's collision spheres sit INSIDE these modeled obstacle(s):")
+            for name, n, c, d in culprits:
+                print(f"        '{name}': {n} spheres inside  · center={[round(x, 3) for x in c]}"
+                      f"  dims={[round(x, 3) for x in d]}")
+            print("      → fix that obstacle's placement/size in cell.yaml, or clear the world for the demo.")
+        else:
+            print("      (couldn't pinpoint via AABB — the obstacle may be a mesh or a rotated box.)")
     else:
         print("  >>> SELF-collision — fails even with NO world. The two-arm self-collision model flags this")
         print("      config (over-conservative spheres / missing cross-arm ignore, or the arms are close).")
