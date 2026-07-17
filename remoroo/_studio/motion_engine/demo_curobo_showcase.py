@@ -335,29 +335,46 @@ def diagnose_start(stack: MotionStack) -> int:
             status = "*** OUT OF LIMITS ***"
             oob.append((n, v, lo, hi))
         print(f"  {n:16s} {v:9.3f} {lo:8.3f} {hi:8.3f}   {status}")
-    verdict = {}
+    # DECISIVE born-collision ablation: a tiny (+3 cm) test plan WITH the modeled world vs WITHOUT it.
+    # If clearing the world makes the start plannable, it's a MODELED OBSTACLE; if it still fails with
+    # NO world, it's SELF-collision (world-independent). Uses the planner's own (working) plan path.
+    arms = list(stack._groups.keys())
+
+    def _tiny_ok() -> Optional[bool]:
+        a = arms[0]
+        p = stack.current_tool_pose(a)
+        if p is None:
+            return None
+        res = stack.move_to_poses({a: [p[0][0], p[0][1], p[0][2] + 0.03]}, execute=False)
+        return bool(getattr(res, "ok", False))
+
+    print("\n  ablation: a +3 cm test plan WITH the modeled world vs WITHOUT it (no motion)...")
+    with_world = _tiny_ok()
+    no_world = None
     try:
-        verdict = cvp.world_sphere_collision(seed)
-    except Exception as e:  # noqa: BLE001
-        print(f"\n  validate() failed: {type(e).__name__}: {e}")
-    cf, npen = verdict.get("collision_free"), verdict.get("n_penetrating")
-    print(f"\n  cuRobo validate(current): collision_free={cf}  world-penetrating spheres={npen}")
+        cvp.clear_world()
+        no_world = _tiny_ok()
+    finally:
+        try:
+            cvp.set_world(stack.world)
+        except Exception:  # noqa: BLE001
+            pass
+    print(f"    plan WITH modeled world : {with_world}")
+    print(f"    plan with world CLEARED : {no_world}")
+
     print("\n  VERDICT:")
     if oob:
-        print(f"  >>> {len(oob)} joint(s) OUT OF THE PLANNER'S LIMITS — THIS is it. The start is out of")
-        print("      BOUNDS (an angle the URDF/planner forbids), which cuRobo reports as 'start in collision'.")
-        for n, v, lo, hi in oob:
-            past = (v - hi) if v > hi else (lo - v)
-            print(f"        {n}: {v:.3f} rad is {past:.3f} past [{lo:.3f}, {hi:.3f}]")
-        print("      FIX: jog that joint back inside its range (or unwrap a wrist that spun past ±180°),")
-        print("      then re-run. It's NOT a physical collision — the arm is fine, the angle is illegal.")
-    elif npen:
-        print("  >>> WORLD collision — the current config sits inside a MODELED obstacle (cell cuboid).")
-    elif cf is False:
-        print("  >>> SELF-collision — the arms' spheres overlap at this config (genuinely close, or the")
-        print("      two-arm self-collision spheres / ignore matrix are over-conservative).")
-    elif cf is True:
-        print("  >>> validate() says the START IS FINE — the planner's own check disagrees; deeper look.")
+        print(f"  >>> {len(oob)} joint(s) OUT OF LIMITS — bounds violation; unwrap/jog them back.")
+    elif with_world:
+        print("  >>> the start plans fine now — the config is OK; earlier failures were from a different")
+        print("      (worse) pose. Re-run the demo.")
+    elif no_world:
+        print("  >>> WORLD collision — clearing the modeled obstacles fixed it. A cell cuboid (table/wall/")
+        print("      cage) is placed where the arm sits. The fix is the MODELED WORLD (cell.yaml obstacles),")
+        print("      not the arm. The demo could also just clear the world (it doesn't need obstacles).")
+    else:
+        print("  >>> SELF-collision — fails even with NO world. The two-arm self-collision model flags this")
+        print("      config (over-conservative spheres / missing cross-arm ignore, or the arms are close).")
     print("=" * 72)
     return 0
 
