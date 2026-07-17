@@ -315,11 +315,61 @@ def _joints_readable(stack: MotionStack) -> bool:
         return False
 
 
+def diagnose_start(stack: MotionStack) -> int:
+    """Interrogate the CURRENT config to explain 'Start in collision' — NO motion. Shows each joint vs
+    its planner limit (out-of-bounds is the usual cause after a wrist wraps past a URDF limit), plus
+    cuRobo's `validate` verdict, split into bounds / world / self."""
+    cvp = stack._planner_for(list(stack._groups.keys()))
+    names = list(cvp.planner.joint_names)
+    seed = stack._seed_positions()
+    lims = cvp.joint_limits()
+    print("\n" + "=" * 72)
+    print("START-CONFIG DIAGNOSIS — why every plan says 'Start in collision' (NO motion)")
+    print(f"  {'joint':16s} {'current':>9s} {'min':>8s} {'max':>8s}   status")
+    oob = []
+    for n in names:
+        v = float(seed.get(n, float("nan")))
+        lo, hi = lims.get(n, (float("nan"), float("nan")))
+        status = "OK"
+        if v == v and lo == lo and (v < lo - 1e-6 or v > hi + 1e-6):
+            status = "*** OUT OF LIMITS ***"
+            oob.append((n, v, lo, hi))
+        print(f"  {n:16s} {v:9.3f} {lo:8.3f} {hi:8.3f}   {status}")
+    verdict = {}
+    try:
+        verdict = cvp.world_sphere_collision(seed)
+    except Exception as e:  # noqa: BLE001
+        print(f"\n  validate() failed: {type(e).__name__}: {e}")
+    cf, npen = verdict.get("collision_free"), verdict.get("n_penetrating")
+    print(f"\n  cuRobo validate(current): collision_free={cf}  world-penetrating spheres={npen}")
+    print("\n  VERDICT:")
+    if oob:
+        print(f"  >>> {len(oob)} joint(s) OUT OF THE PLANNER'S LIMITS — THIS is it. The start is out of")
+        print("      BOUNDS (an angle the URDF/planner forbids), which cuRobo reports as 'start in collision'.")
+        for n, v, lo, hi in oob:
+            past = (v - hi) if v > hi else (lo - v)
+            print(f"        {n}: {v:.3f} rad is {past:.3f} past [{lo:.3f}, {hi:.3f}]")
+        print("      FIX: jog that joint back inside its range (or unwrap a wrist that spun past ±180°),")
+        print("      then re-run. It's NOT a physical collision — the arm is fine, the angle is illegal.")
+    elif npen:
+        print("  >>> WORLD collision — the current config sits inside a MODELED obstacle (cell cuboid).")
+    elif cf is False:
+        print("  >>> SELF-collision — the arms' spheres overlap at this config (genuinely close, or the")
+        print("      two-arm self-collision spheres / ignore matrix are over-conservative).")
+    elif cf is True:
+        print("  >>> validate() says the START IS FINE — the planner's own check disagrees; deeper look.")
+    print("=" * 72)
+    return 0
+
+
 def run(stack: MotionStack, args) -> int:
     arms = list(stack._groups.keys())
     execute = bool(args.execute) and not args.dry_run
     print("=" * 74)
     print(f"cuRobo showcase — arms={arms}  mode={'EXECUTE (real motion)' if execute else 'DRY-RUN (plan only)'}")
+
+    if getattr(args, "diagnose", False):
+        return diagnose_start(stack)
 
     # BEST-EFFORT retract: try to start the dance from the cell's cspace-home (a clean, spread base).
     # NON-fatal: if the big move to home can't be planned (it crosses a spot the collision model
@@ -419,6 +469,9 @@ def main() -> int:
     ap.add_argument("--cell", default=os.environ.get("REMOROO_CELL", "remoroo_cell"))
     ap.add_argument("--execute", action="store_true", help="ACTUALLY MOVE the robot (default: dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="plan + time only, never move (overrides --execute)")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="diagnostic, NO motion: show each joint vs its planner limit + cuRobo's validate "
+                         "verdict to explain a 'Start in collision' abort (usually an out-of-bounds joint)")
     ap.add_argument("--loops", type=int, default=1, help="how many times through the routine (execute phase)")
     ap.add_argument("--poses", type=int, default=0,
                     help="generate N procedural flowing poses instead of the curated ~21-move routine "
