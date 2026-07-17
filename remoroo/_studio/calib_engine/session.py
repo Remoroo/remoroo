@@ -1575,7 +1575,13 @@ class BaseToBaseSession:
             a = np.asarray(v, float).ravel() if v is not None else np.zeros(0)
             return a if a.size == n else np.zeros(n)
         self.fk_a, self.fk_b = _fk(fk_a, chain_a.n), _fk(fk_b, chain_b.n)
+        # PER-CAMERA intrinsics (latent bug: both wrist cams shared one K) — the bridges carry
+        # each camera's real K on the edge; the service default is only the off-robot fallback.
+        ka, kb = getattr(bridge_a, "K", None), getattr(bridge_b, "K", None)
+        self.K_a = np.asarray(ka, float) if ka is not None else self.K
+        self.K_b = np.asarray(kb, float) if kb is not None else self.K
         self.obs: List[dict] = []
+        self.last_report: Optional[dict] = None   # solve policy report (method/per-view/offsets)
         self.result: Optional[CalibResult] = None
         self.min_corners = int(board.min_points)
         self.accept_agreement_mm = float(accept_agreement_mm)
@@ -1589,14 +1595,35 @@ class BaseToBaseSession:
         idb, uvb = self.bridge_b.capture()
         if len(ida) < self.min_corners or len(idb) < self.min_corners:
             return None
-        sa = CaptureSample(id=0, joints=self.bridge_a.read_joints(), fk_pose=self.bridge_a.read_pose(),
-                           corner_ids=ida, corners=uva)
-        sb = CaptureSample(id=0, joints=self.bridge_b.read_joints(), fk_pose=self.bridge_b.read_pose(),
-                           corner_ids=idb, corners=uvb)
+        qa, qb = self.bridge_a.read_joints(), self.bridge_b.read_joints()
+        from .solve import _planar_pose_candidates
+        P = self.board.points
+
+        def _side(ids, uv, K):
+            """Best-branch pose + the P2 ambiguity signal: the view is AMBIGUITY-PRONE when
+            the OTHER flip branch explains the pixels nearly as well (the formal
+            weak-perspective condition — small/distant/near-fronto-parallel board) or the
+            board is near-fronto-parallel. Frozen commitment to such a view is what produced
+            the live 35mm agreement failure; the capture WARNS instead of silently storing."""
+            cands = _planar_pose_candidates(P[np.asarray(ids, int)], np.asarray(uv, float), K)
+            T = cands[0][0]
+            ambiguous = bool(len(cands) == 2 and np.isfinite(cands[1][1])
+                             and cands[1][1] < 3.0 * max(cands[0][1], 1e-6))
+            view = T[:3, 3] / (np.linalg.norm(T[:3, 3]) + 1e-12)
+            tilt = float(np.degrees(np.arccos(np.clip(abs(float(T[:3, 2] @ view)), 0.0, 1.0))))
+            return T, ambiguous, tilt
+
+        Ta, amb_a, tilt_a = _side(ida, uva, self.K_a)
+        Tb, amb_b, tilt_b = _side(idb, uvb, self.K_b)
         return {
-            "joints_a": sa.joints, "T_ca_marker": _estimate_target_pose(sa, self.board.points, self.K),
-            "joints_b": sb.joints, "T_cb_marker": _estimate_target_pose(sb, self.board.points, self.K),
+            "joints_a": qa, "T_ca_marker": Ta,
+            "joints_b": qb, "T_cb_marker": Tb,
+            # the RAW measurement — the pixel bundle re-estimates the board pose per view,
+            # so per-view PnP error (incl. the flip ambiguity) is absorbed, never frozen in
+            "ids_a": np.asarray(ida, int), "uv_a": np.asarray(uva, float), "K_a": self.K_a,
+            "ids_b": np.asarray(idb, int), "uv_b": np.asarray(uvb, float), "K_b": self.K_b,
             "_n_a": int(len(ida)), "_n_b": int(len(idb)),
+            "_amb_a": amb_a, "_amb_b": amb_b, "_tilt_a": tilt_a, "_tilt_b": tilt_b,
         }
 
     def capture(self) -> dict:
@@ -1605,13 +1632,33 @@ class BaseToBaseSession:
             return {"type": "b2b_capture", "accepted": False, "n_a": 0, "n_b": 0,
                     "collected": len(self.obs)}
         n_a, n_b = o.pop("_n_a"), o.pop("_n_b")
+        amb_a, amb_b = o.pop("_amb_a"), o.pop("_amb_b")
+        tilt_a, tilt_b = o.pop("_tilt_a"), o.pop("_tilt_b")
         self.obs.append(o)
-        return {"type": "b2b_capture", "accepted": True, "n_a": n_a, "n_b": n_b,
-                "collected": len(self.obs)}
+        out = {"type": "b2b_capture", "accepted": True, "n_a": n_a, "n_b": n_b,
+               "collected": len(self.obs),
+               "ambiguous_a": amb_a, "ambiguous_b": amb_b,
+               "tilt_a_deg": round(tilt_a, 1), "tilt_b_deg": round(tilt_b, 1)}
+        if amb_a or amb_b:
+            side = "both cameras" if (amb_a and amb_b) else ("camera A" if amb_a else "camera B")
+            out["warning"] = (f"this view is AMBIGUITY-PRONE for {side} (board too small/"
+                              f"distant/fronto-parallel — its pose has two near-equal "
+                              f"interpretations). Bring the board CLOSER and TILT it more; "
+                              f"such views add little and can mislead the legacy metric.")
+        return out
 
-    def _bundle(self, obs: List[dict]) -> CalibResult:
-        return solve_base_to_base_bundle(obs, self.X_a, self.X_b, self.chain_a, self.chain_b,
-                                         self.board.points, fk_a=self.fk_a, fk_b=self.fk_b)
+    def _bundle(self, obs: List[dict], full: bool = False) -> CalibResult:
+        """The solve policy (see solve_base_to_base_auto): branch-aware selection + the
+        two-camera PIXEL bundle when corner obs exist (legacy 3D bundle otherwise); `full`
+        additionally runs the held-out-guarded joint-offsets trial (solve/validate — too
+        heavy for the per-capture observe meter)."""
+        from .solve import solve_base_to_base_auto
+        r, report = solve_base_to_base_auto(
+            obs, self.X_a, self.X_b, self.chain_a, self.chain_b, self.board.points,
+            fk_a=self.fk_a, fk_b=self.fk_b,
+            min_views_for_offsets=20 if full else 10 ** 9)
+        self.last_report = report
+        return r
 
     def observe(self) -> dict:
         """Live feedback during collection (the b2b analog of CalibSession.observe): once ≥2
@@ -1630,7 +1677,7 @@ class BaseToBaseSession:
             return {"type": "b2b_solve", "error": "need >=2 shared-board captures"}
         from .geometry import transform_geodesic
         from .solve import solve_base_to_base
-        self.result = self._bundle(self.obs)
+        self.result = self._bundle(self.obs, full=True)   # incl. the offsets trial when earned
         T_AB = self.result.T_optical
         agreement_mm = float(self.result.metrics.get("agreement_mm", float("nan")))
         # Self-consistency: spread of the per-obs closed-form solves vs the bundle (rotation deg
@@ -1642,9 +1689,14 @@ class BaseToBaseSession:
         cons_trans_mm = max((s[1] for s in spreads), default=0.0) * 1000.0
         obsj = _b2b_obs_json(self.result)
         observable = bool(obsj.get("observability") and self._observable())
+        rep = self.last_report or {}
         return {"type": "b2b_solve", "T_base_to_base": _T(T_AB), "captures": len(self.obs),
                 "agreement_mm": round(agreement_mm, 3), "consensus_deg": round(float(cons_deg), 3),
                 "consensus_trans_mm": round(float(cons_trans_mm), 3), "observable": observable,
+                "method": self.result.metrics.get("method"),
+                "flipped_views": self.result.metrics.get("flipped_views", 0),
+                "pixel_rms_px": self.result.metrics.get("pixel_rms_px"),
+                "per_view": rep.get("per_view"), "offsets": rep.get("offsets"),
                 **obsj}
 
     def _observable(self) -> bool:
@@ -1665,9 +1717,25 @@ class BaseToBaseSession:
             return {"type": "b2b_validate", "error": "need >=2 shared-board captures"}
         if self.result is None:
             self.result = self._bundle(self.obs)
-        held = heldout_interarm_agreement_mm(self.obs, self.X_a, self.X_b, self.chain_a,
-                                             self.chain_b, self.board.points, n_test=n_heldout,
-                                             fk_a=self.fk_a, fk_b=self.fk_b)
+        # Held-out through the SAME policy as the solve (branch-aware + pixel bundle when
+        # corners exist): fit on the train split, score UNSEEN views with flip branches
+        # picked under the fitted T_AB — the honest generalization number.
+        n = len(self.obs)
+        held = float("nan")
+        if n >= 4:
+            from .solve import _b2b_heldout_mm
+            k = max(1, n // 3) if n_heldout <= 0 else int(n_heldout)
+            train, test = list(self.obs[: n - k]), list(self.obs[n - k:])
+            try:
+                rtr = self._bundle(train)
+                dq = rtr.fk_offsets
+                dqa = dq[: self.chain_a.n] if dq.size else np.zeros(self.chain_a.n)
+                dqb = dq[self.chain_a.n:] if dq.size else np.zeros(self.chain_b.n)
+                held = _b2b_heldout_mm(test, rtr.T_optical, self.X_a, self.X_b,
+                                       self.chain_a, self.chain_b, self.board.points,
+                                       self.fk_a + dqa, self.fk_b + dqb)
+            except Exception:  # noqa: BLE001 — fall back to the training agreement below
+                held = float("nan")
         train_mm = float(self.result.metrics.get("agreement_mm", float("nan")))
         score = held if held == held else train_mm   # NaN-safe: fall back to training agreement
         observable = self._observable()
@@ -1689,10 +1757,14 @@ class BaseToBaseSession:
         if o is None:
             return {"type": "b2b_verify", "ok": False, "reason": "both cameras must see the board",
                     "tracks": False}
-        o.pop("_n_a", None); o.pop("_n_b", None)
-        mm = interarm_agreement_mm(self.result.T_optical, [o], self.X_a, self.X_b,
-                                   self.chain_a, self.chain_b, self.board.points,
-                                   fk_a=self.fk_a, fk_b=self.fk_b)
+        for k in ("_n_a", "_n_b", "_amb_a", "_amb_b", "_tilt_a", "_tilt_b"):
+            o.pop(k, None)
+        # fresh-placement agreement with the flip branch picked UNDER the solved T_AB — a
+        # single view can't vote its own branch (that's the frozen-PnP failure)
+        from .solve import _b2b_heldout_mm
+        mm = _b2b_heldout_mm([o], self.result.T_optical, self.X_a, self.X_b,
+                             self.chain_a, self.chain_b, self.board.points,
+                             self.fk_a, self.fk_b)
         return {"type": "b2b_verify", "ok": True, "tracks": bool(mm < self.accept_agreement_mm),
                 "agreement_mm": round(float(mm), 3), "thresh_mm": self.accept_agreement_mm}
 

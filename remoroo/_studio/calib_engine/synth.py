@@ -305,6 +305,113 @@ def make_base_to_base_dataset(*, seed: int = 0, n_obs: int = 8):
     return {"obs": obs, "X_a": X_a, "X_b": X_b, "chain_a": chain, "chain_b": chain, "T_AB": T_AB}
 
 
+def make_base_to_base_pixel_dataset(
+    *,
+    seed: int = 0,
+    n_obs: int = 12,
+    noise_px: float = 0.3,
+    ambiguous_frac: float = 0.0,
+    fk_true_a: Optional[np.ndarray] = None,
+    fk_true_b: Optional[np.ndarray] = None,
+    wh: Tuple[int, int] = (1280, 720),
+):
+    """PIXEL-LEVEL dual-arm base-to-base ground truth — the validation harness for the
+    branch-aware / pixel-bundle solvers. Per shared view it emits what the REAL capture
+    stores: reported joints for both arms + detected corner PIXELS per camera (+ each
+    camera's K), plus every truth needed to score an estimator (T_AB, per-view board poses,
+    injected joint offsets).
+
+    Geometry is CONTROLLED per view on camera A (the operator-facing knob):
+      * normal views: close (0.35-0.6 m) and well tilted (25-50°) — perspective decidable;
+      * `ambiguous_frac` of views: FAR (1.3-1.8 m) and near-fronto-parallel (2-7°) — the
+        formal weak-perspective regime where the planar flip ambiguity bites (Collins &
+        Bartoli). Camera B's joints are rejection-sampled until it actually sees the board.
+    Reported joints are BIASED by fk_true (the controller doesn't know its own offsets):
+    truth uses q_true = q_reported + fk_true, mirroring the FakeBridge convention."""
+    rng = np.random.default_rng(seed)
+    chain = default_chain()
+    n = chain.n
+    board = default_board()
+    P = board.points
+    K_a, K_b = default_K(), default_K(f=850.0)          # distinct intrinsics per camera
+    W, H = wh
+    fa = np.zeros(n) if fk_true_a is None else np.asarray(fk_true_a, float)
+    fb = np.zeros(n) if fk_true_b is None else np.asarray(fk_true_b, float)
+    X_a = make_T(rodrigues(np.deg2rad([4.0, -3.0, 6.0])), [0.04, -0.02, 0.06])
+    X_b = make_T(rodrigues(np.deg2rad([-5.0, 2.0, -4.0])), [-0.03, 0.05, 0.05])
+    T_AB = make_T(rodrigues(np.deg2rad([2.0, 1.0, 30.0])), [0.8, 0.1, 0.0])
+
+    ctr = P.mean(0)
+
+    def cam_to_board(dist, tilt_deg, roll):
+        """Camera→board pose: board centre `dist` ahead on the optical axis, plane tilted
+        `tilt_deg` off fronto-parallel, rolled in plane."""
+        Rt = rodrigues(np.deg2rad(tilt_deg) * np.array([1.0, 0.0, 0.0]))
+        Rr = rodrigues(roll * np.array([0.0, 0.0, 1.0]))
+        T = make_T(Rr @ Rt, [0.0, 0.0, dist])
+        T[:3, 3] -= T[:3, :3] @ ctr - np.array([0.0, 0.0, 0.0])   # centre the BOARD CENTRE on axis
+        T[:3, 3] += np.array([0.0, 0.0, 0.0])
+        return T
+
+    def corners(K, T_cam_board, npx=noise_px):
+        pc = transform_points(T_cam_board, P)
+        if np.any(pc[:, 2] < 0.05):
+            return None, None
+        uv = project(K, pc)
+        ok = (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
+        if ok.sum() < max(8, P.shape[0] // 2):
+            return None, None
+        ids = np.arange(P.shape[0])[ok]
+        return ids, uv[ok] + rng.normal(0.0, npx, (int(ok.sum()), 2))
+
+    obs, truth_views = [], []
+    n_amb = int(round(ambiguous_frac * n_obs))
+    for i in range(n_obs):
+        ambiguous = i < n_amb
+        for _attempt in range(200):
+            if ambiguous:
+                # TRUE weak perspective with a CONSEQUENTIAL flip: far (board ~60-90px
+                # across, both branches explain the pixels) at MODERATE tilt — a committed
+                # wrong branch is then a 2×tilt ≈ 12-28° rotation error, the regime that
+                # produced the live tens-of-mm agreement failure
+                Ca = cam_to_board(rng.uniform(2.0, 2.8), rng.uniform(6.0, 14.0),
+                                  rng.uniform(-0.4, 0.4))
+            else:
+                Ca = cam_to_board(rng.uniform(0.35, 0.6), rng.uniform(25.0, 50.0),
+                                  rng.uniform(-0.8, 0.8))
+            qa = rng.uniform(-0.6, 0.6, n)
+            ids_a, uv_a = corners(K_a, Ca, npx=(2.0 * noise_px if ambiguous else noise_px))
+            if ids_a is None:
+                continue
+            # the board's WORLD pose follows from arm A's TRUE kinematics
+            M_A = chain.fk(qa + fa) @ X_a @ Ca                     # board in baseA
+            M_B = inv_T(T_AB) @ M_A                                # board in baseB
+            qb = rng.uniform(-0.6, 0.6, n)
+            Cb = inv_T(chain.fk(qb + fb) @ X_b) @ M_B              # camera B → board (whatever falls out)
+            ids_b, uv_b = corners(K_b, Cb)
+            if ids_b is None:
+                continue
+            # legacy frozen-PnP fields come from the SAME single-pose estimator the live
+            # pipeline used — so the legacy method is scored with its real failure modes
+            from .solve import _estimate_target_pose
+            sa = CaptureSample(id=i, joints=qa, fk_pose=chain.fk(qa), corner_ids=ids_a, corners=uv_a)
+            sb = CaptureSample(id=i, joints=qb, fk_pose=chain.fk(qb), corner_ids=ids_b, corners=uv_b)
+            obs.append({
+                "joints_a": qa, "joints_b": qb,
+                "T_ca_marker": _estimate_target_pose(sa, P, K_a),
+                "T_cb_marker": _estimate_target_pose(sb, P, K_b),
+                "ids_a": ids_a, "uv_a": uv_a, "K_a": K_a,
+                "ids_b": ids_b, "uv_b": uv_b, "K_b": K_b,
+            })
+            truth_views.append({"C_a": Ca, "C_b": Cb, "ambiguous": ambiguous})
+            break
+        else:
+            raise RuntimeError(f"could not sample a visible shared view (i={i})")
+    return {"obs": obs, "X_a": X_a, "X_b": X_b, "chain_a": chain, "chain_b": chain,
+            "T_AB": T_AB, "fk_true_a": fa, "fk_true_b": fb, "board": board,
+            "K_a": K_a, "K_b": K_b, "views": truth_views}
+
+
 def make_static_camera_views(*, seed: int = 0, n_views: int = 8, noise_px: float = 0.3):
     """A WORLD-FIXED camera and a FIXED board (operator placed it at the reference). Returns
     (views, T_optical_true, board, K): N captures of the same board from the fixed camera, so

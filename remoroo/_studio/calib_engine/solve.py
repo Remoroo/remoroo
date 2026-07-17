@@ -162,31 +162,70 @@ def refine_target_pose(sample: CaptureSample, board_points: np.ndarray, K: np.nd
     return make_T(rodrigues(res.x[:3]), res.x[3:]), float(res.cost)
 
 
-def _estimate_target_pose(sample: CaptureSample, board_points: np.ndarray, K: np.ndarray) -> np.ndarray:
-    """Board->camera pose from observed corners. MULTI-START: the planar-homography pose
-    has a two-fold (flip) ambiguity, so we LM-refine from both the homography seed AND the
-    facing-camera seed and keep the lowest-residual solution. This makes PnP robust for an
-    arbitrarily-oriented board (eye-to-hand) WITHOUT regressing the face-on case (eye-in-
-    hand). (cv2.solvePnP on-robot; numpy here for CI.)"""
-    pts = board_points[sample.corner_ids]            # (M,3) board frame
-    uv = sample.corners                              # (M,2)
+def _flip_seed(T: np.ndarray) -> np.ndarray:
+    """The SECOND branch of the planar two-fold ambiguity (Collins & Bartoli, IJCV'14): the
+    board plane's normal reflected about the camera→board viewing direction, with minimal
+    in-plane change. Refining from this seed lands in the other basin when the view is
+    weak-perspective (small/distant/near-fronto-parallel board) — the regime where the
+    lowest-residual pick is wrong ~50% of the time."""
+    R, t = T[:3, :3], T[:3, 3]
+    v = t / (np.linalg.norm(t) + 1e-12)              # camera → board centre (optical ray)
+    n = R[:, 2]
+    n2 = 2.0 * float(n @ v) * v - n                  # reflect the plane normal about the ray
+    axis = np.cross(n, n2)
+    s_ = np.linalg.norm(axis)
+    c_ = float(np.clip(n @ n2, -1.0, 1.0))
+    if s_ < 1e-9:                                    # already fronto-parallel → no distinct flip
+        return T.copy()
+    R_align = rodrigues((axis / s_) * np.arctan2(s_, c_))
+    return make_T(R_align @ R, t)
 
+
+def _planar_pose_candidates(pts: np.ndarray, uv: np.ndarray, K: np.ndarray):
+    """BOTH ambiguity branches of the planar board pose, LM-refined, sorted by cost:
+    [(T, rms_px), ...] (1-2 entries; near-duplicates merged). The single-pose
+    `_estimate_target_pose` keeps the lowest-cost one (unchanged behaviour); the base-to-base
+    solve keeps BOTH and lets cross-view/cross-camera consistency pick the branch — the
+    published fix for frozen-PnP flip commitment (IPPE returns both for the same reason)."""
     def resid(x):
         T = make_T(rodrigues(x[:3]), x[3:])
-        return (project(K, transform_points(T, pts)) - uv).ravel()
+        pc = transform_points(T, pts)
+        z = np.maximum(pc[:, 2], 1e-3)      # depth-clamped: a diverging flip-basin LM must
+        u = pc[:, 0] / z * K[0, 0] + K[0, 2]  # yield large finite residuals, not inf/NaN
+        v = pc[:, 1] / z * K[1, 1] + K[1, 2]
+        return (np.stack([u, v], axis=1) - uv).ravel()
 
     seeds = [np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.5])]  # board facing the camera
     try:
         T0 = _planar_pose_init(pts, uv, K)
         seeds.insert(0, np.concatenate([rotvec_from_R(T0[:3, :3]), T0[:3, 3]]))
+        seeds.insert(1, np.concatenate([rotvec_from_R(_flip_seed(T0)[:3, :3]), _flip_seed(T0)[:3, 3]]))
     except Exception:  # noqa: BLE001
         pass
-    best, best_cost = None, np.inf
+    sols = []
     for x0 in seeds:
         res = least_squares(resid, x0, method="lm", max_nfev=200)
-        if res.cost < best_cost:
-            best, best_cost = res.x, res.cost
-    return make_T(rodrigues(best[:3]), best[3:])
+        T = make_T(rodrigues(res.x[:3]), res.x[3:])
+        rms = float(np.sqrt(np.mean(res.fun ** 2))) if res.fun.size else float("inf")
+        sols.append((T, rms))
+    sols.sort(key=lambda tr: tr[1])
+    kept = []
+    for T, rms in sols:                              # merge same-basin refinements
+        from .geometry import transform_geodesic
+        if all(transform_geodesic(T, Tk)[0] > 5.0 or transform_geodesic(T, Tk)[1] > 0.01
+               for Tk, _ in kept) or not kept:
+            kept.append((T, rms))
+        if len(kept) == 2:
+            break
+    return kept
+
+
+def _estimate_target_pose(sample: CaptureSample, board_points: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """Board->camera pose from observed corners — the LOWEST-COST branch of
+    `_planar_pose_candidates` (unchanged single-pose behaviour; see it for the ambiguity
+    story). (cv2.solvePnP on-robot; numpy here for CI.)"""
+    cands = _planar_pose_candidates(board_points[sample.corner_ids], sample.corners, K)
+    return cands[0][0]
 
 
 # --------------------------------------------------------------------------- #
@@ -451,6 +490,317 @@ def solve_base_to_base(
         raise ValueError("base_to_base needs at least one shared-marker observation")
     from .geometry import average_transforms
     return average_transforms(Ts)
+
+
+# --------------------------------------------------------------------------- #
+# Base-to-base: branch-aware selection (P0) + two-camera pixel bundle (P1/P3). #
+# Research grounding (2026-07 deep-research, all claims 3-0 verified):         #
+#  - frozen per-view PnP poses can commit to the WRONG planar-ambiguity branch #
+#    at low pixel residual (Collins&Bartoli IJCV'14; Ch'ng ICRA'20) — the      #
+#    published mechanism matching the live 35.7mm-at-σ1mm failure;             #
+#  - SOTA estimators are joint image-space bundles insensitive to per-view PnP #
+#    error (Koide&Menegatti ICRA'19; Ali et al. Sensors'19);                   #
+#  - joint kinematic offsets belong in the bundle only with enough views and a #
+#    good init (Pradeep'10; Stepanova RCIM'22 local-minima warning).           #
+# --------------------------------------------------------------------------- #
+def _view_candidates(o: dict, board_points: np.ndarray):
+    """Per-camera branch candidates for ONE shared view: BOTH planar-ambiguity branches from
+    the stored corners (new-style obs), or the single frozen pose (legacy obs without
+    corners). Returns ([(T, rms_px)...]_a, [...]_b)."""
+    P = np.asarray(board_points, float)
+    out = []
+    for side in ("a", "b"):
+        ids, uv, K = o.get(f"ids_{side}"), o.get(f"uv_{side}"), o.get(f"K_{side}")
+        if ids is not None and uv is not None and K is not None and len(ids) >= 4:
+            out.append(_planar_pose_candidates(P[np.asarray(ids, int)],
+                                               np.asarray(uv, float), np.asarray(K, float)))
+        else:
+            out.append([(np.asarray(o[f"T_c{side}_marker"], float), float("nan"))])
+    return out[0], out[1]
+
+
+def select_b2b_branches(
+    obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
+    board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None,
+    fk_b: Optional[np.ndarray] = None, iters: int = 5,
+) -> Tuple[List[dict], List[dict], np.ndarray]:
+    """P0 — branch-AWARE base-to-base: never commit a view's planar-flip branch in isolation.
+    Alternate (1) per view, pick the branch combination minimising THAT view's inter-arm
+    corner disagreement under the current T_AB, (2) re-solve T_AB on the selected branches —
+    until the selection is stable. Returns (obs with the selected poses substituted,
+    per-view diagnostics, T_AB). Legacy obs (no corners) degrade to their single pose."""
+    fa = np.zeros(chain_a.n) if fk_a is None else np.asarray(fk_a, float)
+    fb = np.zeros(chain_b.n) if fk_b is None else np.asarray(fk_b, float)
+    P = np.asarray(board_points, float)
+    cands = [_view_candidates(o, P) for o in obs]
+    TA_base = [chain_a.fk(np.asarray(o["joints_a"], float) + fa) @ X_a for o in obs]
+    TB_base = [chain_b.fk(np.asarray(o["joints_b"], float) + fb) @ X_b for o in obs]
+
+    def obs_with(sel):
+        out = []
+        for o, (ia, ib), (ca, cb) in zip(obs, sel, cands):
+            oo = dict(o)
+            oo["T_ca_marker"], oo["T_cb_marker"] = ca[ia][0], cb[ib][0]
+            out.append(oo)
+        return out
+
+    def view_cost(k, ia, ib, T_AB):
+        PA = transform_points(TA_base[k] @ cands[k][0][ia][0], P)
+        PB = transform_points(TB_base[k] @ cands[k][1][ib][0], P)
+        d = PA - transform_points(T_AB, PB)
+        return float(np.sqrt(np.mean(np.sum(d ** 2, axis=1))))
+
+    sel = [(0, 0)] * len(obs)                        # start at each view's lowest-cost branch
+    T_AB = solve_base_to_base(obs_with(sel), X_a, X_b, chain_a, chain_b, fk_a=fa, fk_b=fb)
+    for _ in range(max(1, iters)):
+        new_sel = []
+        for k, (ca, cb) in enumerate(cands):
+            combos = [(ia, ib) for ia in range(len(ca)) for ib in range(len(cb))]
+            new_sel.append(min(combos, key=lambda c: view_cost(k, c[0], c[1], T_AB)))
+        changed = new_sel != sel
+        sel = new_sel
+        T_AB = solve_base_to_base_bundle(obs_with(sel), X_a, X_b, chain_a, chain_b, P,
+                                         fk_a=fa, fk_b=fb).T_optical
+        if not changed:
+            break
+    diag = []
+    for k, ((ca, cb), (ia, ib)) in enumerate(zip(cands, sel)):
+        # ambiguity-proneness: the OTHER branch explains the pixels nearly as well (the formal
+        # weak-perspective condition) — flag it even when the selection is right
+        def _amb(cl):
+            return bool(len(cl) == 2 and np.isfinite(cl[1][1])
+                        and cl[1][1] < 3.0 * max(cl[0][1], 1e-6))
+        diag.append({"view": k, "agreement_mm": round(view_cost(k, ia, ib, T_AB) * 1000.0, 3),
+                     "flipped": bool((ia, ib) != (0, 0)),
+                     "ambiguous_a": _amb(ca), "ambiguous_b": _amb(cb)})
+    return obs_with(sel), diag, T_AB
+
+
+class _B2BPixelProblem:
+    """P1 — the joint TWO-CAMERA reprojection bundle (the SOTA formulation): parameters
+    x = [xi_AB(6) | board-in-baseA pose per view (6·V) | dq_a(na), dq_b(nb) (optional P3)],
+    residuals = PIXEL reprojection of every shared corner in BOTH wrist cameras (Huber at the
+    caller). Per-view board poses are PARAMETERS, so per-view PnP error (incl. the flip
+    ambiguity) is absorbed instead of frozen in; xi_AB FIRST means the existing
+    σ²(JᵀJ)⁻¹ machinery hands back the MARGINALISED T_AB covariance with no extra code."""
+
+    def __init__(self, obs, X_a, X_b, chain_a, chain_b, board_points, fk_a, fk_b,
+                 estimate_offsets: bool):
+        self.obs = list(obs)
+        self.X_a, self.X_b = np.asarray(X_a, float), np.asarray(X_b, float)
+        self.chain_a, self.chain_b = chain_a, chain_b
+        self.P = np.asarray(board_points, float)
+        self.fa = np.asarray(fk_a, float) if fk_a is not None else np.zeros(chain_a.n)
+        self.fb = np.asarray(fk_b, float) if fk_b is not None else np.zeros(chain_b.n)
+        self.est_off = bool(estimate_offsets)
+        self.V = len(self.obs)
+        self.na, self.nb = chain_a.n, chain_b.n
+        # GAUGE FIX: each arm's FIRST joint offset is degenerate with T_AB (a base-joint
+        # offset is exactly a rotation of every flange pose about that arm's base axis,
+        # absorbable by T_AB + the free per-view board poses) — estimating it would let the
+        # bundle trade a real transform error for a fictitious offset. Joints 1..n-1 only.
+        self.noff_a = max(0, self.na - 1) if self.est_off else 0
+        self.noff_b = max(0, self.nb - 1) if self.est_off else 0
+        self.nparams = 6 + 6 * self.V + self.noff_a + self.noff_b
+
+    def unpack(self, x):
+        T_AB = make_T(rodrigues(x[:3]), x[3:6])
+        boards = [make_T(rodrigues(x[6 + 6 * i:9 + 6 * i]), x[9 + 6 * i:12 + 6 * i])
+                  for i in range(self.V)]
+        dqa, dqb = np.zeros(self.na), np.zeros(self.nb)
+        if self.est_off:
+            o0 = 6 + 6 * self.V
+            dqa[1:] = x[o0:o0 + self.noff_a]
+            dqb[1:] = x[o0 + self.noff_a:o0 + self.noff_a + self.noff_b]
+        return T_AB, boards, dqa, dqb
+
+    @staticmethod
+    def _proj(K, pc, uv):
+        """Projection residual with the depth CLAMPED away from zero — TRF explores poses
+        that put corners at z≈0 mid-iteration; a finite (large) residual keeps the solver on
+        a smooth barrier instead of inf/NaN wrecking the step."""
+        z = np.maximum(pc[:, 2], 1e-3)
+        u = pc[:, 0] / z * K[0, 0] + K[0, 2]
+        v = pc[:, 1] / z * K[1, 1] + K[1, 2]
+        return (np.stack([u, v], axis=1) - uv).ravel()
+
+    def residual(self, x):
+        T_AB, boards, dqa, dqb = self.unpack(x)
+        T_BA = inv_T(T_AB)
+        out = []
+        for i, o in enumerate(self.obs):
+            Ta = self.chain_a.fk(np.asarray(o["joints_a"], float) + self.fa + dqa) @ self.X_a
+            Tb = self.chain_b.fk(np.asarray(o["joints_b"], float) + self.fb + dqb) @ self.X_b
+            bA = boards[i]
+            pa = transform_points(inv_T(Ta) @ bA, self.P[np.asarray(o["ids_a"], int)])
+            out.append(self._proj(np.asarray(o["K_a"], float), pa, np.asarray(o["uv_a"], float)))
+            pb = transform_points(inv_T(Tb) @ (T_BA @ bA), self.P[np.asarray(o["ids_b"], int)])
+            out.append(self._proj(np.asarray(o["K_b"], float), pb, np.asarray(o["uv_b"], float)))
+        return np.concatenate(out) if out else np.zeros(0)
+
+    def sparsity(self):
+        """Residual-block structure for TRF's grouped finite differences: view i's pixels
+        depend only on xi_AB, board_i, and the offsets — this is what keeps the bundle fast
+        at MANY poses (the whole point of the many-poses regime)."""
+        from scipy.sparse import lil_matrix
+        rows = []
+        for o in self.obs:
+            rows.append(2 * len(o["ids_a"]) + 2 * len(o["ids_b"]))
+        S = lil_matrix((int(sum(rows)), self.nparams), dtype=np.uint8)
+        r0 = 0
+        for i, nr in enumerate(rows):
+            S[r0:r0 + nr, 0:6] = 1
+            S[r0:r0 + nr, 6 + 6 * i:12 + 6 * i] = 1
+            if self.est_off:
+                S[r0:r0 + nr, 6 + 6 * self.V:] = 1
+            r0 += nr
+        return S
+
+
+def solve_base_to_base_pixel(
+    obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
+    board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None,
+    fk_b: Optional[np.ndarray] = None, estimate_joint_offsets: bool = False,
+    robust: bool = True, f_scale_px: float = 2.0, max_offset_rad: float = 0.03,
+) -> CalibResult:
+    """P1 (+P3) — solve T_baseA_baseB by the joint two-camera PIXEL bundle. Requires
+    corner-bearing obs (ids/uv/K per camera) — raises ValueError otherwise so callers fall
+    back to the legacy 3D bundle. Init = P0 branch-aware selection (certified start before
+    the nonlinear bundle, per the local-minima literature). With `estimate_joint_offsets`,
+    per-joint corrections of BOTH arms join the parameter vector, bounded to ±max_offset_rad
+    so they can never absorb gross pose error."""
+    if not obs:
+        raise ValueError("no observations")
+    for o in obs:
+        for k in ("ids_a", "uv_a", "K_a", "ids_b", "uv_b", "K_b"):
+            if o.get(k) is None:
+                raise ValueError("pixel bundle needs corner-bearing obs (ids/uv/K per camera)")
+    P = np.asarray(board_points, float)
+    sel_obs, diag, T_AB0 = select_b2b_branches(obs, X_a, X_b, chain_a, chain_b, P,
+                                               fk_a=fk_a, fk_b=fk_b)
+    fa = np.asarray(fk_a, float) if fk_a is not None else np.zeros(chain_a.n)
+    fb = np.asarray(fk_b, float) if fk_b is not None else np.zeros(chain_b.n)
+    prob = _B2BPixelProblem(obs, X_a, X_b, chain_a, chain_b, P, fa, fb, estimate_joint_offsets)
+    x0 = np.zeros(prob.nparams)
+    x0[:3], x0[3:6] = rotvec_from_R(T_AB0[:3, :3]), T_AB0[:3, 3]
+    for i, o in enumerate(sel_obs):
+        bA = (chain_a.fk(np.asarray(o["joints_a"], float) + fa) @ X_a
+              @ np.asarray(o["T_ca_marker"], float))
+        x0[6 + 6 * i:9 + 6 * i] = rotvec_from_R(bA[:3, :3])
+        x0[9 + 6 * i:12 + 6 * i] = bA[:3, 3]
+    lo = np.full(prob.nparams, -np.inf)
+    hi = np.full(prob.nparams, np.inf)
+    if estimate_joint_offsets:
+        lo[6 + 6 * prob.V:], hi[6 + 6 * prob.V:] = -max_offset_rad, max_offset_rad
+    res = least_squares(prob.residual, x0, loss="huber" if robust else "linear",
+                        f_scale=f_scale_px, method="trf", jac_sparsity=prob.sparsity(),
+                        bounds=(lo, hi), max_nfev=400)
+    T_AB, _boards, dqa, dqb = prob.unpack(res.x)
+    # the task-space headline, computed the SAME way as the legacy path (comparable numbers):
+    # frozen selected branches vs the final T_AB, with the estimated offsets folded in
+    PA, PB = _b2b_corner_pairs(sel_obs, X_a, X_b, chain_a, chain_b, P,
+                               fk_a=fa + dqa, fk_b=fb + dqb)
+    d = PA - transform_points(T_AB, PB) if PA.shape[0] else np.zeros((0, 3))
+    agreement_mm = float(np.sqrt(np.mean(np.sum(d ** 2, axis=1))) * 1000.0) if d.shape[0] else float("nan")
+    pix = prob.residual(res.x)
+    result = CalibResult(
+        T_optical=T_AB, T_board=np.eye(4),
+        fk_offsets=(np.concatenate([dqa, dqb]) if estimate_joint_offsets else np.zeros(0)),
+        board_scale=1.0, residual_px=float(np.sqrt(np.mean(pix ** 2))) if pix.size else 0.0,
+        samples_used=len(obs), kind="base_to_base", converged=bool(res.success),
+        message=str(res.message),
+        metrics={"agreement_mm": agreement_mm, "method": "pixel_bundle",
+                 "pixel_rms_px": round(float(np.sqrt(np.mean(pix ** 2))), 3) if pix.size else 0.0,
+                 "offsets_estimated": bool(estimate_joint_offsets),
+                 "flipped_views": int(sum(1 for dv in diag if dv["flipped"]))},
+    )
+    result._problem = prob   # type: ignore[attr-defined]
+    result._x = res.x        # type: ignore[attr-defined]
+    result._per_view = diag  # type: ignore[attr-defined]
+    return result
+
+
+B2B_OFFSETS_MIN_VIEWS = 20   # joint offsets join the bundle only with this many shared views
+                             # (identifiability + the local-minima literature; the held-out
+                             # guard below still has to APPROVE them)
+
+
+def _b2b_heldout_mm(test_obs, T_AB, X_a, X_b, chain_a, chain_b, board_points, fk_a, fk_b):
+    """Task-space agreement (mm) of `T_AB` on UNSEEN shared views — per-view flip branches are
+    picked under the GIVEN T_AB (a handful of test views can't stably vote alone)."""
+    P = np.asarray(board_points, float)
+    tot, n = 0.0, 0
+    for o in test_obs:
+        ca, cb = _view_candidates(o, P)
+        TA = chain_a.fk(np.asarray(o["joints_a"], float) + fk_a) @ X_a
+        TB = chain_b.fk(np.asarray(o["joints_b"], float) + fk_b) @ X_b
+        best = np.inf
+        for Tca, _ in ca:
+            PA = transform_points(TA @ Tca, P)
+            for Tcb, _ in cb:
+                PB = transform_points(TB @ Tcb, P)
+                d = PA - transform_points(T_AB, PB)
+                best = min(best, float(np.mean(np.sum(d ** 2, axis=1))))
+        tot += best * P.shape[0]
+        n += P.shape[0]
+    return float(np.sqrt(tot / max(n, 1)) * 1000.0)
+
+
+def solve_base_to_base_auto(
+    obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
+    board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None,
+    fk_b: Optional[np.ndarray] = None, min_views_for_offsets: int = B2B_OFFSETS_MIN_VIEWS,
+) -> Tuple[CalibResult, dict]:
+    """THE base-to-base solve policy, in one place. Corner-bearing obs → P0 branch-aware
+    selection + P1 pixel bundle; ≥min_views_for_offsets views → ALSO try P3 joint offsets,
+    kept only when HELD-OUT agreement improves (never blind trust in extra parameters).
+    Legacy obs (no corners) → branch-aware selection over whatever candidates exist + the
+    3D bundle (old behaviour, still flip-hardened where corners allow). Returns
+    (result, report) — the report carries method / per-view diagnostics / the offsets trial."""
+    fa = np.asarray(fk_a, float) if fk_a is not None else np.zeros(chain_a.n)
+    fb = np.asarray(fk_b, float) if fk_b is not None else np.zeros(chain_b.n)
+    P = np.asarray(board_points, float)
+    have_px = bool(obs) and all(
+        all(o.get(k) is not None for k in ("ids_a", "uv_a", "K_a", "ids_b", "uv_b", "K_b"))
+        for o in obs)
+    if not have_px:
+        sel_obs, diag, _ = select_b2b_branches(obs, X_a, X_b, chain_a, chain_b, P,
+                                               fk_a=fa, fk_b=fb)
+        r = solve_base_to_base_bundle(sel_obs, X_a, X_b, chain_a, chain_b, P, fk_a=fa, fk_b=fb)
+        r.metrics["method"] = "3d_bundle_branchaware"
+        r.metrics["flipped_views"] = int(sum(1 for dv in diag if dv["flipped"]))
+        r._per_view = diag   # type: ignore[attr-defined]
+        return r, {"method": r.metrics["method"], "per_view": diag,
+                   "offsets": {"tried": False, "kept": False}}
+
+    r = solve_base_to_base_pixel(obs, X_a, X_b, chain_a, chain_b, P, fk_a=fa, fk_b=fb,
+                                 estimate_joint_offsets=False)
+    report = {"method": "pixel_bundle", "per_view": r._per_view,
+              "offsets": {"tried": False, "kept": False}}
+    if len(obs) >= int(min_views_for_offsets):
+        k = max(3, len(obs) // 3)
+        train, test = list(obs[:-k]), list(obs[-k:])
+        try:
+            rb = solve_base_to_base_pixel(train, X_a, X_b, chain_a, chain_b, P,
+                                          fk_a=fa, fk_b=fb, estimate_joint_offsets=False)
+            ro = solve_base_to_base_pixel(train, X_a, X_b, chain_a, chain_b, P,
+                                          fk_a=fa, fk_b=fb, estimate_joint_offsets=True)
+            dqa, dqb = ro.fk_offsets[:chain_a.n], ro.fk_offsets[chain_a.n:]
+            h0 = _b2b_heldout_mm(test, rb.T_optical, X_a, X_b, chain_a, chain_b, P, fa, fb)
+            h1 = _b2b_heldout_mm(test, ro.T_optical, X_a, X_b, chain_a, chain_b, P,
+                                 fa + dqa, fb + dqb)
+            report["offsets"] = {"tried": True, "kept": bool(h1 < h0),
+                                 "heldout_base_mm": round(h0, 3),
+                                 "heldout_offsets_mm": round(h1, 3)}
+            if h1 < h0:                          # offsets EARNED their place on unseen views
+                r = solve_base_to_base_pixel(obs, X_a, X_b, chain_a, chain_b, P,
+                                             fk_a=fa, fk_b=fb, estimate_joint_offsets=True)
+                report["method"] = "pixel_bundle+joint_offsets"
+                report["per_view"] = r._per_view
+        except Exception as e:  # noqa: BLE001 — the offsets trial must never sink the solve
+            report["offsets"] = {"tried": True, "kept": False, "error": f"{type(e).__name__}: {e}"}
+    r.metrics["method"] = report["method"]
+    return r, report
 
 
 # --------------------------------------------------------------------------- #
