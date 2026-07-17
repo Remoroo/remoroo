@@ -668,7 +668,7 @@ def solve_base_to_base_pixel(
     board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None,
     fk_b: Optional[np.ndarray] = None, estimate_joint_offsets: bool = False,
     robust: bool = True, f_scale_px: float = 2.0, max_offset_rad: float = 0.03,
-    max_nfev: int = 400,
+    max_nfev: int = 400, warm_x: Optional[np.ndarray] = None, warm_views: int = 0,
 ) -> CalibResult:
     """P1 (+P3) — solve T_baseA_baseB by the joint two-camera PIXEL bundle. Requires
     corner-bearing obs (ids/uv/K per camera) — raises ValueError otherwise so callers fall
@@ -695,6 +695,13 @@ def solve_base_to_base_pixel(
               @ np.asarray(o["T_ca_marker"], float))
         x0[6 + 6 * i:9 + 6 * i] = rotvec_from_R(bA[:3, :3])
         x0[9 + 6 * i:12 + 6 * i] = bA[:3, 3]
+    # WARM START: obs only ever APPEND (view i keeps its slot), so the previous solution's
+    # T_AB + first `warm_views` board poses are a near-converged start — the per-capture
+    # meter re-solved 9 known boards from scratch on the Orin (25s at 10 views) without this.
+    if warm_x is not None and 0 < int(warm_views) <= prob.V:
+        w = np.asarray(warm_x, float).ravel()
+        if w.size >= 6 + 6 * int(warm_views):
+            x0[:6 + 6 * int(warm_views)] = w[:6 + 6 * int(warm_views)]
     lo = np.full(prob.nparams, -np.inf)
     hi = np.full(prob.nparams, np.inf)
     if estimate_joint_offsets:
@@ -757,7 +764,7 @@ def solve_base_to_base_auto(
     obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
     board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None,
     fk_b: Optional[np.ndarray] = None, min_views_for_offsets: int = B2B_OFFSETS_MIN_VIEWS,
-    max_nfev: int = 400,
+    max_nfev: int = 400, warm_x: Optional[np.ndarray] = None, warm_views: int = 0,
 ) -> Tuple[CalibResult, dict]:
     """THE base-to-base solve policy, in one place. Corner-bearing obs → P0 branch-aware
     selection + P1 pixel bundle; ≥min_views_for_offsets views → ALSO try P3 joint offsets,
@@ -782,17 +789,21 @@ def solve_base_to_base_auto(
                    "offsets": {"tried": False, "kept": False}}
 
     r = solve_base_to_base_pixel(obs, X_a, X_b, chain_a, chain_b, P, fk_a=fa, fk_b=fb,
-                                 estimate_joint_offsets=False, max_nfev=max_nfev)
+                                 estimate_joint_offsets=False, max_nfev=max_nfev,
+                                 warm_x=warm_x, warm_views=warm_views)
     report = {"method": "pixel_bundle", "per_view": r._per_view,
               "offsets": {"tried": False, "kept": False}}
     if len(obs) >= int(min_views_for_offsets):
         k = max(3, len(obs) // 3)
         train, test = list(obs[:-k]), list(obs[-k:])
         try:
+            # train is a PREFIX of obs → the full solve's solution warm-starts both trials
             rb = solve_base_to_base_pixel(train, X_a, X_b, chain_a, chain_b, P,
-                                          fk_a=fa, fk_b=fb, estimate_joint_offsets=False)
+                                          fk_a=fa, fk_b=fb, estimate_joint_offsets=False,
+                                          warm_x=r._x, warm_views=len(train))
             ro = solve_base_to_base_pixel(train, X_a, X_b, chain_a, chain_b, P,
-                                          fk_a=fa, fk_b=fb, estimate_joint_offsets=True)
+                                          fk_a=fa, fk_b=fb, estimate_joint_offsets=True,
+                                          warm_x=r._x, warm_views=len(train))
             dqa, dqb = ro.fk_offsets[:chain_a.n], ro.fk_offsets[chain_a.n:]
             h0 = _b2b_heldout_mm(test, rb.T_optical, X_a, X_b, chain_a, chain_b, P, fa, fb)
             h1 = _b2b_heldout_mm(test, ro.T_optical, X_a, X_b, chain_a, chain_b, P,
@@ -802,7 +813,8 @@ def solve_base_to_base_auto(
                                  "heldout_offsets_mm": round(h1, 3)}
             if h1 < h0:                          # offsets EARNED their place on unseen views
                 r = solve_base_to_base_pixel(obs, X_a, X_b, chain_a, chain_b, P,
-                                             fk_a=fa, fk_b=fb, estimate_joint_offsets=True)
+                                             fk_a=fa, fk_b=fb, estimate_joint_offsets=True,
+                                             warm_x=r._x, warm_views=len(obs))
                 report["method"] = "pixel_bundle+joint_offsets"
                 report["per_view"] = r._per_view
         except Exception as e:  # noqa: BLE001 — the offsets trial must never sink the solve

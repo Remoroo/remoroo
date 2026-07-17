@@ -1582,6 +1582,7 @@ class BaseToBaseSession:
         self.K_b = np.asarray(kb, float) if kb is not None else self.K
         self.obs: List[dict] = []
         self.last_report: Optional[dict] = None   # solve policy report (method/per-view/offsets)
+        self._px_warm: Optional[tuple] = None     # (x, n_views) — warm start for the next solve
         self.result: Optional[CalibResult] = None
         self.min_corners = int(board.min_points)
         self.accept_agreement_mm = float(accept_agreement_mm)
@@ -1668,12 +1669,17 @@ class BaseToBaseSession:
         from .solve import solve_base_to_base_auto
         # the per-capture METER runs a bounded-iteration bundle (a live gauge doesn't need
         # full convergence on an Orin-class CPU); Solve/validate get the full budget
+        warm_x, warm_n = self._px_warm if self._px_warm is not None else (None, 0)
         r, report = solve_base_to_base_auto(
             obs, self.X_a, self.X_b, self.chain_a, self.chain_b, self.board.points,
             fk_a=self.fk_a, fk_b=self.fk_b,
             min_views_for_offsets=20 if full else 10 ** 9,
-            max_nfev=400 if full else 100)
+            max_nfev=400 if full else 60,
+            warm_x=warm_x, warm_views=min(int(warm_n), len(obs)))
         self.last_report = report
+        if str(report.get("method", "")).startswith("pixel") and getattr(r, "_x", None) is not None \
+                and len(obs) == len(self.obs):
+            self._px_warm = (np.asarray(r._x[:6 + 6 * len(obs)], float).copy(), len(obs))
         print(f"[b2b] solve({'full' if full else 'meter'}): {r.metrics.get('method')} "
               f"· {len(obs)} views · {_t.time() - _t0:.2f}s "
               f"· px_rms {r.metrics.get('pixel_rms_px')} "
