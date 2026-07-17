@@ -303,11 +303,55 @@ def generate_poses(home: Dict[str, Pose], arms: List[str], n: int,
 
 # --- orchestration -----------------------------------------------------------------------------
 
+def _joints_readable(stack: MotionStack) -> bool:
+    """True iff the robot's CURRENT joints can be read (a non-empty seed). If False, executing ANY
+    plan is a FLY-HOME hazard: the planner seeds from its DEFAULTS (= home), not the arm's real pose,
+    so the executed trajectory starts at the wrong config and the arm jumps violently to 'home'. On
+    this rig `get_observation()` couples the ZED grab with the joint read, so a camera fault empties
+    the seed — exactly the incident that needed an E-stop."""
+    try:
+        return bool(stack._seed_positions())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def prove_jerk(stack: MotionStack) -> int:
+    """CONFIRM the fly-home jerk mechanism — plan-only, NO motion. Shows the arm's REAL current joints
+    vs the planner's DEFAULT (home) config that an EMPTY seed falls back to. The per-joint `jump` is
+    exactly how far the arm lurches at waypoint 0 when `get_observation` fails (dead camera → empty
+    seed). Cross-check: `home` for joint1..6 should equal the angles the xArm kept rejecting in the run."""
+    import numpy as np
+    cvp = stack._planner_for(list(stack._groups.keys()))
+    names = list(cvp.planner.joint_names)
+    real = stack._seed_positions()                       # the real joints (empty if the camera read fails)
+    home = cvp.planner.default_joint_state.position.detach().cpu().numpy().reshape(-1)
+    print("\n" + "=" * 66)
+    print("EMPTY-SEED FLY-HOME PROOF — plan-only, NO motion")
+    if not real:
+        print("  seed_positions is EMPTY right now (camera/joint read is down) — so a plan would seed")
+        print("  from 'home' below and the arm would lurch there. Real joints unavailable to size it.")
+    print(f"  {'joint':16s} {'now(real)':>10s} {'home(empty-seed)':>18s} {'jump rad':>9s}")
+    maxj = 0.0
+    for n, d in zip(names, home):
+        r = real.get(n, float("nan"))
+        j = abs(r - float(d)) if r == r else float("nan")
+        if j == j:
+            maxj = max(maxj, j)
+        rs = f"{r:10.3f}" if r == r else f"{'n/a':>10s}"
+        print(f"  {n:16s} {rs} {float(d):18.3f} {j:9.3f}")
+    print(f"\n  MAX JUMP = {maxj:.3f} rad  ← the arm lurches THIS much at waypoint 0 with an empty seed.")
+    print("=" * 66)
+    return 0
+
+
 def run(stack: MotionStack, args) -> int:
     arms = list(stack._groups.keys())
     execute = bool(args.execute) and not args.dry_run
     print("=" * 74)
     print(f"cuRobo showcase — arms={arms}  mode={'EXECUTE (real motion)' if execute else 'DRY-RUN (plan only)'}")
+
+    if getattr(args, "prove_jerk", False):
+        return prove_jerk(stack)
 
     # GATE: plan (and in execute, perform) a retract to home. This both establishes a clean spread
     # start — the crux the working plan→execute demo relied on — and, if it fails, distinguishes a
@@ -368,13 +412,32 @@ def run(stack: MotionStack, args) -> int:
     # ── PHASE 2 · EXECUTE — run on hardware (re-plans against live state; motion chains the poses).
     print(f"\n── PHASE 2 · EXECUTE {len(seq)} poses × {args.loops} loop(s) ──")
     exec_log: List[dict] = []
+    aborted = False
     for loop in range(args.loops):
+        if aborted:
+            break
         if args.loops > 1:
             print(f"  · loop {loop + 1}/{args.loops}")
         for name, offsets in seq:
+            # SAFETY: never plan+execute when the current joints can't be read. An empty seed makes the
+            # planner start from HOME (not the arm's real pose) → a violent fly-home jump (the E-stop
+            # incident). If the joint read is down (e.g. a dead camera killing get_observation), STOP.
+            if not _joints_readable(stack):
+                print("\n" + "!" * 74)
+                print("SAFETY ABORT — cannot read the robot's current joints (get_observation failed; see")
+                print("the camera/bridge errors above). Executing now would seed the plan from HOME, not the")
+                print("arm's real pose → a violent fly-home jump. Refusing all further motion.")
+                print("Fix the camera cable / bridge, then re-run. (E-stop now if the arm is still moving.)")
+                print("!" * 74)
+                aborted = True
+                break
             step(stack, name, home, arms, offsets, execute=True, log=exec_log)
-    print("\nretracting home...")
-    stack.retract(execute=True)
+
+    if aborted:
+        print("\nNOT auto-retracting — a retract would also fly-home with unreadable joints. Recover manually.")
+    else:
+        print("\nretracting home...")
+        stack.retract(execute=True)
 
     ok = [r for r in exec_log if r.get("ok")]
     pms = [r["plan_ms"] for r in exec_log if r.get("plan_ms")]
@@ -396,6 +459,9 @@ def main() -> int:
     ap.add_argument("--cell", default=os.environ.get("REMOROO_CELL", "remoroo_cell"))
     ap.add_argument("--execute", action="store_true", help="ACTUALLY MOVE the robot (default: dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="plan + time only, never move (overrides --execute)")
+    ap.add_argument("--prove-jerk", action="store_true",
+                    help="diagnostic, NO motion: print the arm's real joints vs the planner's home "
+                         "config (the empty-seed fallback) to confirm the fly-home jerk mechanism, then exit")
     ap.add_argument("--loops", type=int, default=1, help="how many times through the routine (execute phase)")
     ap.add_argument("--poses", type=int, default=0,
                     help="generate N procedural flowing poses instead of the curated ~21-move routine "
