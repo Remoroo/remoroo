@@ -124,7 +124,7 @@ _SCALES = (1.0, 0.6, 0.35, 0.15)   # shrink the offset toward the current pose u
 
 def step(stack: MotionStack, name: str, home: Dict[str, Pose], arms: List[str],
          offsets: Dict[str, XYZ], execute: bool, log: List[dict],
-         scales: tuple = _SCALES) -> bool:
+         scales: tuple = _SCALES):
     """ONE coordinated move, ADAPTIVE: try the full offset, and on a planning failure shrink it toward
     the current pose and retry (`scales`). Since scale→0 is the current (trivially feasible) pose, a
     scene never spams failures — it lands the largest feasible version, or reports that even the
@@ -156,10 +156,12 @@ def step(stack: MotionStack, name: str, home: Dict[str, Pose], arms: List[str],
               f"motion {dur:.1f}s | wall {wall:5.0f} ms | {st}")
         log.append({"scene": name, "ok": True, "plan_ms": plan_ms, "sep": sep,
                     "dq": dq, "scale": scale, "executed": bool(mv.executed)})
-        return True
-    print(f"  ✗ {name:16s} no plan even at {int(scales[-1] * 100)}% offset ({(err or '')[:44]})")
+        return mv                                          # the MoveResult (carries the trajectory)
+    print(f"  ✗ {name:16s} no plan even at {int(scales[-1] * 100)}% offset")
+    if err:
+        print(f"      {err[:200]}")                        # includes the START-CONFIG CHECK cause now
     log.append({"scene": name, "ok": False})
-    return False
+    return None
 
 
 # --- scenes (coordinated dual-arm, TCPs meeting near the shared centre) -------------------------
@@ -303,6 +305,53 @@ def generate_poses(home: Dict[str, Pose], arms: List[str], n: int,
 
 # --- orchestration -----------------------------------------------------------------------------
 
+class _FakeObs:
+    """A stand-in observation carrying only joint_positions — all the plan seed needs."""
+
+    def __init__(self, joint_positions: Dict[str, float]) -> None:
+        self.joint_positions = dict(joint_positions)
+
+
+class _SeedTracker:
+    """Keep the plan seed ALIVE across camera-coupled `get_observation()` failures — a stop-gap for a
+    flaky camera cable so the demo CONTINUES instead of aborting. Every good read is cached; on a failed
+    read it returns the last-known joints (advanced by each executed trajectory), so the planner always
+    seeds from where the arm ACTUALLY is — never HOME → no fly-home. Wraps `bridge.get_observation`
+    in place. (Real fix is the camera cable + a joint read decoupled from the cameras.)"""
+
+    def __init__(self, bridge) -> None:
+        self._real = bridge.get_observation
+        self.tracked: Optional[Dict[str, float]] = None
+        self.using_fallback = False
+        self.fallbacks = 0
+        bridge.get_observation = self._get_observation      # monkeypatch in place
+
+    def _get_observation(self, *a, **k):
+        try:
+            obs = self._real(*a, **k)
+            jp = getattr(obs, "joint_positions", None)
+            if jp:
+                self.tracked = {str(n): float(v) for n, v in dict(jp).items()}
+                self.using_fallback = False
+                return obs
+        except Exception:  # noqa: BLE001 — camera/bridge read failed
+            pass
+        if self.tracked is not None:                        # fall back to the tracked config
+            self.using_fallback = True
+            self.fallbacks += 1
+            return _FakeObs(self.tracked)
+        raise RuntimeError("no joint reading available and no cached seed to fall back on")
+
+    def advance(self, traj) -> None:
+        """After an executed move the arm is at the trajectory's END — record it so the tracked seed
+        stays accurate even while the camera read is down."""
+        if self.tracked is not None and traj is not None:
+            try:
+                self.tracked.update({str(n): float(v) for n, v in zip(traj.joint_names, traj.final)})
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _joints_readable(stack: MotionStack) -> bool:
     """True iff the robot's CURRENT joints can be read (a non-empty seed). If False, executing ANY
     plan is a FLY-HOME hazard: the planner seeds from its DEFAULTS (= home), not the arm's real pose,
@@ -412,7 +461,7 @@ def diagnose_start(stack: MotionStack) -> int:
     return 0
 
 
-def run(stack: MotionStack, args) -> int:
+def run(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None) -> int:
     arms = list(stack._groups.keys())
     execute = bool(args.execute) and not args.dry_run
     print("=" * 74)
@@ -479,22 +528,28 @@ def run(stack: MotionStack, args) -> int:
         if args.loops > 1:
             print(f"  · loop {loop + 1}/{args.loops}")
         for name, offsets in seq:
-            # SAFETY: never plan+execute when the current joints can't be read. An empty seed makes the
-            # planner start from HOME (not the arm's real pose) → a violent fly-home jump (the E-stop
-            # incident). If the joint read is down (e.g. a dead camera killing get_observation), STOP.
+            # SAFETY: the seed must reflect where the arm ACTUALLY is, or the plan starts from HOME →
+            # a violent fly-home jump. With the tracker, a camera-read drop falls back to the last-known
+            # config (kept fresh by advance()), so we CONTINUE safely. We only stop if there's no seed
+            # AND no cached fallback (camera dead before any good read) — then a plan would fly home.
             if not _joints_readable(stack):
                 print("\n" + "!" * 74)
-                print("SAFETY ABORT — cannot read the robot's current joints (get_observation failed; see")
-                print("the camera/bridge errors above). Executing now would seed the plan from HOME, not the")
-                print("arm's real pose → a violent fly-home jump. Refusing all further motion.")
-                print("Fix the camera cable / bridge, then re-run. (E-stop now if the arm is still moving.)")
+                print("SAFETY ABORT — no joint reading AND no cached seed (camera failed before any good")
+                print("read). A plan now would seed from HOME → fly-home jump. Refusing further motion.")
+                print("Fix the camera cable / bridge, then re-run. (E-stop now if the arm is moving.)")
                 print("!" * 74)
                 aborted = True
                 break
-            step(stack, name, home, arms, offsets, execute=True, log=exec_log)
+            mv = step(stack, name, home, arms, offsets, execute=True, log=exec_log)
+            if tracker is not None:
+                tracker.advance(getattr(mv, "trajectory", None))   # keep the tracked seed accurate
+                if tracker.using_fallback:
+                    print("      ⚠ camera read down — continuing on the tracked seed (arm's real pose)")
 
     if aborted:
-        print("\nNOT auto-retracting — a retract would also fly-home with unreadable joints. Recover manually.")
+        print("\nNOT auto-retracting — no safe seed; a retract could fly-home. Recover manually.")
+    elif tracker is not None and tracker.using_fallback:
+        print("\nskipping auto-retract — camera read is down; leaving the arms where they are (safe).")
     else:
         print("\nretracting home...")
         stack.retract(execute=True)
@@ -566,11 +621,20 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    # Keep the plan seed alive across camera-read drops (flaky cable stop-gap) — wraps get_observation
+    # BEFORE the stack is built so every stack read goes through it. Falls back to the last-known joints
+    # (never HOME) so the demo continues instead of fly-home-aborting.
+    tracker = None
+    try:
+        tracker = _SeedTracker(bridge)
+    except Exception as e:  # noqa: BLE001 — never let the safety wrapper block the run
+        print(f"  (seed tracker not installed: {type(e).__name__}: {e})")
+
     try:
         print("building + warming the motion stack...")
         stack = MotionStack.from_cell(cell, bridge=bridge)
         stack.prewarm()
-        return run(stack, args)
+        return run(stack, args, tracker)
     except KeyboardInterrupt:
         return 130
     except Exception as e:  # noqa: BLE001

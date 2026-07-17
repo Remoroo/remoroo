@@ -630,6 +630,21 @@ class MotionStack:
         m = self._mapper
         return float(getattr(m, "esdf_voxel_size", 0.03) or 0.03) if m is not None else 0.03
 
+    def explain_start_collision(self, start_positions: Optional[Dict[str, float]] = None,
+                                *, tcp: Optional[str] = None) -> dict:
+        """WHY the current (or given) config is rejected as 'start in collision', decomposed and NAMED:
+        `{bounds:[joints], world:[obstacles], self, summary}` — the born-collision diagnosis promoted
+        into the stack. The plan verbs auto-attach `summary` to a failed `MoveResult.message`; call this
+        directly for the full structured report. Uses the live seed when `start_positions` is None."""
+        tcp = tcp or next(iter(self._groups), None)
+        if tcp is None:
+            return {"bounds": [], "world": [], "self": None, "summary": "no kinematic groups"}
+        planner = self._planner_for([tcp])
+        if not hasattr(planner, "explain_start_collision"):
+            return {"bounds": [], "world": [], "self": None, "summary": "planner has no explainer"}
+        seed = start_positions if start_positions is not None else self._seed_positions()
+        return planner.explain_start_collision(seed)
+
     # --- debug world: EXACTLY what the planner avoids, as inspectable geometry ----------------
     def debug_world(self) -> dict:
         """The EXACT collision world the planner clears, as plain geometry for render/inspection:

@@ -780,6 +780,80 @@ class CuroboV2Planner:
         a = state.robot_spheres.detach().cpu().numpy().reshape(-1, 4)
         return a[a[:, 3] > 0]
 
+    def explain_start_collision(self, start_positions: Optional[Dict[str, float]] = None) -> dict:
+        """WHY a config is rejected as 'start in collision', DECOMPOSED and NAMED — the answer we used
+        to reverse-engineer by hand. Built on the working introspection (`joint_limits` for BOUNDS,
+        `robot_spheres` vs the modeled cuboids for WORLD → which obstacle); the SELF verdict is
+        best-effort via `world_sphere_collision` (which has a scene-format bug on some cells, so it's
+        wrapped). NEVER raises — it runs on a failure path. Returns {bounds, world, self, summary}."""
+        out: dict = {"bounds": [], "world": [], "self": None, "summary": ""}
+        try:
+            names = list(self.planner.joint_names)
+            q = self._start_js(start_positions).position.detach().cpu().numpy().reshape(-1)
+            seed = {names[i]: float(q[i]) for i in range(min(len(names), len(q)))}
+            lims = self.joint_limits()
+            for n in names:
+                v, lohi = seed.get(n), lims.get(n)
+                if v is None or lohi is None:
+                    continue
+                lo, hi = lohi
+                if v < lo - 1e-6 or v > hi + 1e-6:
+                    out["bounds"].append({"joint": n, "value": round(v, 3),
+                                          "min": round(lo, 3), "max": round(hi, 3)})
+            try:                                            # WORLD — which modeled cuboid the spheres sit in
+                spheres = self.robot_spheres(start_positions)
+                cuboids = (self._world.scene or {}).get("cuboid") or {}
+                hits = []
+                for name, b in cuboids.items():
+                    pose = list(b.get("pose") or [0, 0, 0])
+                    c = [float(x) for x in (list(pose[:3]) + [0, 0, 0])[:3]]
+                    d = [float(x) for x in (list(b.get("dims") or [0.1, 0.1, 0.1]) + [0.1, 0.1, 0.1])[:3]]
+                    nhit = sum(1 for s in spheres
+                               if abs(float(s[0]) - c[0]) <= d[0] / 2 + float(s[3])
+                               and abs(float(s[1]) - c[1]) <= d[1] / 2 + float(s[3])
+                               and abs(float(s[2]) - c[2]) <= d[2] / 2 + float(s[3]))
+                    if nhit:
+                        hits.append({"obstacle": name, "spheres_inside": int(nhit)})
+                out["world"] = sorted(hits, key=lambda w: -w["spheres_inside"])
+            except Exception:  # noqa: BLE001
+                pass
+            try:                                            # SELF — best-effort canonical verdict
+                cf = self.world_sphere_collision(start_positions).get("collision_free")
+                if cf is False and not out["bounds"] and not out["world"]:
+                    out["self"] = True
+            except Exception:  # noqa: BLE001
+                out["self"] = None
+            parts = []
+            if out["bounds"]:
+                parts.append("OUT OF JOINT LIMITS: " + ", ".join(
+                    f"{b['joint']}={b['value']}∉[{b['min']},{b['max']}]" for b in out["bounds"]))
+            if out["world"]:
+                parts.append("START INSIDE MODELED OBSTACLE(S): " + ", ".join(
+                    f"'{w['obstacle']}' ({w['spheres_inside']} spheres)" for w in out["world"]))
+            if out["self"]:
+                parts.append("SELF-COLLISION (arm spheres overlap)")
+            if not parts:
+                parts.append("no joint-limit or modeled-obstacle violation → likely SELF-COLLISION "
+                             "(arm-vs-arm) or a live-ESDF/mesh obstacle; check the self-collision model")
+            out["summary"] = " | ".join(parts)
+        except Exception as e:  # noqa: BLE001
+            out["summary"] = f"(start-collision explain unavailable: {type(e).__name__}: {e})"
+        return out
+
+    def _fail_msg(self, result, start_positions, *, home: bool = False) -> str:
+        """The failure message with the born-collision CAUSE appended when a goal exists but the path
+        failed (result is not None = IK found a goal → the block is start/waypoint collision, worth
+        explaining). For a pure reach miss (result is None) we skip it — there's no start to blame."""
+        msg = _plan_failure_message(result, home=home)
+        if result is not None:
+            try:
+                info = self.explain_start_collision(start_positions)
+                if info.get("summary"):
+                    msg += "  ·  START-CONFIG CHECK → " + info["summary"]
+            except Exception:  # noqa: BLE001 — never let the explainer break the failure path
+                pass
+        return msg
+
     # --- introspection ----------------------------------------------------
     @property
     def tool_frames(self) -> List[str]:
@@ -1063,7 +1137,7 @@ class CuroboV2Planner:
         except Exception as e:  # a planner exception is a failure to surface, not a crash
             return PlanResult(False, None, f"plan_pose raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
-            return PlanResult(False, None, _plan_failure_message(result))
+            return PlanResult(False, None, self._fail_msg(result, start_positions))
         traj = self._to_trajectory(result.get_interpolated_plan())
         return PlanResult(True, traj, "ok", float(getattr(result, "total_time", traj.duration)))
 
@@ -1106,7 +1180,7 @@ class CuroboV2Planner:
         except Exception as e:
             return PlanResult(False, None, f"plan_cspace raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
-            return PlanResult(False, None, _plan_failure_message(result, home=True))
+            return PlanResult(False, None, self._fail_msg(result, start_positions, home=True))
         traj = self._to_trajectory(self._trimmed_plan(result))   # trimmed, never the padded buffer
         return PlanResult(True, traj, "ok", traj.duration)
 
@@ -1149,7 +1223,7 @@ class CuroboV2Planner:
         except Exception as e:
             return PlanResult(False, None, f"plan_cspace raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
-            return PlanResult(False, None, _plan_failure_message(result))
+            return PlanResult(False, None, self._fail_msg(result, start_positions))
         with span("interpolate→Trajectory"):
             traj = self._to_trajectory(self._trimmed_plan(result))
         from .mtrace import stamp
