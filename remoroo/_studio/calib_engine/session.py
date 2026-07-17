@@ -1591,21 +1591,26 @@ class BaseToBaseSession:
     def _capture_obs(self) -> Optional[dict]:
         """Both arms view the shared board once → (joints, camera->marker) per arm, or None if
         either camera misses it. Shared by capture / verify."""
+        import time as _t
+        _t0 = _t.time()
         ida, uva = self.bridge_a.capture()
         idb, uvb = self.bridge_b.capture()
+        _t_grab = _t.time()
         if len(ida) < self.min_corners or len(idb) < self.min_corners:
+            print(f"[b2b] capture REJECTED: grabs+detect {_t_grab - _t0:.2f}s "
+                  f"· corners {len(ida)}/{len(idb)} (min {self.min_corners})", flush=True)
             return None
         qa, qb = self.bridge_a.read_joints(), self.bridge_b.read_joints()
         from .solve import _planar_pose_candidates
         P = self.board.points
+        _t_det = _t.time()
 
-        def _side(ids, uv, K):
+        def _side_from(cands):
             """Best-branch pose + the P2 ambiguity signal: the view is AMBIGUITY-PRONE when
             the OTHER flip branch explains the pixels nearly as well (the formal
             weak-perspective condition — small/distant/near-fronto-parallel board) or the
             board is near-fronto-parallel. Frozen commitment to such a view is what produced
             the live 35mm agreement failure; the capture WARNS instead of silently storing."""
-            cands = _planar_pose_candidates(P[np.asarray(ids, int)], np.asarray(uv, float), K)
             T = cands[0][0]
             ambiguous = bool(len(cands) == 2 and np.isfinite(cands[1][1])
                              and cands[1][1] < 3.0 * max(cands[0][1], 1e-6))
@@ -1613,9 +1618,15 @@ class BaseToBaseSession:
             tilt = float(np.degrees(np.arccos(np.clip(abs(float(T[:3, 2] @ view)), 0.0, 1.0))))
             return T, ambiguous, tilt
 
-        Ta, amb_a, tilt_a = _side(ida, uva, self.K_a)
-        Tb, amb_b, tilt_b = _side(idb, uvb, self.K_b)
+        ca = _planar_pose_candidates(P[np.asarray(ida, int)], np.asarray(uva, float), self.K_a)
+        cb = _planar_pose_candidates(P[np.asarray(idb, int)], np.asarray(uvb, float), self.K_b)
+        Ta, amb_a, tilt_a = _side_from(ca)
+        Tb, amb_b, tilt_b = _side_from(cb)
+        print(f"[b2b] capture: camera grabs+detect {_t_grab - _t0:.2f}s · joints {_t_det - _t_grab:.2f}s "
+              f"· branch fits {_t.time() - _t_det:.2f}s · corners {len(ida)}/{len(idb)}", flush=True)
         return {
+            "_cands": (ca, cb),   # branch fits are per-capture work — never redone downstream
+
             "joints_a": qa, "T_ca_marker": Ta,
             "joints_b": qb, "T_cb_marker": Tb,
             # the RAW measurement — the pixel bundle re-estimates the board pose per view,
@@ -1652,12 +1663,22 @@ class BaseToBaseSession:
         two-camera PIXEL bundle when corner obs exist (legacy 3D bundle otherwise); `full`
         additionally runs the held-out-guarded joint-offsets trial (solve/validate — too
         heavy for the per-capture observe meter)."""
+        import time as _t
+        _t0 = _t.time()
         from .solve import solve_base_to_base_auto
+        # the per-capture METER runs a bounded-iteration bundle (a live gauge doesn't need
+        # full convergence on an Orin-class CPU); Solve/validate get the full budget
         r, report = solve_base_to_base_auto(
             obs, self.X_a, self.X_b, self.chain_a, self.chain_b, self.board.points,
             fk_a=self.fk_a, fk_b=self.fk_b,
-            min_views_for_offsets=20 if full else 10 ** 9)
+            min_views_for_offsets=20 if full else 10 ** 9,
+            max_nfev=400 if full else 100)
         self.last_report = report
+        print(f"[b2b] solve({'full' if full else 'meter'}): {r.metrics.get('method')} "
+              f"· {len(obs)} views · {_t.time() - _t0:.2f}s "
+              f"· px_rms {r.metrics.get('pixel_rms_px')} "
+              f"· flips {r.metrics.get('flipped_views', 0)}"
+              + (f" · offsets {report.get('offsets')}" if full else ""), flush=True)
         return r
 
     def observe(self) -> dict:

@@ -506,7 +506,12 @@ def solve_base_to_base(
 def _view_candidates(o: dict, board_points: np.ndarray):
     """Per-camera branch candidates for ONE shared view: BOTH planar-ambiguity branches from
     the stored corners (new-style obs), or the single frozen pose (legacy obs without
-    corners). Returns ([(T, rms_px)...]_a, [...]_b)."""
+    corners). Returns ([(T, rms_px)...]_a, [...]_b). CACHED on the obs — the corners never
+    change after capture, and re-fitting 6 LM problems per view on EVERY observe/solve was
+    the per-capture latency on the rig."""
+    cached = o.get("_cands")
+    if cached is not None:
+        return cached
     P = np.asarray(board_points, float)
     out = []
     for side in ("a", "b"):
@@ -516,7 +521,8 @@ def _view_candidates(o: dict, board_points: np.ndarray):
                                                np.asarray(uv, float), np.asarray(K, float)))
         else:
             out.append([(np.asarray(o[f"T_c{side}_marker"], float), float("nan"))])
-    return out[0], out[1]
+    o["_cands"] = (out[0], out[1])
+    return o["_cands"]
 
 
 def select_b2b_branches(
@@ -662,6 +668,7 @@ def solve_base_to_base_pixel(
     board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None,
     fk_b: Optional[np.ndarray] = None, estimate_joint_offsets: bool = False,
     robust: bool = True, f_scale_px: float = 2.0, max_offset_rad: float = 0.03,
+    max_nfev: int = 400,
 ) -> CalibResult:
     """P1 (+P3) — solve T_baseA_baseB by the joint two-camera PIXEL bundle. Requires
     corner-bearing obs (ids/uv/K per camera) — raises ValueError otherwise so callers fall
@@ -694,7 +701,7 @@ def solve_base_to_base_pixel(
         lo[6 + 6 * prob.V:], hi[6 + 6 * prob.V:] = -max_offset_rad, max_offset_rad
     res = least_squares(prob.residual, x0, loss="huber" if robust else "linear",
                         f_scale=f_scale_px, method="trf", jac_sparsity=prob.sparsity(),
-                        bounds=(lo, hi), max_nfev=400)
+                        bounds=(lo, hi), max_nfev=int(max_nfev))
     T_AB, _boards, dqa, dqb = prob.unpack(res.x)
     # the task-space headline, computed the SAME way as the legacy path (comparable numbers):
     # frozen selected branches vs the final T_AB, with the estimated offsets folded in
@@ -750,6 +757,7 @@ def solve_base_to_base_auto(
     obs: Sequence[dict], X_a: np.ndarray, X_b: np.ndarray, chain_a: Chain, chain_b: Chain,
     board_points: np.ndarray, *, fk_a: Optional[np.ndarray] = None,
     fk_b: Optional[np.ndarray] = None, min_views_for_offsets: int = B2B_OFFSETS_MIN_VIEWS,
+    max_nfev: int = 400,
 ) -> Tuple[CalibResult, dict]:
     """THE base-to-base solve policy, in one place. Corner-bearing obs → P0 branch-aware
     selection + P1 pixel bundle; ≥min_views_for_offsets views → ALSO try P3 joint offsets,
@@ -774,7 +782,7 @@ def solve_base_to_base_auto(
                    "offsets": {"tried": False, "kept": False}}
 
     r = solve_base_to_base_pixel(obs, X_a, X_b, chain_a, chain_b, P, fk_a=fa, fk_b=fb,
-                                 estimate_joint_offsets=False)
+                                 estimate_joint_offsets=False, max_nfev=max_nfev)
     report = {"method": "pixel_bundle", "per_view": r._per_view,
               "offsets": {"tried": False, "kept": False}}
     if len(obs) >= int(min_views_for_offsets):
