@@ -315,61 +315,21 @@ def _joints_readable(stack: MotionStack) -> bool:
         return False
 
 
-def prove_jerk(stack: MotionStack) -> int:
-    """CONFIRM the fly-home jerk mechanism — plan-only, NO motion. Shows the arm's REAL current joints
-    vs the planner's DEFAULT (home) config that an EMPTY seed falls back to. The per-joint `jump` is
-    exactly how far the arm lurches at waypoint 0 when `get_observation` fails (dead camera → empty
-    seed). Cross-check: `home` for joint1..6 should equal the angles the xArm kept rejecting in the run."""
-    import numpy as np
-    cvp = stack._planner_for(list(stack._groups.keys()))
-    names = list(cvp.planner.joint_names)
-    real = stack._seed_positions()                       # the real joints (empty if the camera read fails)
-    home = cvp.planner.default_joint_state.position.detach().cpu().numpy().reshape(-1)
-    print("\n" + "=" * 66)
-    print("EMPTY-SEED FLY-HOME PROOF — plan-only, NO motion")
-    if not real:
-        print("  seed_positions is EMPTY right now (camera/joint read is down) — so a plan would seed")
-        print("  from 'home' below and the arm would lurch there. Real joints unavailable to size it.")
-    print(f"  {'joint':16s} {'now(real)':>10s} {'home(empty-seed)':>18s} {'jump rad':>9s}")
-    maxj = 0.0
-    for n, d in zip(names, home):
-        r = real.get(n, float("nan"))
-        j = abs(r - float(d)) if r == r else float("nan")
-        if j == j:
-            maxj = max(maxj, j)
-        rs = f"{r:10.3f}" if r == r else f"{'n/a':>10s}"
-        print(f"  {n:16s} {rs} {float(d):18.3f} {j:9.3f}")
-    print(f"\n  MAX JUMP = {maxj:.3f} rad  ← the arm lurches THIS much at waypoint 0 with an empty seed.")
-    print("=" * 66)
-    return 0
-
-
 def run(stack: MotionStack, args) -> int:
     arms = list(stack._groups.keys())
     execute = bool(args.execute) and not args.dry_run
     print("=" * 74)
     print(f"cuRobo showcase — arms={arms}  mode={'EXECUTE (real motion)' if execute else 'DRY-RUN (plan only)'}")
 
-    if getattr(args, "prove_jerk", False):
-        return prove_jerk(stack)
-
-    # GATE: plan (and in execute, perform) a retract to home. This both establishes a clean spread
-    # start — the crux the working plan→execute demo relied on — and, if it fails, distinguishes a
-    # genuinely-stuck config from a mere demo-target problem.
+    # BEST-EFFORT retract: try to start the dance from the cell's cspace-home (a clean, spread base).
+    # NON-fatal: if the big move to home can't be planned (it crosses a spot the collision model
+    # rejects, or the model is conservative), we DON'T abort — the arms are wherever they are, and the
+    # dance is small OFFSETS FROM THE CURRENT POSE, which plan fine on their own. Phase 1 (no motion)
+    # confirms before anything executes. `home` below is read LIVE from the arm either way.
     ok, moved = retract_gate(stack, execute)
     if not ok:
-        print("-" * 74)
-        print("ABORTED: cuRobo can't plan a path to HOME from the current config. This is NOT the demo")
-        print("targets — the current pose is genuinely stuck: born-in-collision, or the two-arm")
-        print("self-collision spheres / ignore matrix are over-conservative. Physically jog the arms")
-        print("apart, or check `stack.debug_world()` + the self-collision model, then retry.")
-        print("-" * 74)
-        return 3
-    if not moved:
-        print("  NOTE: dry-run did NOT move the arms — the scenes below are planned from the CURRENT")
-        print("  (possibly crowded) config, NOT from home. If the arms are close, in-place scenes will")
-        print("  still fail. For a from-home preview run with --execute (retracts first), or jog the")
-        print("  arms to a spread pose. (This is why dry-run 'doesn't work' but plan→execute does.)")
+        print("  retract to cspace-home couldn't plan — SKIPPING it and dancing from the CURRENT pose")
+        print("  (the moves are small offsets from here; Phase 1 below plans them all with no motion).")
 
     home = {a: stack.current_tool_pose(a) for a in arms}
     if any(v is None for v in home.values()):
@@ -459,9 +419,6 @@ def main() -> int:
     ap.add_argument("--cell", default=os.environ.get("REMOROO_CELL", "remoroo_cell"))
     ap.add_argument("--execute", action="store_true", help="ACTUALLY MOVE the robot (default: dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="plan + time only, never move (overrides --execute)")
-    ap.add_argument("--prove-jerk", action="store_true",
-                    help="diagnostic, NO motion: print the arm's real joints vs the planner's home "
-                         "config (the empty-seed fallback) to confirm the fly-home jerk mechanism, then exit")
     ap.add_argument("--loops", type=int, default=1, help="how many times through the routine (execute phase)")
     ap.add_argument("--poses", type=int, default=0,
                     help="generate N procedural flowing poses instead of the curated ~21-move routine "
