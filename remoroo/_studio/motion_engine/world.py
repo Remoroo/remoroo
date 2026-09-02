@@ -114,3 +114,36 @@ def load_world(cell_dir: str) -> WorldInputs:
     world at commission/demo is the LIVE depth ESDF. Pure data, no cuRobo."""
     obstacles = list((_read_yaml(Path(cell_dir) / "cell.yaml") or {}).get("obstacles") or [])
     return WorldInputs(scene=build_scene(obstacles), meta={"n_obstacles": len(obstacles)})
+
+
+def sphere_box_overlaps(spheres, scene: dict) -> dict:
+    """For each obstacle cuboid, how many of the robot's spheres PENETRATE it, and the min
+    clearance (sphere-surface → box, negative = inside). Sphere centers are transformed into
+    the box's LOCAL frame first — a rotated wall must never read as an axis-aligned slab
+    through the workspace (the 'START INSIDE obs_5_wall' misdiagnosis, 2026-07-18; resurfaced
+    2026-07-20 via curobo_v2's private AABB copy — this is now the ONE obstacle-naming test,
+    shared by the stack's world introspection AND the planner's failure diagnostics)."""
+    out: dict = {}
+    sph = np.asarray(spheres, dtype=float)
+    if sph.size == 0:
+        return out
+    for name, box in (scene.get("cuboid") or {}).items():
+        pose = list(box.get("pose") or [0, 0, 0, 1, 0, 0, 0])
+        c = np.asarray(pose[:3], dtype=float)
+        q = np.asarray(pose[3:7] if len(pose) >= 7 else [1, 0, 0, 0], dtype=float)
+        nq = float(np.linalg.norm(q))
+        w, x, y, z = (q / nq) if nq > 1e-9 else (1.0, 0.0, 0.0, 0.0)
+        rot = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+        half = np.asarray(box.get("dims") or [0, 0, 0], dtype=float) / 2.0
+        n, mind = 0, 1e9
+        for s in sph:
+            p = rot.T @ (np.asarray(s[:3], dtype=float) - c)  # sphere center in the BOX frame
+            d = np.maximum(np.abs(p) - half, 0.0)             # per-axis outside distance
+            dist = float(np.linalg.norm(d)) - float(s[3])
+            mind = min(mind, dist)
+            if dist < 0:
+                n += 1
+        out[name] = {"spheres_penetrating": int(n), "min_clearance_m": round(mind, 4)}
+    return out

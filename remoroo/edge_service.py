@@ -241,6 +241,10 @@ def start(project_dir: Path, echo: Echo = print, *, port: Optional[str] = None,
     env = dict(os.environ)
     env.update({"EDGE_PORT": port, "REMOROO_CELL": cell,
                 "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"})
+    # Jetson's CUDA driver JIT cache (~/.nv/ComputeCache) defaults to 256 MiB and this stack
+    # fills it (rig 2026-07-20: 260 MB) — eviction re-pays PTX→SASS JIT on every edge restart.
+    # 4 GiB keeps every compiled blob resident. Respect an operator's own setting.
+    env.setdefault("CUDA_CACHE_MAXSIZE", str(4 << 30))
 
     lp = log_path(project_dir)
     try:

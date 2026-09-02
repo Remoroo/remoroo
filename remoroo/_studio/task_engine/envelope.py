@@ -29,11 +29,43 @@ class Envelope:
 
     @classmethod
     def from_cell(cls, cell: Dict[str, Any]) -> "Envelope":
+        """Consume the REAL cell.yaml schema (audit 2026-07-21: this read three keys
+        that exist in no shipped cell — `safety.max_speed_frac`, `safety.workspace`,
+        `instrumentation` — so speed ran at the loose default, the workspace check was
+        empty, and guarded stops were permanently locked).
+
+        Actual schema: safety.max_joint_speed_frac; workspace.bounds_m {min:[x,y,z],
+        max:[x,y,z]}; sensing.{current_sense,ft_sensor} (booleans, agent-authored).
+        Legacy keys stay honoured so older cells keep their declared meaning."""
+        cell = cell or {}
         safety = cell.get("safety") or {}
+        speed = safety.get("max_joint_speed_frac")
+        if speed is None:
+            speed = safety.get("max_speed_frac")            # legacy spelling
+        # workspace: canonical cell.yaml `workspace.bounds_m` {min,max} triplets ->
+        # the axis dict the checks use; a legacy axis-dict passes through.
+        ws_src = (cell.get("workspace") or {}).get("bounds_m") \
+            or safety.get("workspace")
+        workspace: Dict[str, Any] = {}
+        if isinstance(ws_src, dict) and ws_src.get("min") and ws_src.get("max"):
+            lo, hi = list(ws_src["min"]), list(ws_src["max"])
+            for i, axis in enumerate(("x", "y", "z")):
+                if i < len(lo) and i < len(hi):
+                    workspace[axis] = [float(lo[i]), float(hi[i])]
+        elif isinstance(ws_src, dict):
+            workspace = {k: list(v) for k, v in ws_src.items()
+                         if k in ("x", "y", "z") and v}
+        # guarded stops: sensing.* is where the agent declares them (cell.yaml has a
+        # `sensing` block; `instrumentation` never existed). Absent -> restrictive.
+        inst = dict(cell.get("instrumentation") or {})      # legacy passthrough
+        sensing = cell.get("sensing") or {}
+        for k in ("current_sense", "ft_sensor"):
+            if k not in inst and k in sensing:
+                inst[k] = sensing[k]
         return cls(
-            max_speed_frac=float(safety.get("max_speed_frac", 0.3)),
-            workspace=safety.get("workspace") or {},
-            instrumentation=cell.get("instrumentation") or {},
+            max_speed_frac=float(speed) if speed is not None else 0.3,
+            workspace=workspace,
+            instrumentation=inst,
         )
 
     # speed ------------------------------------------------------------------

@@ -42,6 +42,10 @@ app.add_typer(models_app, name="models")
 app.add_typer(edge_app, name="edge")
 app.add_typer(vla_app, name="vla")
 
+from .heal_cmd import doctor as _doctor, heal as _heal  # noqa: E402 — self-healing surface
+app.command("doctor")(_doctor)
+app.command("heal")(_heal)
+
 @app.command()
 def login():
     """Lock in your API Key."""

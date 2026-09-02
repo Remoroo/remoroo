@@ -813,7 +813,9 @@ def _headless_step_loop(
     (None means "loop forever").
 
     Exits on:
-      - a terminal `workflow_*` step (returns the outcome),
+      - a terminal `workflow_*` step (returns the outcome read from its
+        payload; the step is never handed to the worker or acked — see
+        the comment at the check itself),
       - or `max_iterations` polls if provided without seeing one.
 
     Never raises; any exception inside `handle_fn` / `submit_fn` is
@@ -861,6 +863,33 @@ def _headless_step_loop(
 
         step_type = getattr(step, "type", "") or ""
         stats.last_step_type = step_type
+
+        # A terminal step is an ANNOUNCEMENT, not work. The brain has already
+        # decided the outcome and put it in the payload, and the worker has no
+        # handler for these types — running one returns `success=False,
+        # error="Unknown request type: workflow_complete"`. Submitting that ack
+        # made the CP re-derive the run outcome from a failed ExecutionResult
+        # and overwrite the SUCCESS it had written when the same step was
+        # polled, so a run that succeeded landed as FAILED/EXECUTION. Mirror
+        # the TUI loop (`tui_run.py`): return without handling or submitting.
+        if step_type in _HEADLESS_TERMINAL_STEP_TYPES:
+            payload = getattr(step, "payload", None) or {}
+            _emit_headless_log(
+                "headless.terminal_step",
+                stream=log_stream,
+                run_id=run_id,
+                step_type=step_type,
+            )
+            return (
+                HeadlessLoopOutcome(
+                    outcome=str(payload.get("outcome", "UNKNOWN") or "UNKNOWN"),
+                    success=bool(payload.get("success", False)),
+                    partial_success=bool(payload.get("partial_success", False)),
+                    final_result=payload or None,
+                    step_type=step_type,
+                ),
+                stats,
+            )
 
         try:
             result = handle_fn(step)
@@ -911,17 +940,6 @@ def _headless_step_loop(
             run_id=run_id,
             step_type=step_type,
         )
-
-        if step_type in _HEADLESS_TERMINAL_STEP_TYPES:
-            payload = getattr(step, "payload", None) or {}
-            outcome = HeadlessLoopOutcome(
-                outcome=str(payload.get("outcome", "UNKNOWN") or "UNKNOWN"),
-                success=bool(payload.get("success", False)),
-                partial_success=bool(payload.get("partial_success", False)),
-                final_result=getattr(result, "data", None),
-                step_type=step_type,
-            )
-            return outcome, stats
 
 
 def run_local_worker_headless(cfg: "Any") -> LocalRunResult:

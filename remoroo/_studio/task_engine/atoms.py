@@ -11,6 +11,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from . import effector as _eff
+from .effector import DEFAULT_EFFECTOR
 from .envelope import STOP_CURRENT, STOP_FT, STOP_TIMEOUT, STOP_Z, Envelope
 from .params import Knobs
 from .trace import Trace
@@ -117,6 +119,78 @@ class Ctx:
     knobs: Knobs
     arm_of: Callable[[str], str] = lambda tcp: tcp     # tcp -> gripper/arm name
     home_poses: Dict[str, Any] = field(default_factory=dict)
+    # EMBODIMENT FRAMES (cell-declared, agent-authored like `groups`). Defaults = a
+    # tabletop manipulator, so shipped cells are byte-for-byte unchanged; a wall arm /
+    # suction head / humanoid declares its own and the same atoms just work.
+    up_of: Callable[[str], Any] = lambda tcp: (0.0, 0.0, 1.0)        # anti-gravity
+    approach_of: Callable[[str], Any] = lambda tcp: (0.0, 0.0, -1.0)  # tool advance dir
+    # FULL default declaration (effector.DEFAULT_EFFECTOR) — never a bare kind, so
+    # every consumer downstream can convert units without guessing (b12f5aa1).
+    effector_of: Callable[[str], Dict[str, Any]] = \
+        lambda tcp: dict(DEFAULT_EFFECTOR)
+
+
+def _unit(v) -> tuple:
+    import math
+    v = [float(x) for x in list(v)[:3]]
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return (v[0] / n, v[1] / n, v[2] / n)
+
+
+def _along(p, u) -> float:
+    return sum(float(p[i]) * u[i] for i in range(3))
+
+
+def _actuate(ctx: "Ctx", tcp: str, *, engage: bool, width: Optional[float] = None,
+             **params) -> Any:
+    """General effector command. `width` is CANONICAL aperture-METRES (or None for
+    the declared engage/disengage endpoint). Prefers bridge.actuate_effector(arm,
+    engage, effector, ...); the set_gripper fallback converts canonical->NATIVE via
+    the cell's effector declaration (effector.command_native) — NEVER raw metres
+    into a fraction bridge (incident b12f5aa1: sim 1.0, metal never closed)."""
+    eff = _eff.normalize(ctx.effector_of(tcp))
+    fn = getattr(ctx.bridge, "actuate_effector", None)
+    if callable(fn):
+        return fn(ctx.arm_of(tcp), engage=engage, effector=eff, width=width, **params)
+    native = _eff.command_native(eff, width_m=width, engage=engage)
+    return ctx.bridge.set_gripper(ctx.arm_of(tcp), native)
+
+
+def _settled_effector_state(ctx: "Ctx", tcp: str, *, timeout_s: float = 3.0,
+                            poll_s: float = 0.25) -> Optional[dict]:
+    """effector state AFTER the fingers stop moving. Run 48236590 (2026-07-21):
+    the xArm close command is wait=False and evidence was read 0.5s later — the
+    measured aperture was ~fully open MID-TRAVEL, poisoning `held` both ways
+    (holding-band false positive + expectation false negative). Poll until the
+    closure measurement stops changing; a bridge that reports instantly-stable
+    values (every sim) exits after one cheap re-read."""
+    import time as _t
+    st = _effector_state(ctx, tcp)
+    if st is None:
+        return None
+    last = st.get("closed_frac", st.get("closed_width"))
+    t0 = _t.monotonic()
+    while _t.monotonic() - t0 < timeout_s:
+        _t.sleep(0.05 if _t.monotonic() - t0 < 0.06 else poll_s)
+        st = _effector_state(ctx, tcp) or st
+        cur = st.get("closed_frac", st.get("closed_width"))
+        if cur is not None and last is not None and abs(float(cur) - float(last)) < 0.004:
+            return st                               # fingers stopped moving
+        last = cur
+    return st
+
+
+def _effector_state(ctx: "Ctx", tcp: str) -> Optional[dict]:
+    """None = NOT INSTRUMENTED (grasp evidence abstains). A bridge whose read
+    fails at runtime returns a falsy value — that is None here too, never {}
+    (an empty dict would masquerade as 'instrumented and empty' and raise a
+    false grasp_empty)."""
+    fn = (getattr(ctx.bridge, "effector_state", None)
+          or getattr(ctx.bridge, "gripper_state", None))
+    if not callable(fn):
+        return None
+    st = fn(ctx.arm_of(tcp))
+    return st if st else None
 
 
 # --- atoms ---------------------------------------------------------------------------------
@@ -127,7 +201,10 @@ def reach(ctx: Ctx, tcp: str, pose: Any, *, speed: Optional[float] = None,
     # mode). Neither identity (infeasible, the 2026-07-15 probe bug) nor "current
     # orientation" (arbitrary mid-task state) is ever substituted. Envelope checks
     # need only xyz; the raw pose passes through to the stack untouched.
-    tgt = _xyzq(pose) if len(list(pose)) != 3 or isinstance(pose, dict) else list(pose)
+    # dict poses carry agent-declared constraints ({position, quaternion, axes}) — the
+    # stack reads them RAW (_axes_of); flattening here dropped the axes key (audit 2026-07-18)
+    tgt = (pose if isinstance(pose, dict)
+           else (list(pose) if len(list(pose)) == 3 else _xyzq(pose)))
     legs = [(p if not isinstance(p, dict) and len(list(p)) == 3 else _xyzq(p))
             for p in via] + [tgt]
     ctx.envelope.check_points(legs)
@@ -140,101 +217,154 @@ def reach(ctx: Ctx, tcp: str, pose: Any, *, speed: Optional[float] = None,
     return _planned(res, h)
 
 
-def descend(ctx: Ctx, tcp: str, to_z: float, *, speed: Optional[float] = None,
-            stop_on: str = STOP_Z, step_m: float = 0.005,
-            max_steps: int = 200) -> AtomResult:
-    """Guarded vertical approach: step down, poll the stop signal between steps.
-    The stop signal is a Bridge fact (currents/FT), never computed here."""
+def descend(ctx: Ctx, tcp: str, to_z: Optional[float] = None, *,
+            distance: Optional[float] = None, axis: Optional[Any] = None,
+            speed: Optional[float] = None, stop_on: str = STOP_Z,
+            step_m: float = 0.005, max_steps: int = 200) -> AtomResult:
+    """APPROACH along an axis. TWO regimes, chosen by what stop_on needs:
+
+    - stop_on=z_reached (no guard signal): ONE planned trajectory straight to the
+      target — there is NOTHING to poll between steps, so stepping is pure waste
+      (operator, run 48236590: 'our descend atom is stupid — it should go directly
+      into the object, not in small chunks'; 17 plans x 1.3s = 22s per 8cm).
+    - stop_on=current/FT: the guarded loop — step, polling the stop signal (a
+      Bridge fact, never computed here) between steps; the stepping IS the guard.
+
+    BACKWARD-COMPATIBLE: descend(tcp, to_z=Z) advances world -Z until z==Z (the
+    tabletop default). A wall/suction/humanoid TCP passes axis=<its approach> (or
+    the cell declares approach_of) for `distance` metres."""
     ctx.envelope.require_stop(stop_on)
     spd = ctx.envelope.clamp_speed(speed)
     cur = _live_pose(ctx, tcp)
-    h = ctx.trace.begin("descend", tcp=tcp, frm_z=cur[2], to_z=to_z, stop_on=stop_on, speed=spd)
-    z = cur[2]
-    steps = 0
-    cause = STOP_TIMEOUT
+    p0 = cur[:3]
+    if to_z is not None and axis is None:
+        a = (0.0, 0.0, -1.0)                          # COMPAT: straight down
+        total = max(0.0, p0[2] - float(to_z))
+    else:
+        a = _unit(axis if axis is not None else ctx.approach_of(tcp))
+        total = abs(float(distance if distance is not None else 0.0))
+    h = ctx.trace.begin("descend", tcp=tcp, frm=list(p0), axis=list(a),
+                        total=round(total, 4), to_z=to_z, stop_on=stop_on, speed=spd)
+    if stop_on not in (STOP_CURRENT, STOP_FT):
+        # UNGUARDED: one planned move. A midpoint waypoint keeps the path close to
+        # the approach line (a free plan may bow); still ONE trajectory, ONE plan.
+        mid = [p0[i] + a[i] * total * 0.5 for i in range(3)] + cur[3:7]
+        end = [p0[i] + a[i] * total for i in range(3)] + cur[3:7]
+        ctx.envelope.check_points([mid, end])
+        res = (ctx.stack.move_through_poses(tcp, [mid, end]) if total > 0.02
+               else ctx.stack.move_to_pose(tcp, end))
+        if not res.ok:
+            return _planned(res, h, travelled=0.0)
+        h.done(ok=True, stop_cause=STOP_Z, z_final=end[2], steps=1)
+        return AtomResult(ok=True, stop_cause=STOP_Z,
+                          evidence={"z": end[2], "steps": 1})
+    travelled, steps, cause = 0.0, 0, STOP_TIMEOUT
     while steps < max_steps:
         if stop_on in (STOP_CURRENT, STOP_FT):
-            # stop_signal is OPTIONAL bridge instrumentation (the authored contract does
-            # not require it): without it, contact stops degrade to the z target.
             sig = getattr(ctx.bridge, "stop_signal", None)
             if callable(sig) and sig(stop_on, tcp):
                 cause = stop_on
                 break
-        if z <= to_z + 1e-9:
-            cause = STOP_Z
+        if travelled >= total - 1e-9:
+            cause = STOP_Z                            # target distance reached
             break
-        z = max(to_z, z - abs(step_m))
-        nxt = [cur[0], cur[1], z] + cur[3:7]
+        travelled = min(total, travelled + abs(step_m))
+        nxt = [p0[i] + a[i] * travelled for i in range(3)] + cur[3:7]
         ctx.envelope.check_xyz(nxt[:3])
         res = ctx.stack.move_to_pose(tcp, nxt)
         if not res.ok:
-            return _planned(res, h, z=z)
+            return _planned(res, h, travelled=round(travelled, 4))
         steps += 1
     ok = cause in (STOP_Z, STOP_CURRENT, STOP_FT)
-    h.done(ok=ok, stop_cause=cause, z_final=z, steps=steps)
-    return AtomResult(ok=ok, stop_cause=cause, evidence={"z": z, "steps": steps})
+    z_final = p0[2] + a[2] * travelled
+    h.done(ok=ok, stop_cause=cause, z_final=z_final, steps=steps)
+    return AtomResult(ok=ok, stop_cause=cause, evidence={"z": z_final, "steps": steps})
 
 
-def grasp(ctx: Ctx, tcp: str, *, width: float, force_hint: Optional[float] = None) -> AtomResult:
-    arm = ctx.arm_of(tcp)
-    h = ctx.trace.begin("grasp", tcp=tcp, width=width, force_hint=force_hint)
-    ctx.bridge.set_gripper(arm, width)
-    gs = getattr(ctx.bridge, "gripper_state", None)   # OPTIONAL instrumentation
-    if callable(gs):
-        state = gs(arm) or {}
+def grasp(ctx: Ctx, tcp: str, *, width: Optional[float] = None,
+          force_hint: Optional[float] = None, **params) -> AtomResult:
+    """ENGAGE the effector — width for a parallel gripper, vacuum for suction, current
+    for magnetic, a finger config for a hand — via the effector abstraction. `held` is
+    generic evidence from effector_state (a suction cup holds at width~0 and is NOT
+    misread as empty). width=None -> the effector's own closed value."""
+    h = ctx.trace.begin("grasp", tcp=tcp, width=width, force_hint=force_hint,
+                        effector=(ctx.effector_of(tcp) or {}).get("kind"))
+    _actuate(ctx, tcp, engage=True, width=width, force_hint=force_hint, **params)
+    state = _settled_effector_state(ctx, tcp)       # evidence AFTER travel, never mid
+    if state is not None:
         closed = float(state.get("closed_width", 0.0))
-        held = bool(state.get("holding", closed > 1e-3))
+        held = bool(state.get("holding", state.get("engaged", closed > 1e-3)))
         ev = GraspEvidence(held=held, closed_width=closed)
         h.done(ok=held, stop_cause=None if held else "grasp_empty", **ev.to_dict())
         return AtomResult(ok=held, stop_cause=None if held else "grasp_empty",
                           evidence=ev.to_dict())
-    # No gripper feedback on this bridge: the grasp PROCEEDS (the verifier judges the
-    # outcome from perception — the actual truth); evidence states held=UNKNOWN so the
-    # judge's proprioceptive channel abstains instead of lying.
+    # No effector feedback: proceed; the verifier judges the OUTCOME from perception,
+    # and evidence states held=UNKNOWN so the proprio channel abstains, never lies.
     h.done(ok=True, stop_cause=None, held=None, closed_width=None, instrumented=False)
     return AtomResult(ok=True, stop_cause=None,
                       evidence={"held": None, "closed_width": None,
                                 "instrumented": False})
 
 
-def release(ctx: Ctx, tcp: str, *, open_width: float = 0.04,
-            at: Optional[Any] = None) -> AtomResult:
+def release(ctx: Ctx, tcp: str, *, open_width: Optional[float] = None,
+            at: Optional[Any] = None, **params) -> AtomResult:
+    """DISENGAGE the effector — open a gripper, vacuum-off a suction cup, current-off a
+    magnet. open_width=None -> the effector's own open value (0.04 m for a gripper)."""
     if at is not None:
         r = reach(ctx, tcp, at)
         if not r.ok:
             return r
-    arm = ctx.arm_of(tcp)
-    h = ctx.trace.begin("release", tcp=tcp, open_width=open_width)
-    ctx.bridge.set_gripper(arm, open_width)
+    h = ctx.trace.begin("release", tcp=tcp, open_width=open_width,
+                        effector=(ctx.effector_of(tcp) or {}).get("kind"))
+    _actuate(ctx, tcp, engage=False, width=open_width, **params)
     h.done(ok=True)
     return AtomResult(ok=True)
 
 
 def carry(ctx: Ctx, tcp: str, to: Any, *, arc_h: float, speed: Optional[float] = None,
-          via: Sequence[Any] = ()) -> AtomResult:
-    """Transport while holding: lift-over arc so the payload clears obstacles between here
-    and there. arc peak z = max(start_z, end_z) + arc_h."""
+          via: Sequence[Any] = (), up: Optional[Any] = None) -> AtomResult:
+    """Transport while holding: a clearance arc along the cell's UP (anti-gravity) axis
+    so the payload clears obstacles. Default up=+Z (tabletop: peak = max(z0,z1)+arc_h);
+    a wall/ceiling/mobile embodiment declares up_of and the arc bows along THAT axis."""
     p0 = _live_pose(ctx, tcp)
     p1 = _xyzq_live(ctx, tcp, to)
-    peak_z = max(p0[2], p1[2]) + abs(arc_h)
-    mid = [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0, peak_z] + p1[3:7]
+    u = _unit(up if up is not None else ctx.up_of(tcp))
+    mid_xyz = [(p0[i] + p1[i]) / 2.0 for i in range(3)]
+    peak = max(_along(p0[:3], u), _along(p1[:3], u)) + abs(arc_h)
+    lift = peak - _along(mid_xyz, u)                  # raise midpoint to the arc peak
+    mid = [mid_xyz[i] + u[i] * lift for i in range(3)] + p1[3:7]
     legs = [mid] + [_xyzq_live(ctx, tcp, p) for p in via] + [p1]
     ctx.envelope.check_points(legs)
     spd = ctx.envelope.clamp_speed(speed)
-    h = ctx.trace.begin("carry", tcp=tcp, to=p1, arc_h=arc_h, peak_z=peak_z, speed=spd)
+    h = ctx.trace.begin("carry", tcp=tcp, to=p1, arc_h=arc_h, up=list(u),
+                        peak=round(peak, 4), speed=spd)
     res = ctx.stack.move_through_poses(tcp, legs)
-    return _planned(res, h, peak_z=peak_z)
+    return _planned(res, h, peak_z=mid[2])
 
 
-def sweep(ctx: Ctx, tcp: str, frm: Any, to: Any, *, press_z: float,
+def sweep(ctx: Ctx, tcp: str, frm: Any, to: Any, *, press_z: Optional[float] = None,
+          press: Optional[float] = None, normal: Optional[Any] = None,
           speed: Optional[float] = None) -> AtomResult:
-    """Planar move in contact with a surface at constant z (press_z)."""
+    """Move in contact with a surface, holding a constant press ALONG the surface normal
+    while sliding in its tangent plane. Default normal=+Z with press_z pins world z (the
+    tabletop wipe); a vertical wall / tilted panel declares a normal + press and the two
+    endpoints hold that normal offset instead of world z."""
     a = _xyzq_live(ctx, tcp, frm)
     b = _xyzq_live(ctx, tcp, to)
-    a[2] = b[2] = float(press_z)
+    if normal is None and press_z is not None:
+        a[2] = b[2] = float(press_z)                  # COMPAT: constant world z
+        n, pv = (0.0, 0.0, 1.0), float(press_z)
+    else:
+        n = _unit(normal if normal is not None else ctx.up_of(tcp))
+        pv = float(press if press is not None else (press_z or 0.0))
+        for p in (a, b):                              # set the along-normal component to pv
+            delta = pv - _along(p[:3], n)
+            for i in range(3):
+                p[i] += n[i] * delta
     ctx.envelope.check_points([a, b])
     spd = ctx.envelope.clamp_speed(speed)
-    h = ctx.trace.begin("sweep", tcp=tcp, frm=a[:3], to=b[:3], press_z=press_z, speed=spd)
+    h = ctx.trace.begin("sweep", tcp=tcp, frm=a[:3], to=b[:3], normal=list(n),
+                        press=pv, speed=spd)
     res = ctx.stack.move_through_poses(tcp, [a, b])
     return _planned(res, h)
 
@@ -277,13 +407,17 @@ def home(ctx: Ctx, tcp: str) -> AtomResult:
 
 
 def sync(ctx: Ctx, targets: Dict[str, Any], *, speed: Optional[float] = None) -> AtomResult:
-    """Two tcps to two poses as ONE jointly-planned motion (v1 supports exactly 2; the
-    MotionStack goal set is already N-arm, lift the cap when a third arm exists)."""
-    if len(targets) != 2:
-        raise ValueError("sync v1 supports exactly two tcps")
-    goals = {t: (list(p) if not isinstance(p, dict) and len(list(p)) == 3 else _xyzq(p))
+    """N tcps to N poses as ONE jointly-planned motion. Count-agnostic (1, 2, or a
+    humanoid's many) — the MotionStack goal set is already N-tool; sync just delegates
+    the whole set to one trajectory."""
+    if not targets:
+        raise ValueError("sync needs at least one tcp target")
+    goals = {t: (p if isinstance(p, dict)                       # dicts RAW: axes survive
+                 else (list(p) if len(list(p)) == 3 else _xyzq(p)))
              for t, p in targets.items()}          # bare = position-only (stack marks it)
-    ctx.envelope.check_points(list(goals.values()))
+    ctx.envelope.check_points([
+        (list(p["position"])[:3] if isinstance(p, dict) else list(p)[:3])
+        for p in goals.values()])
     spd = ctx.envelope.clamp_speed(speed)
     h = ctx.trace.begin("sync", tcps=sorted(goals.keys()), speed=spd)
     res = ctx.stack.move_to_poses(goals)

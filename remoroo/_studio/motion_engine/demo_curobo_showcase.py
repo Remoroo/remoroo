@@ -320,25 +320,257 @@ def generate_poses(home: Dict[str, Pose], arms: List[str], n: int,
 # both dissolve because there is exactly one solve.
 
 
-def _catmull_rom(pts: np.ndarray, per: int) -> np.ndarray:
-    """Dense C1-smooth path PASSING THROUGH every keypose in `pts` (K,3), `per` samples per segment.
+_URDF_VEL_LIMIT = 3.14      # rad/s — every revolute joint on this rig declares velocity="3.14"
+
+
+def _flow_path(keys: Dict[str, List[XYZ]], arms: List[str], v_cruise: float, a_max: float,
+               dt: float, m: int = 200, ds: float = 0.001):
+    """Time-parameterise the dance so the TCPs never exceed `a_max` Cartesian acceleration — the
+    CURVATURE-AWARE parameterisation (TOPP-style), which is what actually removes jerk.
+
+    Two wrong parameterisations were measured before landing here:
+      1. uniform-in-spline-parameter (the original): segments differ ~20x in length (443 mm beside
+         26 mm), so the TCP crawled through short segments and sprinted through long ones — a ~57x
+         speed swing, and every speed change is an acceleration spike.
+      2. constant arc-length speed: fixes the swing but is WORSE — it drives the tight corners at full
+         cruise, and speed through a sharp corner IS acceleration (v^2 * curvature). Measured peak
+         Cartesian accel got ~10x higher.
+
+    So speed must be bounded BY CURVATURE: v <= sqrt(a_max / |P''(s)|), taking the tightest bound
+    across both arms (they share one clock, so both must be satisfied). Forward/backward passes then
+    bound the TANGENTIAL acceleration, and pinning v=0 at both ends starts and stops at rest with no
+    ad-hoc ramp. Result: slow through corners, cruise on the straights, smooth throughout."""
+    fine = {a: _catmull_rom(np.asarray(keys[a], float), m) for a in arms}
+    L = len(next(iter(fine.values())))
+    step = np.zeros(L - 1)
+    for a in arms:                                        # shared arc length = the busiest arm
+        step = np.maximum(step, np.linalg.norm(np.diff(fine[a], axis=0), axis=1))
+    s_fine = np.concatenate([[0.0], np.cumsum(step)])
+    S = float(s_fine[-1])
+    if S < 1e-6:
+        return {a: np.asarray(keys[a], float) for a in arms}, 0.0, len(next(iter(keys.values()))), 0.0
+
+    n = max(8, int(S / ds) + 1)                           # uniform arc-length grid
+    s = np.linspace(0.0, S, n)
+    h = float(s[1] - s[0])
+    P = {a: np.stack([np.interp(s, s_fine, fine[a][:, k]) for k in range(3)], axis=1) for a in arms}
+
+    vlim = np.full(n, float(v_cruise))                    # curvature limit: v <= sqrt(a_max/|P''|)
+    for a in arms:
+        d2 = np.zeros_like(P[a])
+        d2[1:-1] = (P[a][2:] - 2.0 * P[a][1:-1] + P[a][:-2]) / (h * h)
+        vlim = np.minimum(vlim, np.sqrt(float(a_max) / np.maximum(np.linalg.norm(d2, axis=1), 1e-9)))
+    vlim = np.minimum(vlim, float(v_cruise))
+
+    v = vlim.copy()
+    v[0] = v[-1] = 0.0                                    # start and end at REST
+    for i in range(1, n):                                 # forward: bound tangential accel
+        v[i] = min(v[i], math.sqrt(max(v[i - 1] ** 2 + 2.0 * a_max * h, 0.0)))
+    for i in range(n - 2, -1, -1):                        # backward: bound tangential decel
+        v[i] = min(v[i], math.sqrt(max(v[i + 1] ** 2 + 2.0 * a_max * h, 0.0)))
+
+    t = np.concatenate([[0.0], np.cumsum(h / np.maximum((v[1:] + v[:-1]) * 0.5, 1e-6))])
+    T = float(t[-1])
+    N = max(4, int(round(T / dt)) + 1)
+    tq = np.linspace(0.0, T, N)                           # resample on the CONTROL clock
+    out = {a: np.stack([np.interp(tq, t, P[a][:, k]) for k in range(3)], axis=1) for a in arms}
+    return out, S, N, T
+
+
+def _catmull_rom(pts: np.ndarray, per_seg) -> np.ndarray:
+    """Dense C1-smooth path PASSING THROUGH every keypose in `pts` (K,3). `per_seg` is the sample count
+    PER SEGMENT (one int per segment, so frames can be allocated by arc length → constant speed).
     Endpoints are clamped (duplicated) so the path starts/ends at REST (zero tangent) but keeps a
     continuous, non-zero velocity THROUGH the interior keyposes — that continuity is what removes the
     per-pose pause. Pure numpy (no scipy), one spline per axis."""
     pts = np.asarray(pts, float)
     if len(pts) < 2:
         return pts.copy()
+    per_seg = [int(max(2, n)) for n in np.atleast_1d(per_seg)]
+    if len(per_seg) == 1:
+        per_seg = per_seg * (len(pts) - 1)
     P = np.vstack([pts[0], pts, pts[-1]])          # clamp: tangent≈0 at the very start and end
     out: List[np.ndarray] = []
     for s in range(len(pts) - 1):
         p0, p1, p2, p3 = P[s], P[s + 1], P[s + 2], P[s + 3]
         last = s == len(pts) - 2
-        for t in np.linspace(0.0, 1.0, per, endpoint=last):
+        for t in np.linspace(0.0, 1.0, per_seg[s], endpoint=last):
             t2, t3 = t * t, t * t * t
             out.append(0.5 * ((2 * p1) + (-p0 + p2) * t
                               + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
                               + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
     return np.asarray(out)
+
+
+def smooth_joints(q: np.ndarray, win: int) -> np.ndarray:
+    """Low-pass the SOLVED joint trajectory (Hann kernel, edge-padded so the endpoints hold).
+
+    Per-frame IK jitter is HIGH-frequency — the solver lands on a slightly different null-space branch
+    each frame — while the dance itself is low-frequency. Rig sweeps proved NO solver parameter reaches
+    that jitter (position_tolerance 10x tighter and velocity_regularization 500x higher both left peak
+    accel at ~250 rad/s^2, and reshaping the Cartesian path did nothing either). Acceleration and jerk
+    are 2nd/3rd differences, so they are dominated by exactly the frequencies this filter removes.
+    Deviation from the solved path is reported and every waypoint is re-validated (`validate_flow`)."""
+    win = int(win)
+    if win <= 1:
+        return q
+    if win % 2 == 0:
+        win += 1
+    k = np.hanning(win + 2)[1:-1]
+    k = k / k.sum()
+    pad = win // 2
+    qp = np.pad(q, ((pad, pad), (0, 0)), mode="edge")
+    return np.stack([np.convolve(qp[:, i], k, mode="valid") for i in range(q.shape[1])], axis=1)
+
+
+def validate_flow(stack: MotionStack, arms: List[str], flow, chunk: int = 512) -> dict:
+    """Collision-validate EVERY waypoint against the modeled world + self + bounds, via cuRobo's
+    canonical `RobotCollisionChecker.validate` (batched, so the whole path costs one or two GPU calls).
+
+    This gate is NOT optional for the flow: the retargeter treats collision as a soft COST rather than
+    a constraint (unlike trajopt, which is why the per-pose pipeline is safe by construction), and we
+    additionally low-pass the solved joints — so nothing upstream guarantees the executed path is
+    collision-free. Modeled obstacles only, not the live ESDF."""
+    import torch
+    try:
+        cvp = stack._planner_for(arms)
+        checker = cvp._collision_checker()
+        names = list(cvp.planner.joint_names)
+        idx = {n: i for i, n in enumerate(flow.joint_names)}
+        missing = [n for n in names if n not in idx]
+        if missing:
+            return {"ok": False, "error": f"trajectory is missing planner joints {missing[:4]}"}
+        q_all = np.ascontiguousarray(np.asarray(flow.positions, float)[:, [idx[n] for n in names]])
+        bad: List[int] = []
+        for s in range(0, len(q_all), chunk):
+            q = torch.as_tensor(np.ascontiguousarray(q_all[s:s + chunk]), dtype=torch.float32,
+                                device=cvp._device).unsqueeze(1).contiguous()   # [B, 1, dof]
+            v = checker.validate(q).view(-1).detach().cpu().numpy().astype(bool)
+            bad.extend((s + np.nonzero(~v)[0]).tolist())
+        return {"ok": not bad, "bad": bad, "n": int(len(q_all))}
+    except Exception as e:  # noqa: BLE001 — a checker failure must READ as unverified, never as "safe"
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def tcp_tracking_error(stack: MotionStack, arms: List[str], flow, targets: np.ndarray,
+                       chunk: int = 2048) -> dict:
+    """How far the EXECUTED TCP path strays from the dance we ASKED for (metres), after solving and
+    smoothing. Smoothing trades fidelity for feasibility, so this is the number that says whether the
+    choreography still looks like itself — jerk figures alone can be 'fixed' by smoothing the dance
+    into mush. `targets` is (frames, links, 3); it is resampled if the solver emitted a different
+    frame count (MPC emits steps_per_target per input target)."""
+    import torch
+    from curobo.types import JointState
+    try:
+        cvp = stack._planner_for(arms)
+        names = list(cvp.planner.joint_names)
+        idx = {n: i for i, n in enumerate(flow.joint_names)}
+        q_all = np.ascontiguousarray(np.asarray(flow.positions, float)[:, [idx[n] for n in names]])
+        T = len(q_all)
+        tg = np.asarray(targets, float)
+        if len(tg) != T:                                   # align target count to solver output
+            src = np.linspace(0.0, 1.0, len(tg))
+            dst = np.linspace(0.0, 1.0, T)
+            tg = np.stack([np.stack([np.interp(dst, src, tg[:, li, k]) for k in range(3)], axis=1)
+                           for li in range(tg.shape[1])], axis=1)
+        tips = [stack._tip(a) for a in arms]
+        per_link = {tf: [] for tf in tips}
+        for s in range(0, T, chunk):
+            t = torch.as_tensor(np.ascontiguousarray(q_all[s:s + chunk]),
+                                dtype=torch.float32, device=cvp._device).contiguous()
+            st = cvp.planner.compute_kinematics(JointState.from_position(t, joint_names=names))
+            for li, tf in enumerate(tips):
+                xyz = st.tool_poses.get_link_pose(tf).position.detach().cpu().numpy().reshape(-1, 3)
+                per_link[tf].append(np.linalg.norm(xyz - tg[s:s + chunk, li, :], axis=1))
+        e = np.concatenate([np.concatenate(v) for v in per_link.values()])
+        return {"ok": True, "max": float(e.max()), "mean": float(e.mean()),
+                "p95": float(np.percentile(e, 95))}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def max_speedup(flow, dt: float, limits, margin: float = 0.95) -> float:
+    """The largest time-compression this trajectory can take and still respect the rig's limits.
+
+    Compressing time by k leaves the GEOMETRY untouched (so a collision-clean path stays clean — speed
+    cannot create a collision) while scaling velocity by k, acceleration by k^2 and jerk by k^3. So the
+    ceiling is whichever limit binds first, times a safety margin."""
+    p = np.asarray(flow.positions, float)
+    if len(p) < 4:
+        return 1.0
+    v = np.diff(p, axis=0) / dt
+    a = np.diff(v, axis=0) / dt
+    j = np.diff(a, axis=0) / dt
+    pv, pa, pj = float(np.abs(v).max()), float(np.abs(a).max()), float(np.abs(j).max())
+    lv, la, lj = (float(x) for x in limits)
+    k = min(lv / max(pv, 1e-9), math.sqrt(la / max(pa, 1e-9)), (lj / max(pj, 1e-9)) ** (1.0 / 3.0))
+    return max(1.0, k * float(margin))
+
+
+def retime(flow, speed: float):
+    """Same path, new clock: dt/speed, with velocities refreshed to match the new cadence."""
+    if abs(speed - 1.0) < 1e-6:
+        return flow
+    dt_new = flow.dt / float(speed)
+    pos = np.asarray(flow.positions, float)
+    vel = np.zeros_like(pos)
+    vel[1:] = (pos[1:] - pos[:-1]) / dt_new
+    meta = dict(flow.meta or {})
+    meta["speed"] = round(float(speed), 3)
+    return Trajectory(list(flow.joint_names), pos, dt_new, velocities=vel, meta=meta)
+
+
+def flow_smoothness(flow, dt: float, limits=None, top: int = 5) -> dict:
+    """MEASURE where a flow trajectory is rough — no motion, pure numpy on the solved path. Jerk you
+    FEEL on the arm is acceleration discontinuity, so we report per-joint peak |v|,|a|,|j| plus a
+    CHATTER count (acceleration sign flips): smooth motion flips sign a few times per move, while
+    per-frame IK noise flips it constantly. High chatter + low peak |a| ⇒ solver wobble (tighten
+    position_tolerance / raise the regularization); low chatter + high peak |a| ⇒ genuinely aggressive
+    motion at a few frames (slow the path down)."""
+    p = np.asarray(flow.positions, float)
+    if len(p) < 4:
+        return {}
+    v = np.diff(p, axis=0) / dt
+    a = np.diff(v, axis=0) / dt
+    j = np.diff(a, axis=0) / dt
+    flips = np.sum(np.diff(np.sign(a), axis=0) != 0, axis=0)          # per joint: accel sign changes
+    names = list(flow.joint_names)
+    rows = [{"joint": names[k], "v": float(np.max(np.abs(v[:, k]))), "a": float(np.max(np.abs(a[:, k]))),
+             "j": float(np.max(np.abs(j[:, k]))), "flips": int(flips[k]),
+             "worst_frame": int(np.argmax(np.abs(a[:, k])))} for k in range(p.shape[1])]
+    rows.sort(key=lambda r: -r["j"])
+    print(f"\n  ── smoothness (jerk diagnosis · {len(p)} waypoints @ dt={dt*1e3:.0f}ms) ──")
+    print(f"    {'joint':12s} {'peak|v|':>9s} {'peak|a|':>10s} {'peak|jerk|':>11s} {'chatter':>8s}  {'%frames':>7s}")
+    for r in rows[:top]:
+        pct = 100.0 * r["flips"] / max(len(a) - 1, 1)
+        print(f"    {r['joint']:12s} {r['v']:9.2f} {r['a']:10.1f} {r['j']:11.0f} {r['flips']:8d}  {pct:6.1f}%")
+    worst = rows[0]
+    chat = 100.0 * worst["flips"] / max(len(a) - 1, 1)
+    # NOTE: chatter alone is NOT a verdict — it counts sign flips without weighting by MAGNITUDE, so a
+    # smooth path hovering near zero accel flips often at tiny amplitude and scores "worse" than a
+    # violent one that swings hard a few times. The feasibility numbers below are the real verdict.
+    print(f"    → worst: {worst['joint']} (jerk {worst['j']:.0f} rad/s³ at frame {worst['worst_frame']}); "
+          f"accel sign-flips on {chat:.0f}% of frames (magnitude, not this %, is the verdict)")
+
+    out = {"rows": rows, "chatter_pct": chat}
+    if limits:
+        pv = max(r["v"] for r in rows); pa = max(r["a"] for r in rows); pj = max(r["j"] for r in rows)
+        lv, la, lj = float(limits[0]), float(limits[1]), float(limits[2])
+        # A pure TIME STRETCH by k scales v by 1/k, a by 1/k^2, j by 1/k^3 (same geometric path).
+        k = max(1.0, pv / lv, math.sqrt(pa / la), (pj / lj) ** (1.0 / 3.0))
+        print(f"\n    ── dynamic feasibility vs the rig's OWN limits ──")
+        print(f"    {'':10s} {'peak':>10s} {'limit':>10s} {'over':>8s}")
+        nwp = len(p)                                     # p is the positions array (T, dof)
+        for nm, pk, lm in (("velocity", pv, lv), ("accel", pa, la), ("jerk", pj, lj)):
+            print(f"    {nm:10s} {pk:10.1f} {lm:10.1f} {pk / lm:7.1f}x{'  OK' if pk <= lm else '  ** OVER **'}")
+        if k > 1.001:
+            print(f"    → the retargeter does NOT enforce these (trajopt does — that is why the per-pose "
+                  f"path is smooth).\n      Time-stretch {k:.2f}x (dt {dt:.4f} → {dt * k:.4f}, "
+                  f"{(nwp - 1) * dt:.1f}s → {(nwp - 1) * dt * k:.1f}s) would make it feasible.")
+        else:
+            print("    → within every limit: dynamically feasible as-is.")
+        out.update({"peak": (pv, pa, pj), "stretch": k})
+    return out
 
 
 def run_flow(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None) -> int:
@@ -380,12 +612,25 @@ def run_flow(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None)
         keys[a].append(list(home[a][0]))                                        # …and return home
 
     # 2) densify into a shared, synchronized frame count (both arms hit keypose k at the same frame) -
-    max_seg = max(float(np.linalg.norm(np.diff(np.asarray(keys[a]), axis=0), axis=1).max()) for a in arms)
-    per = int(np.clip(round(max_seg / max(float(args.flow_step), 1e-3)), 2, 60))
-    dense = {a: _catmull_rom(np.asarray(keys[a], float), per) for a in arms}
-    N = len(next(iter(dense.values())))
-    print(f"  path: {len(seq) + 2} keyposes → {N} frames "
-          f"(~{max_seg * 1e3:.0f} mm max segment · {per}/seg · {(N - 1) * dt:.1f}s at dt)")
+    # MPC consumes `steps_per_target` control steps per target, and EACH step advances real time by dt —
+    # so at the same target density the dance would run steps× slower (1200 targets × 4 = 120 s). Space
+    # the targets steps× further apart to hold the tempo; MPC's horizon smooths between them, which is
+    # exactly what a horizon is for. IK is 1 step per target, so it is unaffected (mult = 1).
+    steps = max(1, int(args.flow_steps))
+    mult = steps if args.flow_mpc else 1
+    eff_step = float(args.flow_step) * mult
+    seg = np.stack([np.linalg.norm(np.diff(np.asarray(keys[a], float), axis=0), axis=1) for a in arms])
+    seg_max = seg.max(axis=0)
+    # `eff_step/dt` is the CRUISE speed we'd like; `--flow-accel` caps Cartesian acceleration so the
+    # path slows itself through corners instead of spiking. Target dt is the MPC-compensated clock.
+    v_cruise = eff_step / dt
+    dense, S, N, T = _flow_path(keys, arms, v_cruise, float(args.flow_accel), dt * mult)
+    out_wp = N * mult                                                   # waypoints the solver will emit
+    print(f"  path: {len(seq) + 2} keyposes → {N} targets  (arc {S * 1e3:.0f} mm · "
+          f"segments {seg_max.min() * 1e3:.0f}-{seg_max.max() * 1e3:.0f} mm · "
+          f"cruise {v_cruise:.2f} m/s capped at {float(args.flow_accel):.1f} m/s² → {T:.1f}s of path)")
+    print(f"        {'MPC ' + str(steps) + ' steps/target' if args.flow_mpc else 'IK 1 step/target'} "
+          f"→ ~{out_wp} waypoints ≈ {(out_wp - 1) * dt:.1f}s of motion")
 
     tool_frames = [stack._tip(a) for a in arms]
     pos = np.stack([dense[a] for a in arms], axis=1)                            # (N, L, 3)
@@ -394,6 +639,11 @@ def run_flow(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None)
     quat_t[..., 0] = 1.0                                                        # identity wxyz (ignored: position-only)
 
     # 3) build the retargeter solver from OUR robot cfg + modeled world (self + world collision) ----
+    # cuRobo's global IK draws 64 RANDOM seeds, so an unseeded solve lands in a different
+    # null-space branch every run — same targets, different elbows, different collisions (measured:
+    # the same config validated clean once and 29-bad the next). Seed it so a validated dry-run
+    # actually predicts the next run.
+    torch.manual_seed(int(args.flow_seed)); np.random.seed(int(args.flow_seed))
     print(f"  building retargeter solver ({'IK+MPC' if args.flow_mpc else 'warm-started IK'} · "
           "self+world collision)... (one-time)")
     try:
@@ -404,35 +654,112 @@ def run_flow(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None)
             self_collision_check=True,
             scene_model=stack.world.scene,
             optimization_dt=dt,                                                 # velocity limit rides THIS dt
-            position_tolerance=0.005,
+            # NOTE: the default 0.005 (5 mm) is ~the size of --flow-step (6 mm) — the solver's accepted
+            # slop is comparable to the step, so consecutive frames can wobble. Tighten to smooth.
+            position_tolerance=float(args.flow_tol),
+            velocity_regularization_weight=(None if args.flow_vreg < 0 else float(args.flow_vreg)),
+            steps_per_target=steps,
+            # The acceleration term is what kills jerk — and it is only truly live in MPC mode
+            # (in IK mode the retargeter never populates _prev_velocity, so (v-v_prev)/dt has no v_prev).
+            acceleration_regularization_weight=(None if args.flow_areg < 0 else float(args.flow_areg)),
         )
         retargeter = MotionRetargeter(cfg)
-        dev = cfg.device_cfg.device
+        dev_t = cfg.device_cfg.device
         seq_goal = SequenceGoalToolPose(tool_frames=list(tool_frames),
-                                        position=pos_t.to(dev), quaternion=quat_t.to(dev))
-        t0 = time.perf_counter()
-        result = retargeter.solve_sequence(seq_goal)
-        solve_ms = (time.perf_counter() - t0) * 1e3
+                                        position=pos_t.to(dev_t), quaternion=quat_t.to(dev_t))
     except Exception as e:  # noqa: BLE001
         import traceback
         print(f"  ✗ retargeter FAILED to build/solve: {type(e).__name__}: {e}")
         traceback.print_exc()
         return 1
 
-    # IK: one velocity-limited solve per frame → `joint_state` IS the path (frames are `dt` apart).
-    # MPC: `joint_state` holds only the per-frame ENDPOINTS (steps_per_target apart); the fine path at
-    # `optimization_dt` is in `result.trajectory` — use it so the replay cadence stays correct.
-    src = result.trajectory if (args.flow_mpc and result.trajectory is not None) else result.joint_state
-    names = list(src.joint_names)
-    positions = src.position[0].detach().cpu().numpy()                         # (T, dof)
-    T = len(positions)
-    vel = np.zeros_like(positions)
-    vel[1:] = (positions[1:] - positions[:-1]) / dt                            # feed-forward consistent with dt
-    flow = Trajectory(names, positions, dt, velocities=vel,
-                      meta={"flow": True, "frames": int(T), "solver": "mpc" if args.flow_mpc else "ik"})
-    vmax = float(np.max(np.abs(vel))) if len(flow) else 0.0
-    print(f"  ✓ solved {N} targets → {flow.summary()} in {solve_ms:.0f} ms  · "
-          f"Δq {_max_dq(flow):.2f} rad · peak |q̇| {vmax:.2f} rad/s")
+    # The rig's OWN declared dynamics (same numbers the stack prints at boot) — velocity from the URDF,
+    # accel/jerk from safety.planner_limits(). trajopt treats these as constraints; the retargeter does not.
+    try:
+        lim = dict(getattr(stack, "_limits", None) or {})
+        limits = (_URDF_VEL_LIMIT, float(lim.get("max_acceleration", 15.0)), float(lim.get("max_jerk", 500.0)))
+    except Exception:  # noqa: BLE001 — diagnostics must never block the run
+        limits = (_URDF_VEL_LIMIT, 15.0, 500.0)
+
+    # ── SOLVE → VALIDATE → RE-SOLVE ────────────────────────────────────────────────────────────────
+    # The solve is NOT reproducible: identical inputs produced a collision-clean path on one run and 40
+    # colliding waypoints on the next (TCP error moved 3.4mm → 9.4mm too). cuRobo's IK `random_seed` is
+    # already fixed at 123 and torch.manual_seed changes nothing, so this is GPU float non-determinism
+    # at frame 0 amplified through hundreds of warm-started frames into a different null-space branch —
+    # different elbows, different collisions. Chasing determinism is the wrong fight. Instead gate on
+    # the ACTUAL trajectory and re-solve until one passes, so what executes is always a verified path.
+    win = int(args.flow_smooth)
+    tries = max(1, int(args.flow_tries))
+    flow = vres = best = best_v = None
+    for attempt in range(1, tries + 1):
+        retargeter.reset()                              # fresh global IK, new branch
+        t0 = time.perf_counter()
+        result = retargeter.solve_sequence(seq_goal)
+        solve_ms = (time.perf_counter() - t0) * 1e3
+        # IK: one velocity-limited solve per frame → `joint_state` IS the path (frames are `dt` apart).
+        # MPC: `joint_state` holds only per-frame ENDPOINTS (steps_per_target apart); the fine path at
+        # `optimization_dt` is in `result.trajectory` — use it so the replay cadence stays correct.
+        src = result.trajectory if (args.flow_mpc and result.trajectory is not None) else result.joint_state
+        names = list(src.joint_names)
+        raw = src.position[0].detach().cpu().numpy()                           # (T, dof)
+        positions = smooth_joints(raw, win)                                    # kill the IK jitter
+        moved = float(np.abs(positions - raw).max()) if win > 1 else 0.0
+        vel = np.zeros_like(positions)
+        vel[1:] = (positions[1:] - positions[:-1]) / dt                        # feed-forward matches dt
+        cand = Trajectory(names, positions, dt, velocities=vel,
+                          meta={"flow": True, "frames": int(len(positions)), "smooth": win,
+                                "solver": "mpc" if args.flow_mpc else "ik", "attempt": attempt})
+        v = validate_flow(stack, arms, cand)
+        nbad = len(v.get("bad") or [])
+        tag = ("CLEAN" if v.get("ok") else
+               (f"UNVERIFIED ({str(v.get('error'))[:38]})" if v.get("error") else f"{nbad} colliding wp"))
+        print(f"  attempt {attempt}/{tries}: {cand.summary()} in {solve_ms:.0f} ms · "
+              f"smoothing moved joints {math.degrees(moved):.1f}° · {tag}")
+        if best is None or (nbad < len(best_v.get("bad") or [0] * 10 ** 6)):
+            best, best_v = cand, v
+        if v.get("ok"):
+            flow, vres = cand, v
+            break
+    if flow is None:                                    # nothing clean — keep the least-bad to REPORT
+        flow, vres = best, best_v
+        print(f"  → no collision-free solve in {tries} attempts (best: "
+              f"{len(vres.get('bad') or [])} bad waypoints)")
+
+    print(f"  ✓ flow: {flow.summary()} · Δq {_max_dq(flow):.2f} rad")
+    flow_smoothness(flow, dt, limits=limits)
+
+    # ── SPEED. Time-compression leaves the geometry alone (so it can never create a collision) and
+    # scales v by k, a by k^2, j by k^3 — so we can run right up to the rig's own envelope, measured.
+    speed = float(args.flow_speed)
+    if args.flow_fit:
+        speed = max_speedup(flow, dt, limits, margin=float(args.flow_margin))
+        print(f"\n  ── speed fit: {speed:.2f}x within limits (margin {float(args.flow_margin):.2f}) "
+              f"→ {flow.duration:.1f}s becomes {flow.duration / speed:.1f}s ──")
+    if abs(speed - 1.0) > 1e-6:
+        flow = retime(flow, speed)
+        dt = flow.dt
+        print(f"  retimed: dt {dt * 1e3:.1f}ms · {flow.duration:.1f}s · {len(flow)} waypoints")
+        flow_smoothness(flow, dt, limits=limits)
+
+    # HARD GATE (already computed per attempt above — time-compression cannot change it, since it
+    # leaves the geometry untouched). Reported here so the verdict sits next to the execute decision.
+    print("\n  ── collision validation (every waypoint · modeled world + self + bounds) ──")
+    if vres.get("error"):
+        print(f"    ⚠ could NOT validate ({vres['error']}) — treating as UNVERIFIED, refusing to execute.")
+    elif vres["ok"]:
+        print(f"    ✓ all {vres['n']} waypoints collision-free")
+    else:
+        b = vres["bad"]
+        print(f"    ✗ {len(b)}/{vres['n']} waypoints in collision (first at frame {b[0]}) — refusing to execute.")
+
+    # Fidelity: smoothing buys feasibility by moving joints, so confirm the CHOREOGRAPHY survived —
+    # a jerk number can always be "fixed" by smoothing the dance into mush.
+    terr = tcp_tracking_error(stack, arms, flow, pos)
+    if terr.get("ok"):
+        print(f"    TCP tracking vs the intended dance: mean {terr['mean'] * 1e3:.1f} mm · "
+              f"p95 {terr['p95'] * 1e3:.1f} mm · max {terr['max'] * 1e3:.1f} mm")
+    else:
+        print(f"    (TCP tracking check unavailable: {terr.get('error', '?')})")
 
     if not execute:
         print("-" * 74)
@@ -442,6 +769,9 @@ def run_flow(stack: MotionStack, args, tracker: Optional["_SeedTracker"] = None)
         return 0
 
     # 4) GATE, then approach the flow's start config and REPLAY the single trajectory ---------------
+    if not vres.get("ok"):
+        print("\nNOT executing: the flow did not pass collision validation (see above).")
+        return 1
     q0 = {n: float(v) for n, v in zip(names, positions[0])}
     try:
         input(f"\n>>> Press ENTER to (1) move to the flow start, then (2) run the {flow.duration:.1f}s "
@@ -569,26 +899,22 @@ def _joints_readable(stack: MotionStack) -> bool:
 
 def _world_culprits(stack: MotionStack, cvp, seed) -> list:
     """Which modeled cuboid(s) the robot's collision spheres penetrate at `seed` → (name, n_spheres,
-    center, dims), worst first. AABB test (rotation ignored), inflated by each sphere's radius — names
-    the exact obstacle the arm is sitting inside."""
+    center, dims), worst first. ROTATION-AWARE via world.sphere_box_overlaps — the private AABB copy
+    here read the 90°-yawed wall as a slab through the workspace (the obs_5_wall lie, 2026-07-20)."""
     try:
         spheres = cvp.robot_spheres(seed)
     except Exception:  # noqa: BLE001
         return []
-    cuboids = (stack.world.scene or {}).get("cuboid") or {}
+    from motion_engine.world import sphere_box_overlaps
+    scene = stack.world.scene or {}
+    cuboids = scene.get("cuboid") or {}
     hits = []
-    for name, b in cuboids.items():
-        pose = list(b.get("pose") or [0, 0, 0])
-        c = [float(x) for x in (list(pose[:3]) + [0, 0, 0])[:3]]
-        d = [float(x) for x in (list(b.get("dims") or [0.1, 0.1, 0.1]) + [0.1, 0.1, 0.1])[:3]]
-        n = 0
-        for s in spheres:
-            sx, sy, sz, r = float(s[0]), float(s[1]), float(s[2]), float(s[3])
-            if (abs(sx - c[0]) <= d[0] / 2 + r and abs(sy - c[1]) <= d[1] / 2 + r
-                    and abs(sz - c[2]) <= d[2] / 2 + r):
-                n += 1
-        if n:
-            hits.append((name, n, c, d))
+    for name, v in sphere_box_overlaps(spheres, scene).items():
+        if v["spheres_penetrating"] > 0:
+            b = cuboids.get(name) or {}
+            c = [float(x) for x in (list(b.get("pose") or [0, 0, 0])[:3])]
+            d = [float(x) for x in (b.get("dims") or [0.1, 0.1, 0.1])]
+            hits.append((name, int(v["spheres_penetrating"]), c, d))
     hits.sort(key=lambda h: -h[1])
     return hits
 
@@ -811,9 +1137,54 @@ def main() -> int:
     ap.add_argument("--flow-step", type=float, default=0.006,
                     help="target TCP spacing (m) between consecutive flow frames — the density knob: "
                          "smaller = smoother + slower, larger = faster + coarser (default 6 mm)")
+    ap.add_argument("--flow-tol", type=float, default=0.005,
+                    help="retargeter position tolerance (m). The default 0.005 is ~the size of "
+                         "--flow-step, so the solver's accepted slop is comparable to the step and "
+                         "frames can wobble → jerk. Try 0.001 to smooth (costs solve time)")
+    ap.add_argument("--flow-vreg", type=float, default=-1.0,
+                    help="velocity regularization weight — penalizes (q-q_prev)/dt. -1 = cuRobo default "
+                         "(0.001, weak). Raise (e.g. 0.05) for smoother joint velocity at the cost of "
+                         "tracking accuracy")
     ap.add_argument("--flow-mpc", action="store_true",
-                    help="use the retargeter's MPC solver (Level 3: smoothest, acceleration/jerk-aware) "
-                         "instead of warm-started IK — slower to solve, nicer motion")
+                    help="use the retargeter's MPC solver (Level 3: smoothest — it carries velocity/"
+                         "acceleration/JERK state across frames, which warm-started IK does not) instead "
+                         "of IK. 2-4x slower to solve. Targets are auto-spaced --flow-steps× further "
+                         "apart so the dance keeps its tempo (MPC's horizon smooths between them)")
+    ap.add_argument("--flow-smooth", type=int, default=25,
+                    help="low-pass window (frames) applied to the SOLVED joint trajectory — the only "
+                         "lever measured to reach the retargeter's per-frame IK jitter (no solver "
+                         "parameter did). 1 = off. Rig-measured at 25: peak accel 252->9.3 (limit 15) "
+                         "and jerk 20091->75 (limit 500) for +2.5mm mean TCP error. Every waypoint is "
+                         "re-validated for collision afterwards")
+    ap.add_argument("--flow-tries", type=int, default=4,
+                    help="re-solve up to N times until a collision-free trajectory is found. The solve "
+                         "is NOT reproducible (GPU non-determinism picks a different null-space branch "
+                         "each run), so this is what makes the demo reliable rather than lucky")
+    ap.add_argument("--flow-seed", type=int, default=0,
+                    help="RNG seed for cuRobo's global IK. Unseeded, every solve picks a different "
+                         "null-space branch, so a clean dry-run does NOT predict the next run")
+    ap.add_argument("--flow-fit", action="store_true",
+                    help="RUN AS FAST AS THE RIG ALLOWS: after solving, time-compress the trajectory "
+                         "until the first of velocity/accel/jerk hits its limit (times --flow-margin). "
+                         "Time-compression cannot create a collision — it leaves the geometry untouched")
+    ap.add_argument("--flow-speed", type=float, default=1.0,
+                    help="manual time-compression multiplier (2.0 = twice as fast). Ignored when "
+                         "--flow-fit is set")
+    ap.add_argument("--flow-margin", type=float, default=0.95,
+                    help="fraction of the rig's limits --flow-fit is allowed to reach (default 0.95)")
+    ap.add_argument("--flow-accel", type=float, default=1.5,
+                    help="Cartesian acceleration cap (m/s²) for the TCP path — THE smoothness/speed "
+                         "dial. The path slows itself through corners to respect it and cruises on the "
+                         "straights, so lower = smoother (and a bit longer), higher = snappier "
+                         "(and jerkier). Default 1.5")
+    ap.add_argument("--flow-steps", type=int, default=4,
+                    help="MPC control steps per target (steps_per_target). More = smoother tracking but "
+                         "each target costs steps×dt of motion time (auto-compensated by target spacing). "
+                         "Ignored when --flow-mpc is off (default 4)")
+    ap.add_argument("--flow-areg", type=float, default=-1.0,
+                    help="acceleration regularization weight — penalizes (v-v_prev)/dt, THE anti-jerk "
+                         "term. -1 = cuRobo default (0.01). Raise (e.g. 0.1) with --flow-mpc for the "
+                         "smoothest motion")
     args = ap.parse_args()
     cell = str(Path(args.cell).resolve())
 

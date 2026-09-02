@@ -116,6 +116,13 @@ class TargetMetric:
         return ops.get(self.operator, False)
 
 
+# Hang detection must be ON by default. A job with no max_silent_s produced no
+# SILENT_TIMEOUT at all, so a wedged process was only noticed by the agent loop's
+# 2h watch-mode ceiling (agent_loop.max_watch_s). The agent's explicit value always
+# wins; this is only the floor used when it declares nothing.
+DEFAULT_MAX_SILENT_S = 900.0
+
+
 @dataclass
 class JobMetadata:
     """Hints from the LLM about the workload."""
@@ -126,7 +133,7 @@ class JobMetadata:
     file_watch_paths: List[str] = field(default_factory=list)
     silent_phase_ok: bool = False  # legacy, unused
     target_metrics: List[TargetMetric] = field(default_factory=list)
-    max_silent_s: Optional[float] = None
+    max_silent_s: Optional[float] = DEFAULT_MAX_SILENT_S
     readiness_regex: Optional[str] = None
     readiness_port: Optional[int] = None
     redirect_output_file: Optional[str] = None
@@ -338,7 +345,7 @@ class SupervisedJob:
         if self.metadata.max_silent_s is not None:
             print(f"  [watch] job={self.job_id} max_silent_s={self.metadata.max_silent_s}", flush=True)
         else:
-            print(f"  [watch] job={self.job_id} WARNING: max_silent_s not set — no hang detection", flush=True)
+            print(f"  [watch] job={self.job_id} max_silent_s explicitly disabled — no hang detection", flush=True)
         resolved = self._resolve_redirect_path()
         if resolved:
             exists = os.path.exists(resolved)
@@ -888,7 +895,9 @@ class SupervisedJob:
             inferred = _redirect_target_from_command(self.command)
             if inferred:
                 redir = inferred
+        redir_abs = ""
         if redir:
+            redir_abs = redir if os.path.isabs(redir) else os.path.join(self.cwd, redir)
             redirect_tail = self._read_redirect_tail(tail_lines, redirect_path=redir)
             if redirect_tail:
                 if stdout_tail.strip():
@@ -906,12 +915,17 @@ class SupervisedJob:
             "output_lines": len(stdout_lines),
             "events": [e.to_dict() for e in events],
         }
+        # Recovery path for truncated output. Without this the brain's
+        # "Full output saved to: ... use grep_artifact" hint never fires and the
+        # agent has no way back to the head of a long log.
+        if redir_abs and os.path.exists(redir_abs):
+            out["output_file_path"] = redir_abs
         if self.state.value in ("finished", "failed", "killed", "backoff") and self.metadata.metric_probes:
             full_out = "".join(stdout_lines)
             full_err = "".join(stderr_lines)
             redirect_bytes = 0
-            if redir:
-                redir_path = redir if os.path.isabs(redir) else os.path.join(self.cwd, redir)
+            if redir_abs:
+                redir_path = redir_abs
                 try:
                     with open(redir_path, "r", encoding="utf-8", errors="replace") as _rf:
                         redirect_full = _rf.read(4 * 1024 * 1024)

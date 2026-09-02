@@ -923,7 +923,11 @@ class CalibSession:
             self.X_est = r.T_optical
             return {"type": "observe", "ready": True, "collected": len(self.samples),
                     "train_rms_px": round(r.residual_px, 3), **self._static_obs_json(r)}
-        if len(self.samples) < max(6, self.min_corners):
+        # an arm-presented FIXED camera solves from 4 views (the UI's MIN_STATIC_VIEWS), so
+        # the σ meter must wake there too — it stayed dark through whole live eth sessions
+        # because this threshold was tuned for the wrist-cam pose sweep
+        need = 4 if self.kind == "eye_to_hand" else max(6, self.min_corners)
+        if len(self.samples) < need:
             return {"type": "observe", "ready": False, "collected": len(self.samples)}
         r = self._gated_solve()
         self.result = r                       # so the next suggest_pose can target the weak axis
@@ -1310,6 +1314,11 @@ class CalibSession:
     def active_start(self, max_poses: int = 24) -> dict:
         if self.static:
             return {"type": "active_start", "ok": False, "error": "arm-motion steps only"}
+        if self.kind == "eye_to_hand":
+            return {"type": "active_start", "ok": False,
+                    "error": "active refinement for a FIXED camera needs the board-presentation "
+                             "pose generator (not built yet) — the wrist-cam NBV math does not "
+                             "apply; collect diverse tilts/depths by hand instead"}
         if not self.bridge.estop_ok():
             return {"type": "active_start", "ok": False, "error": "E-stop not OK"}
         if len(self.samples) < max(6, self.min_corners):

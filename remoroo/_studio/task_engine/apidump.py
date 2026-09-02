@@ -48,10 +48,10 @@ def _dc_fields(cls: Any) -> str:
 
 
 def dump() -> str:
-    from . import atoms, envelope, params, probe_mech, run_trial, trace
+    from . import atoms, envelope, params, run_trial, trace
     from . import env as env_mod
     from .judge import v0 as judge_v0
-    from .perceive import ground_mech, loaders, operators, serving
+    from .perceive import loaders, operators, serving
     from .scene import state as scene_state
     from .service import BRIDGE_VERBS, TaskService
 
@@ -65,12 +65,10 @@ def dump() -> str:
         "from task_engine.params import Knobs",
         "from task_engine.trace import Trace",
         "from task_engine.scene.state import SceneState, Entity, FeatureChannel",
-        "from task_engine.judge.v0 import Verdict, EnsembleJudge, milestones, depth_delta_score",
+        "from task_engine.judge.v0 import Verdict",
         "from task_engine.perceive.operators import PerceptionOps",
         "from task_engine.perceive.serving import ModelRegistry",
         "from task_engine.perceive.loaders import register_default_models, models_status",
-        "from task_engine.perceive import ground_mech        # scan/fuse/visibility/nudge/attempt_lift",
-        "from task_engine import probe_mech                  # probe_touch/push/lift_place (TOP-LEVEL)",
         "from task_engine.run_trial import run_trial, TrialBudget",
     ]
 
@@ -96,8 +94,6 @@ def dump() -> str:
     L += _methods(operators.PerceptionOps, "PerceptionOps.")
     L += _methods(serving.ModelRegistry, "ModelRegistry.")
     L += _sigs(loaders, "loaders.")
-    L += _sigs(ground_mech, "ground_mech.")
-    L += _sigs(probe_mech, "probe_mech.")
 
     L.append("\n## judge.v0")
     L += _sigs(judge_v0)

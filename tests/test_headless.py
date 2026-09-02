@@ -97,9 +97,13 @@ def test_loop_returns_outcome_on_workflow_complete():
     assert outcome.success is True
     assert outcome.partial_success is False
     assert outcome.step_type == "workflow_complete"
-    assert stats.steps_handled == 1
+    # A terminal step is an announcement: never executed, never acked.
+    # Acking it made the CP re-derive the run outcome from a failed
+    # ExecutionResult and flip a SUCCESS run to FAILED/EXECUTION.
+    assert stats.steps_handled == 0
     assert stats.polls == 1
-    assert len(submitter.calls) == 1
+    assert submitter.calls == []
+    assert handler.calls == []
 
 
 def test_loop_handles_non_terminal_steps_before_completion():
@@ -130,7 +134,7 @@ def test_loop_handles_non_terminal_steps_before_completion():
     assert outcome.outcome == "PARTIAL_SUCCESS"
     assert outcome.success is False
     assert outcome.partial_success is True
-    assert stats.steps_handled == 3
+    assert stats.steps_handled == 2  # the terminal step is not work
     assert stats.last_step_type == "workflow_complete"
 
 
@@ -154,7 +158,7 @@ def test_loop_skips_none_steps():
 
     assert outcome.success is True
     assert stats.polls == 3
-    assert stats.steps_handled == 1  # only the terminal step made it to handle
+    assert stats.steps_handled == 0  # the terminal step is not handed to the worker
 
 
 # ── Error-isolation paths ───────────────────────────────────────-
@@ -250,6 +254,36 @@ def test_max_iterations_exits_even_without_terminal_step():
     )
     assert outcome.outcome == "UNKNOWN"
     assert stats.polls == 4  # loop polls exactly `max_iterations` times, then exits
+
+
+def test_terminal_step_is_not_executed_or_acked():
+    """Regression: run be6f3cfc finished SUCCESS but was stored FAILED.
+
+    The loop handed `workflow_complete` to the worker, which has no handler
+    for it and acked `success=False`; the CP then re-derived the run outcome
+    from that ack and overwrote the SUCCESS it had already written.
+    """
+    payload = {"outcome": "SUCCESS", "success": True, "metrics": {"pass": 1.0}}
+    handler = FakeHandler()
+    submitter = FakeSubmitter()
+    log = io.StringIO()
+
+    outcome, stats = _headless_step_loop(
+        run_id="be6f3cfc",
+        poll_fn=FakePoller([(FakeStep("workflow_complete", payload), None, None)]),
+        handle_fn=handler,
+        submit_fn=submitter,
+        log_stream=log,
+    )
+
+    assert handler.calls == []
+    assert submitter.calls == []
+    assert stats.steps_handled == 0
+    assert outcome.success is True
+    # the brain's payload reaches the session summary (metrics render from it)
+    assert outcome.final_result == payload
+    events = [json.loads(ln)["event"] for ln in log.getvalue().splitlines() if ln]
+    assert "headless.terminal_step" in events
 
 
 # ── Logging ─────────────────────────────────────────────────────

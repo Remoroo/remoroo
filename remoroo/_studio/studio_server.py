@@ -277,6 +277,161 @@ class Handler(BaseHTTPRequestHandler):
                         "If you just restarted setup, reopen that fresh URL.",
             }, 401)
             return
+        # ---- World Engine bundles (2026-07-19): list / serve / save-layout -------
+        if path == "/project/worlds" and self.command == "GET":
+            import json as _json
+            wd = PROJECT / ".remoroo" / "worlds"
+            out = []
+            if wd.exists():
+                for m in sorted(wd.glob("*/manifest.json")):
+                    try:
+                        d = _json.loads(m.read_text(encoding="utf-8"))
+                        d["id"] = m.parent.name
+                        out.append(d)
+                    except Exception:
+                        continue
+            self._json({"worlds": out})
+            return
+        if path == "/project/worlds/file" and self.command == "GET":
+            rel = (query.get("p") or [""])[0]
+            base = (PROJECT / ".remoroo" / "worlds").resolve()
+            fp = (base / rel).resolve()
+            if not str(fp).startswith(str(base) + "/") or not fp.is_file():
+                self._json({"error": "world file not found"}, 404)
+                return
+            import mimetypes
+            mime = {".glb": "model/gltf-binary", ".ply": "application/octet-stream",
+                    ".urdf": "application/xml"}.get(
+                fp.suffix.lower(), mimetypes.guess_type(fp.name)[0] or "application/octet-stream")
+            data = fp.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            if (query.get("dl") or [""])[0]:
+                self.send_header("Content-Disposition", f'attachment; filename="{fp.name}"')
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path == "/project/worlds/save" and self.command == "POST":
+            import json as _json
+            body = self._body_json() if hasattr(self, "_body_json") else None
+            if body is None:
+                ln = int(self.headers.get("Content-Length") or 0)
+                body = _json.loads(self.rfile.read(ln) or b"{}")
+            wid = str(body.get("id") or "")
+            base = (PROJECT / ".remoroo" / "worlds").resolve()
+            tgt = (base / wid).resolve()
+            if not str(tgt).startswith(str(base) + "/") or not tgt.is_dir():
+                self._json({"error": "unknown world id"}, 404)
+                return
+            (tgt / "layout_edit.json").write_text(
+                _json.dumps(body.get("poses") or {}, indent=1), encoding="utf-8")
+            self._json({"ok": True})
+            return
+        # ---- World Engine generation proxy (2026-07-19): the Studio never talks to
+        # the GPU worker directly — this server signs (HMAC, sibling header names)
+        # and forwards, then pulls finished bundles into .remoroo/worlds/ so the
+        # existing list/viewer route serves them. Config: REMOROO_SIBLING_URL/_SECRET
+        # env or PROJECT/.remoroo/sibling.json {"url","secret"}.
+        if path in ("/project/worlds/generate", "/project/worlds/poll",
+                    "/project/worlds/pull", "/project/worlds/events"):
+            import hashlib as _hl
+            import hmac as _hmac
+            import json as _json
+            import time as _time
+            import urllib.request as _rq
+            from urllib.parse import quote as _q
+
+            cfg_file = PROJECT / ".remoroo" / "sibling.json"
+            cfg = {}
+            if cfg_file.exists():
+                try:
+                    cfg = _json.loads(cfg_file.read_text(encoding="utf-8"))
+                except Exception:
+                    cfg = {}
+            url = (os.environ.get("REMOROO_SIBLING_URL") or cfg.get("url") or "").rstrip("/")
+            secret = os.environ.get("REMOROO_SIBLING_SECRET") or cfg.get("secret") or ""
+            if not url:
+                self._json({"error": "no sibling worker configured "
+                                     "(set REMOROO_SIBLING_URL or .remoroo/sibling.json)"}, 503)
+                return
+
+            def _worker(method: str, wpath: str, body: dict = None, raw: bool = False):
+                data = _json.dumps(body).encode() if body is not None else None
+                req = _rq.Request(url + wpath, data=data, method=method)
+                if data is not None:
+                    req.add_header("Content-Type", "application/json")
+                    if secret:
+                        ts = str(int(_time.time()))
+                        sig = _hmac.new(secret.encode(), f"{ts}.".encode() + data,
+                                        _hl.sha256).hexdigest()
+                        req.add_header("X-Sibling-Timestamp", ts)
+                        req.add_header("X-Sibling-Signature", sig)
+                with _rq.urlopen(req, timeout=120) as r:
+                    blob = r.read()
+                return blob if raw else _json.loads(blob)
+
+            if path == "/project/worlds/events" and self.command == "GET":
+                # SSE passthrough: the worker's live world-state feed (sibling_state
+                # events from running sim jobs) → the Worlds panel's live view.
+                try:
+                    up = _rq.urlopen(url + "/events", timeout=3600)
+                except Exception as e:                      # noqa: BLE001 - stated
+                    self._json({"error": f"worker events unreachable: {e}"}, 502)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                try:
+                    while True:
+                        chunk = up.readline()
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        if chunk in (b"\n", b"\r\n"):
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    up.close()
+                return
+            try:
+                if path == "/project/worlds/generate" and self.command == "POST":
+                    ln = int(self.headers.get("Content-Length") or 0)
+                    body = _json.loads(self.rfile.read(ln) or b"{}")
+                    body["kind"] = "world_generate"
+                    self._json(_worker("POST", "/submit", body))
+                    return
+                if path == "/project/worlds/poll" and self.command == "GET":
+                    jid = (query.get("job_id") or [""])[0]
+                    self._json(_worker("GET", f"/poll?job_id={jid}"))
+                    return
+                if path == "/project/worlds/pull" and self.command == "POST":
+                    ln = int(self.headers.get("Content-Length") or 0)
+                    jid = str(_json.loads(self.rfile.read(ln) or b"{}").get("job_id") or "")
+                    fetched = _worker("GET", f"/fetch?job_id={jid}")
+                    manifest = fetched.get("results") or {}
+                    if fetched.get("error") or not manifest.get("id"):
+                        self._json({"error": fetched.get("error") or "job has no bundle"}, 502)
+                        return
+                    wid = manifest["id"]
+                    tgt = PROJECT / ".remoroo" / "worlds" / wid
+                    for rel in manifest.get("files") or []:
+                        blob = _worker("GET", "/worlds/file?p=" +
+                                       _q(f"{wid}/{rel}", safe=""), raw=True)
+                        fp = tgt / rel
+                        fp.parent.mkdir(parents=True, exist_ok=True)
+                        fp.write_bytes(blob)
+                    (tgt / "manifest.json").write_text(
+                        _json.dumps(manifest, indent=1), encoding="utf-8")
+                    self._json({"ok": True, "id": wid,
+                                "files": len(manifest.get("files") or [])})
+                    return
+            except Exception as e:                          # noqa: BLE001 - stated to UI
+                self._json({"error": f"worker call failed: {type(e).__name__}: {e}"}, 502)
+                return
         cell_path = PROJECT / "cell.studio.json"
         if path == "/project/cell" and self.command == "GET":
             if not cell_path.exists():

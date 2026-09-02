@@ -100,7 +100,10 @@ def _stable_token(project_dir: Path) -> str:
 
 
 def find_studio() -> Optional[Studio]:
-    return _bundled() or _repo()
+    # In a source checkout, run the Studio code beside the checkout so edge/service
+    # edits take effect immediately. Installed packages normally have no discoverable
+    # repo tree and therefore fall back to the prebuilt package data.
+    return _repo() or _bundled()
 
 
 def lan_ip() -> str:

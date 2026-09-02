@@ -120,6 +120,19 @@ def _plan_failure_message(result, *, home: bool = False) -> str:
         bits.append(f"best position error {pe * 1000:.0f} mm")
     if re_ is not None:
         bits.append(f"rotation error {re_:.3f} rad")
+    # PER-FRAME attribution (2026-07-18): the min() above hides WHICH tool frame fails
+    # convergence — a HELD frame drifting in null-space can fail the judgment while the
+    # tracked frame is perfect. Dump the raw per-link error tensors so the blocker is
+    # named, not guessed.
+    try:
+        import torch as _t
+        for nm, val in (("pos_err", getattr(result, "position_error", None)),
+                        ("rot_err", getattr(result, "rotation_error", None))):
+            if val is not None and hasattr(val, "flatten"):
+                v = [round(float(x), 3) for x in val.flatten().tolist()[:8]]
+                bits.append(f"{nm} raw={v}")
+    except Exception:  # noqa: BLE001
+        pass
     extra = (" (" + ", ".join(bits) + ")") if bits else ""
     return ("trajopt stage failed — a goal config exists but cuRobo found no collision-free, "
             f"dynamically-feasible path from the start to {goal}{extra}: the start or an intermediate "
@@ -449,9 +462,11 @@ class CuroboV2Planner:
         with span("MotionPlanner(cfg) build"):
             self.planner = MotionPlanner(cfg)
         self._assert_tool_frames_built()
-        # COUNT real PRM graph-fallback usage (a plan's attempt ≥1). The roadmap warmup costs
-        # ~88 s; whether it earns its keep on this rig has never been measured — this stamp is
-        # the measurement. Warmup's own find_path calls are suppressed via _in_prm_warmup.
+        # COUNT real PRM graph-fallback usage (a plan's attempt ≥1). Measured 2026-07-20: the
+        # fallback HAS fired (15 stamps across run history), so the graph planner stays; but a
+        # fallback find_path is ~20 s of GPU on the Orin, so each stamp is also a flag that the
+        # attempt-0 path failed somewhere worth investigating. The prime's own rollout work is
+        # suppressed via _in_prm_warmup.
         self._graph_fallbacks = 0
         self._in_prm_warmup = False
         gp0 = getattr(self.planner, "graph_planner", None)
@@ -466,13 +481,13 @@ class CuroboV2Planner:
                 return _orig_find_path(*a, **kw)
 
             gp0.find_path = _counted_find_path
-        # Warmup is TWO-STAGE (round-2 rig attribution: IK/trajopt 42 s, PRM roadmap 87 s):
-        # stage 1 (HERE) — 5 fake plans that JIT the warp kernels and capture the IK/trajopt CUDA
-        # graphs; after this the planner is FULLY usable (a plan_pose attempt 0 never graph-seeds).
-        # Stage 2 — the PRM graph-planner roadmap — is DEFERRED to `finish_warmup()`, which the
-        # stack runs in the background AFTER reporting alive: it's only consulted when an attempt
-        # falls back to graph seeding, and an un-warmed roadmap then just builds lazily (slow
-        # once, correct always). This is what puts time-to-usable at ~85 s instead of ~170 s.
+        # Warmup is TWO-STAGE (rig cProfile 2026-07-20, cubin cache warm): stage 1 (HERE) — 5
+        # fake plans that JIT the warp kernels and capture the IK/trajopt CUDA graphs, ~5 s;
+        # after this the planner is FULLY usable (a plan_pose attempt 0 never graph-seeds).
+        # Stage 2 — a ~1-2 s PRM PRIME (feasibility-rollout CUDA-graph capture; see
+        # finish_warmup for why upstream gp.warmup()'s ~105 s roadmap build bought nothing) —
+        # is DEFERRED to `finish_warmup()`, which the stack runs in the background AFTER
+        # reporting alive. An un-primed roadmap still builds lazily (slow once, correct always).
         if warmup:
             with span("planner.warmup (IK/trajopt: warp JIT + CUDA-graph capture)", iters=5):
                 self.planner.warmup(enable_graph=False, num_warmup_iterations=5)
@@ -493,9 +508,18 @@ class CuroboV2Planner:
         self._interp_dt = float(self.planner.trajopt_solver.config.interpolation_dt)
 
     def finish_warmup(self) -> bool:
-        """Deferred warmup stage 2: the PRM graph-planner roadmap (~87 s on the Orin — the
-        single biggest slice of the build). Idempotent; pure GPU (no bridge). Returns whether a
-        roadmap warmup actually ran."""
+        """Deferred warmup stage 2: PRIME the PRM graph planner (~1-2 s) instead of running
+        upstream `gp.warmup()`. Rig cProfile 2026-07-20: gp.warmup(5) spent ~105 s of PEGGED
+        GPU (mean 1289 MHz) building 20 real 14-DOF roadmap queries — and `reset_buffer()`
+        then threw every roadmap away. The only durable state it left was ONE CUDA-graph
+        capture of the feasibility rollout (0.55 s), TorchScript first-call compiles, and
+        allocator pools. A single feasible-sample call walks the same rollout GraphExecutor
+        (same fixed batch shape — 4596 replays shared one capture), so it buys that capture
+        at ~2% of the cost, and it no longer starves the ZED + first real plans that used to
+        contend with the background roadmap build. A real graph fallback (counted by
+        _graph_fallbacks) builds its roadmap lazily — slow once, correct always, which is
+        the un-warmed behavior this stack already accepts. Idempotent; pure GPU (no bridge).
+        Returns whether a prime actually ran."""
         if not getattr(self, "_graph_warmup_pending", False):
             return False
         self._graph_warmup_pending = False
@@ -503,16 +527,12 @@ class CuroboV2Planner:
         if gp is None:
             return False
         from .mtrace import span
-        # 5 iterations, NOT fewer: upstream sizes its feasible-sample pool as iters×2×batch and
-        # slices start/goal batches out of it — the FEASIBILITY sampler can under-deliver in a
-        # cluttered cell, and with iters=2 the pool is so small the slices come out ragged
-        # ("x_start and x_goal must have the same batch size", rig 2026-07-05). iters=5 has the
-        # headroom and is proven on this rig. Cost doesn't matter anymore: this runs lock-free
-        # in the background (thread_local capture), so nobody waits on it.
-        self._in_prm_warmup = True                    # don't count warmup's own find_path calls
+        self._in_prm_warmup = True                    # don't count the prime's own rollout work
         try:
-            with span("planner.finish_warmup (PRM graph-planner roadmap — deferred stage 2)"):
-                gp.warmup(num_warmup_iterations=5)
+            with span("planner.finish_warmup (PRM prime: feasibility-rollout CUDA-graph capture)"):
+                gp.sampling_strategy.generate_feasible_action_samples(num_samples=8)
+                gp.reset_buffer()   # sampling registers no nodes, but mirror gp.warmup exactly
+                gp.reset_seed()     # find_path sampling stays deterministic, as after gp.warmup
         finally:
             self._in_prm_warmup = False
         return True
@@ -722,9 +742,17 @@ class CuroboV2Planner:
             scene = self._world.scene or None
             n_cub = len((scene or {}).get("cuboid", {})) + 8
             n_mesh = len((scene or {}).get("mesh", {})) + 4
+            # warp INDEXES its device list with `torch_device.index`, so a bare "cuda" (index None)
+            # raises `TypeError: list indices must be integers or slices, not NoneType` deep inside
+            # warp.device_from_torch — which is what made this checker (and `world_sphere_collision`,
+            # our ground-truth born-collision verdict) look like an unfixable cuRobo scene-format bug.
+            # It is neither cuRobo nor the scene: the device just has to carry an explicit index.
+            dev = torch.device(self._device)
+            if dev.type == "cuda" and dev.index is None:
+                dev = torch.device(f"cuda:{torch.cuda.current_device()}")
             cfg = RobotCollisionCheckerCfg.load_from_config(
                 robot_config=self._robot_cfg, scene_model=scene,
-                device_cfg=DeviceCfg(device=torch.device(self._device), dtype=torch.float32),
+                device_cfg=DeviceCfg(device=dev, dtype=torch.float32),
                 n_cuboids=int(n_cub), n_meshes=int(n_mesh),
                 collision_activation_distance=0.0)          # 0 = exact penetration verdict
             self._coll_checker = RobotCollisionChecker(cfg)
@@ -800,23 +828,20 @@ class CuroboV2Planner:
                 if v < lo - 1e-6 or v > hi + 1e-6:
                     out["bounds"].append({"joint": n, "value": round(v, 3),
                                           "min": round(lo, 3), "max": round(hi, 3)})
-            try:                                            # WORLD — which modeled cuboid the spheres sit in
+            try:                                            # WORLD — which modeled cuboid the spheres sit in.
+                # ROTATION-AWARE (world.sphere_box_overlaps): a private AABB here ignored obstacle
+                # yaw, so the 90°-yawed wall read as a phantom slab through the workspace and EVERY
+                # failure blamed 'obs_5_wall' (~150 spheres) — a lie that also suppressed the SELF
+                # verdict below (world non-empty ⇒ self never set). 2026-07-20.
+                from .world import sphere_box_overlaps
                 spheres = self.robot_spheres(start_positions)
-                cuboids = (self._world.scene or {}).get("cuboid") or {}
-                hits = []
-                for name, b in cuboids.items():
-                    pose = list(b.get("pose") or [0, 0, 0])
-                    c = [float(x) for x in (list(pose[:3]) + [0, 0, 0])[:3]]
-                    d = [float(x) for x in (list(b.get("dims") or [0.1, 0.1, 0.1]) + [0.1, 0.1, 0.1])[:3]]
-                    nhit = sum(1 for s in spheres
-                               if abs(float(s[0]) - c[0]) <= d[0] / 2 + float(s[3])
-                               and abs(float(s[1]) - c[1]) <= d[1] / 2 + float(s[3])
-                               and abs(float(s[2]) - c[2]) <= d[2] / 2 + float(s[3]))
-                    if nhit:
-                        hits.append({"obstacle": name, "spheres_inside": int(nhit)})
+                pen = sphere_box_overlaps(spheres, self._world.scene or {})
+                hits = [{"obstacle": n, "spheres_inside": int(v["spheres_penetrating"])}
+                        for n, v in pen.items() if v["spheres_penetrating"] > 0]
                 out["world"] = sorted(hits, key=lambda w: -w["spheres_inside"])
             except Exception:  # noqa: BLE001
                 pass
+            cf = None
             try:                                            # SELF — best-effort canonical verdict
                 cf = self.world_sphere_collision(start_positions).get("collision_free")
                 if cf is False and not out["bounds"] and not out["world"]:
@@ -833,8 +858,12 @@ class CuroboV2Planner:
             if out["self"]:
                 parts.append("SELF-COLLISION (arm spheres overlap)")
             if not parts:
-                parts.append("no joint-limit or modeled-obstacle violation → likely SELF-COLLISION "
-                             "(arm-vs-arm) or a live-ESDF/mesh obstacle; check the self-collision model")
+                if cf is True:      # cuRobo's own verdict: the start is FINE — say so, don't speculate
+                    parts.append("start config is CLEAN per cuRobo (bounds+world+self all pass) — "
+                                 "the failure is elsewhere: the PATH/dynamics, or the live ESDF")
+                else:
+                    parts.append("no joint-limit or modeled-obstacle violation → likely SELF-COLLISION "
+                                 "(arm-vs-arm) or a live-ESDF/mesh obstacle; check the self-collision model")
             out["summary"] = " | ".join(parts)
         except Exception as e:  # noqa: BLE001
             out["summary"] = f"(start-collision explain unavailable: {type(e).__name__}: {e})"
@@ -1000,13 +1029,23 @@ class CuroboV2Planner:
                                       f"cannot FK hold-goal for un-goaled tip {t!r} (cuRobo V2 "
                                       f"needs every tool frame goaled; this planner carries "
                                       f"{self._tool_frames})")
-                holds[t] = (list(fk[0]), list(fk[1]))
+                # THE DANCE SHAPE (2026-07-18, standalone-proven): a held frame is a
+                # position-only goal at its CURRENT position with the FILLER quat — the
+                # exact form the showcase dance and the dual-goal test plan in 0.6s. The
+                # FK quaternion must NOT ride in the goal tensor: with it, the identical-
+                # criteria singular plan fails trajopt (quaternion-sensitive seeding /
+                # double-cover at wrist ±π); with the filler it plans. Zero-cost null-
+                # space holds and 7-pose FK holds are both dead ends, measured live.
+                holds[t] = (list(fk[0]), [1.0, 0.0, 0.0, 0.0])
             goals = {**goals, **holds}
-            # The hold is ZERO-COST, not an exact 6-DoF pin: the goal buffer needs every
-            # tool frame (reorder_links), but the pose COST tracks only the goaled tips —
-            # the held limbs ride the null-space at the current seed (live 2026-07-13).
-            _stamp("plan_pose: un-goaled tips held ZERO-COST (null-space), not pinned",
+            pos_only |= set(missing)
+            _stamp("plan_pose: un-goaled tips POSITION-HELD (bare-position goal at current "
+                   "spot, orientation free)",
                    held=missing, tracked=[t for t in goals if t not in missing])
+        # CANONICAL slot order (2026-07-18 root cause): the goal tensor maps slots by
+        # dict iteration order; an arm2-first dict swapped the tips' goals (~70cm
+        # teleports, best-position-error == the arm separation). Order by tool_frames.
+        goals = {t: goals[t] for t in self._tool_frames if t in goals}
         axes = dict(axes_weight or {})
         if pos_only:
             # POSITION-ONLY goals: the caller stated a position and NO orientation, so
@@ -1025,7 +1064,7 @@ class CuroboV2Planner:
                    frames={k: list(v) for k, v in axes.items()})
         try:
             if missing or pos_only or axes:
-                self._apply_criteria(held=missing, position_only=pos_only, axes=axes)
+                self._apply_criteria(held=None, position_only=pos_only, axes=axes)
             return self._plan_pose_once(goals, start_positions, max_attempts)
         finally:
             if missing or pos_only or axes:
@@ -1051,7 +1090,13 @@ class CuroboV2Planner:
         from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
         crit = {}
         for f in held or []:
-            crit[f] = ToolPoseCriteria.disabled()
+            # POSITION-HOLD (2026-07-18, replaces the zero-cost null-space hold): the held
+            # frame's goal is already FK-filled at its CURRENT pose, so track_position =
+            # "stay where you are, orientation free". The disabled()+null-space hold made
+            # every singular plan that held arm1 fail trajopt (reproduced standalone:
+            # hold-arm1 FAILS both pose forms; both-goaled plans in 0.6s — the dance's
+            # shape). Position-hold is also strictly safer: a held arm cannot drift.
+            crit[f] = ToolPoseCriteria.track_position()
         for f in position_only or []:
             crit[f] = ToolPoseCriteria.track_position()
         for f, w in (axes or {}).items():
@@ -1096,6 +1141,78 @@ class CuroboV2Planner:
             return ts.solve_cspace(goal, start, **kw)
         except Exception:  # noqa: BLE001 — fast-path failure just escalates (poison recovers on the retry)
             return None
+
+    def _prm_endpoint_verdict(self, gp, start_q, goal_q) -> str:
+        """Which ENDPOINT the graph planner's OWN feasibility rollout rejects (bounds+self+world
+        at ITS margins). find_path fast-fails the whole query when EITHER endpoint fails that
+        check — so a physics-verified catch config can read infeasible HERE and nowhere else,
+        and without this verdict the refusal is unexplained. Measured evidence, never a guess."""
+        try:
+            import torch
+            ok = gp.check_samples_feasibility(torch.cat([start_q, goal_q], dim=0)).reshape(-1)
+            s_ok, g_ok = bool(ok[0].item()), bool(ok[-1].item())
+            return (f"graph endpoint feasibility: start={'OK' if s_ok else 'IN-COLLISION'}, "
+                    f"goal={'OK' if g_ok else 'IN-COLLISION'}")
+        except Exception as e:  # noqa: BLE001 — evidence-gathering must never fail the failure path
+            return f"graph endpoint feasibility unavailable ({type(e).__name__}: {e})"
+
+    def _prm_cspace_fallback(self, goal, start):
+        """EXPLICIT PRM graph retry for a JOINT-SPACE goal — measured need (A10G dual-xArm6
+        catch, 2026-07-28): IK-valid, physics-verified catch configs fail `plan_joints` at
+        trajopt in 0.8–3.4 s, which proves the ~20 s roadmap effort the POSE path's fallback
+        spends never happened for cspace goals — `plan_cspace`'s own graph attempts (attempt≥1)
+        either fast-fail at find_path's endpoint gate or lean-miss on the seed, and `continue`
+        silently. This runs ONE find_path directly (the same call `_get_graph_seed_trajectories`
+        makes), feeds any roadmap seed to a FULL-iteration `solve_cspace`, and — win or lose —
+        returns a note naming what the graph did (timings, debug_info, WHICH endpoint it
+        rejects). Failure-path only: a plan that succeeds earlier never comes here, so the fast
+        tiers and warm latency are untouched. Returns (TrajOptSolverResult | None, note)."""
+        import time as _time
+        gp = getattr(self.planner, "graph_planner", None)
+        ts = getattr(self.planner, "trajopt_solver", None)
+        if gp is None or ts is None or not hasattr(gp, "find_path"):
+            return None, "PRM graph fallback unavailable (no graph planner built)"
+        from .mtrace import stamp
+        try:
+            from curobo._src.graph_planner.graph_planner_prm import TrajInterpolationType
+            num_seeds = int(ts.config.num_seeds)
+            dof = int(goal.position.shape[-1])
+            starts = start.position.view(1, dof).repeat(num_seeds, 1)
+            goals = goal.position.view(1, dof).repeat(num_seeds, 1)
+            t0 = _time.perf_counter()
+            res = gp.find_path(
+                starts.clone(), goals.clone(),
+                interpolate_waypoints=True,
+                interpolation_steps=int(ts.action_horizon),
+                interpolation_type=TrajInterpolationType.LINEAR,
+                validate_interpolated_trajectory=False,   # trajopt repairs the seed, as plan_cspace does
+            )
+            graph_s = _time.perf_counter() - t0
+            import torch
+            n_ok = int(torch.count_nonzero(res.success)) if res is not None else 0
+            if n_ok == 0:
+                which = self._prm_endpoint_verdict(gp, starts[:1], goals[:1])
+                dbg = getattr(res, "debug_info", None) or "no roadmap path found"
+                stamp("plan_joints PRM fallback REFUSED", seconds=round(graph_s, 2),
+                      debug=str(dbg), verdict=which)
+                return None, f"PRM graph fallback REFUSED in {graph_s:.1f}s ({dbg}; {which})"
+            seed_traj = res.interpolated_waypoints[res.success, :, :].unsqueeze(0)
+            t1 = _time.perf_counter()
+            tr = ts.solve_cspace(goal, start, seed_traj=seed_traj,
+                                 finetune_attempts=3, finetune_dt_scale=0.75)
+            opt_s = _time.perf_counter() - t1
+            if self._solve_ok(tr):
+                stamp("plan_joints PRM fallback SUCCEEDED", roadmap_s=round(graph_s, 2),
+                      seeds=f"{n_ok}/{num_seeds}", trajopt_s=round(opt_s, 2))
+                return tr, (f"via PRM graph fallback (roadmap {graph_s:.1f}s, "
+                            f"{n_ok}/{num_seeds} seeds, trajopt {opt_s:.1f}s)")
+            stamp("plan_joints PRM fallback: roadmap OK but trajopt still failed",
+                  roadmap_s=round(graph_s, 2), seeds=f"{n_ok}/{num_seeds}", trajopt_s=round(opt_s, 2))
+            return None, (f"PRM found a roadmap path ({n_ok}/{num_seeds} seeds, {graph_s:.1f}s) "
+                          f"but trajopt STILL failed on the graph seed ({opt_s:.1f}s) — the goal "
+                          "region itself is infeasible for the optimizer")
+        except Exception as e:  # noqa: BLE001 — the fallback must never mask the original failure
+            return None, f"PRM graph fallback raised: {type(e).__name__}: {e}"
 
     def _fast_pose(self, goal, start, iters: int):
         """Lean pose: IK (num_seeds) → lean trajopt.solve_pose (finetune=0, `iters`). Mirrors the fork's
@@ -1212,6 +1329,7 @@ class CuroboV2Planner:
                         v = min(max(v, lo + 1e-4), hi - 1e-4)
                     q[0, i] = v
             goal = JointState.from_position(q, joint_names=names)
+            prm_note = ""
             with span("plan_cspace", attempts=max_attempts, named=len(goal_positions)):
                 result = None
                 for _it in self._fast_tiers():                 # lean ladder: 25 (~350ms) → 100 (~1s)
@@ -1220,10 +1338,20 @@ class CuroboV2Planner:
                         break
                 if not self._solve_ok(result):                 # still a miss → full PRM retry
                     result = self.planner.plan_cspace(goal, start, max_attempts=max_attempts)
+                if not self._solve_ok(result):
+                    # LAST RESORT (2026-07-28, A10G catch measurement): plan_cspace's internal
+                    # graph attempts fast-fail silently, so a cspace miss never got the PRM
+                    # effort pose goals get. One explicit graph retry — succeed or say WHY not.
+                    fb, prm_note = self._prm_cspace_fallback(goal, start)
+                    if fb is not None:
+                        result = fb
         except Exception as e:
             return PlanResult(False, None, f"plan_cspace raised: {e}{self._recover_if_capture_poisoned(e)}")
         if result is None or not bool(result.success.any()):
-            return PlanResult(False, None, self._fail_msg(result, start_positions))
+            msg = self._fail_msg(result, start_positions)
+            if prm_note:
+                msg += "  ·  " + prm_note
+            return PlanResult(False, None, msg)
         with span("interpolate→Trajectory"):
             traj = self._to_trajectory(self._trimmed_plan(result))
         from .mtrace import stamp
@@ -1237,7 +1365,9 @@ class CuroboV2Planner:
         if diag:
             stamp("plan_cspace diagnostics", **{k: (round(float(v), 3) if isinstance(v, (int, float)) else v)
                                                 for k, v in diag.items()})
-        return PlanResult(True, traj, "ok", traj.duration)
+        # a fallback-won plan says so — the tag is how the operator/agent learns the normal
+        # solve missed and the roadmap earned its keep (mirrors the pose path's counting).
+        return PlanResult(True, traj, ("ok (" + prm_note + ")") if prm_note else "ok", traj.duration)
 
     @staticmethod
     def _trimmed_plan(result):

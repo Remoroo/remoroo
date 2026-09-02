@@ -785,8 +785,15 @@ def sse_commission(_q):
                     except Exception as e:  # noqa: BLE001
                         reasons = [{"camera": None, "ok": False, "why": f"{type(e).__name__}: {e}"}]
                 q.put({"step": "camera_inputs", "ok": bool(live), "n_frames": len(live), "cameras": reasons})
+                # groups[].effector from cell.yaml -> the actuation echo check
+                # (commission proves the gripper DECLARATION against the metal;
+                # the b12f5aa1 inversion would have been caught right here)
+                effs = {str(g.get("name")): g.get("effector")
+                        for g in (load_cell_yaml().get("groups") or [])
+                        if isinstance(g, dict) and g.get("effector")}
                 out["report"] = st.commission(execute=execute, target=target, tcp=tcp,
-                                               frames=lambda: live, progress=lambda s: q.put(s))
+                                               frames=lambda: live, progress=lambda s: q.put(s),
+                                               bridge=b, effectors=effs)
             except Exception as e:  # noqa: BLE001
                 out["report"] = {"ok": False, "message": f"{type(e).__name__}: {e}"}
             finally:
@@ -1314,6 +1321,23 @@ def h_verify_start(_q):
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "tcp": tcp}
     rep["ok"] = True
     return rep
+
+
+def h_motion_reload(_q):
+    """HOT RELOAD of the motion stack (2026-07-18, the 5-minute-restart tax): drop the
+    planner caches so the next motion verb rebuilds (~90s) against the CURRENT cell
+    artifacts (collision_spheres.yml etc.) — cameras, perception kernels, and the process
+    itself stay warm. This is what a heal loop should call after editing the collision
+    model; a full `remoroo edge restart` is only for CODE (primitives.py) changes."""
+    try:
+        with _bridge_lock:
+            reset_curobo_cache()
+            reset_motion_stack()
+        return {"ok": True, "note": ("planner caches dropped — the next motion verb "
+                                     "rebuilds (~90s) with the current cell artifacts; "
+                                     "cameras/kernels/process stayed warm")}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def h_diagnose_motion(_q):
@@ -2865,6 +2889,7 @@ ROUTES = {
     "/edge/motion/warmup": ("json", h_motion_warmup),
     "/edge/motion/tcp_pose": ("json", h_tcp_pose),
     "/edge/motion/suggest_targets": ("json", h_suggest_targets),
+    "/edge/motion/reload": ("json", h_motion_reload),
     "/edge/motion/diagnose": ("json", h_diagnose_motion),
     "/edge/motion/validate_config": ("json", h_validate_config),
     "/edge/motion/verify_start": ("json", h_verify_start),

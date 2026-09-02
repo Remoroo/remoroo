@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -36,6 +36,7 @@ from .safety import Safety, audit_trajectory, load_safety
 from .trajectory import Trajectory
 from .world import WorldInputs, load_world, mask_robot_points
 from .live_world import observed_extent, esdf_resolution, union_extent, obstacle_bboxes
+import inspect
 import threading
 import time
 
@@ -136,29 +137,9 @@ def _bbox(pts) -> Optional[dict]:
             "max": [round(float(x), 3) for x in a[:, :3].max(0)]}
 
 
-def _sphere_box_overlaps(spheres, scene: dict) -> dict:
-    """For each axis-aligned obstacle cuboid, how many of the robot's spheres PENETRATE it, and the
-    min clearance (sphere-surface → box, negative = inside). Box yaw is ignored (table/walls are
-    axis-aligned) — a fast, honest first read of 'is this config inside an obstacle'."""
-    out: dict = {}
-    sph = np.asarray(spheres, dtype=float)
-    if sph.size == 0:
-        return out
-    for name, box in (scene.get("cuboid") or {}).items():
-        pose = box.get("pose") or [0, 0, 0, 1, 0, 0, 0]
-        c = np.asarray(pose[:3], dtype=float)
-        half = np.asarray(box.get("dims") or [0, 0, 0], dtype=float) / 2.0
-        lo, hi = c - half, c + half
-        n, mind = 0, 1e9
-        for s in sph:
-            p, r = s[:3], float(s[3])
-            d = np.maximum(np.maximum(lo - p, p - hi), 0.0)   # per-axis outside distance
-            dist = float(np.linalg.norm(d)) - r
-            mind = min(mind, dist)
-            if dist < 0:
-                n += 1
-        out[name] = {"spheres_penetrating": int(n), "min_clearance_m": round(mind, 4)}
-    return out
+# _sphere_box_overlaps moved to world.py (sphere_box_overlaps) so curobo_v2's failure diagnostics
+# use the SAME rotation-aware math — its private AABB copy resurrected the obs_5_wall lie (2026-07-20).
+from .world import sphere_box_overlaps as _sphere_box_overlaps  # noqa: E402  (back-compat alias)
 
 
 def _foreign_motion(traj, goal_names, tol_rad: float = 0.03) -> dict:
@@ -219,7 +200,8 @@ class MotionStack:
     def __init__(self, *, config: dict, spheres: Dict[str, List[dict]], sphere_buffer: float,
                  world: WorldInputs, safety: Safety, bridge=None,
                  urdf_path: str = "robot.urdf", planner_factory: Optional[PlannerFactory] = None,
-                 mapper_factory=None, self_collision_ignore: Optional[Dict[str, List[str]]] = None) -> None:
+                 mapper_factory=None, self_collision_ignore: Optional[Dict[str, List[str]]] = None,
+                 planner_lock_joints: Optional[Mapping[str, float]] = None) -> None:
         self.config = config
         self.spheres = spheres
         self.sphere_buffer = sphere_buffer
@@ -258,14 +240,38 @@ class MotionStack:
         self._live_voxels: np.ndarray = np.zeros((0, 4), dtype=float)
         self._live_voxels_dirty = False                # a fast (diagnostics=False) refresh left the
         #                                                render voxels stale; esdf_voxels() reads back lazily
-        # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace; the
-        # ones we're not driving get locked, so cuRobo never meets a joint missing from the list.
+        # EVERY URDF actuated joint (incl. gripper drivers not in any group) → cuRobo cspace.
+        # Generic stacks drive the full cspace as before; a proof stack may explicitly lock a
+        # validated subset at immutable, measured values.
         self._actuated = actuated_joints(urdf_path)
+        if planner_lock_joints is not None and not isinstance(planner_lock_joints, Mapping):
+            raise ValueError("planner_lock_joints must be a joint-name mapping")
+        self._planner_lock_joints: Dict[str, float] = {}
+        known_actuated = set(self._actuated)
+        for raw_name, raw_value in (planner_lock_joints or {}).items():
+            if not isinstance(raw_name, str) or raw_name not in known_actuated:
+                raise ValueError(
+                    f"planner_lock_joints contains unknown actuated joint {raw_name!r}; "
+                    f"known={sorted(known_actuated)}")
+            if isinstance(raw_value, bool):
+                raise ValueError(
+                    f"planner_lock_joints[{raw_name!r}] must be finite, not bool")
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"planner_lock_joints[{raw_name!r}] must be finite") from exc
+            if not np.isfinite(value):
+                raise ValueError(
+                    f"planner_lock_joints[{raw_name!r}] must be finite")
+            self._planner_lock_joints[raw_name] = value
         self._cell_dir: Optional[str] = None          # set by from_cell → enables reload_world hot-swap
 
     # --- construction -----------------------------------------------------
     @classmethod
-    def from_cell(cls, cell_dir: str, bridge=None, *, planner_factory: Optional[PlannerFactory] = None) -> "MotionStack":
+    def from_cell(cls, cell_dir: str, bridge=None, *,
+                  planner_factory: Optional[PlannerFactory] = None,
+                  planner_lock_joints: Optional[Mapping[str, float]] = None) -> "MotionStack":
         """Build from the on-disk cell: the AUTHORED config (cell.yaml groups) + collision_spheres.yml
         + world/ + safety."""
         with span("from_cell: load_robot_config"):
@@ -291,7 +297,8 @@ class MotionStack:
         urdf_path = str((Path(cell_dir) / "robot_model" / "robot.urdf").resolve())
         st = cls(config=config, spheres=spheres, sphere_buffer=buffer, world=world,
                  safety=safety, bridge=bridge, urdf_path=urdf_path, planner_factory=planner_factory,
-                 self_collision_ignore=authored_ignore)
+                 self_collision_ignore=authored_ignore,
+                 planner_lock_joints=planner_lock_joints)
         st._cell_dir = str(cell_dir)
         return st
 
@@ -396,13 +403,21 @@ class MotionStack:
         """The cuRobo robot_cfg dict for these groups. The cspace DEFAULT (retract / null-space
         target) is the CURRENT robot config, not zeros — so when we drive one limb's TCP over the
         full cspace (lock_joints: None), the un-driven limbs are HELD at their real pose instead of
-        being pulled toward zero (which can swing them into the world). Shared by `_planner_for` and
-        the diagnostic probes so they all see the same held configuration."""
-        return build_v2_robot_cfg(
+        being pulled toward zero (which can swing them into the world). Proof callers may opt into
+        an immutable `planner_lock_joints` map; cuRobo then removes those coordinates from its active
+        solve while retaining them in collision kinematics and augmenting the returned trajectory.
+        Shared by `_planner_for` and the diagnostic probes so they all see the same configuration."""
+        cfg = build_v2_robot_cfg(
             self.config, self.spheres, active_groups=list(active_groups),
             urdf_path=self.urdf_path, sphere_buffer=self.sphere_buffer, limits=self._limits,
             self_collision_ignore=self._self_collision_ignore(), actuated_joints=self._actuated,
             default_joint_position=self._seed_positions())
+        # build_v2_robot_cfg deliberately preserves the generic stack's no-lock default. This
+        # instance-level override is opt-in and baked into the cached planner, so lock VALUES can
+        # never silently change underneath an existing kinematic/collision model.
+        cfg["robot_cfg"]["kinematics"]["lock_joints"] = (
+            dict(self._planner_lock_joints) or None)
+        return cfg
 
     def _self_mask_world(self, planner) -> bool:
         """DEAD by design: the scanned cloud is no longer loaded into cuRobo (see
@@ -854,6 +869,19 @@ class MotionStack:
         if self.bridge is None:
             stamp("seed_positions: NO BRIDGE — planner defaults will seed (fly-home hazard)")
             return {}
+        # JOINT STREAM FIRST (2026-07-18): get_observation grabs CAMERA frames to answer a
+        # JOINTS question — measured 156s stalls when the ZED contends with background
+        # perception. The lock-free stream cache is the same source the tracking watchdog
+        # trusts; cameras are only a fallback here.
+        watch = getattr(self.bridge, "latest_joints", None)
+        if callable(watch):
+            try:
+                lj = dict(watch() or {})
+                if lj:
+                    stamp("seed_positions from joint stream", joints=len(lj))
+                    return {str(k): float(v) for k, v in lj.items()}
+            except Exception:  # noqa: BLE001 — stream degraded: fall through to observation
+                pass
         with span("seed_positions (get_observation)"):
             try:
                 obs = self.bridge.get_observation()
@@ -885,8 +913,55 @@ class MotionStack:
         `play_trajectory`), without re-planning or reading the live state each step."""
         if not targets:
             return MoveResult(False, "no targets given")
-        arms = list(targets.keys())
+        # WHOLE-ROBOT planner ALWAYS (2026-07-18, the day's root cause): the subset
+        # planner LOCKS the un-goaled arms' joints, and a locked neighbor makes a
+        # singular move from an entangled pose genuinely infeasible ("arm1 is pointed
+        # toward arm2" — every singular arm2 plan failed while the dance planned 19/19).
+        # Over the whole cspace the un-goaled arms become soft stay-here goals that may
+        # yield millimeters — the dance shape, standalone-proven (0.6s vs infeasible).
+        arms = list(self._groups.keys())
         planner = self._planner_for(arms)
+        # STACK-LEVEL stay-here fill (2026-07-18, the 705mm smoking gun): un-goaled arms
+        # are goaled AT THEIR CURRENT POSITION *here*, from the STACK's own FK — the
+        # operator's design ("if we don't want to move one, we goal it through the tcp").
+        # The planner-side fill used planner.link_pose, which returns arm1's tip in the
+        # wrong frame (base_to_base): its "stay here" meant "teleport ~70cm" — every
+        # singular plan holding arm1 failed with best-position-error ~= the arm
+        # separation. Bare position -> position-only -> may yield millimeters (dance shape).
+        # Which groups did the caller goal (by group OR tip name — the one-name contract)?
+        claimed = set()
+        for k in targets:
+            try:
+                claimed.add(self._tip(k))
+            except KeyError:
+                pass                                  # unknown names stay -> _tip raises below
+        ordered: Dict[str, object] = {}
+        for g_ in list(self._groups.keys()):          # CANONICAL group order, always: dict
+            tip_ = self._tip(g_)                      # order IS goal-slot order downstream —
+            if tip_ not in claimed:                   # an arm2-first dict swapped the tips'
+                # Stay-here must mean "stay at the PLAN-START pose": when the caller chains with
+                # `start=`, FK THAT config — not the live joints. FKing live joints here (the old
+                # behavior) silently pinned the un-goaled arm to wherever the rig REALLY is; with
+                # no bridge that's the all-zeros default, whose fingertips sit ~6mm INSIDE the
+                # modeled table — so every offline IK had to hold an in-collision pose and failed
+                # ("bridge=None planning is useless", 2026-07-20: THIS was the mechanism).
+                cur_ = (planner.current_tool_pose(tip_, start)
+                        if (start and hasattr(planner, "current_tool_pose"))
+                        else self.current_tool_pose(g_))   # live FK (the 705mm fix, 2026-07-18)
+                if cur_ is not None:
+                    ordered[g_] = [float(cur_[0][0]), float(cur_[0][1]), float(cur_[0][2])]
+                continue
+            for k, v in targets.items():
+                try:
+                    if self._tip(k) == tip_:
+                        ordered[k] = v
+                        break
+                except KeyError:
+                    continue
+        for k, v in targets.items():                  # unknown names preserved: the
+            if k not in ordered:                      # one-name contract raises loudly
+                ordered[k] = v
+        targets = ordered
         goals = {self._tip(a): _norm_pose(p) for a, p in targets.items()}
         pos_only = [self._tip(a) for a, p in targets.items() if _is_bare_position(p)]
         axes = {self._tip(a): w for a, p in targets.items()
@@ -962,11 +1037,12 @@ class MotionStack:
         return {"groups": active, "seconds": round(_time.time() - t0, 1)}
 
     def finish_warmup(self) -> dict:
-        """Warmup stage 2 for every cached planner — the deferred PRM graph-planner roadmap
-        (~87 s on the Orin; see CuroboV2Planner.finish_warmup). Pure GPU, touches no bridge, so
-        the edge runs it OFF the bridge lock after reporting alive: the fast plan path is usable
-        the whole time, and a plan that graph-falls-back before this finishes just builds the
-        roadmap lazily (slow once, correct always)."""
+        """Warmup stage 2 for every cached planner — the deferred PRM prime (~1-2 s on the
+        Orin, replacing the ~105 s roadmap warmup that threw its roadmaps away; see
+        CuroboV2Planner.finish_warmup). Pure GPU, touches no bridge, so the edge runs it OFF
+        the bridge lock after reporting alive: the fast plan path is usable the whole time,
+        and a plan that graph-falls-back just builds its roadmap lazily (slow once, correct
+        always)."""
         n = 0
         for p in self._planners.values():
             try:
@@ -1394,6 +1470,136 @@ class MotionStack:
                               "doesn't clear it). Fix both: the scan masking AND the offending cage/obstacle box.")
         return rep
 
+    def _self_pairs_fast(self, q: Dict[str, float], margin: float = 0.0):
+        """VECTORIZED self-collision pair report at a config — ONE numpy shot over every
+        sphere pair (the python link-pair loop took minutes; this takes <1s). Reports
+        link pairs whose closest spheres come within `margin` of touching (negative
+        clearance = overlap at TRUE radii). Non-ignored pairs only — the planner's view."""
+        planner = self._planner_for(list(self._groups.keys())[:1])
+        poses = planner.link_poses(list(self.spheres.keys()), q) \
+            if hasattr(planner, "link_poses") else {}
+        from .live_world import _quat_wxyz_to_R
+        centers, radii, links = [], [], []
+        for link, sl in self.spheres.items():
+            pose = poses.get(link)
+            if pose is None:
+                continue
+            xyz, quat = pose
+            Rm = _quat_wxyz_to_R(quat)
+            for s in sl:
+                c = np.asarray(xyz) + Rm @ np.asarray([float(v) for v in s["center"]])
+                centers.append(c)
+                radii.append(float(s["radius"]))
+                links.append(link)
+        if not centers:
+            return []
+        C = np.asarray(centers)
+        Rr = np.asarray(radii)
+        d = np.linalg.norm(C[:, None, :] - C[None, :, :], axis=-1) - Rr[:, None] - Rr[None, :]
+        ig = self._self_collision_ignore()
+        out: Dict[tuple, float] = {}
+        li = np.asarray(links)
+        for a in range(len(self.spheres)):
+            pass  # link-pair reduction below via unique names
+        names = sorted(set(links))
+        idx = {n: np.where(li == n)[0] for n in names}
+        for i, na in enumerate(names):
+            for nb in names[i + 1:]:
+                if nb in (ig.get(na) or []) or na in (ig.get(nb) or []):
+                    continue
+                clear = float(d[np.ix_(idx[na], idx[nb])].min())
+                if clear < margin:
+                    out[(na, nb)] = clear
+        return sorted(
+            [{"links": [a, b], "clearance_mm": round(c * 1000.0, 1)}
+             for (a, b), c in out.items()], key=lambda e: e["clearance_mm"])[:8]
+
+    def _heal_payload(self, g: str, verdict: str) -> dict:
+        return {
+            "goal": (f"Motion health failed on '{g}': phantom self-collision blocks planning. "
+                     f"{verdict} Repair the cell's collision model — "
+                     "robot_model/collision_spheres.yml: slim/re-fit the spheres of the NAMED "
+                     "links (negative or small clearance at buffered radii = the blockers), or "
+                     "add the pair to self_collision_ignore ONLY if the links are adjacent "
+                     "by-design touches. Touch nothing else. After each edit: "
+                     "POST /edge/motion/reload (hot reload, ~90s) then re-check with "
+                     "motion_health {quick: true}."),
+            "metric": "the motion_health verb returns ok=true for every arm",
+            "artifacts": ["remoroo_cell/robot_model/collision_spheres.yml"]}
+
+    def motion_health(self, quick: bool = False) -> dict:
+        """THE DECISION TREE (operator design 2026-07-18) — quick, decisive, tool-grade:
+          probe(world) ok                → healthy.
+          probe(EMPTY world) FAILS      → SELF-COLLISION (obstacles are almost never it):
+                                          name the sphere pairs at true AND buffered radii
+                                          with the planner's own FK → route=agent, heal
+                                          targets THOSE spheres.
+          probe(empty) ok, world fails  → an obstacle/proximity issue: name it → human.
+        Every probe is ONE plan attempt (~1s warm). No ablation, no GPU sweeps."""
+        rank = {"ok": 0, "unverified": 1, "engine": 2, "agent": 3, "human": 4}
+        arms: dict = {}
+        overall, heal = "ok", None
+        for g in list(self._groups.keys()):
+            a: dict = {"ok": False, "route": "human", "verdict": ""}
+            try:
+                cur = self.current_tool_pose(g)
+                if cur is None:
+                    a["verdict"] = "bridge/FK unreadable — is the edge's bridge connected?"
+                    arms[g] = a
+                    overall = "human" if rank["human"] > rank[overall] else overall
+                    continue
+                tgt = [cur[0][0], cur[0][1], cur[0][2] + 0.03]
+                probe = self.move_to_pose(g, (tgt, cur[1]), execute=False, max_attempts=1)
+                if probe.ok:
+                    a.update(ok=True, route="ok", verdict="plans clean from the current pose")
+                    arms[g] = a
+                    continue
+                # TEST 1: the same plan in an EMPTY world (in-memory toggle, instant).
+                planner = self._planner_for(list(self._groups.keys())[:1])
+                empty_ok = None
+                if hasattr(planner, "clear_world") and hasattr(planner, "set_world"):
+                    try:
+                        planner.clear_world()
+                        empty_ok = bool(self.move_to_pose(
+                            g, (tgt, cur[1]), execute=False, max_attempts=1).ok)
+                    finally:
+                        planner.set_world(self.world)
+                if empty_ok is False:
+                    seed = self._seed_positions()
+                    buf = float(getattr(self, "sphere_buffer", 0.0) or 0.0)
+                    tight = self._self_pairs_fast(seed, margin=0.001)
+                    near = self._self_pairs_fast(seed, margin=max(2 * buf, 0.02))
+                    a.update(route="agent",
+                             verdict=("SELF-COLLISION (empty-world plan still fails; "
+                                      "obstacles exonerated). Pairs overlapping at TRUE "
+                                      f"radii: {tight or 'none'}; pairs within the buffered "
+                                      f"margin ({max(2 * buf, 0.02) * 1000:.0f}mm): {near or 'none'} "
+                                      "— slim THESE links' spheres."))
+                    a["pairs"] = {"overlapping": tight, "near_margin": near}
+                    a["heal"] = self._heal_payload(g, a["verdict"])
+                    if heal is None:
+                        heal = a["heal"]
+                elif empty_ok is True:
+                    a.update(route="human",
+                             verdict=("OBSTACLE/PROXIMITY: plans clean in an empty world — "
+                                      "a modeled obstacle (or the arm parked inside its "
+                                      "buffer zone) blocks it. Check the world model vs "
+                                      "reality or move the arm clear. Full-pose failure: "
+                                      + str(probe.message)[:160]))
+                else:
+                    a.update(route="unverified",
+                             verdict="planner cannot toggle the world — full diagnose needed: "
+                                     + str(probe.message)[:200])
+            except Exception as e:  # noqa: BLE001 — a crashing check is the ENGINE's bug, stated
+                a.update(route="engine", verdict=f"health check raised: {type(e).__name__}: {e}")
+            arms[g] = a
+            if rank.get(a["route"], 1) > rank[overall]:
+                overall = a["route"]
+        return {"ok": overall == "ok", "route": overall, "arms": arms, "heal": heal,
+                "verdict": ("all arms plan clean" if overall == "ok" else
+                            " · ".join(f"{g}: {v['verdict']}" for g, v in arms.items()
+                                       if not v["ok"]))}
+
     def diagnose_motion(self, tcp: Optional[str] = None, xyz: Optional[Sequence[float]] = None) -> dict:
         """Honest, decisive collision diagnosis for 'no collision-free trajectory'. Plans the SAME
         small move WITH the world and WITHOUT it, and reports what the START config's spheres overlap:
@@ -1417,7 +1623,7 @@ class MotionStack:
         rep["self_collision"] = {
             "ignore_links": len(ig),
             "ignore_pairs": sum(len(v) for v in ig.values()),
-            "generated_by_curobo": self._ignore_warn is None,
+            "ignore_matrix": getattr(self, "_ignore_provenance", None) or "unknown",
             "warn": self._ignore_warn,
         }
 
@@ -1741,7 +1947,8 @@ class MotionStack:
             rep["probe_error"] = f"{type(e).__name__}: {e}"
         ig = self._self_collision_ignore()
         rep["self_collision_ignore"] = {"n_links": len(ig), "n_pairs": sum(len(v) for v in ig.values()),
-                                        "generated_by_curobo": self._ignore_warn is None, "warn": self._ignore_warn}
+                                        "ignore_matrix": getattr(self, "_ignore_provenance", None) or "unknown",
+                                        "warn": self._ignore_warn}
         # If the start is self-colliding, NAME the exact link pairs (100% — replicates cuRobo's rule).
         if rep.get("start_self_collision_free") is False:
             try:
@@ -1799,9 +2006,82 @@ class MotionStack:
         return rep
 
     # --- commission self-test --------------------------------------------
+    def actuation_echo(self, bridge: Any, effectors: Dict[str, dict],
+                       *, settle_s: float = 4.0) -> dict:
+        """Command declared-close → read the metal → verify the DECLARATION against
+        reality; then declared-open, same check. THE check the b12f5aa1 incident was
+        missing: the sim scored 1.0 while set_gripper semantics were inverted, and no
+        gate had ever closed a gripper and read it back. `effectors` = cell.yaml
+        groups[].effector keyed by group name ({units, open, closed, holding_band}).
+        An EMPTY cell is assumed: a full close must measure ~fully closed (above the
+        holding band), a full open ~fully open (below it). No gripper_state on the
+        bridge = stated UNPROVEN, never a silent pass."""
+        import time as _t
+        out: dict = {"ok": True, "arms": {}}
+        read = getattr(bridge, "gripper_state", None) \
+            or getattr(bridge, "effector_state", None)
+        for arm, eff in (effectors or {}).items():
+            eff = eff or {}
+            open_cmd = float(eff.get("open", 0.0))
+            closed_cmd = float(eff.get("closed", 1.0))
+            band = list(eff.get("holding_band") or [0.05, 0.97])
+            rec: dict = {"declared": {"open": open_cmd, "closed": closed_cmd,
+                                      "units": eff.get("units", "fraction")}}
+            if not callable(read):
+                rec.update(ok=None, note=("UNPROVEN: bridge has no gripper_state/"
+                                          "effector_state — author the measured read "
+                                          "(bridge_primitives.md) so the declaration "
+                                          "is provable against the metal"))
+                out["arms"][arm] = rec
+                continue
+
+            def _measure() -> Optional[float]:
+                st = read(arm) or {}
+                cf = st.get("closed_frac")
+                if cf is None and st.get("closed_width") is not None \
+                        and eff.get("width_max_m"):
+                    cf = 1.0 - float(st["closed_width"]) / float(eff["width_max_m"])
+                return None if cf is None else float(cf)
+
+            def _command_and_settle(value: float) -> Optional[float]:
+                bridge.set_gripper(arm, value)
+                last, t0 = None, _t.monotonic()
+                while _t.monotonic() - t0 < settle_s:
+                    _t.sleep(0.3)
+                    cur = _measure()
+                    if cur is not None and last is not None \
+                            and abs(cur - last) < 0.005:
+                        return cur                      # fingers stopped moving
+                    last = cur
+                return last
+
+            close_frac = _command_and_settle(closed_cmd)
+            open_frac = _command_and_settle(open_cmd)
+            rec["measured"] = {"after_close": close_frac, "after_open": open_frac}
+            if close_frac is None or open_frac is None:
+                rec.update(ok=None, note="UNPROVEN: gripper_state returned no "
+                                         "closure measurement")
+            else:
+                ok_close = close_frac >= float(band[1])   # empty close ≈ fully closed
+                ok_open = open_frac <= float(band[0])
+                rec["ok"] = bool(ok_close and ok_open)
+                if not rec["ok"]:
+                    rec["note"] = (
+                        f"DECLARATION vs METAL mismatch: commanded close measured "
+                        f"closure {close_frac:.2f} (want ≥{band[1]}), commanded open "
+                        f"measured {open_frac:.2f} (want ≤{band[0]}) — the units/"
+                        f"direction in cell.yaml groups[{arm!r}].effector are wrong "
+                        f"(the b12f5aa1 failure class). Fix the declaration, not the "
+                        f"programs.")
+                    out["ok"] = False
+            out["arms"][arm] = rec
+        return out
+
     def commission(self, *, execute: bool = True, progress: Optional[Callable[[dict], None]] = None,
                    target: Optional[Sequence[float]] = None, tcp: Optional[str] = None,
-                   frames: Optional[Callable[[], Sequence]] = None) -> dict:
+                   frames: Optional[Callable[[], Sequence]] = None,
+                   bridge: Optional[Any] = None,
+                   effectors: Optional[Dict[str, dict]] = None) -> dict:
         """Build the stack and VERIFY the end-to-end chain once: spheres healthy → planner builds →
         the LIVE collision world is built from the cameras → ONE collision-free plan → trajectory →
         (optionally) the bridge's whole-robot executor replays it. This is what the commission gate runs so G8
@@ -1924,9 +2204,31 @@ class MotionStack:
             mv, chosen = self.safe_demo_move(first, execute=execute)
         step("plan_move", mv.ok, tcp=first, target=chosen, message=mv.message, executed=mv.executed,
              trajectory=(mv.trajectory.summary() if mv.trajectory else None), audit=mv.audit)
+        # ACTUATION ECHO — commission proves the EFFECTOR declaration against the
+        # metal, not just the motion chain (b12f5aa1: no gate had ever closed a
+        # gripper and read it back; the declaration inversion reached a live run).
+        if execute and mv.ok and bridge is not None and effectors:
+            try:
+                echo = self.actuation_echo(bridge, effectors)
+                report["actuation_echo"] = echo
+                step("actuation_echo", echo["ok"], arms=echo["arms"])
+                if not echo["ok"]:
+                    report["ok"] = False
+                    report["message"] = ("actuation echo FAILED — the cell.yaml "
+                                         "effector declaration disagrees with the "
+                                         "metal (see actuation_echo.arms)")
+                    return report
+            except Exception as e:  # noqa: BLE001 — echo must never mask the motion result
+                step("actuation_echo", False, error=f"{type(e).__name__}: {e}")
+        elif execute and mv.ok and bridge is not None:
+            step("actuation_echo", True,
+                 note="skipped: no groups[].effector declared in cell.yaml — "
+                      "gripperless cell, or an UNDECLARED gripper (declare it; "
+                      "undeclared actuation is the b12f5aa1 failure class)")
         report["ok"] = mv.ok
         report["target"] = chosen
-        report["message"] = "commissioned — the motion stack is proven end-to-end" if mv.ok else mv.message
+        report["message"] = ("commissioned — the motion stack is proven end-to-end"
+                             if mv.ok else mv.message)
         report["move"] = mv.to_dict()
         return report
 
@@ -2053,12 +2355,24 @@ class MotionStack:
             threading.Thread(target=_track, daemon=True, name="track-watchdog").start()
         base_abort = should_abort
         should_abort = (lambda: bool((base_abort() if base_abort else False) or tracking["failed"]))
+        # Abort-capability is decided by SIGNATURE, never by catching TypeError: an INTERNAL
+        # TypeError from the authored executor after waypoints have streamed must surface as a
+        # failure — not trigger a silent second full replay with the abort channel disconnected.
+        target = getattr(self.bridge, "_b", self.bridge)      # see through the locked proxy
+        try:
+            params = inspect.signature(target.execute_trajectory).parameters
+            takes_abort = ("should_abort" in params
+                           or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()))
+        except (TypeError, ValueError):
+            takes_abort = True                                # uninspectable: assume the seed contract
+        if not takes_abort:
+            stamp("executor lacks should_abort — E-stop/watchdog CANNOT interrupt this trajectory")
         try:
             with span("bridge.execute_trajectory", detail=info), heartbeat("execute_trajectory", info=info):
-                try:
+                if takes_abort:
                     ok = self.bridge.execute_trajectory(traj, should_abort=should_abort)
-                except TypeError:
-                    ok = self.bridge.execute_trajectory(traj)  # driver that doesn't accept should_abort
+                else:
+                    ok = self.bridge.execute_trajectory(traj)
         except Exception as e:
             # executed=True: the executor was ENTERED (the arm may have moved) — callers use
             # this to tell "plan refused, safe to skip" from "execution failed, stop the run"

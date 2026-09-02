@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import itertools
 import sys
 import threading
@@ -19,14 +20,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .params import Knobs
-from .perceive.bank import RegressionBank
-from .record import TrialStore, replay_score
-from .reset.reversibility import ReversibilityTable
+from .record import TrialStore
 from .run_trial import TrialBudget, run_trial
-from .supervisor import Supervisor, SupervisorConfig
 
-BRIDGE_VERBS = {"trial_run", "vla_rollout", "ritual_trial", "perceive_run",
-                "probe_run", "scout_run", "scene_snapshot"}
+BRIDGE_VERBS = {"trial_run", "vla_rollout", "scene_snapshot"}
 # edge_real wraps these in its _bridge_lock. The long ones ALSO run as background jobs
 # (_run_as_job): the HTTP reply returns fast while the service's one-motion-at-a-time
 # lock guards the hardware for the job's whole life.
@@ -39,9 +36,6 @@ class TaskService:
                  stack_provider: Optional[Callable[[], Any]] = None) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.bank = RegressionBank.load(str(self.data_dir / "bank.jsonl"))
-        self.reversibility = ReversibilityTable.load(str(self.data_dir / "reversibility.json"))
-        self.supervisor: Optional[Supervisor] = None
         self._bridge = bridge
         self._stack_provider = stack_provider
         self._env_builder = env_builder or self._default_env_builder
@@ -56,16 +50,34 @@ class TaskService:
             self._stores[task_slug] = TrialStore(str(self.data_dir / "trials" / task_slug))
         return self._stores[task_slug]
 
+    def _cell(self) -> Dict[str, Any]:
+        """The parsed cell.yaml — THE contract (audit 2026-07-21: it was parsed in two
+        stray corners and consumed by neither the authored package nor the envs; the
+        b12f5aa1 gripper inversion lived exactly in that gap)."""
+        try:
+            import yaml
+            return yaml.safe_load(Path("remoroo_cell/cell.yaml").read_text()) or {}
+        except Exception:                              # noqa: BLE001 - off-robot: no cell
+            return {}
+
     def _shared(self) -> Dict[str, Any]:
         """THE handoff to the authored cell package: build_env(shared) receives the LIVE
-        surfaces here — the Bridge and the MotionStack — plus the task data dir. This is
-        the contract; the package never reaches into the edge for accessors."""
+        surfaces here — the Bridge and the MotionStack — plus the task data dir, the
+        parsed cell.yaml, and the cell's embodiment resolvers (up_of/approach_of/
+        effector_of from groups[]). This is the contract; the package never reaches
+        into the edge for accessors."""
         stack = None
         if self._stack_provider is not None:
             stack = self._stack_provider()             # may build/warm: that's the point
+        cell = self._cell()
+        from .env import resolvers_from_cell
+        up_of, approach_of, effector_of = resolvers_from_cell(cell)
         return {"bridge": self._bridge, "stack": stack,
                 "data_dir": str(self.data_dir),
-                "calib": self._calib_surface()}
+                "calib": self._calib_surface(),
+                "cell": cell,
+                "resolvers": {"up_of": up_of, "approach_of": approach_of,
+                              "effector_of": effector_of}}
 
     def _calib_surface(self) -> Dict[str, Any]:
         """The cell's calibration, resolved by the ENGINE (audit 2026-07-13: the agent
@@ -111,30 +123,79 @@ class TaskService:
             p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
             for p in inspect.signature(build).parameters.values())
         env = build(self._shared()) if takes_shared else build()
+        self._wire_cell_resolvers(env)
         return env, getattr(mod, "actor")
 
-    def _perception_env(self, task_slug: str) -> Any:
-        """Looking needs ONLY perception (audit 2026-07-13: requiring mod.actor made
-        the agent author 7 files before its first look). Try the full package; when it
-        is absent or partial, import perception_task alone and wrap it: make_perceive
-        (preferred) or perceive/observe. Hot-reloaded like the full path."""
+    def _wire_cell_resolvers(self, env: Any) -> None:
+        """Inject the cell's embodiment resolvers into a GenericEnv whose authored
+        build_env left the class defaults (audit 2026-07-21: resolvers_from_cell had
+        ZERO callers — the effector declaration never reached atoms, and the b12f5aa1
+        gripper inversion rode exactly that gap). An authored env that SET its own
+        resolvers is respected; only untouched defaults are replaced."""
+        from .env import GenericEnv, resolvers_from_cell
         try:
-            env, _actor = self._env_builder(task_slug)
-            return env
-        except Exception:                              # noqa: BLE001 - partial package
-            pass
-        mod_name = f"remoroo_cell.task_{task_slug}.perception_task"
-        for name in [m for m in list(sys.modules)
-                     if m.startswith(f"remoroo_cell.task_{task_slug}")]:
-            del sys.modules[name]
-        importlib.invalidate_caches()
-        mod = importlib.import_module(mod_name)
-        maker = getattr(mod, "make_perceive", None) or getattr(mod, "perceive", None)
-        if maker is None:
-            raise AttributeError(f"{mod_name} must define make_perceive(shared)")
-        perceive = maker(self._shared())
-        stack = self._stack_provider() if self._stack_provider else None
-        return type("E", (), {"stack": stack, "observe": staticmethod(perceive)})()
+            fields = GenericEnv.__dataclass_fields__
+            defaults = {k: fields[k].default
+                        for k in ("up_of", "approach_of", "effector_of")}
+        except Exception:                              # noqa: BLE001 - not a GenericEnv
+            return
+        cell = self._cell()
+        if not cell:
+            return
+        up_of, approach_of, effector_of = resolvers_from_cell(cell)
+        wired = {"up_of": up_of, "approach_of": approach_of,
+                 "effector_of": effector_of}
+        for name, default in defaults.items():
+            if getattr(env, name, None) is default:
+                setattr(env, name, wired[name])
+
+    def _preflight_env(self, env: Any, actor: Optional[Callable], *,
+                       slug: str) -> Optional[str]:
+        """Validate the authored package BEFORE any hardware motion. Returns a NAMED
+        refusal (str) or None. Audit 2026-07-21: engine validation used to be `import
+        succeeds + mod.actor exists` — run b12f5aa1 executed 279s of real motion, then
+        judge_fn (None, wrong import in the authored __init__) raised post-motion and
+        the evidence was lost. Every check here costs zero motion."""
+        if actor is not None and not callable(actor):
+            return (f"preflight {slug}: actor is not callable "
+                    f"({type(actor).__name__}) — fix the package's actor")
+        fn = getattr(env, "perceive_fn", None)
+        if not callable(fn):
+            return (f"preflight {slug}: env.perceive_fn is "
+                    f"{'None' if fn is None else 'not callable'} — build_env must "
+                    f"wire it; nothing moves until this is fixed")
+        # judge_fn is OPTIONAL (robotics_program 2026-07-22): None = no authored
+        # judge, success is decided from images by the program loop. If one IS
+        # wired, it must be callable and must survive the dry-run below.
+        jf = getattr(env, "judge_fn", None)
+        if jf is not None and not callable(jf):
+            return f"preflight {slug}: env.judge_fn is set but not callable"
+        rf = getattr(env, "reset_fn", None)
+        if rf is not None and not callable(rf):
+            return f"preflight {slug}: env.reset_fn is set but not callable"
+        if getattr(env, "bridge", None) is None:
+            return (f"preflight {slug}: env.bridge is None — no hardware surface; "
+                    f"build_env(shared) must keep shared['bridge']")
+        if getattr(env, "stack", None) is None:
+            return (f"preflight {slug}: env.stack is None — no motion surface; "
+                    f"build_env(shared) must keep shared['stack']")
+        # JUDGE DRY-RUN (zero motion): observe once, judge(pre, pre, empty trace).
+        # A judge that cannot even run on identical scenes will certainly crash after
+        # the robot moved — refuse NOW instead.
+        try:
+            pre = env.observe()
+        except Exception as e:                         # noqa: BLE001
+            return (f"preflight {slug}: observe() raised before any motion: "
+                    f"{type(e).__name__}: {e} — fix perception_task first")
+        try:
+            from .trace import Trace
+            env.judge(pre, pre, Trace())
+        except Exception as e:                         # noqa: BLE001
+            return (f"preflight {slug}: judge dry-run judge(pre, pre) raised: "
+                    f"{type(e).__name__}: {e} — fix perception_judge before any "
+                    f"hardware motion")
+        return None
+
 
     # ---- dispatch --------------------------------------------------------------------
     def handle(self, verb: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -163,6 +224,17 @@ class TaskService:
         job_id = f"{kind}_{next(self._jobs_seq):04d}"
         rec: Dict[str, Any] = {"kind": kind, "state": "running", "t0": time.time()}
         self._jobs[job_id] = rec
+        # DISK MARKER (2026-07-18, the mid-run edge death): a running job must survive the
+        # process in STATED form — an edge restart wiped the registry and the agent read
+        # "unknown job" as a typo instead of "your robot died MID-MOTION", then proceeded
+        # to sibling work with the arm parked over the object.
+        try:
+            jd = self.data_dir / "jobs"
+            jd.mkdir(parents=True, exist_ok=True)
+            (jd / f"{job_id}.json").write_text(json.dumps(
+                {"kind": kind, "state": "running", "t0": rec["t0"]}), encoding="utf-8")
+        except Exception:  # noqa: BLE001 — the marker is best-effort
+            pass
         finished = threading.Event()
 
         def work():
@@ -172,6 +244,10 @@ class TaskService:
                 rec["result"] = {"error": f"{type(e).__name__}: {e}"}
             finally:
                 rec["t1"] = time.time()
+                try:
+                    (self.data_dir / "jobs" / f"{job_id}.json").unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
                 rec["state"] = "done"
                 self._motion_lock.release()
                 finished.set()
@@ -195,7 +271,16 @@ class TaskService:
                              for j, r in recent]}
         rec = self._jobs.get(job)
         if rec is None:
-            return {"error": f"unknown job {job!r}"}
+            grave = self.data_dir / "jobs" / f"{job}.json"
+            if grave.exists():
+                return {"job": job, "state": "died_with_edge",
+                        "error": (f"job {job!r} DIED WITH AN EDGE RESTART while possibly "
+                                  "MID-MOTION — the robot may be parked ANYWHERE (occluding "
+                                  "cameras, mid-scene). STOP phase work NOW. RECOVER FIRST: "
+                                  "run the goto_home verb, then re-observe (scene_snapshot) "
+                                  "and re-check the record before continuing; results from "
+                                  "before the death are suspect.")}
+            return {"error": f"unknown job {job!r} — never issued on this edge process"}
         out = {"job": job, "kind": rec["kind"], "state": rec["state"],
                "elapsed_s": round((rec.get("t1") or time.time()) - rec["t0"], 1)}
         if rec["state"] == "done":
@@ -253,10 +338,36 @@ class TaskService:
         bridge = self._bridge
         if bridge is None:
             return {"error": "no bridge wired; snapshots need the cell"}
-        cameras = body.get("cameras") or ([body["camera"]] if body.get("camera") else [])
+
+        requested = body.get("cameras")
+        if isinstance(requested, str):
+            if requested.strip().lower() == "all":
+                configured = self._cell().get("cameras") or []
+                if isinstance(configured, dict):
+                    names = configured.keys()
+                else:
+                    names = (
+                        (camera.get("name") or camera.get("id"))
+                        if isinstance(camera, dict) else camera
+                        for camera in configured
+                    )
+                # Resolve the contract once, before the background job, so a live edit
+                # to cell.yaml cannot change which cameras belong to this snapshot.
+                cameras = tuple(sorted({
+                    str(name).strip() for name in names if name is not None and str(name).strip()
+                }))
+            else:
+                cameras = (requested,)
+        elif requested:
+            cameras = tuple(requested)
+        elif body.get("camera"):
+            cameras = (body["camera"],)
+        else:
+            cameras = ()
         if not cameras:
             return {"error": "name the camera(s): {'camera': 'overhead'} or "
-                             "{'cameras': [...]} (cell.yaml lists them)"}
+                             "{'cameras': [...]} / {'cameras': 'all'} "
+                             "(cell.yaml lists them)"}
 
         def run() -> dict:
             from .perceive.operators import PerceptionOps
@@ -287,50 +398,14 @@ class TaskService:
         return {
             "service": "task", "data_dir": str(self.data_dir),
             "build_stamp": self._build_stamp(),
-            "supervisor": self.supervisor.status() if self.supervisor else {"state": "off"},
-            "bank_cases": len(self.bank.cases),
-            "reversibility": self.reversibility.to_dict(),
         }
 
-    def v_supervisor_start(self, body: dict) -> dict:
-        if self.supervisor is None:
-            cfg = SupervisorConfig(**(body.get("config") or {}))
-            bridge = self._bridge
-            if bridge is None:
-                return {"error": "no bridge wired; supervisor needs the cell"}
-            self.supervisor = Supervisor(bridge, cfg)
-            self.supervisor.start()
-        return {"ok": True, "status": self.supervisor.status()}
 
-    def v_supervisor_status(self, body: dict) -> dict:
-        return self.supervisor.status() if self.supervisor else {"state": "off"}
 
-    def v_supervisor_stop(self, body: dict) -> dict:
-        if self.supervisor:
-            self.supervisor.shutdown()
-            self.supervisor = None
-        return {"ok": True}
 
-    def v_reversibility_get(self, body: dict) -> dict:
-        return {"table": self.reversibility.to_dict()}
 
-    def v_reversibility_update(self, body: dict) -> dict:
-        self.reversibility.update(body["action_class"], bool(body["undo_ok"]))
-        self.reversibility.save(str(self.data_dir / "reversibility.json"))
-        return {"ok": True, "score": self.reversibility.score(body["action_class"])}
 
-    def v_bank_stats(self, body: dict) -> dict:
-        by = {}
-        for c in self.bank.cases:
-            by[c.source] = by.get(c.source, 0) + 1
-        return {"cases": len(self.bank.cases), "by_source": by}
 
-    def v_bank_label_grasp(self, body: dict) -> dict:
-        case = self.bank.label_from_grasp(predicted_xyz=body["xyz"], held=bool(body["held"]),
-                                          closed_width=float(body.get("closed_width", 0.0)),
-                                          frame_ref=body.get("frame_ref"))
-        self.bank.save(str(self.data_dir / "bank.jsonl"))
-        return {"ok": True, "case_id": case.case_id}
 
     def v_trial_ids(self, body: dict) -> dict:
         return {"trial_ids": self._store(body["task_slug"]).all_ids()}
@@ -346,11 +421,18 @@ class TaskService:
             return {"error": (f"job {', '.join(running) or '?'} is still RUNNING on the "
                               "robot — poll job_status; hardware takes one thing at a time")}
         slug = body["task_slug"]
+        self._ensure_home(slug)                    # the run STARTS at home (no ceremony)
+        refusal = self._verify_sim_floor(slug, body)
+        if refusal:
+            return {"error": refusal}
         try:
             env, actor = self._env_builder(slug)
         except Exception as e:                     # noqa: BLE001
             return {"error": (f"cell task package not available for {slug!r}: "
                               f"{type(e).__name__}: {e}")}
+        refusal = self._preflight_env(env, actor, slug=slug)
+        if refusal:
+            return {"error": refusal}
         rec = run_trial(env, actor, task_slug=slug,
                         program_ref=body.get("program_ref", f"{slug}@cell"),
                         knobs=Knobs(body.get("knobs") or {}),
@@ -361,91 +443,129 @@ class TaskService:
         return {"trial_id": rec.trial_id, "outcome": rec.outcome, "verdict": rec.verdict,
                 "knobs": rec.knobs}
 
-    def v_trial_replay(self, body: dict) -> dict:
-        """Re-judge a stored trial from its evidence (the DEC-05 re-basing path)."""
-        rec = self._store(body["task_slug"]).load(body["trial_id"])
-        env, _actor = self._env_builder(body["task_slug"])
-        return {"trial_id": rec.trial_id, "old": rec.verdict,
-                "new": replay_score(rec, env.judge_fn)}
+    def _ensure_home(self, slug: str) -> None:
+        """THE RUN STARTS AT HOME (robotics_program 2026-07-22): the first motion verb
+        stamps HOME from wherever the operator parked the robot — no phase_start
+        ceremony. goto_home returns to this pose; an already-stamped home is kept."""
+        led = self._ledger(slug)
+        if (getattr(led, "run_home", None) or {}).get("joints"):
+            return
+        stack = self._stack_provider() if self._stack_provider else None
+        reader = (getattr(stack, "joint_positions", None)
+                  or getattr(self._bridge, "joint_state", None)
+                  or getattr(stack, "_seed_positions", None))
+        joints = dict(reader()) if callable(reader) else {}
+        if joints:
+            led.set_run_home(joints)
+
+    def _verify_sim_floor(self, slug: str, body: dict) -> Optional[str]:
+        """ENGINE-ENFORCED N (robotics_program): real execution requires a
+        WORKER-VERIFIED practice report with >= N episodes. The engine fetches the
+        report from the sibling worker itself — agent claims are never evidence.
+        Enforced only where a worker is configured (a cell without one cannot
+        practice at all — the run terminates upstream); floor<=0 disables (dev)."""
+        import os as _os
+        import urllib.request as _rq
+        floor = int(_os.environ.get("REMOROO_SIM_TRIALS_FLOOR", "1000"))
+        if floor <= 0:
+            return None
+        url = (_os.environ.get("REMOROO_SIBLING_URL", "") or "").rstrip("/")
+        if not url:
+            cfg = self.data_dir.parent / "sibling.json"
+            if cfg.exists():
+                try:
+                    url = (json.loads(cfg.read_text(encoding="utf-8"))
+                           .get("url") or "").rstrip("/")
+                except Exception:                       # noqa: BLE001
+                    url = ""
+        if not url:
+            return None
+        ev_dir = self.data_dir / "sim_evidence"
+        ev_path = ev_dir / f"{slug}.json"
+        job = str(body.get("sim_job") or "")
+        if not job and ev_path.exists():
+            try:
+                cached = json.loads(ev_path.read_text(encoding="utf-8"))
+            except Exception:                           # noqa: BLE001
+                cached = {}
+            if int(cached.get("episodes", 0)) >= floor:
+                return None
+        if not job:
+            return (f"real execution refused: no verified sim practice for {slug!r}. "
+                    f"Run a task_sibling evolve campaign and pass its job id as "
+                    f"sim_job — the engine requires >= {floor} episodes "
+                    f"(engine-enforced N, robotics_program; set "
+                    f"REMOROO_SIM_TRIALS_FLOOR to tune)")
+        try:
+            with _rq.urlopen(f"{url}/fetch?job_id={job}", timeout=20) as r:
+                report = (json.loads(r.read().decode()).get("results")) or {}
+        except Exception as e:                          # noqa: BLE001
+            return (f"real execution refused: could not verify sim job {job!r} "
+                    f"against the worker ({type(e).__name__}: {e}) — a report the "
+                    f"engine cannot fetch is not evidence")
+        episodes = int(report.get("episodes") or 0)
+        if episodes < floor:
+            return (f"real execution refused: sim job {job!r} ran {episodes} "
+                    f"episodes < the N floor ({floor}). Keep evolving "
+                    f"(more generations/seeds/scenes) before touching the robot")
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        ev_path.write_text(json.dumps(
+            {"job_id": job, "episodes": episodes,
+             "n_scenes": report.get("n_scenes"),
+             "success_rate_best": report.get("success_rate_best"),
+             "verified_at": time.time()}, indent=1), encoding="utf-8")
+        return None
+
 
     # ---- scene record + phase spine + ritual (Task Engine v2, M0) ----------------------
-    def _record(self, task_slug: str):
-        from .scene_record.store import SceneRecord
-        return SceneRecord.load(str(self.data_dir / "record" / f"{task_slug}.json"),
-                                task_slug)
 
     def _ledger(self, task_slug: str):
         from .spine import PhaseLedger
         return PhaseLedger.load(str(self.data_dir / "state" / f"{task_slug}.json"),
                                 task_slug)
 
-    def v_record_submit(self, body: dict) -> dict:
-        """The agent's perception submits a scene WITH capture provenance; the engine
-        merges and GRADES (two looks or a touch; arm-correlation bounce; calibration
-        attribution). Returns the grade — the agent iterates until it passes."""
-        rec = self._record(body["task_slug"])
-        return rec.submit(body.get("entities") or [], body.get("provenance") or {})
 
-    def v_record_get(self, body: dict) -> dict:
-        return self._record(body["task_slug"]).to_dict()
 
-    def v_record_confirm(self, body: dict) -> dict:
-        """Physical proof from a probe/trial: touch|lift|trial. Also narrows ranges."""
-        rec = self._record(body["task_slug"])
-        rec.confirm_touch(body["object_id"], kind=body.get("kind", "touch"),
-                          source=body.get("source", "probe"))
-        for n in body.get("narrow") or []:
-            rec.narrow(body["object_id"], n["param"], float(n["lo"]), float(n["hi"]))
-        return {"ok": True,
-                "proof_level": rec.objects[body["object_id"]].proof_level()}
 
-    def _facts(self, slug: str, evidence: Optional[dict] = None) -> Dict[str, Any]:
-        """The engine's own answer to "did this phase earn its exit" — computed from
-        the record, the ground-truth library, and the trial store (measured), plus
-        shape-checked tool-result documents for the off-cell phases (reported). The
-        agent's claims are never facts (audit 2026-07-13)."""
-        led = self._ledger(slug)
-        rec = self._record(slug)
-        facts: Dict[str, Any] = {
-            "run_home_set": bool(led.run_home),
-            "actionable": len(rec.entities(min_proof="corroborated")),
-            "gt_cases": len(self._library().cases),
-        }
-        store = self._store(slug)
-        from .expect import summarize
-        total = ok = declared = passed = 0
-        for tid in store.all_ids():
-            r = store.load(tid)
-            total += 1
-            if r.verdict.get("ok") or r.outcome == "success":
-                ok += 1
-            s = summarize(r.trace)
-            declared += int(s.get("declared", 0))
-            passed += int(s.get("passed", 0))
-        facts.update(trials_total=total, trials_ok=ok,
-                     expect_declared=declared, expect_passed=passed)
-        ev = evidence if isinstance(evidence, dict) else {}
-        ranked = ev.get("ranked")
-        facts["sim_ranked"] = (sum(1 for r in ranked
-                                   if isinstance(r, dict) and r.get("ref")
-                                   and isinstance(r.get("mean"), (int, float)))
-                               if isinstance(ranked, list) else 0)
-        promoted = ev.get("promoted")
-        facts["promoted_fitness"] = (promoted.get("fitness")
-                                     if isinstance(promoted, dict) else None)
-        facts["vla_day0"] = bool(led.instruments.get("vla_day0"))
-        facts["vla_waived"] = "vla" in led.waivers
-        return facts
 
-    def v_phase_status(self, body: dict) -> dict:
-        slug = body["task_slug"]
-        return self._ledger(slug).status(facts=self._facts(slug))
 
-    def v_phase_waive(self, body: dict) -> dict:
-        """Waive sim or search with the stated reason (e.g. task_sibling reported the
-        worker cannot run cousins). LOUD: stamped in the ledger, printed on the cert."""
-        return self._ledger(body["task_slug"]).waive(body.get("phase", ""),
-                                                     body.get("reason", ""))
+    def v_goto_home(self, body: dict) -> dict:
+        """RECOVERY: drive every arm back to the stamped RUN HOME (probes/rituals END
+        there — cameras clear; a died_with_edge job may have left the robot mid-scene).
+        Background job like every motion verb."""
+        self._ensure_home(body["task_slug"])       # the run starts at home
+        led = self._ledger(body["task_slug"])
+        joints = (getattr(led, "run_home", None) or {}).get("joints") or {}
+        if not joints:
+            return {"error": "no HOME stamped and no joints readable (edge warming "
+                             "or bridge down) — cannot home"}
+        stack = self._stack_provider() if self._stack_provider else None
+        if stack is None or not hasattr(stack, "goto_joints"):
+            return {"error": "no motion stack (edge warming or bridge down)"}
+
+        def go():
+            r = stack.goto_joints(joints)
+            return {"ok": bool(getattr(r, "ok", False)),
+                    "message": str(getattr(r, "message", r))[:300]}
+        return self._run_as_job("goto_home", go, wait_s=float(body.get("wait_s", 8.0)))
+
+    def v_motion_health(self, body: dict) -> dict:
+        """SELF-HEALING TRIAGE (2026-07-18): prove every arm can PLAN from its current pose;
+        on failure the built-in ablation ROUTES the fix — route=human (world model / limits /
+        bridge: physical reality, do NOT retry, report and stop), route=agent (phantom
+        self-collision: the reply's `heal` carries the goal + metric — repair the cell's
+        collision model, then re-run THIS verb until ok), route=engine (planner fault: state
+        it, stop). Run it BEFORE motion work and whenever 2+ consecutive plans fail — one
+        verdict replaces 50 blind retries."""
+        stack = self._stack_provider() if self._stack_provider else None
+        if stack is None or not hasattr(stack, "motion_health"):
+            return {"error": "no motion stack (edge still warming or bridge down)"}
+        quick = bool(body.get("quick"))
+        return self._run_as_job("motion_health",
+                                lambda: stack.motion_health(quick=quick),
+                                wait_s=float(body.get("wait_s", 8.0)))
+
+
 
     def v_phase_start(self, body: dict) -> dict:
         """Startup: capture RUN HOME from the live stack (COMP-09) + instrument notes."""
@@ -460,177 +580,22 @@ class TaskService:
         if not joints:
             return {"error": "no joints readable for RUN HOME — startup can't complete"}
         led.set_run_home(joints)
-        led.instruments = body.get("instruments") or led.instruments
-        # the VLA truth, declared or not, commissioned or not — the agent must
-        # never have to DISCOVER that a serving policy exists (a live run skipped
-        # the scout because nothing said the server was up)
-        led.instruments["vla"] = self._vla_liveness()
-        commission = (self.data_dir.parent.parent / "remoroo_cell" / "vla"
-                      / "commission.json")
-        if commission.exists():
-            try:
-                import json as _json
-                c = _json.loads(commission.read_text(encoding="utf-8"))
-                led.instruments["vla"].update({
-                    "runtime": c.get("runtime"),
-                    "latency_ms": c.get("latency_ms"),
-                    "wire": c.get("wire"),
-                    "commissioned_at": c.get("commissioned_at")})
-            except Exception as e:             # noqa: BLE001 - stated, not fatal
-                led.instruments["vla"]["commission_error"] = (
-                    f"unreadable commission.json: {type(e).__name__}")
         led.save()
-        v = led.instruments.get("vla") or {}
-        return {"ok": True, "run_home_joints": len(joints),
-                "vla_declared": bool(v.get("declared")),
-                "vla_serving": bool(v.get("serving")),
-                "vla_commissioned": bool(v.get("commissioned_at")),
-                "note": ("VLA is SERVING — vla_load {runtime} NOW (a client handle, "
-                         "PROVES the wire with one round-trip, ~10s warm); "
-                         "scout_run gives your second viewpoints"
-                         if v.get("serving") else
-                         "VLA declared but not serving yet (loading takes minutes); "
-                         "retry vla_load before scouting" if v.get("declared") else
-                         "no VLA on this rig")}
+        return {"ok": True, "run_home_joints": len(joints)}
 
-    def v_phase_advance(self, body: dict) -> dict:
-        slug = body["task_slug"]
-        ev = body.get("evidence") or {}
-        return self._ledger(slug).advance(body["to"], ev,
-                                          facts=self._facts(slug, ev))
 
-    def v_phase_regress(self, body: dict) -> dict:
-        return self._ledger(body["task_slug"]).regress(body["to"],
-                                                       body.get("reason", ""))
-
-    def v_ritual_trial(self, body: dict) -> dict:
-        """A real trial under the ritual (home, drift check, act, home, look, compare).
-        This is how the search's promoted candidates touch hardware; the ledger must be
-        in the 'real' phase (the flow, not a guard: hardware is this phase's tool)."""
-        slug = body["task_slug"]
-        led = self._ledger(slug)
-        if led.phase != "real":
-            return {"error": f"ritual trials belong to the 'real' phase; ledger says "
-                             f"{led.phase!r} — the spine advances on evidence"}
-        try:
-            env, actor = self._env_builder(slug)
-        except Exception as e:                     # noqa: BLE001
-            return {"error": f"cell task package not available: "
-                             f"{type(e).__name__}: {e}"}
-        def run() -> dict:
-            from .ritual import run_ritual_trial
-            out = run_ritual_trial(
-                env, actor, task_slug=slug,
-                program_ref=body.get("program_ref", f"{slug}@cell"),
-                record=self._record(slug), run_home=led.run_home,
-                sim_prediction=body.get("sim_prediction"),
-                knobs=Knobs(body.get("knobs") or {}), seed=int(body.get("seed", 0)),
-                budget=TrialBudget(**(body.get("budget") or {})),
-                store=self._store(slug))
-            rec = out["record"]
-            res = {"ritual": out["ritual"]}
-            if rec is not None:
-                from .expect import summarize
-                res.update(trial_id=rec.trial_id, outcome=rec.outcome,
-                           verdict=rec.verdict,
-                           expectations=summarize(rec.trace))
-            return res
-
-        return self._run_as_job("ritual", run, wait_s=5.0)
-
-    # ---- ground truth + replay + probes + scout (Task Engine v2, M1) --------------------
-    def _library(self):
-        from .perceive.groundtruth import GroundTruthLibrary
-        return GroundTruthLibrary.load(str(self.data_dir / "groundtruth"))
-
-    def v_record_retire(self, body: dict) -> dict:
-        """Retire record objects that never should have been there (debug entities, a
-        wall grabbed as a 'container'). Retired objects keep absorbing sightings (a
-        bounced phantom must not respawn) but leave look_plan and the actionable set.
-        Match by object_ids and/or a label_prefix."""
-        slug = body["task_slug"]
-        rec = self._record(slug)
-        ids = set(body.get("object_ids") or [])
-        prefix = body.get("label_prefix") or ""
-        reason = body.get("reason", "agent retire")
-        hit = [o for o in rec.objects.values()
-               if (o.object_id in ids) or (prefix and o.label.startswith(prefix))]
-        if not hit:
-            return {"error": "nothing matched — pass object_ids and/or label_prefix "
-                             "(record_get lists them)"}
-        for o in hit:
-            if not o.retired:
-                o.retired = reason
-        rec.save()
-        alive = [o for o in rec.objects.values() if not o.retired]
-        return {"retired": sorted(o.object_id for o in hit),
-                "remaining": len(alive),
-                "note": "retired objects no longer appear in look_plan or count "
-                        "toward pending looks"}
-
-    def v_gt_stats(self, body: dict) -> dict:
-        lib = self._library()
-        return {"cases": len(lib.cases),
-                "by_provenance": {p: sum(1 for c in lib.cases
-                                         if c.provenance.startswith(p))
-                                  for p in {"probe", "trial"}}}
-
-    def v_replay_score(self, body: dict) -> dict:
-        """Score a perception program against every physically confirmed scene this
-        cell has ever recorded (IFACE-04) — the free fitness; no robot time."""
-        from .perceive.groundtruth import score_perception
-        lib = self._library()
-        if not lib.cases:
-            return {"error": "ground-truth library is empty — probe first (every "
-                             "touch/lift writes a case), then replay means something"}
-        return score_perception(body["program_src"], lib)
-
-    def v_probe_run(self, body: dict) -> dict:
-        """One probe on a RECORDED object; success writes proof + ground-truth case +
-        narrowed ranges in one call (rule 5). Bridge-locked (real motion)."""
-        slug = body["task_slug"]
-        try:
-            env, _actor = self._env_builder(slug)
-        except Exception as e:                     # noqa: BLE001
-            return {"error": f"cell task package not available: "
-                             f"{type(e).__name__}: {e}"}
-        def run() -> dict:
-            frame = None
-            if body.get("camera"):
-                from .perceive.operators import PerceptionOps
-                frame = PerceptionOps(None, None, env.bridge).capture(body["camera"])
-            from .probe_record import probe_and_record
-            from .ritual import _goto_home
-            led = self._ledger(slug)
-            _goto_home(env, led.run_home)          # probe starts from RUN HOME ...
-            out = probe_and_record(
-                body.get("kind", "touch"), env.new_ctx(), body.get("tcp", ""),
-                record=self._record(slug), object_id=body["object_id"],
-                library=self._library(), frame=frame,
-                narrow=body.get("narrow"), params=body.get("params"))
-            _goto_home(env, led.run_home)          # ... and ends there: cameras clear
-            return out
-
-        return self._run_as_job("probe", run, wait_s=5.0)
-
-    @staticmethod
-    def _fk_ready(stack) -> bool:
-        """True when FK through the stack costs an FK, not a PLANNER BUILD. Live
-        2026-07-14: provenance stamping inside perceive_run triggered the full 124s
-        robot planner build (stack.link_pose -> _planner_for -> build). A real
-        MotionStack exposes _planners; empty means unbuilt — skip FK. Fakes without
-        the attribute stay allowed."""
-        planners = getattr(stack, "_planners", None)
-        return planners is None or bool(planners)
 
     def _cell_groups(self) -> Dict[str, Any]:
         """cell.yaml groups (joint_names per chain) — the packer selects each chain's
         joints from get_observation() with these (live 2026-07-15: without them the
         state vector was all zeros and the stats tour averaged blindness)."""
         try:
-            import yaml
-            cell = yaml.safe_load(Path("remoroo_cell/cell.yaml").read_text()) or {}
-            return dict(cell.get("groups") or {})
+            groups = self._cell().get("groups") or {}
+            if isinstance(groups, list):
+                # canonical cell.yaml shape: groups is a LIST of {name, ...} (audit
+                # 2026-07-21: dict() on that list THREW and this silently returned {})
+                return {str(g.get("name")): g for g in groups if isinstance(g, dict)}
+            return dict(groups)
         except Exception:                          # noqa: BLE001
             return {}
 
@@ -670,228 +635,10 @@ class TaskService:
             self._camera_mounts = mounts
         return self._camera_mounts.get(camera, "")
 
-    def _stamped_provenance(self, env, camera: str) -> Dict[str, Any]:
-        """The ENGINE stamps provenance — never from agent claims (grading
-        integrity). A static camera (cell.yaml mount) is ONE viewpoint forever. A
-        moving mount's viewpoint is the JOINT CONFIGURATION bucketed to 0.05 rad —
-        joints move exactly when the camera moves, cost one bridge read, and need
-        no FK (live 2026-07-14: FK'ing the camera NAME hit cuRobo's parent map
-        with 'overhead' AND triggered the 124s planner build inside perceive_run).
-        Same-place re-looks can still never count as a second look."""
-        arm_poses: Dict[str, list] = {}
-        viewpoint = camera
-        stack = getattr(env, "stack", None)
-        if self._camera_mount(camera) != "static":
-            bucket = ""
-            bridge = self._bridge or getattr(env, "bridge", None)
-            try:                                   # joints ARE the mount's pose
-                obs = bridge.get_observation()
-                jp = dict(getattr(obs, "joint_positions", None) or {})
-                if jp:
-                    import hashlib
-                    key = ",".join(f"{n}:{round(float(v) / 0.05)}"
-                                   for n, v in sorted(jp.items()))
-                    bucket = hashlib.md5(key.encode()).hexdigest()[:8]
-            except Exception:                      # noqa: BLE001 - fall through to FK
-                pass
-            if not bucket and stack is not None and self._fk_ready(stack):
-                try:
-                    cam_pose = stack.link_pose(camera)
-                    xyz = (list(cam_pose[0]) if isinstance(cam_pose, tuple)
-                           else list(cam_pose)[:3])
-                    bucket = "_".join(str(round(v / 0.05)) for v in xyz[:3])
-                except Exception:                  # noqa: BLE001 - static after all
-                    pass
-            if bucket:
-                viewpoint = f"{camera}@{bucket}"
-        if stack is not None and self._fk_ready(stack):
-            for g in list(getattr(stack, "group_names", []) or [])[:4]:
-                try:
-                    pose = stack.link_pose(g)
-                    xyz = (list(pose[0]) if isinstance(pose, tuple) else
-                           list(pose)[:3])
-                    arm_poses[g] = [float(v) for v in xyz[:3]]
-                except Exception:                  # noqa: BLE001 - stamp what we can
-                    continue
-        return {"source": camera, "viewpoint": viewpoint, "modality": "rgbd",
-                "arm_poses": arm_poses, "kind": "view"}
 
-    def v_perceive_run(self, body: dict) -> dict:
-        """THE looking-phase loop (closes the live-run gap of 2026-07-11): run the
-        AUTHORED perception against a live capture and submit the result to the
-        record with ENGINE-stamped provenance. Two paths:
-          - default: the task package's env.observe() (perception_task via build_env,
-            hot-reloaded per call — your edit cycle is edit -> perceive_run);
-          - program_src: run an inline make_perceive(shared) candidate BEFORE the
-            package exists (early iteration; same stamping).
-        Returns the grade + what was seen, so the agent iterates until it passes."""
-        slug = body["task_slug"]
-        camera = body.get("camera", "")
-        if body.get("program_src"):
-            ns: Dict[str, Any] = {}
-            exec(compile(body["program_src"], "<perception_candidate>", "exec"), ns)  # noqa: S102
-            if "make_perceive" not in ns:
-                return {"error": "program_src must define make_perceive(shared)"}
-            perceive = ns["make_perceive"](self._shared())
-            stack = self._stack_provider() if self._stack_provider else None
-            env = type("E", (), {"stack": stack, "observe": staticmethod(perceive)})()
-        else:
-            try:
-                env = self._perception_env(slug)
-            except Exception as e:                 # noqa: BLE001
-                return {"error": (f"no perception for {slug!r} and no program_src "
-                                  f"({type(e).__name__}: {e}) — author "
-                                  "perception_task.py with make_perceive(shared) "
-                                  "(the FULL package with actor is a SIM-phase "
-                                  "deliverable, not a looking one) or pass "
-                                  "program_src")}
-        dry = bool(body.get("dry_run"))
 
-        def run() -> dict:
-            print(f"[perceive] running {slug} perception (FIRST call loads pinned "
-                  "models into this process — minutes on embedded GPUs; this is not a "
-                  "hang)", flush=True)
-            scene = env.observe()
-            print(f"[perceive] done: {len(scene.entities())} entities", flush=True)
-            entities = [{"label": e.label, "pose": list(e.pose[:3]),
-                         "dims": list(e.dims) if e.dims else None}
-                        for e in scene.entities()]
-            shown = entities[:40]                  # the agent reads results HERE, never
-            frame_paths: Dict[str, str] = {}       # by spelunking the record file
-            if camera and self._bridge is not None:
-                try:
-                    from .perceive.operators import PerceptionOps
-                    frame = PerceptionOps(None, None, self._bridge).capture(camera)
-                    frame_paths = self._save_frame(frame, f"{camera}_{time.strftime('%H%M%S')}")
-                except Exception:                  # noqa: BLE001 - frames are a courtesy
-                    frame_paths = {}
-            if dry:
-                return {"seen": len(entities), "entities": shown, "dry_run": True,
-                        "frame": frame_paths or None,
-                        "note": ("DRY RUN — nothing recorded. The scene record is a "
-                                 "world model, never a debug channel. Iterate here "
-                                 "until the entities look sane (view_image the saved "
-                                 "frame to compare), then re-run without dry_run.")}
-            prov = self._stamped_provenance(env, camera or "unknown")
-            grade = self._record(slug).submit(entities, prov)
-            pending = grade.get("pending_second_look") or []
-            if pending:
-                live = self._vla_liveness()
-                how = ("scout_run NOW — the VLA is SERVING and its sweep is your second "
-                       "viewpoint" if live.get("serving") else
-                       "the VLA is still loading — run an atoms.look tour over "
-                       "look_plan's proposals NOW and retry scout_run afterwards"
-                       if live.get("declared") else
-                       "run an atoms.look tour over look_plan's proposals NOW (no VLA "
-                       "on this rig)")
-                note = (f"{len(pending)} object(s) await a SECOND LOOK — do NOT keep "
-                        f"iterating this camera's code (single-view polishing is "
-                        f"unbounded; a second viewpoint corroborates for free): {how}. "
-                        "Iterate perception only for defects visible ACROSS views.")
-            else:
-                note = ("all detections corroborated or bounced — probe the accepted "
-                        "objects next (probe_run), then advance")
-            return {"seen": len(entities), "entities": shown,
-                    "viewpoint": prov["viewpoint"], "frame": frame_paths or None,
-                    "grade": grade, "note": note}
 
-        return self._run_as_job("perceive", run, wait_s=45.0)
 
-    def v_scout_run(self, body: dict) -> dict:
-        """The VLA scout (COMP-12): a guarded rollout that SWEEPS while saving
-        keyframes for the agent's perception to process. Each keyframe carries a
-        distinct viewpoint tag, so submissions from these frames satisfy the two-look
-        rule. No VLA loaded -> stated fallback (PROB-12): use a look tour instead."""
-        runtime = getattr(self, "_vla", None)
-        if runtime is None:
-            return {"error": "no VLA runtime loaded (vla_load first); fallback: plan a "
-                             "look tour with atoms.look over 3-4 viewpoints and submit "
-                             "each view — same two-look effect, slower"}
-        live = self._vla_liveness()
-        if live.get("declared") and not live.get("serving"):
-            return {"error": "the VLA server is still LOADING (a 6B checkpoint takes "
-                             "minutes) — do the atoms.look tour now and retry "
-                             "scout_run when `vla_status`/phase instruments say "
-                             "serving; never restart a loading server"}
-        slug = body["task_slug"]
-        try:
-            env, _actor = self._env_builder(slug)
-        except Exception as e:                     # noqa: BLE001
-            return {"error": f"cell task package not available: "
-                             f"{type(e).__name__}: {e}"}
-        camera = body.get("camera", "wrist")
-        every = int(body.get("keyframe_every", 3))
-        out_dir = self.data_dir / "scout" / slug
-        out_dir.mkdir(parents=True, exist_ok=True)
-        from .perceive.operators import PerceptionOps
-        ops = PerceptionOps(None, None, env.bridge)
-        frames: list = []
-
-        base_observe = (getattr(self, "_vla_observe", None) or env.observe)
-        steps = [0]
-
-        def observe_and_tap():
-            obs = base_observe()
-            if steps[0] % every == 0:
-                f = ops.capture(camera)
-                k = len(frames)
-                ref = str(out_dir / f"kf_{k:03d}.json")
-                import json as _json
-                Path(ref).write_text(_json.dumps(
-                    {"camera": camera, "t": f.get("t_capture"),
-                     "viewpoint": f"scout_{k:03d}"}, default=str))
-                frames.append({"ref": ref, "viewpoint": f"scout_{k:03d}"})
-            steps[0] += 1
-            return obs
-
-        def run() -> dict:
-            from .vla.skill import make_vla_skill
-            vla = make_vla_skill(runtime, observe_of=lambda _env: observe_and_tap)
-            ctx = env.new_ctx()
-            r = vla(env, ctx, body.get("instruction",
-                                       "find the objects and record their poses"),
-                    max_steps=int(body.get("max_steps", 20)))
-            return {"ok": r.ok, "stopped_by": r.evidence.get("stopped_by"),
-                    "keyframes": frames,
-                    "note": "run your perception on each keyframe and record_submit "
-                            "with its viewpoint tag — that satisfies the two-look rule"}
-
-        return self._run_as_job("scout", run, wait_s=5.0)
-
-    def v_audit_bundle(self, body: dict) -> dict:
-        """The cert's audit bundle (ART-06): record + ledger + per-trial expectation
-        stats into .remoroo/task/audit/<slug>/bundle.json — what makes the
-        certificate a legible artifact."""
-        import json as _json
-        slug = body["task_slug"]
-        from .expect import summarize
-        trials = []
-        store = self._store(slug)
-        for tid in store.all_ids()[-50:]:
-            rec = store.load(tid)
-            trials.append({"trial_id": tid, "outcome": rec.outcome,
-                           "verdict": rec.verdict,
-                           "expectations": summarize(rec.trace)})
-        led = self._ledger(slug)
-        bundle = {"task_slug": slug,
-                  "record": self._record(slug).to_dict(),
-                  "ledger": led.status(),
-                  "waivers": led.waivers,      # a waived phase is LOUD on the cert
-                  "evidence_provenance": {
-                      "measured": ["looking", "real"],   # edge-owned stores
-                      "reported": ["sim", "search"],     # off-cell tool results
-                      "waived": sorted(led.waivers)},
-                  "trials": trials}
-        out = self.data_dir / "audit" / slug / "bundle.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(_json.dumps(bundle, indent=1, default=str), encoding="utf-8")
-        return {"ok": True, "path": str(out), "trials": len(trials)}
-
-    def v_look_plan(self, body: dict) -> dict:
-        """Ranked next-viewpoint proposals from the record's open questions (COMP-14):
-        look requests first, then unknown volumes by size, then single-look objects."""
-        from .scene_record.lookplan import propose
-        return {"proposals": propose(self._record(body["task_slug"]))}
 
     def v_toolbox(self, body: dict) -> dict:
         from .perceive.loaders import toolbox_catalog
@@ -1146,6 +893,9 @@ class TaskService:
         instruction = body.get("instruction") or slug.replace("_", " ")
         try:
             env, _actor = self._env_builder(slug)
+            refusal = self._preflight_env(env, None, slug=slug)
+            if refusal:                            # authored but BROKEN: refuse, never
+                return {"error": refusal}          # silently sidestep the authored env
         except Exception:                          # noqa: BLE001 - DAY ZERO has no package
             # THE JUMP START (live lesson 2026-07-14: requiring the authored package
             # here made the day-zero attempt structurally impossible — every agent
@@ -1153,14 +903,11 @@ class TaskService:
             # was meant to precede). A minimal env suffices: the guarded executor
             # clamps every action; judging day zero is the AGENT's job from the
             # before/after snapshots (view_image), not an authored verifier's.
-            from .env import GenericEnv
+            from .env import GenericEnv, resolvers_from_cell
             from .envelope import Envelope
             shared = self._shared()
-            try:
-                import yaml
-                cell_cfg = yaml.safe_load(Path("remoroo_cell/cell.yaml").read_text()) or {}
-            except Exception:                      # noqa: BLE001 - defaults still clamp
-                cell_cfg = {}
+            cell_cfg = shared.get("cell") or {}
+            up_of, approach_of, effector_of = resolvers_from_cell(cell_cfg)
             from .judge.v0 import Verdict, milestones
             from .scene.state import SceneState
             env = GenericEnv(
@@ -1174,7 +921,8 @@ class TaskService:
                     score=milestones(trace), ok=False, confidence=0.0,
                     judge_version="day0-milestones",
                     flags=["day0: judge outcome from snapshots via view_image"]),
-                reset_fn=None, perception_version="day0")
+                reset_fn=None, perception_version="day0",
+                up_of=up_of, approach_of=approach_of, effector_of=effector_of)
         from .vla.skill import make_vla_skill
         packer = getattr(self, "_vla_observe", None)  # profile packer beats env.observe
         vla = make_vla_skill(runtime,

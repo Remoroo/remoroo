@@ -392,13 +392,10 @@ def task(
                             ["components"]["host"][0]})
     except Exception:                                   # noqa: BLE001 - never blocks a run
         pass
-    # VLA policy server: lives in its OWN venv, declared once in .remoroo/vla.yaml
-    # (`remoroo vla` manages it). Kick it off non-blocking now so the weights are warm
-    # by the time the agent's vla_load connects; unconfigured rigs skip silently and a
-    # failure is stated, never fatal — motion/perception don't depend on it.
-    from . import vla_service
-    _vla = vla_service.ensure_started(repo_path,
-                                      echo=lambda m: typer.secho(m, fg=typer.colors.YELLOW))
+    # VLA: NOT part of the task flow (operator decision 2026-07-21) — never
+    # auto-start or initialize it in a task run. `remoroo vla` remains available
+    # as a standalone command for whoever needs it explicitly.
+    _vla = {}
     _vla_none = None
     try:                                    # a RECORDED skip is a decision, not a defect
         import yaml as _yaml
