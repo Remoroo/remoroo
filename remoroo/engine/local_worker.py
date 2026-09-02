@@ -1536,7 +1536,14 @@ class LocalWorker:
                             mtime = os.path.getmtime(abs_path)
                     
                     if not exists:
-                        return ExecutionResult(success=True, data={"exists": False})
+                        # Name where we actually looked. The brain turns this into a
+                        # hard failure; a bare "exists: False" used to be read as an
+                        # empty file and cost the agent several turns to diagnose.
+                        return ExecutionResult(success=True, data={
+                            "exists": False,
+                            "resolved_root": root,
+                            "resolved_path": abs_path,
+                        })
 
                     return ExecutionResult(success=True, data={
                         "content": content, 
@@ -3164,7 +3171,9 @@ class LocalWorker:
             # ── v2 Process Execution Protocol ──
 
             elif request.type == "v2_exec_start":
-                from .process_supervisor import SupervisedJob, JobMetadata, TargetMetric, JobState
+                from .process_supervisor import (
+                    SupervisedJob, JobMetadata, TargetMetric, JobState, DEFAULT_MAX_SILENT_S,
+                )
 
                 cmd = request.payload.get("command", "")
                 env_vars = request.payload.get("env", {})
@@ -3269,7 +3278,9 @@ class LocalWorker:
                     file_watch_paths=file_watches,
                     silent_phase_ok=raw_meta.get("silent_phase_ok", False),
                     target_metrics=parsed_targets,
-                    max_silent_s=float(raw_meta["max_silent_s"]) if raw_meta.get("max_silent_s") is not None else None,
+                    # Default ON: an omitted max_silent_s used to disable hang detection
+                    # entirely. The agent's explicit value still wins.
+                    max_silent_s=float(raw_meta["max_silent_s"]) if raw_meta.get("max_silent_s") is not None else DEFAULT_MAX_SILENT_S,
                     readiness_regex=raw_meta.get("readiness_regex"),
                     readiness_port=int(raw_meta["readiness_port"]) if raw_meta.get("readiness_port") is not None else None,
                     redirect_output_file=abs_redirect if redirect_file else None,
@@ -3322,6 +3333,11 @@ class LocalWorker:
                 job_id = request.payload.get("job_id", "")
                 wait_s = request.payload.get("wait_s", 5)
                 tail_lines = request.payload.get("tail_lines", 80)
+                # Polling policy (small tail: latest lines of a running job) is the
+                # wrong policy for READING a job that has finished. When the caller
+                # supplies final_tail_lines we ship that much for a terminal job and
+                # let the brain's interceptor decide the shape (head+tail).
+                final_tail_lines = request.payload.get("final_tail_lines")
                 # print(f"  [DBG-SUPERVISOR] v2_exec_poll: job={job_id}, wait_s={wait_s}, drain_events={request.payload.get('drain_events', True)}", flush=True)  # DBG-SUPERVISOR
 
                 supervised = self._supervised_jobs.get(job_id)
@@ -3361,8 +3377,17 @@ class LocalWorker:
                 if supervised.state.value in ("finished", "failed", "killed"):
                     supervised._check_output()
 
+                effective_tail = tail_lines
+                if final_tail_lines and supervised.state.value in (
+                    "finished", "failed", "killed", "backoff",
+                ):
+                    try:
+                        effective_tail = max(int(tail_lines), int(final_tail_lines))
+                    except (TypeError, ValueError):
+                        effective_tail = tail_lines
+
                 drain = request.payload.get("drain_events", True)
-                response = supervised.build_poll_response(tail_lines=tail_lines, drain=drain)
+                response = supervised.build_poll_response(tail_lines=effective_tail, drain=drain)
                 return ExecutionResult(success=True, data=response)
 
             elif request.type == "v2_exec_kill":
