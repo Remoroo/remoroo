@@ -49,6 +49,10 @@ def _entry_references_blocked(entry: Any, is_blocked: Callable[[str], bool]) -> 
     return False
 
 
+# Console display only — the full line is always kept in the job's output buffer.
+_LOG_LINE_MAX_CHARS = 2000
+
+
 def _patch_blocked_paths(patch: Any, is_blocked: Callable[[str], bool]) -> List[str]:
     """Return paths in a patch proposal that match the blocklist.
 
@@ -2037,8 +2041,49 @@ class LocalWorker:
                      else:
                          target_path = os.path.join(root, path)
 
+                     # Containment. `os.path.isabs(path) -> target_path = path` above
+                     # let an absolute or ../ path be written anywhere the process can
+                     # reach, and get_modified_files() walks only the working copy — so
+                     # that work vanished from the final patch instead of failing loudly.
+                     # access_policy.is_blocked() declines to block out-of-repo paths on
+                     # the stated assumption that "the worker already restricts most
+                     # operations to repo_root". This is that restriction.
+                     real_root = os.path.realpath(root)
+                     real_target = os.path.realpath(target_path)
+                     try:
+                         contained = (
+                             real_target == real_root
+                             or os.path.commonpath([real_target, real_root]) == real_root
+                         )
+                     except ValueError:
+                         contained = False
+                     if not contained:
+                         return ExecutionResult(success=False, error=(
+                             f"refusing to write outside the workspace: '{path}' resolves to "
+                             f"{real_target}, which is outside the workspace root {real_root}. "
+                             f"Write to a path inside the workspace, or use bash if you "
+                             f"genuinely need to write elsewhere."
+                         ), data={
+                             "outside_root": True, "path": path,
+                             "resolved_path": real_target, "repo_root": real_root,
+                         })
+
+                     # Which parent directories are we about to invent? Reported back so
+                     # a path relative to the wrong root shows up as a signal at write
+                     # time instead of a missing artifact at phase completion.
+                     parent_dir = os.path.dirname(target_path)
+                     created_dirs: List[str] = []
+                     _probe = parent_dir
+                     while _probe and not os.path.isdir(_probe):
+                         created_dirs.append(_probe)
+                         _next = os.path.dirname(_probe)
+                         if _next == _probe:
+                             break
+                         _probe = _next
+                     created_dirs.reverse()
+
                      # Ensure dir exists
-                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                     os.makedirs(parent_dir, exist_ok=True)
                      
                      # v17.1: Log the path that makes sense for the agent's environment
                      display_path = target_path
@@ -2113,7 +2158,22 @@ class LocalWorker:
                          self._log("   📄 Report preview (first 200 chars):")
                          self._log("   " + content[:200].replace("\n", "\n   "))
                          
-                     return ExecutionResult(success=True, data={"path": target_path})
+                     display_target = os.path.abspath(target_path)
+                     try:
+                         rel_to_root = os.path.relpath(display_target, os.path.abspath(root))
+                         rel_to_root = rel_to_root.replace(os.sep, "/")
+                     except ValueError:
+                         rel_to_root = ""
+                     return ExecutionResult(success=True, data={
+                         "path": target_path,
+                         "resolved_path": display_target,
+                         "repo_root": os.path.abspath(root),
+                         "relative_path": rel_to_root,
+                         "created_dirs": [
+                             os.path.relpath(d, os.path.abspath(root)).replace(os.sep, "/")
+                             for d in created_dirs
+                         ],
+                     })
                  except Exception as e:
                      self._log(f"   ❌ Write failed: {e}")
                      traceback.print_exc()
@@ -3230,6 +3290,14 @@ class LocalWorker:
                                     stripped = line.strip()
                                     if stripped:
                                         tag = "dim red" if is_stderr else "dim"
+                                        # base64 readback (view_image/view_video)
+                                        # emits one line per file — up to ~1MB.
+                                        # The buffer keeps it; the console must not.
+                                        if len(stripped) > _LOG_LINE_MAX_CHARS:
+                                            stripped = (
+                                                f"{stripped[:_LOG_LINE_MAX_CHARS]}… "
+                                                f"({len(stripped)} chars, truncated for display)"
+                                            )
                                         log_cb(f"[{tag}]   {stripped}[/{tag}]")
                             stream.close()
                     except Exception as e:
