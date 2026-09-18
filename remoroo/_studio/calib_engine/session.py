@@ -1475,15 +1475,24 @@ class CalibSession:
                             "observability": sj.get("observability"), "depth_caveat": sj.get("depth_caveat")}
                 warning = ("saved while DEPTH-UNDER-CONSTRAINED — the camera's distance is uncertain; "
                            "add board placements at more varied distances/tilts before relying on it")
-        # X is anchored to the OBSERVATION MODEL's reference frame, which is the camera's own mount
-        # link only for eye_in_hand/static. An arm-presented eye_to_hand X is anchored to the
-        # PRESENTING arm's chain base (`chain_from_urdf` trims the fixed world→base prefix), so that
-        # arm's placement in the world has to be composed back in — otherwise the optical frame is
-        # written one whole arm-mount away (0.81 m + 88° on a rig whose arm isn't at the origin).
-        reference_link = urdf_io.optical_reference_link(
-            urdf_path, self.item.camera_link, self.result.kind, self.item.flange_link)
-        T_ref = urdf_io.optical_reference_transform(urdf_path, self.item.camera_link, reference_link)
-        body_optical = inv_T(self.item.nominal_flange_body) @ T_ref @ self.result.T_optical
+        # Normalise the solved X before it becomes a URDF joint: `static` solves the BOARD in the
+        # camera (inverse sense), and an arm-presented `eye_to_hand` X is anchored to the PRESENTING
+        # arm's chain base rather than the camera's mount link (`chain_from_urdf` trims the fixed
+        # world→base prefix), so that arm's placement in the world has to be composed back in —
+        # otherwise the optical frame lands one whole arm-mount away (0.81 m + 88° on a rig whose
+        # arm isn't at the origin). See urdf_io's "WHAT A SOLVED HAND-EYE `X` ACTUALLY IS".
+        # `flange_body` is recomputed from THIS urdf_path so both factors come from one revision —
+        # `item.nominal_flange_body` was captured at plan time and may predate a model-gate rewrite.
+        try:
+            cam_flange = urdf_io.find_flange_link(urdf_path, self.item.camera_link)
+            flange_body = urdf_io.link_chain_transform(urdf_path, cam_flange, self.item.camera_link)
+            reference_link = urdf_io.optical_reference_link(
+                urdf_path, self.item.camera_link, self.result.kind, self.item.flange_link)
+            T_ref = urdf_io.optical_reference_transform(urdf_path, self.item.camera_link, reference_link)
+            X = urdf_io.optical_pose_in_reference(self.result.T_optical, self.result.kind)
+        except ValueError as e:
+            return {"type": "accept", "ok": False, "camera": self.item.camera_link, "error": str(e)}
+        body_optical = inv_T(flange_body) @ T_ref @ X
         dst = urdf_io.write_calibrated_optical(urdf_path, self.item.camera_link, body_optical,
                                                out_path=out_path, provenance=provenance)
         # Persist the CalibResult json the seed promises (so the agent + base_to_base can read
@@ -1493,9 +1502,10 @@ class CalibSession:
         if calib_dir is not None:
             json_path = _write_calib_json(calib_dir, self.item.camera_link, self.result, provenance,
                                           reference_link)
+            # the summary reports the SAME pose the URDF now carries (sense-normalised), in the
+            # frame `reference_link` names — not the solver's raw, kind-dependent X.
             _write_hand_eye_summary(calib_dir, self.item.camera_link, self.item.flange_link,
-                                    self.kind, self.result.T_optical, provenance, self.result,
-                                    reference_link)
+                                    self.kind, X, provenance, self.result, reference_link)
             # An ACCEPTED calibration's recorded trajectory is worth keeping: save it as the
             # step's ROUTINE so recalibration can replay it automatically (latest accepted wins).
             # A replay run records nothing (recorder disarmed) → the original routine survives.
@@ -1600,8 +1610,13 @@ def _write_hand_eye_summary(calib_dir: str, camera: str, flange: str, kind: str,
             f"## {cam}  ({e.get('kind', '?')})",
             # Name the frame the numbers are IN. Calling an eye-to-hand result an offset "vs flange"
             # read as a 1.4 m lens offset when it is really the camera's place in the arm's base frame.
-            f"- camera optical centre in frame `{e.get('reference') or e.get('flange', '?')}`: "
-            f"[{tr[0]}, {tr[1]}, {tr[2]}] mm  (‖offset‖ {e.get('offset_mm', '?')} mm)",
+            # A legacy entry has no `reference`, and `flange` is KNOWN to be the wrong answer for
+            # eye_to_hand — so say it is unrecorded rather than name a frame we'd be guessing.
+            f"- camera optical centre in frame `{e['reference']}`: "
+            f"[{tr[0]}, {tr[1]}, {tr[2]}] mm  (‖offset‖ {e.get('offset_mm', '?')} mm)"
+            if e.get("reference") else
+            f"- camera optical centre [{tr[0]}, {tr[1]}, {tr[2]}] mm  "
+            f"(‖offset‖ {e.get('offset_mm', '?')} mm) — reference frame not recorded; re-accept to record it",
             f"- board scale {e.get('board_scale', '?')} · train RMS {e.get('train_rms_px', '?')} px · "
             f"{e.get('samples', '?')} samples",
             f"- observability: {obs}",
@@ -1904,13 +1919,19 @@ class BaseToBaseSession:
         }, indent=2), encoding="utf-8")
         # BAKE it into the URDF too: place arm B's base at its CALIBRATED pose relative to arm A, so the
         # motion planner's two arms are in their true relative pose (the JSON alone is consumed nowhere).
+        # This MOVES arm B's base — and an eye-to-hand camera's optical frame is anchored to a base, so
+        # any such camera accepted BEFORE this step is now stale by exactly the correction just applied.
+        # `bake_calibration` re-applies base_to_base and then every saved optical frame against the new
+        # placement in one idempotent pass, so ordering the two accepts no longer matters.
         urdf = out_path or urdf_path
         baked = None
         if urdf:
             try:
-                from .bake import apply_base_to_base
-                baked = apply_base_to_base(urdf, self.item.partner_camera, self.item.secondary_camera,
-                                           T_AB)
+                from .bake import bake_calibration
+                rep = bake_calibration(urdf, calib_dir)
+                baked = rep.get("base_to_base")
+                if rep.get("errors"):
+                    baked = {"base_to_base": baked, "errors": rep["errors"]}
             except Exception as e:  # noqa: BLE001 — never block the save on the URDF write; report it
                 baked = {"error": f"{type(e).__name__}: {e}"}
         out = {"type": "b2b_accept", "ok": True, "path": dst, "T_base_to_base": _T(T_AB),

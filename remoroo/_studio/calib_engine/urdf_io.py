@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .geometry import Chain, R_to_rpy, make_T, rpy_to_R
+from .geometry import Chain, R_to_rpy, inv_T, make_T, rpy_to_R
 
 # Names/mesh hints that mark a link as a camera body (so the agent can derive the plan
 # from the rig without guessing). Extend as needed.
@@ -177,34 +177,67 @@ def chain_from_urdf(urdf_path: str, flange_link: str):
 
 
 # --------------------------------------------------------------------------- #
-# WHICH FRAME A SOLVED HAND-EYE `X` IS IN.                                      #
+# WHAT A SOLVED HAND-EYE `X` ACTUALLY IS.                                       #
 #                                                                              #
-# `accept`/`bake` write `body->optical = inv(cam_flange->body) @ X`. That is    #
-# only frame-consistent when X is anchored to the camera's OWN mount link:      #
+# `accept`/`bake` write the `<cam>_optical_frame` joint origin as               #
+# `inv(cam_flange->body) @ X`. That needs X to be (a) the POSE OF THE CAMERA,   #
+# (b) expressed in the camera's OWN mount link. The three observation models    #
+# agree on neither, so both have to be normalised:                              #
 #                                                                              #
-#   eye_in_hand — X = flange->camera-optical, anchored to the camera's mount    #
-#                 link. Both factors are flange-rooted; consistent.             #
-#   static      — X = board->camera with the board AT the world origin          #
-#                 (`solve_static_camera`), and a world-fixed camera's mount     #
-#                 link IS that root. Consistent.                                #
-#   eye_to_hand — X = base->camera-optical. `chain_from_urdf` TRIMS the fixed   #
-#                 world->base prefix, so the solver's fk — and every pose it    #
-#                 emits — is rooted at the PRESENTING arm's base, while the     #
-#                 camera's mount link is the world root. ONE FRAME SHORT: the   #
-#                 arm's own placement in the world is silently dropped.         #
+#   eye_in_hand — X = pose of the camera in the FLANGE it rides (solve.py's     #
+#                 residual inverts `fk @ X` to map base->camera). The camera's  #
+#                 mount link IS that flange. Nothing to do.                     #
+#   eye_to_hand — X = pose of the camera in the PRESENTING ARM'S BASE:          #
+#                 `chain_from_urdf` TRIMS the fixed world->base prefix, so the  #
+#                 solver's fk — and every pose it emits — is base-rooted, while #
+#                 a world-fixed camera's mount link is the world ROOT. One      #
+#                 frame short: the arm's own placement in the world is dropped. #
+#   static      — `solve_static_camera` solves the BOARD'S pose IN THE CAMERA   #
+#                 (its residual projects board points straight through X), the  #
+#                 INVERSE sense of the other two. The board is the reference    #
+#                 frame, so X must be inverted to become a camera pose.         #
 #                                                                              #
-# `optical_reference_link` names the anchor; `optical_reference_transform`      #
-# produces the factor that closes the gap (identity for the consistent models). #
+# `optical_pose_in_reference` fixes the SENSE; `optical_reference_link` names   #
+# the anchor and `optical_reference_transform` produces the factor that carries #
+# it into the mount frame (identity when the anchor already IS the mount link). #
 # --------------------------------------------------------------------------- #
+def _root_links(urdf_path: str) -> set:
+    """Links that are never a joint's child — the URDF's world root(s)."""
+    root = ET.parse(urdf_path).getroot()
+    children = {j.find("child").get("link") for j in root.findall("joint") if j.find("child") is not None}
+    return {l.get("name") for l in root.findall("link")} - children
+
+
+def optical_pose_in_reference(T_optical, kind: str) -> np.ndarray:
+    """A solved `CalibResult.T_optical` as the POSE OF THE CAMERA-OPTICAL FRAME in its reference.
+
+    Only `static` needs flipping — it solves the board in the camera rather than the camera in the
+    board. Inverting HERE (at the URDF write) and not in the solver keeps `metrics`/`curate`, which
+    reproject through X in the solver's own convention, working unchanged."""
+    T = np.asarray(T_optical, float).reshape(4, 4)
+    return inv_T(T) if kind == "static" else T
+
+
 def optical_reference_link(urdf_path: str, camera_link: str, kind: str,
                            chain_flange: Optional[str] = None) -> str:
     """The link a solved `CalibResult.T_optical` is expressed relative to, for `kind`.
 
     `chain_flange` is the step's KINEMATIC chain tip — the presenting arm's flange for an
-    arm-presented eye-to-hand step (`PlanItem.flange_link`), which is what makes its anchor
-    differ from the camera's own mount link."""
+    arm-presented eye-to-hand step (`PlanItem.flange_link`), which is what makes its anchor differ
+    from the camera's own mount link."""
+    cam_flange = find_flange_link(urdf_path, camera_link)
+    if kind in ("eye_to_hand", "static"):
+        # Both models mean a WORLD-FIXED camera, and both anchor X to a frame that does not move.
+        # A camera on a moving link breaks that premise, and the composition below would silently
+        # write a pose that is meaningless the moment the arm moves. Refuse while it is still
+        # explainable rather than at the end of a capture session.
+        if cam_flange not in _root_links(urdf_path):
+            raise ValueError(
+                f"{camera_link}: kind {kind!r} describes a camera FIXED in the world, but this one is "
+                f"mounted on {cam_flange!r}, which moves with the robot — use kind 'eye_in_hand' for a "
+                "camera carried by an arm")
     if kind != "eye_to_hand":
-        return find_flange_link(urdf_path, camera_link)
+        return cam_flange
     if not chain_flange:
         raise ValueError(
             f"{camera_link}: an eye_to_hand calibration is anchored to the PRESENTING arm's base, "
@@ -220,7 +253,13 @@ def optical_reference_transform(urdf_path: str, camera_link: str, reference_link
     cam_flange = find_flange_link(urdf_path, camera_link)
     if reference_link == cam_flange:
         return np.eye(4)
-    return link_chain_transform(urdf_path, cam_flange, reference_link)
+    try:
+        return link_chain_transform(urdf_path, cam_flange, reference_link)
+    except ValueError as e:
+        raise ValueError(
+            f"{camera_link}: its mount link {cam_flange!r} is not rigidly related to {reference_link!r}, "
+            "so the calibration's reference frame cannot be reached from the camera — a camera that MOVES "
+            f"relative to the frame it was calibrated against is not an eye-to-hand rig ({e})") from e
 
 
 # --------------------------------------------------------------------------- #
