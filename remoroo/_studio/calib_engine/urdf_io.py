@@ -177,6 +177,53 @@ def chain_from_urdf(urdf_path: str, flange_link: str):
 
 
 # --------------------------------------------------------------------------- #
+# WHICH FRAME A SOLVED HAND-EYE `X` IS IN.                                      #
+#                                                                              #
+# `accept`/`bake` write `body->optical = inv(cam_flange->body) @ X`. That is    #
+# only frame-consistent when X is anchored to the camera's OWN mount link:      #
+#                                                                              #
+#   eye_in_hand — X = flange->camera-optical, anchored to the camera's mount    #
+#                 link. Both factors are flange-rooted; consistent.             #
+#   static      — X = board->camera with the board AT the world origin          #
+#                 (`solve_static_camera`), and a world-fixed camera's mount     #
+#                 link IS that root. Consistent.                                #
+#   eye_to_hand — X = base->camera-optical. `chain_from_urdf` TRIMS the fixed   #
+#                 world->base prefix, so the solver's fk — and every pose it    #
+#                 emits — is rooted at the PRESENTING arm's base, while the     #
+#                 camera's mount link is the world root. ONE FRAME SHORT: the   #
+#                 arm's own placement in the world is silently dropped.         #
+#                                                                              #
+# `optical_reference_link` names the anchor; `optical_reference_transform`      #
+# produces the factor that closes the gap (identity for the consistent models). #
+# --------------------------------------------------------------------------- #
+def optical_reference_link(urdf_path: str, camera_link: str, kind: str,
+                           chain_flange: Optional[str] = None) -> str:
+    """The link a solved `CalibResult.T_optical` is expressed relative to, for `kind`.
+
+    `chain_flange` is the step's KINEMATIC chain tip — the presenting arm's flange for an
+    arm-presented eye-to-hand step (`PlanItem.flange_link`), which is what makes its anchor
+    differ from the camera's own mount link."""
+    if kind != "eye_to_hand":
+        return find_flange_link(urdf_path, camera_link)
+    if not chain_flange:
+        raise ValueError(
+            f"{camera_link}: an eye_to_hand calibration is anchored to the PRESENTING arm's base, "
+            "so the arm's chain flange is required to name its reference frame")
+    _, _, base_link = chain_from_urdf(urdf_path, chain_flange)
+    return base_link
+
+
+def optical_reference_transform(urdf_path: str, camera_link: str, reference_link: str) -> np.ndarray:
+    """`cam_flange -> reference_link`: the factor that carries a solved X into the frame the
+    `body->optical` composition is written in. Identity when the camera's mount link already IS
+    the reference (eye_in_hand, static)."""
+    cam_flange = find_flange_link(urdf_path, camera_link)
+    if reference_link == cam_flange:
+        return np.eye(4)
+    return link_chain_transform(urdf_path, cam_flange, reference_link)
+
+
+# --------------------------------------------------------------------------- #
 # The CANONICAL ARM MAP — the single source of truth tying arm name ↔ side ↔   #
 # base/ee/flange links ↔ ordered joints ↔ camera. Consumed by cuRobo (per-arm  #
 # base/ee/cspace), the Bridge (arm→joint order), calibration, and the Studio.  #

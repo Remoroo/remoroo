@@ -1475,7 +1475,15 @@ class CalibSession:
                             "observability": sj.get("observability"), "depth_caveat": sj.get("depth_caveat")}
                 warning = ("saved while DEPTH-UNDER-CONSTRAINED — the camera's distance is uncertain; "
                            "add board placements at more varied distances/tilts before relying on it")
-        body_optical = inv_T(self.item.nominal_flange_body) @ self.result.T_optical
+        # X is anchored to the OBSERVATION MODEL's reference frame, which is the camera's own mount
+        # link only for eye_in_hand/static. An arm-presented eye_to_hand X is anchored to the
+        # PRESENTING arm's chain base (`chain_from_urdf` trims the fixed world→base prefix), so that
+        # arm's placement in the world has to be composed back in — otherwise the optical frame is
+        # written one whole arm-mount away (0.81 m + 88° on a rig whose arm isn't at the origin).
+        reference_link = urdf_io.optical_reference_link(
+            urdf_path, self.item.camera_link, self.result.kind, self.item.flange_link)
+        T_ref = urdf_io.optical_reference_transform(urdf_path, self.item.camera_link, reference_link)
+        body_optical = inv_T(self.item.nominal_flange_body) @ T_ref @ self.result.T_optical
         dst = urdf_io.write_calibrated_optical(urdf_path, self.item.camera_link, body_optical,
                                                out_path=out_path, provenance=provenance)
         # Persist the CalibResult json the seed promises (so the agent + base_to_base can read
@@ -1483,9 +1491,11 @@ class CalibSession:
         # (accumulating per camera) + report.md — the named artifacts the cell + gate-check expect.
         json_path = None
         if calib_dir is not None:
-            json_path = _write_calib_json(calib_dir, self.item.camera_link, self.result, provenance)
+            json_path = _write_calib_json(calib_dir, self.item.camera_link, self.result, provenance,
+                                          reference_link)
             _write_hand_eye_summary(calib_dir, self.item.camera_link, self.item.flange_link,
-                                    self.kind, self.result.T_optical, provenance, self.result)
+                                    self.kind, self.result.T_optical, provenance, self.result,
+                                    reference_link)
             # An ACCEPTED calibration's recorded trajectory is worth keeping: save it as the
             # step's ROUTINE so recalibration can replay it automatically (latest accepted wins).
             # A replay run records nothing (recorder disarmed) → the original routine survives.
@@ -1514,12 +1524,17 @@ def safe_camera_name(camera: str) -> str:
     return camera.replace("/", "_").replace("[", "_").replace("]", "_").replace("|", "_")
 
 
-def _write_calib_json(calib_dir: str, camera: str, result: CalibResult, provenance: str) -> str:
+def _write_calib_json(calib_dir: str, camera: str, result: CalibResult, provenance: str,
+                      reference_link: Optional[str] = None) -> str:
     import json
     Path(calib_dir).mkdir(parents=True, exist_ok=True)
     dst = str(Path(calib_dir) / f"{safe_camera_name(camera)}.json")
     Path(dst).write_text(json.dumps({
         "camera": camera, "kind": result.kind, "provenance": provenance,
+        # WHICH FRAME `T_optical` IS IN — the link it is anchored to. Without it the artifact is
+        # ambiguous and `bake_calibration` cannot re-apply it correctly: eye_in_hand anchors to the
+        # camera's own flange, static to the world root, eye_to_hand to the PRESENTING arm's base.
+        "reference_link": reference_link,
         "T_optical": _T(result.T_optical), "T_board": _T(result.T_board),
         "fk_offsets": [round(float(v), 8) for v in result.fk_offsets],
         "board_scale": round(float(result.board_scale), 6),
@@ -1533,7 +1548,8 @@ def _write_calib_json(calib_dir: str, camera: str, result: CalibResult, provenan
 
 
 def _write_hand_eye_summary(calib_dir: str, camera: str, flange: str, kind: str,
-                            X: np.ndarray, provenance: str, result: CalibResult) -> None:
+                            X: np.ndarray, provenance: str, result: CalibResult,
+                            reference_link: Optional[str] = None) -> None:
     """Update `calibration/hand_eye.yaml` (per-camera, ACCUMULATING across steps) + regenerate the
     human-readable `report.md`. These are the named artifacts the cell + the Studio gate-check read.
     Saving one camera here does NOT finalize the calibrate gate — other cameras may still follow."""
@@ -1547,8 +1563,12 @@ def _write_hand_eye_summary(calib_dir: str, camera: str, flange: str, kind: str,
     m = result.metrics or {}
     entry = {
         "flange": flange, "kind": kind, "provenance": provenance,
+        # The frame `T_cam_flange` is anchored to. For eye_in_hand that IS `flange`; for an
+        # arm-presented eye_to_hand it is the presenting arm's BASE (`flange` there names the arm
+        # that held the board, not the frame) — so a reader must use this, not `flange`.
+        "reference": reference_link,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "T_cam_flange": _T(X),                       # camera optical centre in the flange frame (4x4)
+        "T_cam_flange": _T(X),                       # camera optical centre in the REFERENCE frame (4x4)
         "translation_mm": [round(float(t[i]) * 1000.0, 3) for i in range(3)],
         "offset_mm": round(float(np.linalg.norm(t) * 1000.0), 3),
         "board_scale": round(float(result.board_scale), 6),
@@ -1578,7 +1598,9 @@ def _write_hand_eye_summary(calib_dir: str, camera: str, flange: str, kind: str,
             obs += f" (worst rot σ {e['worst_rot_sigma_deg']}°, worst trans σ {e['worst_trans_sigma_mm']} mm)"
         lines += [
             f"## {cam}  ({e.get('kind', '?')})",
-            f"- camera optical centre vs flange `{e.get('flange', '?')}`: "
+            # Name the frame the numbers are IN. Calling an eye-to-hand result an offset "vs flange"
+            # read as a 1.4 m lens offset when it is really the camera's place in the arm's base frame.
+            f"- camera optical centre in frame `{e.get('reference') or e.get('flange', '?')}`: "
             f"[{tr[0]}, {tr[1]}, {tr[2]}] mm  (‖offset‖ {e.get('offset_mm', '?')} mm)",
             f"- board scale {e.get('board_scale', '?')} · train RMS {e.get('train_rms_px', '?')} px · "
             f"{e.get('samples', '?')} samples",

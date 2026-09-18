@@ -3,9 +3,12 @@ stack loads. Calibration's `accept` writes per-camera results (`calibration/<cam
 inter-arm transform (`calibration/base_to_base.json`); this RE-APPLIES all of them to the URDF in one
 idempotent pass:
 
-  - eye-in-hand / eye-to-hand: each `<cam>_optical_frame` joint origin = `inv(flange→body) @ T_optical`
-    (exactly what `accept` writes — recomputed from the saved `T_optical`, so a model-gate rewrite that
-    dropped the optical frames is fully recoverable WITHOUT re-running calibration capture).
+  - eye-in-hand / eye-to-hand: each `<cam>_optical_frame` joint origin =
+    `inv(flange→body) @ (flange→reference) @ T_optical` (exactly what `accept` writes — recomputed from
+    the saved `T_optical`, so a model-gate rewrite that dropped the optical frames is fully recoverable
+    WITHOUT re-running calibration capture). The `flange→reference` factor is identity for eye-in-hand
+    and static; for an arm-presented eye-to-hand camera it is the PRESENTING arm's world placement,
+    which `<cam>.json`'s `reference_link` names (see `urdf_io.optical_reference_link`).
   - base_to_base: the joint that places arm B's base is set so `baseA → baseB == T_baseA_baseB` — the
     bimanual planner's arms are then in their CALIBRATED relative pose (previously the JSON was written
     but applied NOWHERE, so the planner used the URDF's nominal arm-B placement).
@@ -45,6 +48,47 @@ def _base_link_of(urdf_path: str, camera_link: str) -> str:
     """The base (planning root) of the arm carrying `camera_link`: its flange's chain base."""
     flange = urdf_io.find_flange_link(urdf_path, camera_link)
     _, _, base_link = urdf_io.chain_from_urdf(urdf_path, flange)
+    return base_link
+
+
+def _hand_eye_entry(calib_dir: Path, camera: str) -> dict:
+    """`calibration/hand_eye.yaml`'s per-camera entry, or {} if unreadable."""
+    try:
+        import yaml  # type: ignore
+    except Exception:  # noqa: BLE001 — no PyYAML: the caller falls back to its own error
+        return {}
+    he = Path(calib_dir) / "hand_eye.yaml"
+    if not he.exists():
+        return {}
+    try:
+        data = yaml.safe_load(he.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    cams = data.get("cameras")
+    return cams.get(camera, {}) if isinstance(cams, dict) else {}
+
+
+def _legacy_reference_link(urdf_path: str, calib_dir: Path, camera: str, kind: str) -> str:
+    """`reference_link` for a `<cam>.json` saved before the frame was recorded in it.
+
+    eye_in_hand / static anchor to the camera's own mount link, which the URDF still tells us.
+    An eye_to_hand X anchors to the PRESENTING arm's base — a fact only `hand_eye.yaml` kept (its
+    `reference`, or the `flange` of the arm that held the board). With neither, the frame is
+    genuinely unknowable, so raise: the bake reports it rather than silently re-writing a pose that
+    is one arm-mount out."""
+    if kind != "eye_to_hand":
+        return urdf_io.find_flange_link(urdf_path, camera)
+    entry = _hand_eye_entry(calib_dir, camera)
+    ref = entry.get("reference")
+    if ref:
+        return str(ref)
+    flange = entry.get("flange")
+    if not flange:
+        raise ValueError(
+            f"{camera}: this eye_to_hand calibration predates `reference_link` and "
+            "calibration/hand_eye.yaml does not say which arm presented the board, so the frame its "
+            "T_optical is in is unknowable — re-accept this camera's calibration to record it")
+    _, _, base_link = urdf_io.chain_from_urdf(urdf_path, str(flange))
     return base_link
 
 
@@ -100,13 +144,19 @@ def bake_calibration(urdf_path: str, calib_dir: str) -> dict:
             if d.get("kind") not in ("eye_in_hand", "eye_to_hand", "static"):
                 continue
             cam = d.get("camera")
+            kind = d.get("kind")
             T_optical = np.asarray(d["T_optical"], float).reshape(4, 4)
             flange = urdf_io.find_flange_link(urdf_path, cam)
             flange_body = urdf_io.link_chain_transform(urdf_path, flange, cam)
-            body_optical = _inv(flange_body) @ T_optical
+            # Carry X from the frame it was SOLVED in into the camera's mount frame. Identity for
+            # eye_in_hand/static; the presenting arm's world placement for eye_to_hand, which this
+            # composition used to drop (see urdf_io.optical_reference_link).
+            reference = d.get("reference_link") or _legacy_reference_link(urdf_path, calib_dir, cam, kind)
+            T_ref = urdf_io.optical_reference_transform(urdf_path, cam, reference)
+            body_optical = _inv(flange_body) @ T_ref @ T_optical
             urdf_io.write_calibrated_optical(urdf_path, cam, body_optical,
                                              provenance=d.get("provenance", "measured"))
-            report["optical"].append({"camera": cam, "kind": d.get("kind")})
+            report["optical"].append({"camera": cam, "kind": kind, "reference_link": reference})
         except Exception as e:  # noqa: BLE001 — one bad file must not abort the rest
             report["errors"].append(f"{jf.name}: {type(e).__name__}: {e}")
 
