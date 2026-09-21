@@ -2308,6 +2308,57 @@ def _board_outline(target) -> "dict | None":
     return {"center": [float(center[0]), float(center[1])], "size": [w, h], "squares": squares}
 
 
+def _declared_camera_wh(cy: dict, camera_id: str):
+    """The frame size the CELL ASKED FOR for this camera (`cameras[].resolution`), or None if the
+    cell declares none. Matched on `link` OR `name` because the two conventions both reach here
+    (the bridge keys cameras on the URDF link; `_first_camera` returns the friendly name)."""
+    for c in (cy.get("cameras") or []):
+        if camera_id and camera_id in (str(c.get("link") or ""), str(c.get("name") or "")):
+            r = c.get("resolution")
+            if r and len(r) == 2:
+                return (int(r[0]), int(r[1]))
+            return None
+    return None
+
+
+def _px_per_m(target, ids, uv) -> "float | None":
+    """OBSERVED pixels per metre of target — the one number that says whether this frame CAN be
+    detected, and it is target-agnostic (no fiducial type is named here). Fiducial decoding needs
+    roughly 20+ px across a marker, so `px_per_m * marker_len` is the operator's real budget: at
+    470 px/m a 30 mm marker is 14 px and two thirds of the board will not decode.
+
+    Measured as LOCAL scale: each detected point against its nearest neighbour ON THE TARGET,
+    10th percentile over points. Two deliberate choices:
+      * local, not board-spanning — a tilted board's near edge images far bigger than its far
+        edge, and a long baseline averages that away into a number matching neither end;
+      * p10, not median — the sparsest corner of the board is the one that fails first, so the
+        number has to describe the hard part, not the comfortable middle.
+    Calibrated against the thing it predicts: on the rig frame that started all this, p10 local
+    gave 606 px/m => 18.2 px for a 30 mm marker, against 18.6 px measured directly off the
+    detected marker quads. All-pairs median read 818 px/m (24.5 px) — a third too optimistic,
+    and optimistic in exactly the regime where the operator needs the truth.
+
+    ONE CAVEAT, because it cannot be engineered away: this is the scale where detection
+    SUCCEEDED. Where the board is too small to read it contributes nothing, so with few corners
+    the number flatters the rest of the board. Read it next to detected/expected, never alone."""
+    import numpy as np
+    ids = np.asarray(ids, int).reshape(-1)
+    uv = np.asarray(uv, float).reshape(-1, 2)
+    pts = getattr(target, "point_xyz", None)
+    if pts is None or len(ids) < 2 or len(ids) != len(uv):
+        return None
+    xyz = np.asarray(pts, float)[ids]
+    d_px = np.linalg.norm(uv[:, None, :] - uv[None, :, :], axis=-1)
+    d_m = np.linalg.norm(xyz[:, None, :] - xyz[None, :, :], axis=-1)
+    d_m[d_m < 1e-6] = np.inf                 # the diagonal, and any point detected twice
+    rows = np.arange(len(ids))
+    nn = d_m.argmin(1)
+    good = np.isfinite(d_m[rows, nn])
+    if not good.any():
+        return None
+    return float(np.percentile(d_px[rows, nn][good] / d_m[rows, nn][good], 10))
+
+
 def _calib_snapshot() -> dict:
     """Current camera frame (JPEG) + factory intrinsics + (when a target is configured) its
     detection overlay, for the live-cam inset. The RAW FEED shows as soon as the camera is up —
@@ -2339,6 +2390,13 @@ def _calib_snapshot() -> dict:
         except Exception:  # noqa: BLE001
             ids, uv = (np.empty(0, int), np.empty((0, 2)))
     K, _ = _intrinsics_from_bridge(b, camera_id)
+    declared_wh = _declared_camera_wh(cy, camera_id)
+    res_warning = None
+    if declared_wh and (int(w), int(h)) != declared_wh:
+        res_warning = (f"camera is streaming {w}x{h} but cell.yaml asks for "
+                       f"{declared_wh[0]}x{declared_wh[1]} — the driver opened a different mode. "
+                       f"Fiducial detection scales with resolution; set `cameras[].resolution` to a "
+                       f"mode this camera actually has.")
     out = {
         "type": "snapshot", "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
         "w": int(w), "h": int(h),
@@ -2353,6 +2411,18 @@ def _calib_snapshot() -> dict:
         "board_outline": _board_outline(target) if target is not None else None,
         "corners": np.asarray(uv, float).round(1).tolist(),
         "intrinsics": None if K is None else {"fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2]},
+        # DETECTABILITY, measured — not a gate, a number. "31/117 corners" alone cannot tell an
+        # operator whether the board is too far, the lens too wide, or the stream too small; px/m
+        # can: multiply by the printed marker size and compare to the ~20 px decode floor. See
+        # `_px_per_m`.
+        "px_per_m": None if target is None else _px_per_m(target, ids, uv),
+        # WHAT THE CELL ASKED FOR vs WHAT THE CAMERA GAVE. A camera SDK reports factory intrinsics
+        # for the mode it actually opened, so a downgraded stream is perfectly self-consistent and
+        # no consistency check can see it — only this comparison can. (A ZED X Mini asked for
+        # 1280x720, a mode it does not have, opened SVGA 960x600 and quietly cost two thirds of the
+        # ChArUco corners; nothing in the stack said a word.)
+        "declared_wh": list(declared_wh) if declared_wh else None,
+        "resolution_warning": res_warning,
     }
     # When a session is live and seeded, overlay the PREDICTED marker corners (under the current
     # hand-eye X at the live joints) + the px drift + the board/optical poses, so the live cam
@@ -2697,6 +2767,27 @@ def _find_collision_spheres(obj) -> dict:
     return {}
 
 
+def _spheres_staleness(spheres_file) -> dict:
+    """Were these spheres built BEFORE the robot model they are supposed to wrap?
+
+    The spheres are a cached approximation of the URDF's meshes. Change a link's geometry and the
+    cached spheres still describe the old shape — the planner then avoids a shape that is no longer
+    there and is blind to the one that is. Nothing rebuilds them automatically, so the honest thing
+    is to say so rather than let the collision view present stale spheres as current.
+
+    Compares file times, which is what the disk actually knows. It can over-report (a calibration
+    bake rewrites robot.urdf without touching geometry), so the wording says "the model changed",
+    not "your spheres are wrong"."""
+    urdf = CELL_DIR / "robot_model" / "robot.urdf"
+    try:
+        if not spheres_file.exists() or not urdf.exists():
+            return {}
+        built, model = spheres_file.stat().st_mtime, urdf.stat().st_mtime
+        return {"built_at": built, "model_at": model, "stale": model > built}
+    except OSError:
+        return {}
+
+
 def h_spheres(_q):
     """The REAL cuRobo collision spheres for the Studio's collision view — parsed HERE on the edge
     (which owns yaml/numpy/cuRobo), NOT in the stdlib-only studio_server proxy (it has no PyYAML, so
@@ -2729,7 +2820,7 @@ def h_spheres(_q):
                         skipped += 1
                 except (TypeError, ValueError):
                     skipped += 1
-        resp = {"spheres": out, "n": len(out)}
+        resp = {"spheres": out, "n": len(out), **_spheres_staleness(f)}
         if not out:
             resp["error"] = (f"no parseable spheres (found_links={len(cs)}, skipped={skipped}); expected "
                              "link -> [{center:[x,y,z], radius:r}] or [x,y,z,r]")
