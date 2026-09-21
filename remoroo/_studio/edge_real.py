@@ -340,16 +340,21 @@ def _curobo_world():
     workspace floor box (cell.yaml bounds) + the operator-modeled static OBSTACLES
     (table/wall/post) as proper cuRobo cuboids — separate from the robot, the cuRobo way. One
     builder so 'feasible' and 'planned' never disagree about where the table is."""
-    from curobo.geom.types import WorldConfig, Cuboid  # type: ignore
+    from curobo.geom.types import WorldConfig, Cuboid, Mesh  # type: ignore
     from calib_engine.curobo_cfg import build_world_cfg
     cy = load_cell_yaml()
     ws = (cy.get("workspace") or {})
     dims = ws.get("size", [1.5, 1.5, 1.0])
     center = ws.get("center", [0.0, 0.0, dims[2] / 2 - 0.5])
     cubs = [Cuboid(name="workspace_floor", pose=[*center, 1, 0, 0, 0], dims=list(dims))]
-    for nm, c in build_world_cfg(cy.get("obstacles"))["cuboid"].items():
+    world = build_world_cfg(cy.get("obstacles"), str(CELL_DIR))
+    for nm, c in world["cuboid"].items():
         cubs.append(Cuboid(name=nm, pose=c["pose"], dims=c["dims"]))
-    return WorldConfig(cuboid=cubs)
+    # MESH obstacles belong here too. Taking only the cuboids was fine while an obstacle could only
+    # be a box or a post; now that it can be an imported mesh, dropping them would make this
+    # checker disagree with the planner about a pallet exactly as the docstring above forbids.
+    meshes = [Mesh(name=nm, **m) for nm, m in world["mesh"].items()]
+    return WorldConfig(cuboid=cubs, mesh=meshes)
 
 
 def motion_gen():

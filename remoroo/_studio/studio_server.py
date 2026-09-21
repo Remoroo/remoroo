@@ -619,6 +619,24 @@ class Handler(BaseHTTPRequestHandler):
             mdir = PROJECT / "remoroo_cell" / "meshes"
             files = sorted(p.name for p in mdir.glob("*") if p.is_file()) if mdir.exists() else []
             self._json({"meshes": files}); return
+        # An OBSTACLE's mesh, copied into the cell next to the robot's own. The robot's meshes
+        # travel inside the model bundle at the model gate; an obstacle is saved separately
+        # (/edge/obstacles/set writes only cell.yaml), so its file has no bundle to ride in. One
+        # folder for both: a cell keeps its geometry in one place, and cell.yaml's obstacle
+        # file_path is relative to the cell, so the cell stays movable.
+        if path == "/project/mesh" and self.command == "POST":
+            safe = Path((query.get("name") or [""])[0]).name  # basename only — no traversal
+            if not safe or "." not in safe:
+                self._json({"error": "give a mesh file name, e.g. ?name=pallet.stl"}, 400); return
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length <= 0:
+                self._json({"error": "empty mesh upload"}, 400); return
+            mdir = PROJECT / "remoroo_cell" / "meshes"
+            mdir.mkdir(parents=True, exist_ok=True)
+            raw = self.rfile.read(length)
+            (mdir / safe).write_bytes(raw)
+            self._json({"ok": True, "file": safe, "bytes": len(raw), "path": str(mdir / safe)})
+            return
         if path == "/project/mesh" and self.command == "GET":
             safe = Path((query.get("name") or [""])[0]).name  # basename only — no traversal
             f = PROJECT / "remoroo_cell" / "meshes" / safe

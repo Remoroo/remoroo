@@ -71,12 +71,19 @@ def mask_robot_points(points: np.ndarray, spheres, *, margin: float = 0.01):
     return p[keep], int((~keep).sum())
 
 
-def obstacle_geometry(obstacles: Optional[List[dict]]) -> Dict[str, Dict[str, dict]]:
+def obstacle_geometry(obstacles: Optional[List[dict]], cell_dir: Optional[str] = None) -> Dict[str, Dict[str, dict]]:
     """The operator's `cell.yaml: obstacles` → a cuRobo scene dict (cuboids + meshes). Schema per
-    obstacle: `{name, type: cuboid|cylinder|mesh, dims|radius/height|file_path, pose}`. A cylinder
-    is approximated by a tight cuboid bounding box (dims [2r, 2r, h]) — conservative (the avoided
-    volume is slightly larger), matching `calib_engine.curobo_cfg.build_world_cfg` so the unified
-    stack and the classic path agree on where the table is."""
+    obstacle: `{name, type: cuboid|cylinder|mesh, dims|radius+height|file_path+scale, pose}`. A
+    cylinder is approximated by a tight cuboid bounding box (dims [2r, 2r, h]) — conservative (the
+    avoided volume is slightly larger).
+
+    Mesh paths are stored relative to the cell and made absolute by
+    `calib_engine.curobo_cfg.resolve_obstacle_mesh` — the same resolver the classic path uses, so
+    the unified stack and the classic path agree on where the pallet is, not just where the table
+    is. A missing mesh raises there rather than being dropped.
+    """
+    from calib_engine.curobo_cfg import resolve_obstacle_mesh
+
     cuboid: Dict[str, dict] = {}
     mesh: Dict[str, dict] = {}
     for i, o in enumerate(obstacles or []):
@@ -84,7 +91,11 @@ def obstacle_geometry(obstacles: Optional[List[dict]]) -> Dict[str, Dict[str, di
         pose = list(o.get("pose") or [0, 0, 0, 1, 0, 0, 0])
         kind = str(o.get("type") or "cuboid")
         if kind == "mesh" and o.get("file_path"):
-            mesh[name] = {"file_path": o["file_path"], "pose": pose}
+            entry = {"file_path": resolve_obstacle_mesh(str(o["file_path"]), cell_dir), "pose": pose}
+            if o.get("scale") is not None:
+                s = o["scale"]
+                entry["scale"] = [float(x) for x in s] if isinstance(s, (list, tuple)) else [float(s)] * 3
+            mesh[name] = entry
         elif kind == "cylinder":
             r, h = float(o.get("radius", 0.05)), float(o.get("height", 0.1))
             cuboid[name] = {"dims": [2 * r, 2 * r, h], "pose": pose}
@@ -98,12 +109,12 @@ def obstacle_geometry(obstacles: Optional[List[dict]]) -> Dict[str, Dict[str, di
     return out
 
 
-def build_scene(obstacles: Optional[List[dict]] = None) -> Dict[str, Dict[str, dict]]:
-    """The collision scene = the operator's MODELED static obstacles (table/wall/post) as a cuRobo
-    scene dict. REAL geometry only — NO arbitrary workspace-box cage and NO abstract keep-out zones:
-    the live depth ESDF + these modeled obstacles ARE the world the planner avoids."""
+def build_scene(obstacles: Optional[List[dict]] = None, cell_dir: Optional[str] = None) -> Dict[str, Dict[str, dict]]:
+    """The collision scene = the operator's MODELED static obstacles (table/wall/post/mesh) as a
+    cuRobo scene dict. REAL geometry only — NO arbitrary workspace-box cage and NO abstract keep-out
+    zones: the live depth ESDF + these modeled obstacles ARE the world the planner avoids."""
     scene: Dict[str, Dict[str, dict]] = {}
-    for kind, items in obstacle_geometry(obstacles).items():
+    for kind, items in obstacle_geometry(obstacles, cell_dir).items():
         scene[kind] = dict(items)
     return {k: v for k, v in scene.items() if v}
 
@@ -113,7 +124,7 @@ def load_world(cell_dir: str) -> WorldInputs:
     else: no stored scan cloud, no `scene.json`, no workspace-box bounds, no keep-out zones — the real
     world at commission/demo is the LIVE depth ESDF. Pure data, no cuRobo."""
     obstacles = list((_read_yaml(Path(cell_dir) / "cell.yaml") or {}).get("obstacles") or [])
-    return WorldInputs(scene=build_scene(obstacles), meta={"n_obstacles": len(obstacles)})
+    return WorldInputs(scene=build_scene(obstacles, cell_dir), meta={"n_obstacles": len(obstacles)})
 
 
 def sphere_box_overlaps(spheres, scene: dict) -> dict:
@@ -122,7 +133,15 @@ def sphere_box_overlaps(spheres, scene: dict) -> dict:
     the box's LOCAL frame first — a rotated wall must never read as an axis-aligned slab
     through the workspace (the 'START INSIDE obs_5_wall' misdiagnosis, 2026-07-18; resurfaced
     2026-07-20 via curobo_v2's private AABB copy — this is now the ONE obstacle-naming test,
-    shared by the stack's world introspection AND the planner's failure diagnostics)."""
+    shared by the stack's world introspection AND the planner's failure diagnostics).
+
+    CUBOIDS ONLY, by name and by design. A MESH obstacle has no box to test against, so it is not
+    attributed here. This does not affect any collision VERDICT — those come from cuRobo's own
+    checker over the whole scene, meshes included (`world_sphere_collision`) — it affects only
+    which obstacle gets NAMED as the culprit. So a start-in-collision caused by a mesh reads as
+    "in collision, no cuboid penetrating", which is incomplete but not a lie; the alternative,
+    attributing it to the mesh's bounding box, would name the wrong obstacle whenever the box is
+    bigger than the shape, which is always."""
     out: dict = {}
     sph = np.asarray(spheres, dtype=float)
     if sph.size == 0:
