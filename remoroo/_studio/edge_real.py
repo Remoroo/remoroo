@@ -277,48 +277,6 @@ def _groups_as_arm_map(cfg: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # cuRobo helpers (researched API: MotionGenConfig.load_from_robot_config, etc.) #
 # --------------------------------------------------------------------------- #
-def _ensure_complete_urdf(urdf_path: str, prior_text) -> list:
-    """Make the just-written `robot.urdf` COMPLETE for commission: every camera link keeps its
-    `<cam>_optical_frame` (which carries the optical-convention rotation + the hand-eye calibration).
-    Calibration writes that frame in place; the model/sphere gate overwrites robot.urdf with the raw
-    editor URDF and would DROP it, so here we re-apply the calibrated optical-joint transform from the
-    PRIOR robot.urdf (if any), else add an identity frame so the link at least exists. Returns the
-    cameras whose CALIBRATED frame was preserved. This is the SINGLE complete artifact the motion stack
-    loads — no consume-time patching."""
-    import os
-    import tempfile
-    import numpy as _np
-    from calib_engine import urdf_io
-
-    cams = urdf_io.find_camera_links(urdf_path)
-    prior_path = None
-    if prior_text:
-        fd, prior_path = tempfile.mkstemp(suffix=".urdf")
-        os.close(fd)
-        Path(prior_path).write_text(prior_text, encoding="utf-8")
-    preserved: list = []
-    try:
-        for cam in cams:
-            T = None
-            if prior_path:
-                try:
-                    T = urdf_io.read_nominal_optical(prior_path, cam)   # prior body->optical (calibrated)
-                except Exception:  # noqa: BLE001
-                    T = None
-            if T is not None and not _np.allclose(_np.asarray(T, float), _np.eye(4), atol=1e-9):
-                urdf_io.write_calibrated_optical(urdf_path, cam, _np.asarray(T, float), provenance="measured")
-                preserved.append(cam)
-            else:
-                urdf_io.ensure_optical_frame(urdf_path, cam)            # identity until calibrated
-    finally:
-        if prior_path:
-            try:
-                os.unlink(prior_path)
-            except Exception:  # noqa: BLE001
-                pass
-    return preserved
-
-
 def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
     """Write `robot.urdf` + the cuRobo `collision_spheres.yml` (the sphere model calibration's
     motion_gen reads). The KINEMATIC config is NOT written here — it is the AUTHORED `cell.yaml:
@@ -331,15 +289,20 @@ def write_curobo_robot_yaml(urdf_text: str, spheres: list[dict]) -> Path:
     rm = CELL_DIR / "robot_model"
     rm.mkdir(parents=True, exist_ok=True)
     urdf_file = rm / "robot.urdf"
-    prior = urdf_file.read_text(encoding="utf-8") if urdf_file.exists() else None
     urdf_file.write_text(urdf_text, encoding="utf-8")
-    # KEEP THE URDF COMPLETE: re-apply each camera's calibrated `*_optical_frame` from the PRIOR
-    # robot.urdf (the raw editor URDF dropped it). Without this, re-saving the model silently strips
-    # calibration → commission loads an incomplete URDF → the live world has no valid camera pose.
+    # KEEP THE URDF COMPLETE. The raw editor URDF carries no calibration, so without this the model
+    # save silently strips every `<cam>_optical_frame` AND reverts the calibrated inter-arm base to
+    # its nominal pose → commission loads an incomplete URDF and the live world has no valid camera.
+    # Re-apply from `calibration/`, which is the SOURCE OF TRUTH — not from the prior robot.urdf,
+    # which could only ever carry forward whatever the last write happened to contain and knew
+    # nothing about base_to_base.
     try:
-        _ensure_complete_urdf(str(urdf_file), prior)
+        from calib_engine.bake import bake_calibration
+        rep = bake_calibration(str(urdf_file), str(CELL_DIR / "calibration"))
+        for err in rep.get("errors") or []:
+            print(f"[model] calibration re-apply: {err}")
     except Exception as e:  # noqa: BLE001 — never block a model save on this; surface loudly in logs
-        print(f"[model] could not preserve camera optical frames in robot.urdf: {type(e).__name__}: {e}")
+        print(f"[model] could not re-apply calibration to robot.urdf: {type(e).__name__}: {e}")
 
     by_link: dict[str, list[dict]] = {}
     for s in spheres:
@@ -563,24 +526,6 @@ def h_estop(_q):
 def h_safety(_q):
     b = get_bridge()
     return {"estop": bool(getattr(b, "estopped", False)) if b is not None else False}
-
-
-def h_build_robot(_q, body):
-    spheres = body.get("spheres", []) if isinstance(body, dict) else []
-    try:
-        out = write_curobo_robot_yaml(body.get("urdf", ""), spheres)
-        reset_curobo_cache()   # rebuild the planner + collision checker with the new spheres
-        reset_motion_stack()   # the unified motion stack bakes in the robot model too
-        # best-effort: validate by loading the kinematics
-        approximate = True
-        try:
-            motion_gen()  # if it loads, the model is planner-ready
-            approximate = False
-        except Exception:
-            pass
-        return {"spheres": spheres, "count": len(spheres), "approximate": approximate, "configYaml": str(out)}
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"{type(e).__name__}: {e}", "spheres": spheres, "count": len(spheres), "approximate": True}
 
 
 def _joint_value(val) -> float:
@@ -1245,17 +1190,18 @@ def _live_frames(st, b):
                 continue
             # The camera OPTICAL frame at the LIVE joints (eye-in-hand) — the FULL transform (the
             # optical-convention rotation + the hand-eye calibration) lives in robot.urdf's
-            # `<cam>_optical_frame` joint, written by calibration and PRESERVED by the model-gate URDF
-            # writer (`_ensure_complete_urdf`). REFUSE the bare body link: it carries no calibration and
+            # `<cam>_optical_frame` joint, written by calibration and re-applied from `calibration/`
+            # after every model write. REFUSE the bare body link: it carries no calibration and
             # mis-places the whole live cloud onto the robot. A missing optical frame means the URDF is
             # incomplete at commission — say so, loudly, with the fix.
             pose = st.link_pose(f"{link}_optical_frame")
             if pose is None:
                 reasons.append({"camera": name, "ok": False,
-                                "why": f"'{link}_optical_frame' is missing from robot.urdf — the URDF is INCOMPLETE "
-                                       "at commission (calibration wasn't accepted, or an older model save dropped "
-                                       "it). Re-run/accept calibration for this camera; the model-gate writer now "
-                                       "preserves the optical frame. Refusing the un-calibrated body link."})
+                                "why": f"'{link}_optical_frame' is missing from robot.urdf — the URDF is "
+                                       "INCOMPLETE at commission. Either this camera was never calibrated, or "
+                                       "calibration/ has no artifact for it. Run calibration for this camera, or "
+                                       "press 'Apply saved calibration → URDF' if it has been calibrated before. "
+                                       "Refusing the un-calibrated body link."})
                 continue
             frames.append(DepthFrame(depth=depth, intrinsics=K, cam_pose_in_base=pose, name=name))
             # DEPTH VALIDITY — the decisive number when 'robot px masked' is implausibly high: a zero/
@@ -2873,7 +2819,6 @@ ROUTES = {
     "/edge/applyFix": ("json", h_applyfix),
     "/edge/estop": ("json", h_estop),
     "/edge/safety": ("json", h_safety),
-    "/edge/buildRobot": ("json_body", h_build_robot),
     "/edge/arms": ("json", h_arms),
     "/edge/arms/set": ("json_body", h_set_arms),
     "/edge/obstacles": ("json", h_obstacles),

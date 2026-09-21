@@ -1520,7 +1520,12 @@ class CalibSession:
         out = {"type": "accept", "ok": True, "urdf": dst, "camera": self.item.camera_link,
                "optical_frame": self.item.optical_frame, "provenance": provenance,
                "calib_json": json_path, "body_to_optical": _T(body_optical),
-               "X": _T(self.result.T_optical), "flange": self.item.flange_link,
+               # `X` is the SENSE-NORMALISED camera pose and `reference_link` is the frame it is in.
+               # The raw solver X plus `flange` is not enough to place anything: for an arm-presented
+               # eye-to-hand step `flange` is the arm that HELD THE BOARD (link_tcp_1), while X is
+               # anchored to that arm's BASE — mounting X on the flange puts the overhead camera
+               # 2.65 m away, below the floor, riding the gripper.
+               "X": _T(X), "reference_link": reference_link, "flange": self.item.flange_link,
                **self._obs_json(self.result)}
         if warning:
             out["warning"] = warning

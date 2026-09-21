@@ -86,8 +86,20 @@ def find_flange_link(urdf_path: str, camera_link: str) -> str:
     """The link the camera is rigidly mounted to — i.e. walk up through FIXED joints
     until the connecting joint is non-fixed (the last moving link). For the xArm+ZED rig
     `ZEDX_Mini` -> `link6`. If the camera traces to the root through only fixed joints,
-    that root is returned (a static / eye-to-hand camera)."""
+    that root is returned (a static / eye-to-hand camera).
+
+    Raises for a link the URDF does not define. Without that check a stale `calibration/<cam>.json`
+    (a camera since renamed or deleted) walks no joints, returns its own name, composes an identity
+    chain, and the bake SubElements an optical joint whose parent link does not exist — an invalid
+    URDF, written with `errors: []`, and not undone by deleting the stale file. The link SET is the
+    right test, not the parent map: a world-mounted camera's flange is legitimately absent from the
+    parent map because the root is nobody's child."""
     root = ET.parse(urdf_path).getroot()
+    if camera_link not in {l.get("name") for l in root.findall("link")}:
+        raise ValueError(
+            f"{camera_link!r} is not a link in this URDF — a calibration artifact names a camera the "
+            "robot model does not have (renamed or removed?); delete or rename the stale "
+            f"calibration/{camera_link}.json")
     m = _parent_joint_map(root)
     cur = camera_link
     seen = set()

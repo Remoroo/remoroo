@@ -158,6 +158,35 @@ def _sphere_center_radius(s):
     return None, None
 
 
+
+def rebake_calibration(dest: Path) -> dict | None:
+    """Re-apply the saved calibration to the `robot.urdf` that was just overwritten.
+
+    The editor's export is the AUTHORED model — it contains no calibration at all. Writing it over
+    `robot_model/robot.urdf` therefore DROPS every `<cam>_optical_frame` and reverts the calibrated
+    inter-arm base placement to its nominal pose. `calibration/` is the source of truth for both, and
+    `bake_calibration` re-applies them idempotently, so the URDF on disk is complete after EVERY
+    write rather than only when the operator remembers to press "Apply saved calibration".
+
+    This replaces a preservation path that copied the frames out of the PRIOR urdf — strictly worse
+    (it could only carry forward whatever the last write happened to contain, never base_to_base) and
+    which, being reachable solely from a route with no callers, never actually ran.
+
+    Returns the bake report, or None when there is nothing to re-apply. Never raises: a model save
+    must not fail because of a calibration artifact, but the report is handed back so the operator
+    sees the errors instead of a silently incomplete URDF.
+    """
+    urdf = dest / "robot_model" / "robot.urdf"
+    calib = dest / "calibration"
+    if not urdf.exists() or not calib.is_dir():
+        return None
+    try:
+        from calib_engine.bake import bake_calibration
+        return bake_calibration(str(urdf), str(calib))
+    except Exception as e:  # noqa: BLE001 — surfaced in the response, never fatal to the save
+        return {"optical": [], "base_to_base": None, "errors": [f"{type(e).__name__}: {e}"]}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RemorooStudio/1.0"
 
@@ -616,7 +645,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self._json({"error": f"bad model bundle: {e}"}, 400)
                 return
-            self._json({"ok": True, "path": str(dest / "robot_model" / "robot.urdf")})
+            # The bundle just replaced robot.urdf with the editor's calibration-free export;
+            # put the measured frames + the inter-arm transform back before anything loads it.
+            rep = rebake_calibration(dest)
+            self._json({"ok": True, "path": str(dest / "robot_model" / "robot.urdf"),
+                        "recalibrated": rep})
             return
         if path == "/project/export" and self.command == "POST":
             # OVERLAY the operator's model onto remoroo_cell/ — NEVER wipe it. The old code
@@ -633,8 +666,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self._json({"error": f"bad cell bundle: {e}"}, 400)
                 return
+            # same overlay, same hazard: the cell bundle carries the authored URDF, not the
+            # calibrated one. Re-apply before the commit so what is committed is complete.
+            rep = rebake_calibration(dest)
             committed = git_commit(PROJECT, "remoroo_cell") if parse_qs(urlparse(self.path).query).get("commit") == ["1"] else False
-            self._json({"ok": True, "path": str(dest), "committed": committed})
+            self._json({"ok": True, "path": str(dest), "committed": committed, "recalibrated": rep})
             return
         self._json({"error": "not found"}, 404)
 
