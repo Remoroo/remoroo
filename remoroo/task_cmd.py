@@ -428,7 +428,7 @@ def task(
                 fg=typer.colors.YELLOW)
     # Autonomous heavyweight reasoning: same flagship default as `remoroo setup`.
     if not model:
-        model = "anthropic/claude-opus-4.8"
+        model = "anthropic/claude-opus-5.5"
 
     cfg = LaunchConfig(
         mode="new",

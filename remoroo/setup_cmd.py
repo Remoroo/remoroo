@@ -128,7 +128,7 @@ def setup(
         None, "--engine", help="Execution engine ('docker' or 'venv')."
     ),
     model: Optional[str] = typer.Option(
-        None, "--model", help="LLM model id (e.g. anthropic/claude-opus-4.8)."
+        None, "--model", help="LLM model id (e.g. anthropic/claude-opus-5.5)."
     ),
     pick_model: bool = typer.Option(
         True,
@@ -388,15 +388,15 @@ def setup(
 
     # Robot-cell setup is heavyweight, supervised reasoning work — it wants the
     # FLAGSHIP model. The Studio path (the default) does not run the model picker,
-    # so default to the picker's flagship (Opus 4.8) when the operator didn't pass
+    # so default to the picker's flagship (Opus 5.5) when the operator didn't pass
     # --model; otherwise studio setup would fall back to the server's default tier.
     # Effort is already pinned to "high" by the @robot_setup alias (server-side).
     if not model:
         # Flagship for this heavyweight supervised work. Kept as a plain literal
         # (mirrors model_picker.CHOICES[0]) so the Studio path never depends on the
         # Textual picker just to choose the default model.
-        model = "anthropic/claude-opus-4.8"
-        typer.secho("🧠 Model: Claude Opus 4.8 — flagship · effort: high (override with --model)",
+        model = "anthropic/claude-opus-5.5"
+        typer.secho("🧠 Model: Claude Opus 5.5 — flagship · effort: high (override with --model)",
                     fg=typer.colors.CYAN)
 
     cfg = LaunchConfig(

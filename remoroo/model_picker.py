@@ -16,9 +16,10 @@ from .branding import BRAND_MARKUP_MODEL_PICKER
 CHOICES: List[Tuple[str, str]] = [
     ("Default (Haiku 4.5)", ""),
     ("Claude Fable 5 — most capable, premium cost", "anthropic/claude-fable-5"),
-    ("Claude Opus 4.8 — flagship, recommended", "anthropic/claude-opus-4.8"),
+    ("Claude Opus 5.5 — flagship, recommended", "anthropic/claude-opus-5.5"),
     ("Claude Sonnet 4.5 — balanced", "anthropic/claude-sonnet-4.5"),
     ("Claude Haiku 4.5 — fast / cheap", "anthropic/claude-haiku-4.5"),
+    ("Claude Opus 4.8", "anthropic/claude-opus-4.8"),
     ("Claude Opus 4.7", "anthropic/claude-opus-4.7"),
     ("Claude Opus 4.6", "anthropic/claude-opus-4.6"),
 ]

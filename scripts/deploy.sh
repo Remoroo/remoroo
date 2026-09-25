@@ -3,6 +3,8 @@ set -e
 
 # Remoroo CLI Deployment Script
 # Purpose: Push main + tag v{version} to GitHub. Pushing the tag triggers Actions → Publish to PyPI automatically.
+# Version: bumped automatically (patch + 1 past the latest tag), never typed. For a minor/major release,
+# set a higher version in pyproject.toml first — a version above the latest tag is used as is.
 # Before tagging: uv lock (refresh + commit if needed), then scripts/sync_and_build.sh — same checks as the publish workflow.
 
 echo "🚀 Remoroo CLI Deployment Script"
@@ -105,55 +107,32 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-TAG="v$VERSION"
-echo "📦 Version from pyproject.toml: $VERSION"
-echo "🏷️  Tag to create: $TAG"
-echo ""
-
-# Check latest existing tag
+# Auto-bump. A version that is already released (a tag at or above it exists) moves to
+# the latest tag's patch + 1. A version above the latest tag was never released (a run
+# that stopped before tagging, or a minor/major set by hand) and is used as is, so
+# re-running never burns a number.
 LATEST_TAG=$(git tag --sort=-v:refname | head -1)
 if [ -n "$LATEST_TAG" ]; then
     echo "ℹ️  Latest existing tag: $LATEST_TAG"
-    
-    # Extract version from latest tag (remove 'v' prefix)
     LATEST_VERSION="${LATEST_TAG#v}"
-    
-    # Simple version comparison using sort
-    HIGHER=$(printf '%s\n%s' "$VERSION" "$LATEST_VERSION" | sort -V | tail -1)
-    
-    if [ "$VERSION" = "$LATEST_VERSION" ]; then
-        echo ""
-        echo "❌ Error: Version $VERSION already exists as tag $LATEST_TAG"
-        echo ""
-        echo "💡 Suggestion: Bump the version in pyproject.toml"
-        echo "   Current: version = \"$VERSION\""
-        
-        # Suggest next version
-        IFS='.' read -r major minor patch <<< "$VERSION"
-        NEXT_PATCH=$((patch + 1))
-        echo "   Next:    version = \"$major.$minor.$NEXT_PATCH\""
-        echo ""
-        exit 1
-    elif [ "$HIGHER" = "$LATEST_VERSION" ]; then
-        echo ""
-        echo "⚠️  Warning: Current version ($VERSION) is LOWER than latest tag ($LATEST_TAG)"
-        echo ""
-        echo "💡 Suggestion: Update pyproject.toml to a newer version"
-        echo "   Latest:  $LATEST_VERSION"
-        IFS='.' read -r major minor patch <<< "$LATEST_VERSION"
-        NEXT_PATCH=$((patch + 1))
-        echo "   Next:    $major.$minor.$NEXT_PATCH"
-        echo ""
-        read -p "Continue anyway? (y/n) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            echo "❌ Deployment cancelled"
+    HIGHER=$(printf '%s\n%s\n' "$VERSION" "$LATEST_VERSION" | sort -V | tail -1)
+    if [ "$HIGHER" = "$LATEST_VERSION" ]; then
+        if ! [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Error: latest tag $LATEST_TAG is not vMAJOR.MINOR.PATCH — cannot bump past it"
             exit 1
         fi
-    else
-        echo "✅ Version validation passed ($VERSION > $LATEST_VERSION)"
+        IFS='.' read -r major minor patch <<< "$LATEST_VERSION"
+        NEXT_VERSION="$major.$minor.$((patch + 1))"
+        echo "⬆️  Bumping version: $VERSION → $NEXT_VERSION"
+        sed -i.bak "s/^version = \"[^\"]*\"/version = \"$NEXT_VERSION\"/" pyproject.toml
+        rm -f pyproject.toml.bak
+        VERSION="$NEXT_VERSION"
     fi
 fi
+
+TAG="v$VERSION"
+echo "📦 Version: $VERSION"
+echo "🏷️  Tag to create: $TAG"
 echo ""
 
 DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -164,12 +143,12 @@ if ! command -v uv >/dev/null 2>&1; then
     echo "❌ uv is required: https://docs.astral.sh/uv/"
     exit 1
 fi
-echo "🔒 Refreshing uv.lock (if pyproject.toml changed, lock updates here)..."
+echo "🔒 Refreshing uv.lock (the version bump changes it)..."
 (cd "$CLI_ROOT" && uv lock)
-if [ -n "$(git -C "$CLI_ROOT" status --porcelain uv.lock)" ]; then
-    echo "💾 Committing updated uv.lock..."
-    git -C "$CLI_ROOT" add uv.lock
-    git -C "$CLI_ROOT" commit -m "chore: sync uv.lock for release"
+if [ -n "$(git -C "$CLI_ROOT" status --porcelain pyproject.toml uv.lock)" ]; then
+    echo "💾 Committing release files..."
+    git -C "$CLI_ROOT" add pyproject.toml uv.lock
+    git -C "$CLI_ROOT" commit -m "chore: release $TAG"
 fi
 
 echo "🔒 Verifying lockfile and building release artifacts (same as CI publish)..."
@@ -179,21 +158,7 @@ if ! bash "$DEPLOY_SCRIPT_DIR/sync_and_build.sh"; then
 fi
 echo ""
 
-# Check if tag already exists locally
-if git rev-parse "$TAG" >/dev/null 2>&1; then
-    echo "⚠️  Warning: Tag $TAG already exists locally"
-    read -p "Do you want to delete and recreate it? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        git tag -d "$TAG"
-        echo "🗑️  Deleted local tag $TAG"
-    else
-        echo "❌ Deployment cancelled"
-        exit 1
-    fi
-fi
-
-read -p "Proceed with deployment? (y/n) " -n 1 -r
+read -p "Proceed with deployment of $TAG? (y/n) " -n 1 -r
 echo
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     echo "❌ Deployment cancelled"
