@@ -181,8 +181,13 @@ def prepare_local_worker_context(
     allow_overage: bool,
     interactive: bool = False,
     operator_note: str = "",
+    continue_from: Optional[str] = None,
+    continue_note: str = "",
 ) -> LocalWorkerContext:
-    """Health check, auth, POST /runs or GET resume, dirs, transport, heartbeat."""
+    """Health check, auth, POST /runs or GET resume, dirs, transport, heartbeat.
+
+    With ``continue_from`` the new run is seeded with that finished run's conversation
+    (remoroo/continue_session.py) and aborted if the brain does not restore it."""
     import os
 
     repo_path = resolve_canonical_repo_root(Path(repo_path))
@@ -230,6 +235,23 @@ def prepare_local_worker_context(
     # this function raises `UnboundLocalError` on every `--resume` path
     # (e.g. the Try-Now executor on the GPU host).
     run_data = None
+    # A continue is validated BEFORE a server run exists: a checkpoint we cannot use must
+    # not cost a run, and must never degrade into a cold start.
+    prior_checkpoint = None
+    if continue_from:
+        from .continue_session import ContinueError, load_prior, note_message
+
+        if resume_run_id:
+            raise RunPrepareError(
+                "--continue-from starts a NEW run from a finished one; --resume attaches to "
+                "a live one. Pass one of them.",
+                code=2,
+            )
+        try:
+            prior_checkpoint = load_prior(repo_path, continue_from)
+            note_message(continue_note)
+        except ContinueError as e:
+            raise RunPrepareError(f"Cannot continue run {continue_from}: {e}", code=2) from e
     try:
         if resume_run_id:
             resp = requests.get(
@@ -349,6 +371,44 @@ def prepare_local_worker_context(
         remoroo_dir = repo_path / ".remoroo"
         run_output_dir = remoroo_dir / "runs" / remote_run_id
         run_output_dir.mkdir(parents=True, exist_ok=True)
+
+        if prior_checkpoint is not None:
+            # The brain restores only when the checkpoint's goal and metric EQUAL the ones
+            # it runs with -- the server-resolved values, read back here, never the CLI's.
+            # Written before the first heartbeat: the brain reads it right after that.
+            from .continue_session import ContinueError, restorable, seed, write_seed
+
+            info_resp = requests.get(
+                f"{API_URL}/runs/{remote_run_id}", headers=headers, timeout=20.0
+            )
+            info_resp.raise_for_status()
+            info = (info_resp.json() or {}).get("run") or {}
+            srv_goal, srv_metric = info.get("goal"), info.get("metrics")
+            try:
+                seeded = seed(
+                    prior_checkpoint,
+                    run_id=remote_run_id,
+                    goal=srv_goal,
+                    metric=srv_metric,
+                    note=continue_note,
+                )
+            except ContinueError as e:
+                raise RunPrepareError(f"Cannot continue run {continue_from}: {e}", code=2) from e
+            not_restorable = restorable(seeded, goal=srv_goal, metric=srv_metric)
+            if not_restorable:
+                raise RunPrepareError(
+                    f"The brain would not restore run {continue_from} ({not_restorable}); "
+                    "refusing to start cold.",
+                    code=2,
+                )
+            write_seed(run_output_dir, seeded)
+            _prepare_cli_debug(
+                "continue_seeded",
+                log_file=str(_PREPARE_DEBUG_LOG),
+                remote_run_id=remote_run_id,
+                continue_from=continue_from,
+                history=len(seeded.get("history") or []),
+            )
 
         gitignore_path = repo_path / ".gitignore"
         _prepare_cli_debug(
@@ -485,6 +545,25 @@ def prepare_local_worker_context(
 
         heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         heartbeat_thread.start()
+
+        if prior_checkpoint is not None:
+            from .continue_session import watch_for_restore
+
+            def _agent_events() -> list:
+                r = requests.get(
+                    f"{API_URL}/runs/{remote_run_id}/agent_events",
+                    headers=headers,
+                    timeout=10.0,
+                )
+                if r.status_code != 200:
+                    return []
+                return (r.json() or {}).get("events") or []
+
+            watch_for_restore(
+                _agent_events,
+                _abort_run_on_failure,
+                log=lambda m: typer.secho(m, fg=typer.colors.CYAN, err=True),
+            )
 
         return LocalWorkerContext(
             api_url=API_URL,
@@ -978,6 +1057,8 @@ def run_local_worker_headless(cfg: "Any") -> LocalRunResult:
             allow_overage=cfg.allow_overage,
             interactive=getattr(cfg, "interactive", False),
             operator_note=getattr(cfg, "operator_note", ""),
+            continue_from=getattr(cfg, "continue_from", None),
+            continue_note=getattr(cfg, "continue_note", ""),
         )
     except RunPrepareError as exc:
         _emit_headless_log(

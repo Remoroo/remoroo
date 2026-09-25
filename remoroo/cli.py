@@ -342,6 +342,21 @@ def run(
         metavar="RUN_ID",
         help="Attach worker to an existing run instead of creating a new one.",
     ),
+    continue_from: Optional[str] = typer.Option(
+        None,
+        "--continue-from",
+        metavar="RUN_ID",
+        help=(
+            "Continue a FINISHED run: a new run that starts with that run's whole "
+            "conversation (from .remoroo/runs/<RUN_ID>/checkpoint.json) plus your note. "
+            "Refuses rather than starting cold."
+        ),
+    ),
+    note_file: Optional[Path] = typer.Option(
+        None,
+        "--note-file",
+        help="With --continue-from: a file whose text is the next turn (what changed, what to do).",
+    ),
     headless: bool = typer.Option(
         False,
         "--headless",
@@ -410,6 +425,16 @@ def run(
 
     run_id = resume if resume else new_run_id()
     max_wall_time_s = int(budget_hours * 3600)
+    _continue_note = ""
+    if continue_from:
+        if resume:
+            typer.secho("--continue-from and --resume cannot be combined.", fg=typer.colors.RED)
+            raise typer.Exit(code=2)
+        if note_file is None or not Path(note_file).is_file():
+            typer.secho("--continue-from needs --note-file: the turn that says what changed.",
+                        fg=typer.colors.RED)
+            raise typer.Exit(code=2)
+        _continue_note = Path(note_file).read_text()
     gl = (goal or "").strip() if goal else ""
     ml = [m.strip() for m in metrics.split(",") if m.strip()] if metrics else []
     metrics_option_provided = metrics is not None
@@ -452,6 +477,8 @@ def run(
             metrics_list=ml,
             model=model,
             resume_run_id=resume,
+            continue_from=continue_from,
+            continue_note=_continue_note,
             run_id_display=run_id,
             attach_status="",
             attach_goal_preview="",

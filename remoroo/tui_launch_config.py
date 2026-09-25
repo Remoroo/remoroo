@@ -51,6 +51,10 @@ class LaunchConfig:
     # Injected into the v2 system prompt as authoritative guidance so the operator
     # can correct the agent's assumptions and steer decisions up front.
     operator_note: str = ""
+    # `remoroo run --continue-from <run_id>`: a NEW run seeded with that finished run's
+    # conversation (remoroo/continue_session.py), with `continue_note` as its next turn.
+    continue_from: Optional[str] = None
+    continue_note: str = ""
 
     def is_resume(self) -> bool:
         return bool(self.resume_run_id)

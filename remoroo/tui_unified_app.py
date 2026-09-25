@@ -266,6 +266,8 @@ class PrepareWorkerScreen(Screen[PrepareOutcome]):
                     allow_overage=c.allow_overage,
                     interactive=getattr(c, "interactive", False),
                     operator_note=getattr(c, "operator_note", ""),
+                    continue_from=getattr(c, "continue_from", None),
+                    continue_note=getattr(c, "continue_note", ""),
                 )
                 self.app.call_from_thread(self.dismiss, ctx)
             except RunPrepareError as e:
